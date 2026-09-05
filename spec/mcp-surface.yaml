@@ -32,7 +32,7 @@ $error:
     properties:
       type: { type: string, format: uri, description: "Stable URI for the error class, https://kitbash.zyx.tw/errors/<slug>" }
       title: { type: string }
-      status: { type: integer, description: "HTTP status semantics: 400 bad input, 403 not permitted, 404 not found, 409 conflict, 422 manifest invalid, 500 internal" }
+      status: { type: integer, description: "HTTP status semantics: 400 bad input, 403 not permitted, 404 not found, 409 conflict, 413 too large, 415 media type not renderable, 422 manifest invalid, 500 internal" }
       detail: { type: string, description: "What went wrong, specific to this call" }
       instance: { type: string, description: "Path or identifier the error is about" }
       fix: { type: string, description: "What the caller should do next" }
@@ -40,8 +40,10 @@ $error:
     - https://kitbash.zyx.tw/errors/not-found
     - https://kitbash.zyx.tw/errors/not-visible        # folder exists but has no manifest
     - https://kitbash.zyx.tw/errors/not-permitted
+    - https://kitbash.zyx.tw/errors/bad-request        # malformed input, such as content that is not base64
     - https://kitbash.zyx.tw/errors/invalid-path       # outside /org and /home/<caller>, or contains ..
     - https://kitbash.zyx.tw/errors/invalid-manifest   # kitbash.yaml fails spec/manifest.schema.json
+    - https://kitbash.zyx.tw/errors/unsupported-media-type  # fs_read cannot render this media type
     - https://kitbash.zyx.tw/errors/too-large
     - https://kitbash.zyx.tw/errors/conflict           # write raced another commit
     - https://kitbash.zyx.tw/errors/internal
@@ -85,9 +87,12 @@ families:
       fs_list:
         description: >
           List what is visible at a path. With no path, returns the visible top
-          level folders across /org and the caller's home. Inside a folder,
-          returns visible subfolders (name and description only, no contents)
-          and the files directly in it. Folders without a manifest are omitted.
+          level folders across /org and the caller's home. A root path itself is
+          the same roots view: /org and /home/<caller> carry no manifest and are
+          always listable, returning their visible children. Inside any other
+          folder, returns visible subfolders (name and description only, no
+          contents) and the files directly in it. Folders without a manifest are
+          omitted.
         input:
           type: object
           additionalProperties: false
@@ -127,7 +132,7 @@ families:
             size: { type: integer }
             sha: { type: string, description: "Commit that last touched this file" }
             truncated: { type: boolean }
-        errors: [not-found, not-visible, not-permitted, invalid-path, too-large]
+        errors: [not-found, not-visible, not-permitted, invalid-path, unsupported-media-type, too-large]
 
       fs_write:
         description: >
@@ -156,7 +161,7 @@ families:
           properties:
             path: { type: string }
             commit: { $ref: "#/$defs/commit" }
-        errors: [not-permitted, invalid-path, invalid-manifest, too-large, conflict]
+        errors: [bad-request, not-permitted, invalid-path, invalid-manifest, too-large, conflict]
 
       fs_history:
         description: List commits that touched a path, newest first.

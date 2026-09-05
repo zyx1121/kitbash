@@ -117,19 +117,19 @@ func (s *Service) Write(ctx context.Context, req WriteRequest) (*WriteResult, *p
 func payload(instance string, req WriteRequest) ([]byte, *problem.Problem) {
 	switch {
 	case req.Content != nil && req.ContentBase64 != nil:
-		return nil, problem.Internal(instance, "content and contentBase64 are mutually exclusive",
+		return nil, problem.BadRequest(instance, "content and contentBase64 are mutually exclusive",
 			"Send exactly one of content and contentBase64.")
 	case req.Content != nil:
 		return []byte(*req.Content), nil
 	case req.ContentBase64 != nil:
 		data, err := base64.StdEncoding.DecodeString(*req.ContentBase64)
 		if err != nil {
-			return nil, problem.Internal(instance, "contentBase64 is not valid base64: "+err.Error(),
+			return nil, problem.BadRequest(instance, "contentBase64 is not valid base64: "+err.Error(),
 				"Send standard base64, or use content for UTF-8 text.")
 		}
 		return data, nil
 	default:
-		return nil, problem.Internal(instance, "neither content nor contentBase64 was sent",
+		return nil, problem.BadRequest(instance, "neither content nor contentBase64 was sent",
 			"Send exactly one of content and contentBase64.")
 	}
 }

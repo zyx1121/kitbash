@@ -16,8 +16,10 @@ const (
 	SlugNotFound        = "not-found"
 	SlugNotVisible      = "not-visible"
 	SlugNotPermitted    = "not-permitted"
+	SlugBadRequest      = "bad-request"
 	SlugInvalidPath     = "invalid-path"
 	SlugInvalidManifest = "invalid-manifest"
+	SlugUnsupported     = "unsupported-media-type"
 	SlugTooLarge        = "too-large"
 	SlugConflict        = "conflict"
 	SlugInternal        = "internal"
@@ -85,6 +87,21 @@ func NotPermitted(instance, detail, fix string) *Problem {
 		fix = "Ask an administrator for access, or work inside your own home folder."
 	}
 	return newProblem(SlugNotPermitted, "Not permitted", http.StatusForbidden, instance, detail, fix)
+}
+
+// BadRequest reports malformed input the tool's schema does not catch, such as
+// content that is not base64.
+func BadRequest(instance, detail, fix string) *Problem {
+	if fix == "" {
+		fix = "Send arguments that match the tool's input schema."
+	}
+	return newProblem(SlugBadRequest, "Bad request", http.StatusBadRequest, instance, detail, fix)
+}
+
+// UnsupportedMediaType reports a file kitbash cannot render in this milestone.
+func UnsupportedMediaType(instance, detail string) *Problem {
+	return newProblem(SlugUnsupported, "Unsupported media type", http.StatusUnsupportedMediaType, instance, detail,
+		"Read this file from a Package that understands its format.")
 }
 
 // InvalidPath reports a path outside the roots or containing a parent reference.

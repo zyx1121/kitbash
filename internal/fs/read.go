@@ -99,9 +99,8 @@ func (s *Service) Read(ctx context.Context, path string, opts ReadOptions) (*Rea
 		return &ReadResult{Meta: meta, Text: text}, nil
 
 	default:
-		return nil, problem.NotPermitted(clean,
-			fmt.Sprintf("%s is not readable through fs_read; M1 returns text, PNG, JPEG and PDF", mediaType),
-			"Read this file from a Package that understands its format.")
+		return nil, problem.UnsupportedMediaType(clean,
+			fmt.Sprintf("%s is not readable through fs_read; M1 returns text, PNG, JPEG and PDF", mediaType))
 	}
 }
 

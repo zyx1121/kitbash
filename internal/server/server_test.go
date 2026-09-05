@@ -3,6 +3,7 @@ package server_test
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"image"
 	"image/color"
@@ -50,6 +51,7 @@ tags: [docs, onboarding]
 	write(t, filepath.Join(org, "handbook", "README.md"), "# Handbook\n\nStart here.\n")
 	write(t, filepath.Join(org, "handbook", ".secret"), "not part of the surface\n")
 	write(t, filepath.Join(org, "handbook", "logo.png"), string(tinyPNG(t)))
+	write(t, filepath.Join(org, "handbook", "archive.bin"), "\x00\x01\x02\x03binary payload")
 
 	// A visible subfolder, an invisible one, and one with a broken manifest.
 	write(t, filepath.Join(org, "handbook", "policies", "kitbash.yaml"), `name: policies
@@ -533,6 +535,65 @@ func TestInvalidPath(t *testing.T) {
 				t.Errorf("status is %d, want 400", p.Status)
 			}
 		})
+	}
+}
+
+func TestReadUnsupportedMediaType(t *testing.T) {
+	f := newFixture(t)
+	s := connect(t, f)
+
+	p := problemOf(t, call(t, s, "fs_read", map[string]any{
+		"path": filepath.Join(f.org, "handbook", "archive.bin"),
+	}))
+	if p.Slug() != problem.SlugUnsupported {
+		t.Errorf("slug is %s, want unsupported-media-type", p.Slug())
+	}
+	if p.Status != 415 {
+		t.Errorf("status is %d, want 415", p.Status)
+	}
+}
+
+func TestWriteBase64(t *testing.T) {
+	f := newFixture(t)
+	s := connect(t, f)
+
+	path := filepath.Join(f.org, "handbook", "policies", "seal.png")
+	image := tinyPNG(t)
+	ok(t, call(t, s, "fs_write", map[string]any{
+		"path":          path,
+		"contentBase64": base64.StdEncoding.EncodeToString(image),
+		"message":       "Add the policy seal",
+	}), "fs_write")
+	onDisk, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(onDisk, image) {
+		t.Fatalf("base64 content did not round trip: %v", err)
+	}
+
+	p := problemOf(t, call(t, s, "fs_write", map[string]any{
+		"path":          path,
+		"contentBase64": "this is not base64!!",
+		"message":       "Break the seal",
+	}))
+	if p.Slug() != problem.SlugBadRequest {
+		t.Errorf("slug is %s, want bad-request", p.Slug())
+	}
+	if p.Status != 400 {
+		t.Errorf("status is %d, want 400", p.Status)
+	}
+}
+
+func TestListRootPathIsTheRootsView(t *testing.T) {
+	f := newFixture(t)
+	s := connect(t, f)
+
+	res := call(t, s, "fs_list", map[string]any{"path": f.org})
+	ok(t, res, "fs_list")
+	out := structured[fs.ListResult](t, res)
+	if out.Manifest != nil {
+		t.Errorf("a root carries no manifest, got %v", out.Manifest)
+	}
+	if len(out.Folders) != 1 || out.Folders[0].Name != "handbook" {
+		t.Errorf("the root lists its visible children, got %+v", out.Folders)
 	}
 }
 
