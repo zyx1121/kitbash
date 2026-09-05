@@ -123,7 +123,13 @@ families:
             offset: { type: integer, minimum: 0, description: "Byte offset for text files" }
             limit: { type: integer, minimum: 1, maximum: 1048576, description: "Max bytes for text files" }
         output:
-          description: MCP content array. Text as a text block, images as an image block. Structured metadata alongside.
+          description: >
+            Content blocks only. fs_read declares no outputSchema and returns no
+            structuredContent, because clients prefer structuredContent when it
+            is present and would then show the caller the metadata instead of
+            the file body. The first block is the file: text media types as a
+            text block, image/png and image/jpeg as an image block. The trailing
+            block is a text block holding this metadata object as JSON.
           type: object
           required: [path, mediaType, size]
           properties:

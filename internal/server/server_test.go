@@ -198,6 +198,27 @@ func problemOf(t *testing.T, res *mcp.CallToolResult) problem.Problem {
 	return p
 }
 
+// readMeta decodes the trailing text block of fs_read, which is where the
+// metadata lives now that the tool returns no structured content.
+func readMeta(t *testing.T, res *mcp.CallToolResult) fs.ReadMeta {
+	t.Helper()
+	if res.StructuredContent != nil {
+		t.Fatalf("fs_read must not return structured content, got %v", res.StructuredContent)
+	}
+	if len(res.Content) != 2 {
+		t.Fatalf("expected the file and its metadata, got %d content blocks", len(res.Content))
+	}
+	tc, isText := res.Content[1].(*mcp.TextContent)
+	if !isText {
+		t.Fatalf("the metadata block is %T, want text", res.Content[1])
+	}
+	var meta fs.ReadMeta
+	if err := json.Unmarshal([]byte(tc.Text), &meta); err != nil {
+		t.Fatalf("decoding metadata %s: %v", tc.Text, err)
+	}
+	return meta
+}
+
 func structured[T any](t *testing.T, res *mcp.CallToolResult) T {
 	t.Helper()
 	raw, err := json.Marshal(res.StructuredContent)
@@ -232,7 +253,12 @@ func TestInitializeAndToolsList(t *testing.T) {
 		if tool.InputSchema == nil {
 			t.Errorf("tool %s has no input schema", tool.Name)
 		}
-		if tool.OutputSchema == nil {
+		// fs_read is content blocks only, see spec/mcp-surface.yaml.
+		if tool.Name == "fs_read" {
+			if tool.OutputSchema != nil {
+				t.Error("fs_read must not declare an output schema")
+			}
+		} else if tool.OutputSchema == nil {
 			t.Errorf("tool %s has no output schema", tool.Name)
 		}
 	}
@@ -346,7 +372,7 @@ func TestReadTextReturnsTextAndMetadata(t *testing.T) {
 	if got := textOf(t, res); got != "# Handbook\n\nStart here.\n" {
 		t.Errorf("content is %q", got)
 	}
-	meta := structured[fs.ReadMeta](t, res)
+	meta := readMeta(t, res)
 	if meta.MediaType != "text/markdown" {
 		t.Errorf("media type is %q, want text/markdown", meta.MediaType)
 	}
@@ -374,7 +400,7 @@ func TestReadTextWindow(t *testing.T) {
 	if got := textOf(t, res); got != "Handbook" {
 		t.Errorf("window is %q, want Handbook", got)
 	}
-	if meta := structured[fs.ReadMeta](t, res); !meta.Truncated {
+	if meta := readMeta(t, res); !meta.Truncated {
 		t.Error("a window read is truncated")
 	}
 }
@@ -400,7 +426,7 @@ func TestReadImageReturnsImageContent(t *testing.T) {
 	if !bytes.Equal(img.Data, onDisk) {
 		t.Error("image data does not round trip")
 	}
-	if meta := structured[fs.ReadMeta](t, res); meta.MediaType != "image/png" {
+	if meta := readMeta(t, res); meta.MediaType != "image/png" {
 		t.Errorf("metadata media type is %q, want image/png", meta.MediaType)
 	}
 }

@@ -45,9 +45,9 @@ func Register(s *mcp.Server, files *fs.Service) {
 		Name: "fs_read",
 		Description: "Read one file. Text media types return text content. image/png and image/jpeg return " +
 			"MCP image content. application/pdf returns extracted text. Files larger than 1 MiB return " +
-			"too-large; use offset and limit for text.",
-		InputSchema:  readInputSchema,
-		OutputSchema: readOutputSchema,
+			"too-large; use offset and limit for text. The first content block is the file, the trailing " +
+			"text block is the metadata as JSON: path, mediaType, size, sha and truncated.",
+		InputSchema: readInputSchema,
 	}, readHandler(files))
 
 	mcp.AddTool(s, &mcp.Tool{
@@ -126,9 +126,11 @@ func readHandler(files *fs.Service) mcp.ToolHandlerFor[readInput, any] {
 		} else {
 			content = &mcp.TextContent{Text: out.Text}
 		}
+		// fs_read carries no structured content on purpose: clients prefer it
+		// over the content blocks, which would hide the file body behind its
+		// metadata. The metadata is the trailing text block instead.
 		return &mcp.CallToolResult{
-			Content:           []mcp.Content{content, &mcp.TextContent{Text: string(meta)}},
-			StructuredContent: json.RawMessage(meta),
+			Content: []mcp.Content{content, &mcp.TextContent{Text: string(meta)}},
 		}, nil, nil
 	}
 }

@@ -72,17 +72,10 @@ var (
   }
 }`)
 
-	readOutputSchema = json.RawMessage(`{
-  "type": "object",
-  "required": ["path", "mediaType", "size"],
-  "properties": {
-    "path": { "type": "string" },
-    "mediaType": { "type": "string" },
-    "size": { "type": "integer" },
-    "sha": { "type": "string", "description": "Commit that last touched this file" },
-    "truncated": { "type": "boolean" }
-  }
-}`)
+	// fs_read declares no output schema. Its result is content blocks only, so
+	// a client that prefers structured content still shows the caller the file
+	// body. The metadata shape it returns as its trailing text block is
+	// fs.ReadMeta, and it is documented in spec/mcp-surface.yaml.
 
 	writeInputSchema = json.RawMessage(`{
   "type": "object",
