@@ -129,6 +129,24 @@ Rules the core enforces on every manifest:
 - Every operation is idempotent and describes the desired state. Repeating a call is safe.
 - Errors are structured: cause, effect, and a suggested fix. Never a bare string.
 
+### 2.7 Standards
+
+kitbash adopts existing specifications wherever one exists. Nothing in this list is invented here.
+
+| Specification | Where it binds | Note |
+|---------------|----------------|------|
+| OCI image, runtime and distribution specs | Packages, Processes | A Package version is an OCI digest |
+| OpenTelemetry semantic conventions and W3C Trace Context | Telemetry | Attribute names follow the conventions; `traceparent` crosses process boundaries |
+| Model Context Protocol, 2025-06 revision | The MCP surface | Files map onto MCP primitives: binary content as resources, `prompt` entries as prompts, everything else as tools |
+| JSON Schema 2020-12 | Tool input and output in the manifest | Composition binds on schemas, so the draft is pinned |
+| RFC 9457 Problem Details | Every error | Structured errors are `type`, `title`, `detail`, `instance`, plus a `fix` extension |
+| RFC 3339 timestamps, UUIDv7 identifiers | Everywhere | Sortable, unambiguous |
+| Semantic Versioning, git SHA | kitbashd releases, Files versions | Packages use the OCI digest |
+
+Adopted from M4 onward, when Packages start crossing trust boundaries: SLSA provenance with in-toto attestations for builds, Sigstore signatures on images, an SPDX or CycloneDX SBOM per Package, and CloudEvents as the envelope for the Telemetry fan out.
+
+Deliberately not followed: the Filesystem Hierarchy Standard and the Linux Standard Base. Both describe a Linux for humans. `/org` is not an FHS path and does not need to be.
+
 ## 3. Kits
 
 A kit is a Package that implements one or more of the five hooks in the lifecycle:
