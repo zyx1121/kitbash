@@ -13,7 +13,9 @@
 # - Paths are absolute, rooted at /org or /home/<caller>. The caller never sees
 #   another user's home. Access control is the kernel's: kitbash-mcp runs as the
 #   connecting Linux user.
-# - A folder is visible only if it carries kitbash.yaml with name and description.
+# - A folder is visible only if it carries kitbash.yaml with name and
+#   description, and so does every folder between it and its root. kitbash
+#   follows no symlinks and refuses every path component that begins with a dot.
 # - Timestamps are RFC 3339. Identifiers are UUIDv7 unless they are git SHAs or
 #   OCI digests.
 # - Errors are returned as an MCP tool result with isError: true whose single
@@ -32,7 +34,7 @@ $error:
     properties:
       type: { type: string, format: uri, description: "Stable URI for the error class, https://kitbash.zyx.tw/errors/<slug>" }
       title: { type: string }
-      status: { type: integer, description: "HTTP status semantics: 400 bad input, 403 not permitted, 404 not found, 409 conflict, 422 manifest invalid, 500 internal" }
+      status: { type: integer, description: "HTTP status semantics: 400 bad input, 403 not permitted, 404 not found, 409 conflict, 413 too large, 415 media type not renderable, 422 manifest invalid, 500 internal" }
       detail: { type: string, description: "What went wrong, specific to this call" }
       instance: { type: string, description: "Path or identifier the error is about" }
       fix: { type: string, description: "What the caller should do next" }
@@ -40,8 +42,10 @@ $error:
     - https://kitbash.zyx.tw/errors/not-found
     - https://kitbash.zyx.tw/errors/not-visible        # folder exists but has no manifest
     - https://kitbash.zyx.tw/errors/not-permitted
-    - https://kitbash.zyx.tw/errors/invalid-path       # outside /org and /home/<caller>, or contains ..
+    - https://kitbash.zyx.tw/errors/bad-request        # malformed input, such as content that is not base64
+    - https://kitbash.zyx.tw/errors/invalid-path       # outside /org and /home/<caller>, contains .., names a symlink, or names a dot component
     - https://kitbash.zyx.tw/errors/invalid-manifest   # kitbash.yaml fails spec/manifest.schema.json
+    - https://kitbash.zyx.tw/errors/unsupported-media-type  # fs_read cannot render this media type
     - https://kitbash.zyx.tw/errors/too-large
     - https://kitbash.zyx.tw/errors/conflict           # write raced another commit
     - https://kitbash.zyx.tw/errors/internal
@@ -85,9 +89,12 @@ families:
       fs_list:
         description: >
           List what is visible at a path. With no path, returns the visible top
-          level folders across /org and the caller's home. Inside a folder,
-          returns visible subfolders (name and description only, no contents)
-          and the files directly in it. Folders without a manifest are omitted.
+          level folders across /org and the caller's home. A root path itself is
+          the same roots view: /org and /home/<caller> carry no manifest and are
+          always listable, returning their visible children. Inside any other
+          folder, returns visible subfolders (name and description only, no
+          contents) and the files directly in it. Folders without a manifest are
+          omitted.
         input:
           type: object
           additionalProperties: false
@@ -101,7 +108,7 @@ families:
             manifest: { description: "This folder's parsed kitbash.yaml, absent at the roots", type: object }
             folders: { type: array, items: { $ref: "#/$defs/folderEntry" } }
             files: { type: array, items: { $ref: "#/$defs/fileEntry" } }
-        errors: [not-found, not-visible, not-permitted, invalid-path]
+        errors: [not-found, not-visible, not-permitted, invalid-path, internal]
 
       fs_read:
         description: >
@@ -118,7 +125,13 @@ families:
             offset: { type: integer, minimum: 0, description: "Byte offset for text files" }
             limit: { type: integer, minimum: 1, maximum: 1048576, description: "Max bytes for text files" }
         output:
-          description: MCP content array. Text as a text block, images as an image block. Structured metadata alongside.
+          description: >
+            Content blocks only. fs_read declares no outputSchema and returns no
+            structuredContent, because clients prefer structuredContent when it
+            is present and would then show the caller the metadata instead of
+            the file body. The first block is the file: text media types as a
+            text block, image/png and image/jpeg as an image block. The trailing
+            block is a text block holding this metadata object as JSON.
           type: object
           required: [path, mediaType, size]
           properties:
@@ -127,7 +140,7 @@ families:
             size: { type: integer }
             sha: { type: string, description: "Commit that last touched this file" }
             truncated: { type: boolean }
-        errors: [not-found, not-visible, not-permitted, invalid-path, too-large]
+        errors: [not-found, not-visible, not-permitted, invalid-path, unsupported-media-type, too-large, internal]
 
       fs_write:
         description: >
@@ -156,7 +169,7 @@ families:
           properties:
             path: { type: string }
             commit: { $ref: "#/$defs/commit" }
-        errors: [not-permitted, invalid-path, invalid-manifest, too-large, conflict]
+        errors: [bad-request, not-permitted, invalid-path, invalid-manifest, too-large, conflict, internal]
 
       fs_history:
         description: List commits that touched a path, newest first.
@@ -173,7 +186,7 @@ families:
           properties:
             path: { type: string }
             commits: { type: array, items: { $ref: "#/$defs/commit" } }
-        errors: [not-found, not-visible, not-permitted, invalid-path]
+        errors: [not-found, not-visible, not-permitted, invalid-path, internal]
 
   # ---------------------------------------------------------------- pkg (M2)
   pkg:
