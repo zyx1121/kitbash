@@ -9,6 +9,10 @@ ver=$(sed -n 's/^pkgver=//p' "$(dirname "$0")/APKBUILD")
 work=$HOME/abuild/kitbashd; rm -rf "$work"; mkdir -p "$work"; cp "$(dirname "$0")/APKBUILD" "$work/"; cp "$tar" "$work/"
 cd "$work"
 [ -f ~/.abuild/abuild.conf ] || abuild-keygen -a -n -q
+# The signing key must be trusted by apk on the target host, otherwise apk add
+# needs --allow-untrusted and abuild cannot index. As root, once:
+#   cp ~builder/.abuild/*.rsa.pub /etc/apk/keys/
+ls ~/.abuild/*.rsa.pub
 abuild -F checksum 2>/dev/null || abuild checksum
 abuild -r
 ls ~/packages/*/*/kitbashd-*.apk
