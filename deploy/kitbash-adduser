@@ -1,0 +1,27 @@
+#!/bin/sh
+# M1 stand in for the users_create MCP tool. Creates a member.
+# usage: kitbash-adduser <name> '<ssh public key>' [admin]
+set -eu
+name=$1; key=$2; role=${3:-}
+[ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
+echo "$name" | grep -Eq '^[a-z][a-z0-9-]{1,31}$' || { echo "bad name" >&2; exit 1; }
+if ! id "$name" >/dev/null 2>&1; then
+  useradd -m -s /bin/sh -G kitbash-users "$name"
+fi
+# useradd leaves the password field as "!", which sshd treats as a locked
+# account and refuses even key logins. "*" means no password, not locked.
+usermod -p '*' "$name"
+home=$(getent passwd "$name" | cut -d: -f6)
+chmod 700 "$home"
+adduser "$name" kitbash-users >/dev/null 2>&1 || true
+[ "$role" = admin ] && adduser "$name" kitbash-admin >/dev/null 2>&1 || true
+grep -q "^$name:" /etc/subuid || usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$name" 2>/dev/null || {
+  # usermod cannot allocate when ranges overlap; pick the next free block
+  last=$(awk -F: '{print $2+$3}' /etc/subuid | sort -n | tail -1); last=${last:-100000}
+  echo "$name:$last:65536" >> /etc/subuid; echo "$name:$last:65536" >> /etc/subgid
+}
+install -d -m 700 -o "$name" -g "$name" "$home/.ssh"
+touch "$home/.ssh/authorized_keys"; chmod 600 "$home/.ssh/authorized_keys"; chown "$name:$name" "$home/.ssh/authorized_keys"
+grep -qF "$key" "$home/.ssh/authorized_keys" || echo "$key" >> "$home/.ssh/authorized_keys"
+uid=$(id -u "$name"); d=/run/user/$uid; mkdir -p "$d"; chown "$name" "$d"; chmod 700 "$d"
+echo "$name uid=$uid groups=$(id -Gn "$name")"

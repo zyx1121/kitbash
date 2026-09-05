@@ -1,0 +1,29 @@
+# Maintainer: Loki <yongxiang.zhan@outlook.com>
+pkgname=kitbashd
+pkgver=0.1.0
+pkgrel=0
+pkgdesc="kitbash: an operating system layer for AI agents. MCP over SSH, Files, Packages, Processes, Telemetry."
+url="https://github.com/zyx1121/kitbash"
+arch="x86_64 aarch64"
+license="Proprietary"
+depends="podman crun passt shadow shadow-subids git openssh"
+makedepends="go"
+options="!check net"
+source="kitbash-$pkgver.tar.gz"
+builddir="$srcdir/kitbash-$pkgver"
+
+build() {
+	# Alpine pins GOTOOLCHAIN=local; let go fetch the toolchain go.mod asks for.
+	export GOTOOLCHAIN=auto GOFLAGS=-mod=mod GOMODCACHE="$srcdir/gomod"
+	CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=v$pkgver" -o kitbash-mcp ./cmd/kitbash-mcp
+	# go leaves the module cache read only, which breaks abuild cleanup
+	chmod -R u+w "$srcdir/gomod"
+}
+
+package() {
+	install -Dm755 kitbash-mcp "$pkgdir"/usr/bin/kitbash-mcp
+	install -Dm755 deploy/kitbash-adduser "$pkgdir"/usr/bin/kitbash-adduser
+	install -Dm755 deploy/install.sh "$pkgdir"/usr/share/kitbash/install.sh
+	mkdir -p "$pkgdir"/usr/share/kitbash/org
+	cp -R deploy/org/. "$pkgdir"/usr/share/kitbash/org/
+}
