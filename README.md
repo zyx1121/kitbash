@@ -10,13 +10,13 @@
 
 # kitbash
 
-> A toolbox for AI agents. The agent builds the tool, the platform keeps it versioned, deployed, observed and evaluated.
+> An operating system for AI agents. Files, Packages, Processes, Telemetry. Nothing built for a human at a terminal.
 
-An agent gets asked for a skill, an MCP server, a workflow node. Today it writes files into a directory and hopes. kitbash gives it a platform instead: create the artifact, push a version, deploy it, and watch how it is used. Skills, MCP servers, nodes and workflows are all the same kind of thing here, and workflows compose from nodes and from other workflows like bricks.
+An organization installs kitbash on one machine. Every member gets a Linux user and connects their agent over SSH to an MCP endpoint that exposes the whole system. The agent writes source into Files, builds it into a Package, runs it as a Process, and everything it does lands in Telemetry. Third party tools arrive as Packages with schemas, never as host installs.
 
 ## Status
 
-Planning. The product plan and the object schema come first; infrastructure choices follow.
+Planning. Read [PLAN.md](PLAN.md): positioning, the four object model, kits, kitbashOS, and version 1 milestones.
 
 ## License
 
