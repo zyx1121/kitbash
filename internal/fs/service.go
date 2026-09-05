@@ -20,8 +20,13 @@ import (
 const MaxBytes = 1 << 20
 
 // RootsEnv overrides the roots with a colon separated list. It exists for
-// tests and for running the server outside a kitbash host.
+// tests and for running the server outside a kitbash host, so it is honoured
+// only when the process is not serving an SSH session.
 const RootsEnv = "KITBASH_ROOTS"
+
+// SSHEnv is set by sshd on every session. Its presence means the caller is a
+// member connecting through ForceCommand, who must not choose the roots.
+const SSHEnv = "SSH_CONNECTION"
 
 // OrgRoot is the shared root every member can read.
 const OrgRoot = "/org"
@@ -31,9 +36,6 @@ const OrgRoot = "/org"
 type Service struct {
 	user  string
 	roots []string
-	// resolved holds each root with symlinks evaluated, so a path the caller
-	// spells through a symlinked root still matches.
-	resolved []string
 }
 
 // New builds a Service for a named user over the given roots.
@@ -52,13 +54,7 @@ func New(username string, roots []string) (*Service, error) {
 		if !filepath.IsAbs(r) {
 			return nil, fmt.Errorf("fs: root %q is not absolute", r)
 		}
-		clean := filepath.Clean(r)
-		s.roots = append(s.roots, clean)
-		res, err := filepath.EvalSymlinks(clean)
-		if err != nil {
-			res = clean
-		}
-		s.resolved = append(s.resolved, res)
+		s.roots = append(s.roots, filepath.Clean(r))
 	}
 	return s, nil
 }
@@ -71,7 +67,7 @@ func NewFromEnv() (*Service, error) {
 		return nil, fmt.Errorf("fs: reading the current user: %w", err)
 	}
 	name := u.Username
-	if env := os.Getenv(RootsEnv); env != "" {
+	if env := os.Getenv(RootsEnv); env != "" && os.Getenv(SSHEnv) == "" {
 		return New(name, strings.Split(env, ":"))
 	}
 	home := u.HomeDir
@@ -87,7 +83,13 @@ func (s *Service) User() string { return s.user }
 // Roots are the folders the caller may reach.
 func (s *Service) Roots() []string { return append([]string(nil), s.roots...) }
 
-// resolve validates one caller supplied path and returns it cleaned.
+// resolve validates one caller supplied path and returns it cleaned. It is the
+// only way a path enters the surface, so every rule that keeps a caller inside
+// the roots lives here.
+//
+// M1 does not follow symlinks at all. A link anywhere under a root could point
+// outside it, and checking the target after the fact races the filesystem, so
+// any symlink in the path is refused instead.
 func (s *Service) resolve(p string) (string, *problem.Problem) {
 	if p == "" {
 		return "", problem.InvalidPath(p, "the path is empty")
@@ -101,18 +103,46 @@ func (s *Service) resolve(p string) (string, *problem.Problem) {
 		}
 	}
 	clean := filepath.Clean(p)
-	if _, ok := s.rootOf(clean); ok {
-		return clean, nil
+	root, ok := s.rootOf(clean)
+	if !ok {
+		return "", problem.InvalidPath(p, fmt.Sprintf("the path is outside %s", strings.Join(s.roots, " and ")))
 	}
-	// The caller may have spelled a root that is itself a symlink.
-	if res, err := filepath.EvalSymlinks(clean); err == nil {
-		for _, r := range s.resolved {
-			if within(res, r) {
-				return clean, nil
-			}
+	if prob := checkSegments(root, clean); prob != nil {
+		return "", prob
+	}
+	return clean, nil
+}
+
+// checkSegments walks the path one component at a time below the root. Names
+// beginning with a dot are reserved, and no component may be a symlink.
+func checkSegments(root, clean string) *problem.Problem {
+	rel, err := filepath.Rel(root, clean)
+	if err != nil {
+		return problem.InvalidPath(clean, "the path is outside its root")
+	}
+	if rel == "." {
+		return nil
+	}
+	current := root
+	for _, seg := range strings.Split(rel, string(filepath.Separator)) {
+		if strings.HasPrefix(seg, ".") {
+			return problem.InvalidPathFix(clean,
+				fmt.Sprintf("the path component %q begins with a dot", seg),
+				"Names beginning with a dot are reserved.")
+		}
+		current = filepath.Join(current, seg)
+		info, err := os.Lstat(current)
+		if err != nil {
+			// The rest of the path does not exist yet, so it holds no links.
+			return nil
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return problem.InvalidPathFix(clean,
+				fmt.Sprintf("%s is a symlink, and kitbash does not follow symlinks", current),
+				"Write the file itself instead of a link to it.")
 		}
 	}
-	return "", problem.InvalidPath(p, fmt.Sprintf("the path is outside %s", strings.Join(s.roots, " and ")))
+	return nil
 }
 
 // rootOf returns the root a cleaned path belongs to.
@@ -173,17 +203,44 @@ func statProblem(path string, err error) *problem.Problem {
 	}
 }
 
-// folderManifest returns the manifest of a visible folder. Roots carry no
-// manifest and are always readable.
+// folderManifest returns the manifest of a visible folder. A folder is visible
+// only when it and every ancestor below its root carry a valid manifest:
+// progressive disclosure is not defeated by naming a folder deep inside an
+// invisible one. Roots carry no manifest and are always readable.
 func (s *Service) folderManifest(dir string) (*manifest.Manifest, *problem.Problem) {
 	if s.isRoot(dir) {
 		return nil, nil
 	}
 	m, ok := manifest.Visible(dir)
 	if !ok {
-		return nil, problem.NotVisible(dir, "the folder carries no kitbash.yaml with a name and a description, so it is not part of the surface")
+		return nil, notVisible(dir, "")
+	}
+	if prob := s.ancestorsVisible(dir); prob != nil {
+		return nil, prob
 	}
 	return m, nil
+}
+
+// ancestorsVisible checks every folder between dir and its root, dir excluded.
+func (s *Service) ancestorsVisible(dir string) *problem.Problem {
+	root, ok := s.rootOf(dir)
+	if !ok {
+		return problem.InvalidPath(dir, "the path is outside its root")
+	}
+	for current := filepath.Dir(dir); within(current, root) && current != root; current = filepath.Dir(current) {
+		if _, ok := manifest.Visible(current); !ok {
+			return notVisible(current, "")
+		}
+	}
+	return nil
+}
+
+// notVisible builds the problem every tool returns for a folder outside the
+// surface.
+func notVisible(dir, fix string) *problem.Problem {
+	return problem.NotVisible(dir,
+		"the folder carries no kitbash.yaml with a name and a description, so it is not part of the surface",
+		fix)
 }
 
 // hidden reports whether a directory entry is kept out of the surface.

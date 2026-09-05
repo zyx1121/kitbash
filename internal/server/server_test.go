@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -26,9 +27,10 @@ var shaPattern = regexp.MustCompile(`^[a-f0-9]{40}$`)
 // fixture builds a tree that exercises every visibility rule and returns the
 // two roots.
 type fixture struct {
-	org   string
-	home  string
-	files *fs.Service
+	org     string
+	home    string
+	outside string
+	files   *fs.Service
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -63,8 +65,14 @@ description: short
 colour: blue
 `)
 
-	// A top level folder with no manifest at all.
+	// A top level folder with no manifest at all, holding a folder that has a
+	// perfectly good one. The inner folder is still outside the surface.
 	write(t, filepath.Join(org, "nomanifest", "notes.md"), "invisible\n")
+	mkdir(t, filepath.Join(org, "nomanifest", "inner"))
+	write(t, filepath.Join(org, "nomanifest", "inner", "kitbash.yaml"), `name: inner
+description: A folder with a valid manifest under a folder that has none.
+`)
+	write(t, filepath.Join(org, "nomanifest", "inner", "buried.md"), "buried\n")
 	// A top level folder whose manifest does not validate.
 	write(t, filepath.Join(org, "invalid", "kitbash.yaml"), "name: invalid\n")
 
@@ -77,12 +85,18 @@ description: Personal notes that belong to this user and nobody else.
 	gitInit(t, filepath.Join(org, "handbook"))
 	gitInit(t, filepath.Join(home, "notes"))
 
+	// Outside every root, so the symlink repros have somewhere to point.
+	outside := filepath.Join(base, "outside")
+	mkdir(t, outside)
+	write(t, filepath.Join(outside, "secret.txt"), "the crown jewels\n")
+
+	t.Setenv(fs.SSHEnv, "")
 	t.Setenv(fs.RootsEnv, org+":"+home)
 	files, err := fs.NewFromEnv()
 	if err != nil {
 		t.Fatalf("fs.NewFromEnv: %v", err)
 	}
-	return &fixture{org: org, home: home, files: files}
+	return &fixture{org: org, home: home, outside: outside, files: files}
 }
 
 func mkdir(t *testing.T, dir string) {
@@ -621,6 +635,240 @@ func TestListRootPathIsTheRootsView(t *testing.T) {
 	if len(out.Folders) != 1 || out.Folders[0].Name != "handbook" {
 		t.Errorf("the root lists its visible children, got %+v", out.Folders)
 	}
+}
+
+func TestSymlinkIsRefusedOnRead(t *testing.T) {
+	f := newFixture(t)
+	s := connect(t, f)
+
+	link := filepath.Join(f.org, "handbook", "leak.txt")
+	if err := os.Symlink(filepath.Join(f.outside, "secret.txt"), link); err != nil {
+		t.Fatalf("creating the symlink: %v", err)
+	}
+	p := problemOf(t, call(t, s, "fs_read", map[string]any{"path": link}))
+	if p.Slug() != problem.SlugInvalidPath {
+		t.Errorf("slug is %s, want invalid-path", p.Slug())
+	}
+	if p.Status != 400 {
+		t.Errorf("status is %d, want 400", p.Status)
+	}
+
+	// A symlinked folder in the middle of a path is refused as well.
+	linkDir := filepath.Join(f.org, "handbook", "elsewhere")
+	if err := os.Symlink(f.outside, linkDir); err != nil {
+		t.Fatalf("creating the folder symlink: %v", err)
+	}
+	p = problemOf(t, call(t, s, "fs_read", map[string]any{
+		"path": filepath.Join(linkDir, "secret.txt"),
+	}))
+	if p.Slug() != problem.SlugInvalidPath {
+		t.Errorf("slug through a linked folder is %s, want invalid-path", p.Slug())
+	}
+	if _, isListed := listedNames(t, s, filepath.Join(f.org, "handbook")); isListed["elsewhere"] {
+		t.Error("a symlinked folder was listed as a folder of the surface")
+	}
+}
+
+func TestSymlinkIsRefusedOnWrite(t *testing.T) {
+	f := newFixture(t)
+	s := connect(t, f)
+
+	target := filepath.Join(f.outside, "secret.txt")
+	link := filepath.Join(f.org, "handbook", "leak.txt")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("creating the symlink: %v", err)
+	}
+	p := problemOf(t, call(t, s, "fs_write", map[string]any{
+		"path":    link,
+		"content": "overwritten through a link\n",
+		"message": "Follow the link",
+	}))
+	if p.Slug() != problem.SlugInvalidPath {
+		t.Errorf("slug is %s, want invalid-path", p.Slug())
+	}
+	onDisk, err := os.ReadFile(target)
+	if err != nil || string(onDisk) != "the crown jewels\n" {
+		t.Errorf("the file outside the roots was written: %q, %v", onDisk, err)
+	}
+}
+
+func TestDotComponentsAreReserved(t *testing.T) {
+	f := newFixture(t)
+	s := connect(t, f)
+
+	write(t, filepath.Join(f.org, ".env"), "SECRET=1\n")
+	cases := map[string]struct {
+		tool string
+		args map[string]any
+	}{
+		"read a dotfile": {"fs_read", map[string]any{"path": filepath.Join(f.org, ".env")}},
+		"write into .git": {"fs_write", map[string]any{
+			"path":    filepath.Join(f.org, "handbook", ".git", "hooks", "pre-commit"),
+			"content": "#!/bin/sh\nexit 0\n",
+			"message": "Install a hook",
+		}},
+		"list a dot folder": {"fs_list", map[string]any{
+			"path": filepath.Join(f.org, "handbook", ".git"),
+		}},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			p := problemOf(t, call(t, s, c.tool, c.args))
+			if p.Slug() != problem.SlugInvalidPath {
+				t.Errorf("slug is %s, want invalid-path", p.Slug())
+			}
+			if p.Fix != "Names beginning with a dot are reserved." {
+				t.Errorf("fix is %q", p.Fix)
+			}
+		})
+	}
+	if _, err := os.Stat(filepath.Join(f.org, "handbook", ".git", "hooks", "pre-commit")); err == nil {
+		t.Error("a hook was installed into .git")
+	}
+}
+
+func TestInvisibleAncestorHidesEverythingBelowIt(t *testing.T) {
+	f := newFixture(t)
+	s := connect(t, f)
+
+	inner := filepath.Join(f.org, "nomanifest", "inner")
+	cases := map[string]map[string]any{
+		"fs_list":    {"path": inner},
+		"fs_read":    {"path": filepath.Join(inner, "buried.md")},
+		"fs_history": {"path": filepath.Join(inner, "buried.md")},
+	}
+	for tool, args := range cases {
+		t.Run(tool, func(t *testing.T) {
+			p := problemOf(t, call(t, s, tool, args))
+			if p.Slug() != problem.SlugNotVisible {
+				t.Errorf("slug is %s, want not-visible", p.Slug())
+			}
+			if p.Status != 404 {
+				t.Errorf("status is %d, want 404", p.Status)
+			}
+		})
+	}
+
+	t.Run("fs_write needs a visible folder", func(t *testing.T) {
+		p := problemOf(t, call(t, s, "fs_write", map[string]any{
+			"path":    filepath.Join(f.org, "nomanifest", "note.md"),
+			"content": "smuggled\n",
+			"message": "Smuggle a file in",
+		}))
+		if p.Slug() != problem.SlugNotVisible {
+			t.Errorf("slug is %s, want not-visible", p.Slug())
+		}
+		if p.Fix != "Write kitbash.yaml with name and description first" {
+			t.Errorf("fix is %q", p.Fix)
+		}
+	})
+
+	t.Run("fs_write of a manifest below an invisible folder is refused", func(t *testing.T) {
+		p := problemOf(t, call(t, s, "fs_write", map[string]any{
+			"path":    filepath.Join(inner, "kitbash.yaml"),
+			"content": "name: inner\ndescription: A manifest under a folder that has none.\n",
+			"message": "Rewrite the buried manifest",
+		}))
+		if p.Slug() != problem.SlugNotVisible {
+			t.Errorf("slug is %s, want not-visible", p.Slug())
+		}
+	})
+}
+
+func TestSchemaViolationIsProblemDetails(t *testing.T) {
+	f := newFixture(t)
+	s := connect(t, f)
+
+	p := problemOf(t, call(t, s, "fs_write", map[string]any{
+		"path":    filepath.Join(f.org, "handbook", "short.md"),
+		"content": "too terse a message\n",
+		"message": "a",
+	}))
+	if p.Slug() != problem.SlugBadRequest {
+		t.Errorf("slug is %s, want bad-request", p.Slug())
+	}
+	if p.Status != 400 {
+		t.Errorf("status is %d, want 400", p.Status)
+	}
+	if p.Detail == "" {
+		t.Error("the validation detail was dropped")
+	}
+	if p.Instance != "fs_write" {
+		t.Errorf("instance is %q, want fs_write", p.Instance)
+	}
+}
+
+func TestWriteIntoAReadOnlyFolder(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores file modes")
+	}
+	f := newFixture(t)
+	s := connect(t, f)
+
+	locked := filepath.Join(f.org, "handbook", "locked")
+	mkdir(t, locked)
+	write(t, filepath.Join(locked, "kitbash.yaml"), `name: locked
+description: A folder members may read but never write, like /org itself.
+`)
+	if err := os.Chmod(locked, 0o555); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
+
+	p := problemOf(t, call(t, s, "fs_write", map[string]any{
+		"path":    filepath.Join(locked, "new.md"),
+		"content": "should not land\n",
+		"message": "Write into a read only folder",
+	}))
+	if p.Slug() != problem.SlugNotPermitted {
+		t.Fatalf("slug is %s, want not-permitted", p.Slug())
+	}
+	if p.Status != 403 {
+		t.Errorf("status is %d, want 403", p.Status)
+	}
+	if !strings.Contains(p.Fix, "M5") {
+		t.Errorf("fix is %q, want the approvals advice", p.Fix)
+	}
+}
+
+func TestReadDoesNotSwallowGitFailures(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores file modes")
+	}
+	f := newFixture(t)
+	s := connect(t, f)
+
+	gitDir := filepath.Join(f.org, "handbook", ".git")
+	if err := os.Chmod(gitDir, 0o000); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(gitDir, 0o755) })
+
+	p := problemOf(t, call(t, s, "fs_read", map[string]any{
+		"path": filepath.Join(f.org, "handbook", "README.md"),
+	}))
+	switch p.Slug() {
+	case problem.SlugInternal, problem.SlugNotPermitted:
+	default:
+		t.Errorf("slug is %s, want internal or not-permitted, never a silent empty sha", p.Slug())
+	}
+}
+
+// listedNames returns the folder and file names of one listing.
+func listedNames(t *testing.T, s *mcp.ClientSession, path string) (map[string]bool, map[string]bool) {
+	t.Helper()
+	res := call(t, s, "fs_list", map[string]any{"path": path})
+	ok(t, res, "fs_list")
+	out := structured[fs.ListResult](t, res)
+	files := map[string]bool{}
+	folders := map[string]bool{}
+	for _, file := range out.Files {
+		files[file.Name] = true
+	}
+	for _, folder := range out.Folders {
+		folders[folder.Name] = true
+	}
+	return files, folders
 }
 
 func TestReadNotFound(t *testing.T) {

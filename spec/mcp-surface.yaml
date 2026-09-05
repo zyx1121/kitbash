@@ -13,7 +13,9 @@
 # - Paths are absolute, rooted at /org or /home/<caller>. The caller never sees
 #   another user's home. Access control is the kernel's: kitbash-mcp runs as the
 #   connecting Linux user.
-# - A folder is visible only if it carries kitbash.yaml with name and description.
+# - A folder is visible only if it carries kitbash.yaml with name and
+#   description, and so does every folder between it and its root. kitbash
+#   follows no symlinks and refuses every path component that begins with a dot.
 # - Timestamps are RFC 3339. Identifiers are UUIDv7 unless they are git SHAs or
 #   OCI digests.
 # - Errors are returned as an MCP tool result with isError: true whose single
@@ -41,7 +43,7 @@ $error:
     - https://kitbash.zyx.tw/errors/not-visible        # folder exists but has no manifest
     - https://kitbash.zyx.tw/errors/not-permitted
     - https://kitbash.zyx.tw/errors/bad-request        # malformed input, such as content that is not base64
-    - https://kitbash.zyx.tw/errors/invalid-path       # outside /org and /home/<caller>, or contains ..
+    - https://kitbash.zyx.tw/errors/invalid-path       # outside /org and /home/<caller>, contains .., names a symlink, or names a dot component
     - https://kitbash.zyx.tw/errors/invalid-manifest   # kitbash.yaml fails spec/manifest.schema.json
     - https://kitbash.zyx.tw/errors/unsupported-media-type  # fs_read cannot render this media type
     - https://kitbash.zyx.tw/errors/too-large
@@ -106,7 +108,7 @@ families:
             manifest: { description: "This folder's parsed kitbash.yaml, absent at the roots", type: object }
             folders: { type: array, items: { $ref: "#/$defs/folderEntry" } }
             files: { type: array, items: { $ref: "#/$defs/fileEntry" } }
-        errors: [not-found, not-visible, not-permitted, invalid-path]
+        errors: [not-found, not-visible, not-permitted, invalid-path, internal]
 
       fs_read:
         description: >
@@ -138,7 +140,7 @@ families:
             size: { type: integer }
             sha: { type: string, description: "Commit that last touched this file" }
             truncated: { type: boolean }
-        errors: [not-found, not-visible, not-permitted, invalid-path, unsupported-media-type, too-large]
+        errors: [not-found, not-visible, not-permitted, invalid-path, unsupported-media-type, too-large, internal]
 
       fs_write:
         description: >
@@ -167,7 +169,7 @@ families:
           properties:
             path: { type: string }
             commit: { $ref: "#/$defs/commit" }
-        errors: [bad-request, not-permitted, invalid-path, invalid-manifest, too-large, conflict]
+        errors: [bad-request, not-permitted, invalid-path, invalid-manifest, too-large, conflict, internal]
 
       fs_history:
         description: List commits that touched a path, newest first.
@@ -184,7 +186,7 @@ families:
           properties:
             path: { type: string }
             commits: { type: array, items: { $ref: "#/$defs/commit" } }
-        errors: [not-found, not-visible, not-permitted, invalid-path]
+        errors: [not-found, not-visible, not-permitted, invalid-path, internal]
 
   # ---------------------------------------------------------------- pkg (M2)
   pkg:

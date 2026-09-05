@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -23,6 +24,10 @@ import (
 
 // FileName is the manifest file every visible folder carries.
 const FileName = "kitbash.yaml"
+
+// MaxBytes caps kitbash.yaml. A manifest is metadata, and reading an arbitrarily
+// large file on every visibility check is a denial of service.
+const MaxBytes = 64 << 10
 
 // Manifest is a parsed kitbash.yaml. Fields the core reads are typed; the whole
 // document is kept in Raw so the MCP surface can return it verbatim.
@@ -75,6 +80,10 @@ func (e *ErrInvalid) Error() string {
 
 // Parse decodes and validates one kitbash.yaml document.
 func Parse(data []byte) (*Manifest, error) {
+	if len(data) > MaxBytes {
+		return nil, &ErrInvalid{Messages: []string{
+			fmt.Sprintf("kitbash.yaml is %d bytes, over the %d byte limit", len(data), MaxBytes)}}
+	}
 	var doc any
 	if err := yaml.Unmarshal(data, &doc); err != nil {
 		return nil, &ErrInvalid{Messages: []string{"kitbash.yaml is not valid YAML: " + err.Error()}}
@@ -156,9 +165,15 @@ func validationMessages(err error) []string {
 	return out
 }
 
-// Load reads and validates the manifest of one folder.
+// Load reads and validates the manifest of one folder, refusing to read more
+// than MaxBytes of it.
 func Load(dir string) (*Manifest, error) {
-	data, err := os.ReadFile(filepath.Join(dir, FileName))
+	f, err := os.Open(filepath.Join(dir, FileName))
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, MaxBytes+1))
 	if err != nil {
 		return nil, err
 	}

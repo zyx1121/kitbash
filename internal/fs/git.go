@@ -26,6 +26,18 @@ type Commit struct {
 	Message string `json:"message"`
 }
 
+// isPermissionDenied reports whether a git failure was the operating system
+// refusing the write, which is what a member writing into /org gets.
+func isPermissionDenied(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "permission denied") ||
+		strings.Contains(msg, "read-only file system") ||
+		strings.Contains(msg, "operation not permitted")
+}
+
 // isRepo reports whether dir is the top of a git repository.
 func isRepo(dir string) bool {
 	info, err := os.Stat(filepath.Join(dir, ".git"))
@@ -34,7 +46,10 @@ func isRepo(dir string) bool {
 
 // git runs one git command inside repo and returns its standard output.
 func (s *Service) git(ctx context.Context, repo string, args ...string) (string, error) {
+	// /org and its folders are owned by root, so a member's git refuses to
+	// operate on them unless the repository is declared safe.
 	full := append([]string{
+		"-c", "safe.directory=" + repo,
 		"-c", "commit.gpgsign=false",
 		"-c", "advice.detachedHead=false",
 	}, args...)

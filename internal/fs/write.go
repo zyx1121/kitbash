@@ -5,8 +5,10 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"syscall"
 
 	"github.com/zyx1121/kitbash/internal/manifest"
 	"github.com/zyx1121/kitbash/internal/problem"
@@ -47,6 +49,11 @@ func (s *Service) Write(ctx context.Context, req WriteRequest) (*WriteResult, *p
 		return nil, problem.InvalidPath(clean, "the path is a folder, not a file")
 	}
 
+	folder := filepath.Dir(clean)
+	if prob := s.writeVisible(folder, filepath.Base(clean)); prob != nil {
+		return nil, prob
+	}
+
 	data, prob := payload(clean, req)
 	if prob != nil {
 		return nil, prob
@@ -76,7 +83,7 @@ func (s *Service) Write(ctx context.Context, req WriteRequest) (*WriteResult, *p
 
 	before, err := s.lastCommit(ctx, repo, rel)
 	if err != nil {
-		return nil, problem.Internal(clean, err.Error(), "")
+		return nil, gitProblem(clean, err)
 	}
 	if req.ExpectedSha != "" {
 		current := ""
@@ -90,27 +97,86 @@ func (s *Service) Write(ctx context.Context, req WriteRequest) (*WriteResult, *p
 		}
 	}
 
-	if err := os.MkdirAll(filepath.Dir(clean), 0o755); err != nil {
-		return nil, statProblem(clean, err)
+	if err := os.MkdirAll(folder, 0o755); err != nil {
+		return nil, writeProblem(clean, err)
 	}
-	if err := os.WriteFile(clean, data, 0o644); err != nil {
-		return nil, statProblem(clean, err)
+	if err := writeNoFollow(clean, data); err != nil {
+		return nil, writeProblem(clean, err)
 	}
 	if _, err := s.git(ctx, repo, "add", "--", rel); err != nil {
-		return nil, problem.Internal(clean, err.Error(), "")
+		return nil, gitProblem(clean, err)
 	}
 	// An identical write is a no operation, so the call stays idempotent.
 	if _, err := s.git(ctx, repo, "diff", "--cached", "--quiet", "--", rel); err == nil && before != nil {
 		return &WriteResult{Path: clean, Commit: *before}, nil
 	}
 	if _, err := s.git(ctx, repo, "commit", "-m", req.Message, "--", rel); err != nil {
-		return nil, problem.Internal(clean, err.Error(), "")
+		return nil, gitProblem(clean, err)
 	}
 	after, err := s.lastCommit(ctx, repo, rel)
-	if err != nil || after == nil {
+	if err != nil {
+		return nil, gitProblem(clean, err)
+	}
+	if after == nil {
 		return nil, problem.Internal(clean, "the commit was not recorded", "")
 	}
 	return &WriteResult{Path: clean, Commit: *after}, nil
+}
+
+// writeVisible applies the visibility rules to a write. Every ancestor of the
+// target folder must be visible. The folder itself must be visible too, unless
+// the caller is writing the manifest that brings it into the surface.
+func (s *Service) writeVisible(folder, name string) *problem.Problem {
+	if prob := s.ancestorsVisible(folder); prob != nil {
+		return prob
+	}
+	if s.isRoot(folder) || name == manifest.FileName {
+		return nil
+	}
+	if _, ok := manifest.Visible(folder); !ok {
+		return notVisible(folder, "Write kitbash.yaml with name and description first")
+	}
+	return nil
+}
+
+// writeNoFollow replaces a file without ever following a symlink at the final
+// component, which a caller could have planted between the check and the write.
+func writeNoFollow(path string, data []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// writeProblem maps a failed write. A member writing into /org is refused by
+// the kernel, which is the whole permission model in version 1.
+func writeProblem(path string, err error) *problem.Problem {
+	if errors.Is(err, fs.ErrPermission) || errors.Is(err, syscall.EROFS) {
+		return sharedReadOnly(path)
+	}
+	if errors.Is(err, syscall.ELOOP) {
+		return problem.InvalidPathFix(path, "the path is a symlink, and kitbash does not follow symlinks",
+			"Write the file itself instead of a link to it.")
+	}
+	return statProblem(path, err)
+}
+
+// gitProblem maps a failed git invocation.
+func gitProblem(path string, err error) *problem.Problem {
+	if isPermissionDenied(err) {
+		return sharedReadOnly(path)
+	}
+	return problem.Internal(path, err.Error(), "")
+}
+
+func sharedReadOnly(path string) *problem.Problem {
+	return problem.NotPermitted(path, "the operating system refused this write",
+		"This folder is shared and read only for members. Approvals arrive in M5; ask an admin.")
 }
 
 // payload decodes the content the caller sent.

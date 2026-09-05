@@ -5,7 +5,9 @@ package problem
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
+	"os"
 )
 
 // Base is the prefix of every error type URI.
@@ -74,10 +76,13 @@ func NotFound(instance, detail string) *Problem {
 }
 
 // NotVisible reports a folder without a usable kitbash.yaml. It is not found as
-// far as the MCP surface is concerned.
-func NotVisible(instance, detail string) *Problem {
-	return newProblem(SlugNotVisible, "Not visible", http.StatusNotFound, instance, detail,
-		"Write a kitbash.yaml with name and description into the folder to make it visible.")
+// far as the MCP surface is concerned. An empty fix falls back to the advice
+// that makes the folder visible.
+func NotVisible(instance, detail, fix string) *Problem {
+	if fix == "" {
+		fix = "Write a kitbash.yaml with name and description into the folder to make it visible."
+	}
+	return newProblem(SlugNotVisible, "Not visible", http.StatusNotFound, instance, detail, fix)
 }
 
 // NotPermitted reports an operation the host refuses. An empty fix falls back
@@ -110,6 +115,14 @@ func InvalidPath(instance, detail string) *Problem {
 		"Use an absolute path under /org or your home folder, without any .. segment.")
 }
 
+// InvalidPathFix is InvalidPath with advice specific to the rule that was
+// broken.
+func InvalidPathFix(instance, detail, fix string) *Problem {
+	p := InvalidPath(instance, detail)
+	p.Fix = fix
+	return p
+}
+
 // InvalidManifest reports a kitbash.yaml that fails spec/manifest.schema.json.
 func InvalidManifest(instance, detail string) *Problem {
 	return newProblem(SlugInvalidManifest, "Invalid manifest", http.StatusUnprocessableEntity, instance, detail,
@@ -130,10 +143,17 @@ func Conflict(instance, detail string) *Problem {
 		"Read the file again, merge the change, then write with the new expectedSha.")
 }
 
-// Internal reports a failure inside kitbash itself.
-func Internal(instance, detail, fix string) *Problem {
+// logger writes the causes of internal errors where the operator can read them.
+var logger = log.New(os.Stderr, "kitbash: ", log.LstdFlags)
+
+// Internal reports a failure inside kitbash itself. The cause goes to the
+// server log, never to the agent: it carries host paths, git output and other
+// detail the caller has no business seeing and cannot act on.
+func Internal(instance, cause, fix string) *Problem {
 	if fix == "" {
-		fix = "Retry the call. If it keeps failing, report the detail to an administrator."
+		fix = "Retry the call. If it keeps failing, ask an administrator to read the server log."
 	}
-	return newProblem(SlugInternal, "Internal error", http.StatusInternalServerError, instance, detail, fix)
+	logger.Printf("internal error at %s: %s", instance, cause)
+	return newProblem(SlugInternal, "Internal error", http.StatusInternalServerError, instance,
+		"kitbash could not complete this call; the cause is in the server log", fix)
 }

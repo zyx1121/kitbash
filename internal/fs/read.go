@@ -59,9 +59,13 @@ func (s *Service) Read(ctx context.Context, path string, opts ReadOptions) (*Rea
 
 	mediaType := MediaType(clean, sniff(clean))
 	meta := ReadMeta{Path: clean, MediaType: mediaType, Size: info.Size()}
-	if sha, err := s.fileSha(ctx, clean); err == nil {
-		meta.Sha = sha
+	// A failing history lookup is a real failure, not an empty sha: it means
+	// the caller cannot see the repository at all.
+	sha, err := s.fileSha(ctx, clean)
+	if err != nil {
+		return nil, gitProblem(clean, err)
 	}
+	meta.Sha = sha
 
 	switch {
 	case IsText(mediaType):

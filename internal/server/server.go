@@ -26,6 +26,7 @@ func New(version string, files *fs.Service) *mcp.Server {
 		Title:       "kitbash",
 		Description: "Files, Packages, Processes and Telemetry for agents. M1 serves the fs family.",
 	}, nil)
+	s.AddReceivingMiddleware(problemGuard)
 	Register(s, files)
 	return s
 }

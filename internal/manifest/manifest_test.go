@@ -62,6 +62,21 @@ func TestParseInvalid(t *testing.T) {
 	}
 }
 
+func TestParseRefusesAHugeManifest(t *testing.T) {
+	doc := "name: big\ndescription: A manifest padded well past the limit a manifest may reach.\ntags: [" +
+		strings.Repeat("\"padding\", ", 8000) + "\"end\"]\n"
+	if len(doc) <= manifest.MaxBytes {
+		t.Fatalf("the fixture is %d bytes, not over the %d byte limit", len(doc), manifest.MaxBytes)
+	}
+	_, err := manifest.Parse([]byte(doc))
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "over the") {
+		t.Errorf("error is %q, want the size limit", err)
+	}
+}
+
 func TestVisible(t *testing.T) {
 	dir := t.TempDir()
 	if _, ok := manifest.Visible(dir); ok {
