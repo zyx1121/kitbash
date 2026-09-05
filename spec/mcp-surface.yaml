@@ -1,0 +1,357 @@
+# kitbash MCP surface
+#
+# Every tool kitbashd exposes over MCP stdio, grouped by family. Tool names are
+# <family>_<verb> because MCP tool names allow [A-Za-z0-9_-] only; the dot form
+# used in PLAN.md is the same tool spoken aloud.
+#
+# Only the fs family is implemented in M1. The other families are declared here
+# so the surface is designed as one piece and later milestones fill in the
+# implementation without renaming anything.
+#
+# Conventions that hold for every tool:
+# - Input and output are JSON Schema 2020-12.
+# - Paths are absolute, rooted at /org or /home/<caller>. The caller never sees
+#   another user's home. Access control is the kernel's: kitbash-mcp runs as the
+#   connecting Linux user.
+# - A folder is visible only if it carries kitbash.yaml with name and description.
+# - Timestamps are RFC 3339. Identifiers are UUIDv7 unless they are git SHAs or
+#   OCI digests.
+# - Errors are returned as an MCP tool result with isError: true whose single
+#   text content is a JSON object in RFC 9457 Problem Details form, see $error.
+# - Every call emits one span into Telemetry with user, tool, and where relevant
+#   package, process and path.
+
+version: 1
+mcp_protocol: "2025-06-18"
+
+$error:
+  description: RFC 9457 Problem Details, plus a fix extension.
+  schema:
+    type: object
+    required: [type, title, status, detail]
+    properties:
+      type: { type: string, format: uri, description: "Stable URI for the error class, https://kitbash.zyx.tw/errors/<slug>" }
+      title: { type: string }
+      status: { type: integer, description: "HTTP status semantics: 400 bad input, 403 not permitted, 404 not found, 409 conflict, 422 manifest invalid, 500 internal" }
+      detail: { type: string, description: "What went wrong, specific to this call" }
+      instance: { type: string, description: "Path or identifier the error is about" }
+      fix: { type: string, description: "What the caller should do next" }
+  types:
+    - https://kitbash.zyx.tw/errors/not-found
+    - https://kitbash.zyx.tw/errors/not-visible        # folder exists but has no manifest
+    - https://kitbash.zyx.tw/errors/not-permitted
+    - https://kitbash.zyx.tw/errors/invalid-path       # outside /org and /home/<caller>, or contains ..
+    - https://kitbash.zyx.tw/errors/invalid-manifest   # kitbash.yaml fails spec/manifest.schema.json
+    - https://kitbash.zyx.tw/errors/too-large
+    - https://kitbash.zyx.tw/errors/conflict           # write raced another commit
+    - https://kitbash.zyx.tw/errors/internal
+
+$defs:
+  folderEntry:
+    type: object
+    required: [path, name, description]
+    properties:
+      path: { type: string }
+      name: { type: string }
+      description: { type: string }
+      tags: { type: array, items: { type: string } }
+      package: { type: boolean, description: "true when the manifest carries a deploy block" }
+  fileEntry:
+    type: object
+    required: [path, name, size, mediaType]
+    properties:
+      path: { type: string }
+      name: { type: string }
+      size: { type: integer }
+      mediaType: { type: string, description: "IANA media type guessed from extension and sniffing" }
+      modified: { type: string, format: date-time }
+  commit:
+    type: object
+    required: [sha, author, time, message]
+    properties:
+      sha: { type: string, pattern: "^[a-f0-9]{40}$" }
+      author: { type: string, description: "Linux user name" }
+      time: { type: string, format: date-time }
+      message: { type: string }
+
+families:
+
+  # ---------------------------------------------------------------- fs (M1)
+  fs:
+    description: Files. Every top level folder under /org and /home/<caller> is a git repository.
+    implemented_in: M1
+    tools:
+
+      fs_list:
+        description: >
+          List what is visible at a path. With no path, returns the visible top
+          level folders across /org and the caller's home. Inside a folder,
+          returns visible subfolders (name and description only, no contents)
+          and the files directly in it. Folders without a manifest are omitted.
+        input:
+          type: object
+          additionalProperties: false
+          properties:
+            path: { type: string, description: "Absolute folder path. Omit for the roots." }
+        output:
+          type: object
+          required: [path, folders, files]
+          properties:
+            path: { type: string }
+            manifest: { description: "This folder's parsed kitbash.yaml, absent at the roots", type: object }
+            folders: { type: array, items: { $ref: "#/$defs/folderEntry" } }
+            files: { type: array, items: { $ref: "#/$defs/fileEntry" } }
+        errors: [not-found, not-visible, not-permitted, invalid-path]
+
+      fs_read:
+        description: >
+          Read one file. Text media types return text content. image/png and
+          image/jpeg return MCP image content. application/pdf returns extracted
+          text in M1. Files larger than 1 MiB return too-large; use offset and
+          limit for text.
+        input:
+          type: object
+          additionalProperties: false
+          required: [path]
+          properties:
+            path: { type: string }
+            offset: { type: integer, minimum: 0, description: "Byte offset for text files" }
+            limit: { type: integer, minimum: 1, maximum: 1048576, description: "Max bytes for text files" }
+        output:
+          description: MCP content array. Text as a text block, images as an image block. Structured metadata alongside.
+          type: object
+          required: [path, mediaType, size]
+          properties:
+            path: { type: string }
+            mediaType: { type: string }
+            size: { type: integer }
+            sha: { type: string, description: "Commit that last touched this file" }
+            truncated: { type: boolean }
+        errors: [not-found, not-visible, not-permitted, invalid-path, too-large]
+
+      fs_write:
+        description: >
+          Create or replace one file and commit it to the enclosing top level
+          repository, attributed to the caller. Writing kitbash.yaml into a new
+          folder is how a folder becomes visible; the manifest is validated
+          against spec/manifest.schema.json before commit. Binary content is
+          base64. Pass expectedSha to refuse the write if the file changed since
+          it was read.
+        input:
+          type: object
+          additionalProperties: false
+          required: [path, message]
+          oneOf:
+            - required: [content]
+            - required: [contentBase64]
+          properties:
+            path: { type: string }
+            content: { type: string, description: "UTF-8 text" }
+            contentBase64: { type: string, contentEncoding: base64 }
+            message: { type: string, minLength: 3, maxLength: 200, description: "Commit message, imperative mood" }
+            expectedSha: { type: string, description: "Last known commit sha for this file; optimistic lock" }
+        output:
+          type: object
+          required: [path, commit]
+          properties:
+            path: { type: string }
+            commit: { $ref: "#/$defs/commit" }
+        errors: [not-permitted, invalid-path, invalid-manifest, too-large, conflict]
+
+      fs_history:
+        description: List commits that touched a path, newest first.
+        input:
+          type: object
+          additionalProperties: false
+          required: [path]
+          properties:
+            path: { type: string }
+            limit: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        output:
+          type: object
+          required: [path, commits]
+          properties:
+            path: { type: string }
+            commits: { type: array, items: { $ref: "#/$defs/commit" } }
+        errors: [not-found, not-visible, not-permitted, invalid-path]
+
+  # ---------------------------------------------------------------- pkg (M2)
+  pkg:
+    description: Packages. A folder with a deploy block, built to or imported as an OCI image.
+    implemented_in: M2
+    tools:
+      pkg_build:
+        description: Build the Package at path from its current commit. Returns the image digest and records the source commit.
+        input: { type: object, required: [path], properties: { path: { type: string } } }
+        output:
+          type: object
+          required: [path, digest, commit]
+          properties:
+            path: { type: string }
+            digest: { type: string, pattern: "^sha256:[a-f0-9]{64}$" }
+            commit: { type: string }
+            log: { type: string, description: "Tail of the build log" }
+        errors: [not-found, not-visible, invalid-manifest, internal]
+      pkg_import:
+        description: Wrap something external as a Package folder at path using an installed import kit. Writes the folder and manifest, does not build.
+        input:
+          type: object
+          required: [path, source]
+          properties:
+            path: { type: string }
+            source: { type: string, description: "oci://<ref>@sha256:..., npm:<pkg>@<ver>, pypi:<pkg>==<ver>" }
+        output: { type: object, required: [path, commit], properties: { path: { type: string }, commit: { $ref: "#/$defs/commit" } } }
+        errors: [invalid-path, not-permitted, invalid-manifest, internal]
+      pkg_list:
+        description: Packages visible to the caller with their latest built digest, if any.
+        input: { type: object, properties: {} }
+        output:
+          type: object
+          required: [packages]
+          properties:
+            packages:
+              type: array
+              items:
+                type: object
+                required: [path, name]
+                properties:
+                  path: { type: string }
+                  name: { type: string }
+                  digest: { type: string }
+                  builtAt: { type: string, format: date-time }
+                  running: { type: integer, description: "Number of Processes of this Package" }
+      pkg_inspect:
+        description: Manifest, build history and provenance of one Package.
+        input: { type: object, required: [path], properties: { path: { type: string } } }
+        output:
+          type: object
+          required: [path, manifest, builds]
+          properties:
+            path: { type: string }
+            manifest: { type: object }
+            builds:
+              type: array
+              items: { type: object, properties: { digest: { type: string }, commit: { type: string }, builtAt: { type: string, format: date-time } } }
+        errors: [not-found, not-visible, not-permitted]
+
+  # ---------------------------------------------------------------- proc (M2)
+  proc:
+    description: Processes. A Package running as a rootless container under the caller.
+    implemented_in: M2
+    tools:
+      proc_run:
+        description: Start a Process from a Package digest, or converge an existing one with the same name to that digest. Idempotent.
+        input:
+          type: object
+          required: [package]
+          properties:
+            package: { type: string, description: "Package path" }
+            digest: { type: string, description: "Defaults to the latest build" }
+            name: { type: string, description: "Defaults to the package name" }
+        output:
+          type: object
+          required: [id, name, package, digest, state]
+          properties:
+            id: { type: string }
+            name: { type: string }
+            package: { type: string }
+            digest: { type: string }
+            state: { type: string, enum: [starting, running, unhealthy, stopped, failed] }
+            expose: { type: string, enum: [mcp, http, none] }
+            endpoint: { type: string, description: "Internal URL when expose is http" }
+        errors: [not-found, not-permitted, invalid-manifest, internal]
+      proc_list:
+        description: Processes owned by the caller. Admins see all.
+        input: { type: object, properties: {} }
+        output: { type: object, required: [processes], properties: { processes: { type: array, items: { type: object } } } }
+      proc_stop:
+        description: Stop a Process. It stays known and can be run again.
+        input: { type: object, required: [id], properties: { id: { type: string } } }
+        output: { type: object, required: [id, state], properties: { id: { type: string }, state: { type: string } } }
+        errors: [not-found, not-permitted]
+      proc_logs:
+        description: Recent stdout and stderr of a Process. Structured logs are in Telemetry; this is the raw stream.
+        input: { type: object, required: [id], properties: { id: { type: string }, lines: { type: integer, default: 200, maximum: 5000 } } }
+        output: { type: object, required: [id, lines], properties: { id: { type: string }, lines: { type: array, items: { type: string } } } }
+        errors: [not-found, not-permitted]
+
+  # ---------------------------------------------------------------- tel (M3)
+  tel:
+    description: Telemetry. OTLP in, queryable out. Every record carries user, package, process and path attributes.
+    implemented_in: M3
+    tools:
+      tel_query:
+        description: Query spans, metrics or logs by attributes and time range.
+        input:
+          type: object
+          required: [signal]
+          properties:
+            signal: { type: string, enum: [traces, metrics, logs] }
+            user: { type: string }
+            package: { type: string }
+            process: { type: string }
+            path: { type: string }
+            eval: { type: boolean, description: "Only evaluation results written back by kits" }
+            since: { type: string, format: date-time }
+            until: { type: string, format: date-time }
+            limit: { type: integer, default: 100, maximum: 1000 }
+        output: { type: object, required: [signal, records], properties: { signal: { type: string }, records: { type: array, items: { type: object } }, truncated: { type: boolean } } }
+        errors: [not-permitted]
+      tel_retention:
+        description: Read the retention window per signal. Admins may set it.
+        input: { type: object, properties: { set: { type: object, properties: { traces: { type: string }, metrics: { type: string }, logs: { type: string } } } } }
+        output: { type: object, required: [traces, metrics, logs], properties: { traces: { type: string }, metrics: { type: string }, logs: { type: string } } }
+        errors: [not-permitted]
+
+  # ---------------------------------------------------------------- users (M5)
+  users:
+    description: Organization members. Linux users with SSH keys. Admin only except users_me.
+    implemented_in: M5
+    tools:
+      users_me:
+        description: Who am I and what groups am I in.
+        input: { type: object, properties: {} }
+        output: { type: object, required: [user, uid, admin], properties: { user: { type: string }, uid: { type: integer }, admin: { type: boolean }, groups: { type: array, items: { type: string } } } }
+      users_create:
+        description: Create a member with an SSH public key, home repository and subuid range.
+        input: { type: object, required: [name, sshKey], properties: { name: { type: string, pattern: "^[a-z][a-z0-9-]{1,31}$" }, sshKey: { type: string }, admin: { type: boolean, default: false } } }
+        output: { type: object, required: [user, uid], properties: { user: { type: string }, uid: { type: integer } } }
+        errors: [not-permitted, conflict]
+      users_list:
+        description: All members.
+        input: { type: object, properties: {} }
+        output: { type: object, required: [users], properties: { users: { type: array, items: { type: object } } } }
+        errors: [not-permitted]
+      users_add_key:
+        description: Add an SSH public key to a member.
+        input: { type: object, required: [name, sshKey], properties: { name: { type: string }, sshKey: { type: string } } }
+        output: { type: object, required: [user, keys], properties: { user: { type: string }, keys: { type: integer } } }
+        errors: [not-permitted, not-found]
+      users_remove:
+        description: Remove a member. Their Processes stop, their home is archived under /org/.archive/<name>.
+        input: { type: object, required: [name], properties: { name: { type: string } } }
+        output: { type: object, required: [user], properties: { user: { type: string } } }
+        errors: [not-permitted, not-found]
+
+  # ---------------------------------------------------------------- approvals (M5)
+  approvals:
+    description: >
+      The replacement for sudo. Operations outside the caller's own space, such
+      as writes to /org by a regular user, are queued here instead of failing.
+      An admin approves or rejects through the same surface.
+    implemented_in: M5
+    tools:
+      approvals_list:
+        description: Pending approvals. Regular users see their own, admins see all.
+        input: { type: object, properties: { state: { type: string, enum: [pending, approved, rejected], default: pending } } }
+        output: { type: object, required: [approvals], properties: { approvals: { type: array, items: { type: object, required: [id, requester, tool, input, state, requestedAt], properties: { id: { type: string }, requester: { type: string }, tool: { type: string }, input: { type: object }, state: { type: string }, requestedAt: { type: string, format: date-time } } } } } }
+      approvals_approve:
+        description: Approve and execute a queued operation. The result is delivered as if the requester had called the tool.
+        input: { type: object, required: [id], properties: { id: { type: string }, note: { type: string } } }
+        output: { type: object, required: [id, state, result], properties: { id: { type: string }, state: { type: string }, result: { type: object } } }
+        errors: [not-permitted, not-found, conflict]
+      approvals_reject:
+        description: Reject a queued operation with a reason the requester will see.
+        input: { type: object, required: [id, reason], properties: { id: { type: string }, reason: { type: string } } }
+        output: { type: object, required: [id, state], properties: { id: { type: string }, state: { type: string } } }
+        errors: [not-permitted, not-found, conflict]

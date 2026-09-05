@@ -87,7 +87,7 @@ Telemetry is the only object that grows without bound, so retention lives in the
 
 ### 2.5 The manifest
 
-One file format serves both folder metadata and package definition. A folder with only the first block is visible knowledge. A folder with all blocks is a Package.
+One file format serves both folder metadata and package definition. The normative definition is [`spec/manifest.schema.json`](spec/manifest.schema.json); the MCP tools that operate on these objects are defined in [`spec/mcp-surface.yaml`](spec/mcp-surface.yaml). This section is the readable summary. A folder with only the first block is visible knowledge. A folder with all blocks is a Package.
 
 ```yaml
 # kitbash.yaml
@@ -276,7 +276,8 @@ Each milestone is done when its acceptance sentence is true on a real machine, n
 
 ### 5.5 Open decisions
 
-- The exact MCP tool surface: names and arguments of the `fs`, `pkg`, `proc`, `tel`, `users` and `approvals` tool families. To be written as a schema before M1 code.
+The MCP tool surface is decided in `spec/mcp-surface.yaml`: six families, `fs` implemented in M1, the rest declared.
+
 - Whether `files` deploy units are needed in version 1 at all, or whether every Package is a container until a real case appears.
 - The retention defaults per signal.
 
