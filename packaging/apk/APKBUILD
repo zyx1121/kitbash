@@ -13,7 +13,11 @@ source="kitbash-$pkgver.tar.gz"
 builddir="$srcdir/kitbash-$pkgver"
 
 build() {
+	# Alpine pins GOTOOLCHAIN=local; let go fetch the toolchain go.mod asks for.
+	export GOTOOLCHAIN=auto GOFLAGS=-mod=mod GOMODCACHE="$srcdir/gomod"
 	CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=v$pkgver" -o kitbash-mcp ./cmd/kitbash-mcp
+	# go leaves the module cache read only, which breaks abuild cleanup
+	chmod -R u+w "$srcdir/gomod"
 }
 
 package() {

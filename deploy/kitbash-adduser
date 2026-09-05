@@ -23,8 +23,5 @@ grep -q "^$name:" /etc/subuid || usermod --add-subuids 100000-165535 --add-subgi
 install -d -m 700 -o "$name" -g "$name" "$home/.ssh"
 touch "$home/.ssh/authorized_keys"; chmod 600 "$home/.ssh/authorized_keys"; chown "$name:$name" "$home/.ssh/authorized_keys"
 grep -qF "$key" "$home/.ssh/authorized_keys" || echo "$key" >> "$home/.ssh/authorized_keys"
-if [ ! -d "$home/.git" ]; then
-  su - "$name" -c "git init -q && git -c user.name=$name -c user.email=$name@kitbash commit -q --allow-empty -m 'Create home'"
-fi
 uid=$(id -u "$name"); d=/run/user/$uid; mkdir -p "$d"; chown "$name" "$d"; chmod 700 "$d"
 echo "$name uid=$uid groups=$(id -Gn "$name")"

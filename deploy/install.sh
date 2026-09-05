@@ -58,20 +58,28 @@ if [ -n "${KITBASH_APK:-}" ] && [ -f "$KITBASH_APK" ]; then
 fi
 command -v kitbash-mcp >/dev/null || log "warning: kitbash-mcp not installed yet; sshd ForceCommand will fail until it is"
 
-# 8. /org: shared, root owned, group readable, a git repository.
-if [ ! -d /org/.git ]; then
-  log "initialising /org"
-  mkdir -p /org
-  if [ -d "${KITBASH_ORG_SEED:-/usr/share/kitbash/org}" ]; then
-    cp -R "${KITBASH_ORG_SEED:-/usr/share/kitbash/org}"/. /org/
-  fi
-  git -C /org init -q
-  git -C /org -c user.name=root -c user.email=root@kitbash add -A
-  git -C /org -c user.name=root -c user.email=root@kitbash commit -q -m "Seed /org" || true
+# 8. /org: shared and root owned. Every top level folder under it is its own
+#    git repository (PLAN.md 2.1); /org itself is a plain directory.
+mkdir -p /org
+seed="${KITBASH_ORG_SEED:-/usr/share/kitbash/org}"
+if [ -d "$seed" ]; then
+  for src in "$seed"/*/; do
+    [ -d "$src" ] || continue
+    name=$(basename "$src")
+    if [ ! -d "/org/$name/.git" ]; then
+      log "seeding /org/$name"
+      mkdir -p "/org/$name"
+      cp -R "$src". "/org/$name/"
+      git -C "/org/$name" init -q --initial-branch=main
+      git -C "/org/$name" -c user.name=root -c user.email=root@kitbash add -A
+      git -C "/org/$name" -c user.name=root -c user.email=root@kitbash commit -q -m "Seed $name" || true
+    fi
+  done
 fi
 chown -R root:kitbash-users /org
-chmod -R g+rX,o-rwx /org
-git -C /org config core.sharedRepository group
+chmod 750 /org
+find /org -type d -exec chmod 750 {} +
+find /org -type f -exec chmod 640 {} +
 
 # 9. sshd: regular users get the MCP surface and nothing else.
 cat > /etc/ssh/sshd_config.d/60-kitbash.conf <<'S'

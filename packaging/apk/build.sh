@@ -6,7 +6,7 @@ set -eu
 tar=$1
 ver=$(sed -n 's/^pkgver=//p' "$(dirname "$0")/APKBUILD")
 [ "$(basename "$tar")" = "kitbash-$ver.tar.gz" ] || { echo "tarball must be named kitbash-$ver.tar.gz" >&2; exit 1; }
-work=$(mktemp -d); cp "$(dirname "$0")/APKBUILD" "$work/"; cp "$tar" "$work/"
+work=$HOME/abuild/kitbashd; rm -rf "$work"; mkdir -p "$work"; cp "$(dirname "$0")/APKBUILD" "$work/"; cp "$tar" "$work/"
 cd "$work"
 [ -f ~/.abuild/abuild.conf ] || abuild-keygen -a -n -q
 abuild -F checksum 2>/dev/null || abuild checksum
