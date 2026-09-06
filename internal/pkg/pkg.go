@@ -104,8 +104,10 @@ func (s *Service) Build(ctx context.Context, path string) (*BuildResult, *proble
 	result, prob := s.build(ctx, span, path)
 	if prob != nil {
 		span.Fail(prob.Slug(), prob.Title)
+		return nil, prob
 	}
-	return result, prob
+	span.OK()
+	return result, nil
 }
 
 func (s *Service) build(ctx context.Context, span *telemetry.Span, path string) (*BuildResult, *problem.Problem) {
@@ -113,8 +115,10 @@ func (s *Service) build(ctx context.Context, span *telemetry.Span, path string) 
 	if prob != nil {
 		return nil, prob
 	}
-	span.SetPackage(folder)
-	span.SetPath(folder)
+	// The Package is what the whole call is about, so it goes on the tool's
+	// span as well as this one: a query by package has to find pkg_build.
+	telemetry.SetPackage(ctx, folder)
+	telemetry.SetPath(ctx, folder)
 	unit, ok := m.Unit()
 	if !ok || unit.Type != manifest.UnitContainer || unit.Build == "" {
 		return nil, problem.InvalidManifest(folder,

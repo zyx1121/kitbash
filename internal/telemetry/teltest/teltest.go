@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"google.golang.org/protobuf/proto"
 
@@ -71,6 +72,7 @@ type Daemon struct {
 
 	dir      string
 	listener net.Listener
+	server   *http.Server
 
 	mu           sync.Mutex
 	spans        []Span
@@ -79,6 +81,7 @@ type Daemon struct {
 	calls        []Call
 	query        Response
 	retention    Response
+	pause        time.Duration
 }
 
 // Start listens on a unix socket in a temporary directory of its own. The
@@ -89,15 +92,24 @@ func Start() (*Daemon, error) {
 	if err != nil {
 		return nil, err
 	}
-	socket := filepath.Join(dir, "kitbashd.sock")
-	listener, err := net.Listen("unix", socket)
+	d, err := StartAt(filepath.Join(dir, "kitbashd.sock"))
 	if err != nil {
 		os.RemoveAll(dir)
 		return nil, err
 	}
+	d.dir = dir
+	return d, nil
+}
+
+// StartAt listens on a socket the caller names, which is how a test stops a
+// daemon and starts another one where the first was.
+func StartAt(socket string) (*Daemon, error) {
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		return nil, err
+	}
 	d := &Daemon{
 		Socket:   socket,
-		dir:      dir,
 		listener: listener,
 		query: Response{Status: http.StatusOK, ContentType: "application/json",
 			Body: `{"signal":"traces","records":[],"truncated":false}`},
@@ -109,18 +121,44 @@ func Start() (*Daemon, error) {
 	mux.HandleFunc("POST /v1/logs", d.logRecords)
 	mux.HandleFunc("/kitbash/v1/query", d.jsonAPI)
 	mux.HandleFunc("/kitbash/v1/retention", d.jsonAPI)
+	d.server = &http.Server{Handler: mux}
 	go func() {
-		if err := http.Serve(listener, mux); err != nil && !errors.Is(err, net.ErrClosed) {
+		if err := d.server.Serve(listener); err != nil &&
+			!errors.Is(err, net.ErrClosed) && !errors.Is(err, http.ErrServerClosed) {
 			fmt.Fprintf(os.Stderr, "teltest: %v\n", err)
 		}
 	}()
 	return d, nil
 }
 
-// Close stops the daemon and removes its socket.
+// Close stops the daemon and removes its socket. Open connections go with it,
+// the way they would if the process had been restarted: a client holding a
+// keep alive connection to a daemon that is gone has to notice. It is safe to
+// call twice, so a test can stop a daemon in the middle and still defer this.
 func (d *Daemon) Close() {
-	d.listener.Close()
-	os.RemoveAll(d.dir)
+	d.server.Close()
+	if d.dir != "" {
+		os.RemoveAll(d.dir)
+	}
+}
+
+// Delay makes every handler wait before it answers, which is how a daemon that
+// has stopped answering is exercised. A delay longer than the client's timeout
+// is a hung daemon.
+func (d *Daemon) Delay(pause time.Duration) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.pause = pause
+}
+
+// wait honours Delay.
+func (d *Daemon) wait() {
+	d.mu.Lock()
+	pause := d.pause
+	d.mu.Unlock()
+	if pause > 0 {
+		time.Sleep(pause)
+	}
 }
 
 // AnswerQuery replaces what /kitbash/v1/query returns.
@@ -232,6 +270,7 @@ func (d *Daemon) logRecords(w http.ResponseWriter, r *http.Request) {
 // decode reads one OTLP protobuf request, recording the content type it came
 // with so a test can hold the exporter to application/x-protobuf.
 func (d *Daemon) decode(w http.ResponseWriter, r *http.Request, into proto.Message) bool {
+	d.wait()
 	body, err := readAll(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -248,6 +287,7 @@ func (d *Daemon) decode(w http.ResponseWriter, r *http.Request, into proto.Messa
 }
 
 func (d *Daemon) jsonAPI(w http.ResponseWriter, r *http.Request) {
+	d.wait()
 	body, err := readAll(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)

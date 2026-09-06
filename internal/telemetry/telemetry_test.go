@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/zyx1121/kitbash/internal/problem"
 	"github.com/zyx1121/kitbash/internal/telemetry"
@@ -140,6 +141,76 @@ func TestAMissingSocketLogsOneLinePerSession(t *testing.T) {
 	}
 }
 
+// A daemon that goes away and comes back is exported to again. Dropping is a
+// state of the socket, not a verdict on the session: an upgrade or a restart
+// mid session must not leave an agent's work unrecorded until it reconnects.
+func TestExportResumesWhenTheDaemonComesBack(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "kbd.sock")
+	first, err := teltest.StartAt(socket)
+	if err != nil {
+		t.Fatalf("teltest.StartAt: %v", err)
+	}
+	p, logs := newProvider(t, socket)
+	ctx := context.Background()
+
+	record := func(tool string) {
+		_, span := p.StartTool(ctx, tool, "tester")
+		span.OK()
+		span.End()
+		if err := p.ForceFlush(ctx); err != nil {
+			t.Fatalf("flushing %s: %v", tool, err)
+		}
+	}
+
+	record("fs_list")
+	first.Close()
+	record("fs_read")
+
+	second, err := teltest.StartAt(socket)
+	if err != nil {
+		t.Fatalf("restarting the daemon: %v", err)
+	}
+	defer second.Close()
+	record("fs_write")
+	if err := p.Shutdown(ctx); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+
+	if _, only := second.Span("fs_write"); !only {
+		t.Fatalf("the call after the restart did not reach the daemon, it saw %+v", second.Spans())
+	}
+	if _, seen := second.Span("fs_read"); seen {
+		t.Error("the daemon that was down received the call it missed")
+	}
+	written := logs.String()
+	if !strings.Contains(written, "dropping") {
+		t.Errorf("the log is %q, want the line that says records were dropped", written)
+	}
+	if !strings.Contains(written, "resumed") {
+		t.Errorf("the log is %q, want the line that says export resumed", written)
+	}
+}
+
+// A daemon that accepts the connection and never answers must not hold the
+// session open past the shutdown budget.
+func TestAHungDaemonDoesNotOutlastTheShutdownBudget(t *testing.T) {
+	daemon := newDaemon(t)
+	daemon.Delay(30 * time.Second)
+	p, _ := newProvider(t, daemon.Socket)
+
+	_, span := p.StartTool(context.Background(), "fs_list", "tester")
+	span.Info("a record the daemon will never acknowledge")
+	span.OK()
+	span.End()
+
+	start := time.Now()
+	// The error is the point: what matters is that it comes back.
+	_ = p.Shutdown(context.Background())
+	if elapsed := time.Since(start); elapsed > telemetry.ShutdownTimeout+2*time.Second {
+		t.Errorf("shutdown took %s, want it bounded by the %s budget", elapsed, telemetry.ShutdownTimeout)
+	}
+}
+
 func TestQueryPostsTheInputAndReturnsTheBody(t *testing.T) {
 	daemon := newDaemon(t)
 	answer := `{"signal":"traces","records":[],"truncated":false}`
@@ -199,6 +270,48 @@ func TestRetentionReadsAndSets(t *testing.T) {
 	}
 	if calls[1].Method != http.MethodPut || calls[1].Body != `{"logs":"7d"}` {
 		t.Errorf("setting was %s %q, want PUT with the set object", calls[1].Method, calls[1].Body)
+	}
+}
+
+// A daemon that answers 200 with something that is not JSON is broken, not
+// permitted to hand the agent whatever it sent.
+func TestANonJSONAnswerIsAnInternalProblem(t *testing.T) {
+	daemon := newDaemon(t)
+	daemon.AnswerQuery(teltest.Response{Status: http.StatusOK, ContentType: "text/html",
+		Body: "<html>not the daemon you were looking for</html>"})
+	client := telemetry.NewClient(daemon.Socket)
+
+	body, prob := client.Query(context.Background(), json.RawMessage(`{"signal":"traces"}`))
+	if prob == nil {
+		t.Fatalf("a body that is not JSON came back as a success: %s", body)
+	}
+	if prob.Slug() != problem.SlugInternal {
+		t.Errorf("problem is %s, want internal", prob.Slug())
+	}
+	if strings.Contains(prob.Detail, "html") {
+		t.Errorf("detail is %q, want the caller not to be handed the broken body", prob.Detail)
+	}
+}
+
+// A daemon that accepts the connection and never answers is an internal
+// problem with the same advice as one that is not there, and the call comes
+// back rather than hanging the agent.
+func TestAHungDaemonIsAnInternalProblem(t *testing.T) {
+	daemon := newDaemon(t)
+	daemon.Delay(30 * time.Second)
+	client := telemetry.NewClient(daemon.Socket)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	_, prob := client.Query(ctx, json.RawMessage(`{"signal":"traces"}`))
+	if prob == nil {
+		t.Fatal("querying a hung daemon succeeded")
+	}
+	if prob.Slug() != problem.SlugInternal {
+		t.Errorf("problem is %s, want internal", prob.Slug())
+	}
+	if prob.Fix != telemetry.NotRunningFix {
+		t.Errorf("fix is %q, want %q", prob.Fix, telemetry.NotRunningFix)
 	}
 }
 

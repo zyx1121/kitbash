@@ -105,8 +105,11 @@ func (s *Service) Run(ctx context.Context, path, digest, name string) (*Process,
 		span.Fail(prob.Slug(), prob.Title)
 		return nil, prob
 	}
-	span.SetProcess(process.ID)
+	// The Process is what the whole call is about, so it goes on the tool's
+	// span as well as this one: a query by process has to find proc_run.
+	telemetry.SetProcess(ctx, process.ID)
 	span.SetDigest(process.Digest)
+	span.OK()
 	return process, nil
 }
 
@@ -115,7 +118,7 @@ func (s *Service) run(ctx context.Context, span *telemetry.Span, path, digest, n
 	if prob != nil {
 		return nil, prob
 	}
-	span.SetPackage(folder)
+	telemetry.SetPackage(ctx, folder)
 	if manifest.Reserved(m.Name) {
 		return nil, problem.InvalidManifest(folder, fmt.Sprintf(
 			"the Package name %q is a built in tool family, so its tools would collide with the surface", m.Name))

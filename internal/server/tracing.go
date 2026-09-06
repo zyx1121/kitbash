@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -11,6 +12,10 @@ import (
 	"github.com/zyx1121/kitbash/internal/problem"
 	"github.com/zyx1121/kitbash/internal/telemetry"
 )
+
+// telFamily is the prefix of the tel tools, whose arguments describe records
+// other calls left rather than anything this call touches.
+const telFamily = "tel_"
 
 // tracing opens the span of every tools/call, which is the invariant in
 // PLAN.md section 2.6 that there is no untraced path. It is added after
@@ -40,10 +45,12 @@ func tracing(p *telemetry.Provider, files *fs.Service, b *bridge.Bridge) mcp.Mid
 			if path, process, proxied := b.Owner(name); proxied {
 				span.SetPackage(path)
 				span.SetProcess(process)
-			} else {
+			} else if !strings.HasPrefix(name, telFamily) {
 				// A built in tool names the Files path it is about in its
 				// arguments. A Package tool's path means whatever the Package
-				// decided it means, so it is not read here.
+				// decided it means, and a tel tool's is a filter over other
+				// calls rather than a path this call touched, so neither is
+				// read here.
 				span.SetPath(callPath(req))
 			}
 
@@ -89,7 +96,9 @@ func resultProblem(call *mcp.CallToolResult) *problem.Problem {
 
 // callPath is the path argument of a call, empty when the tool takes none.
 // The arguments are read as they arrived: the SDK has not yet validated them
-// when this runs, so anything that does not decode is simply not a path.
+// when this runs, so anything that does not decode is simply not a path, and a
+// path longer than an attribute may be is cut here rather than sent and
+// refused. A caller does not get to choose the size of a telemetry record.
 func callPath(req mcp.Request) string {
 	call, ok := req.(*mcp.CallToolRequest)
 	if !ok || call.Params == nil || len(call.Params.Arguments) == 0 {
@@ -100,6 +109,9 @@ func callPath(req mcp.Request) string {
 	}
 	if err := json.Unmarshal(call.Params.Arguments, &args); err != nil {
 		return ""
+	}
+	if len(args.Path) > telemetry.AttributeValueLimit {
+		return args.Path[:telemetry.AttributeValueLimit]
 	}
 	return args.Path
 }

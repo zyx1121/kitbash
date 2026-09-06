@@ -26,6 +26,7 @@ import (
 type traced struct {
 	*whole
 	session  *mcp.ClientSession
+	server   *mcp.Server
 	daemon   *teltest.Daemon
 	provider *telemetry.Provider
 	bridge   *bridge.Bridge
@@ -87,7 +88,7 @@ func newTraced(t *testing.T, socket string) *traced {
 		serverSession.Wait()
 		tools.Close()
 	})
-	return &traced{whole: w, session: session, provider: provider, bridge: tools, logs: logs}
+	return &traced{whole: w, session: session, server: srv, provider: provider, bridge: tools, logs: logs}
 }
 
 // newTracedWithDaemon is newTraced against a fake kitbashd that records what
@@ -231,6 +232,107 @@ func TestSchemaViolationIsStillTraced(t *testing.T) {
 	}
 }
 
+// An argument is a caller's to choose the size of, and a telemetry record is
+// not: a path larger than kitbashd accepts would take the whole batch down
+// with it, so it is cut before it reaches the span.
+func TestAHugePathIsTruncatedAndTheSpanStillArrives(t *testing.T) {
+	tr := newTracedWithDaemon(t)
+
+	huge := "/org/" + strings.Repeat("a", 5<<20)
+	res := call(t, tr.session, "fs_list", map[string]any{"path": huge})
+	if !res.IsError {
+		t.Fatal("a 5 MiB path was accepted as a folder")
+	}
+	tr.flush(t)
+
+	span, only := tr.daemon.Span("fs_list")
+	if !only {
+		t.Fatalf("want exactly one fs_list span, got %d spans", len(tr.daemon.Spans()))
+	}
+	path := span.Attributes[telemetry.AttrPath]
+	if path == "" {
+		t.Fatal("the span carries no path at all")
+	}
+	if len(path) > telemetry.AttributeValueLimit {
+		t.Errorf("%s is %d bytes, want at most %d", telemetry.AttrPath, len(path), telemetry.AttributeValueLimit)
+	}
+	if !strings.HasPrefix(path, "/org/aaa") {
+		t.Errorf("%s is %q, want the start of the path the caller sent", telemetry.AttrPath, path)
+	}
+}
+
+// A tel call is about records other calls left, so the filters it names are
+// not paths this call touched.
+func TestTelQueryDoesNotRecordItsPathFilter(t *testing.T) {
+	tr := newTracedWithDaemon(t)
+
+	ok(t, call(t, tr.session, "tel_query", map[string]any{
+		"signal": "traces",
+		"path":   "/org/ffmpeg",
+	}), "tel_query")
+	tr.flush(t)
+
+	span, only := tr.daemon.Span("tel_query")
+	if !only {
+		t.Fatalf("want exactly one tel_query span, got %+v", tr.daemon.Spans())
+	}
+	if got := span.Attributes[telemetry.AttrPath]; got != "" {
+		t.Errorf("%s is %q, want the query's filter not to be recorded as a path this call touched",
+			telemetry.AttrPath, got)
+	}
+}
+
+// A handler that panics is a problem to the agent and an error span to
+// Telemetry, not a lost call.
+func TestAPanicIsTracedAsAnError(t *testing.T) {
+	tr := newTracedWithDaemon(t)
+	mcp.AddTool(tr.server, &mcp.Tool{
+		Name:        "fs_panic",
+		Description: "A tool that fails the way a bug fails.",
+		InputSchema: json.RawMessage(`{"type":"object"}`),
+	}, func(_ context.Context, _ *mcp.CallToolRequest, _ json.RawMessage) (*mcp.CallToolResult, any, error) {
+		panic("the handler broke")
+	})
+
+	res := call(t, tr.session, "fs_panic", map[string]any{})
+	p := problemOf(t, res)
+	if p.Slug() != problem.SlugInternal {
+		t.Fatalf("a panic came back as %s, want internal", p.Slug())
+	}
+	tr.flush(t)
+
+	span, only := tr.daemon.Span("fs_panic")
+	if !only {
+		t.Fatalf("want exactly one fs_panic span, got %+v", tr.daemon.Spans())
+	}
+	if span.Status != "error" {
+		t.Errorf("status is %q, want error", span.Status)
+	}
+	if got := span.Attributes[telemetry.AttrError]; got != problem.SlugInternal {
+		t.Errorf("%s is %q, want internal", telemetry.AttrError, got)
+	}
+}
+
+// A call for a tool that is not on the surface fails inside the SDK rather
+// than in a handler, and it is still one span.
+func TestAnUnknownToolIsTraced(t *testing.T) {
+	tr := newTracedWithDaemon(t)
+
+	if _, err := tr.session.CallTool(context.Background(),
+		&mcp.CallToolParams{Name: "fs_teleport", Arguments: map[string]any{}}); err == nil {
+		t.Fatal("calling a tool that does not exist succeeded")
+	}
+	tr.flush(t)
+
+	span, only := tr.daemon.Span("fs_teleport")
+	if !only {
+		t.Fatalf("want exactly one fs_teleport span, got %+v", tr.daemon.Spans())
+	}
+	if span.Status != "error" {
+		t.Errorf("status is %q, want error", span.Status)
+	}
+}
+
 func TestProxiedCallCarriesThePackageAndTheProcess(t *testing.T) {
 	tr := newTracedWithDaemon(t)
 	process := buildAndRun(t, tr)
@@ -276,9 +378,23 @@ func TestBuildOpensAChildSpanAndOneLogRecord(t *testing.T) {
 	if !only {
 		t.Fatalf("want exactly one pkg_build span, got %+v", tr.daemon.Spans())
 	}
+	// A query by package has to find the call, not only the child span that
+	// happened to learn the Package's name first.
+	if got := tool.Attributes[telemetry.AttrPackage]; got != tr.folder {
+		t.Errorf("the pkg_build span's %s is %q, want %s", telemetry.AttrPackage, got, tr.folder)
+	}
+	if got := tool.Attributes[telemetry.AttrPath]; got != tr.folder {
+		t.Errorf("the pkg_build span's %s is %q, want %s", telemetry.AttrPath, got, tr.folder)
+	}
 	child, only := tr.daemon.Span("build")
 	if !only {
 		t.Fatalf("want exactly one build span, got %+v", tr.daemon.Spans())
+	}
+	if child.Status != "ok" {
+		t.Errorf("the build span's status is %q, want ok", child.Status)
+	}
+	if got := child.Attributes[telemetry.AttrTool]; got != "pkg_build" {
+		t.Errorf("the build span's %s is %q, want pkg_build", telemetry.AttrTool, got)
 	}
 	if child.ParentSpanID != tool.SpanID {
 		t.Errorf("the build span's parent is %s, want the pkg_build span %s", child.ParentSpanID, tool.SpanID)
@@ -316,6 +432,13 @@ func TestBuildOpensAChildSpanAndOneLogRecord(t *testing.T) {
 	if got := record.Attributes[telemetry.AttrPackage]; got != tr.folder {
 		t.Errorf("the record's %s is %q, want %s", telemetry.AttrPackage, got, tr.folder)
 	}
+	// A query for the logs of pkg_build has to find the build log.
+	if got := record.Attributes[telemetry.AttrTool]; got != "pkg_build" {
+		t.Errorf("the record's %s is %q, want pkg_build", telemetry.AttrTool, got)
+	}
+	if got := record.Attributes[telemetry.AttrUser]; got != "tester" {
+		t.Errorf("the record's %s is %q, want tester", telemetry.AttrUser, got)
+	}
 }
 
 func TestProcRunOpensAChildSpan(t *testing.T) {
@@ -323,9 +446,26 @@ func TestProcRunOpensAChildSpan(t *testing.T) {
 	process := buildAndRun(t, tr)
 	tr.flush(t)
 
+	tool, only := tr.daemon.Span("proc_run")
+	if !only {
+		t.Fatalf("want exactly one proc_run span, got %+v", tr.daemon.Spans())
+	}
+	// A query by process has to find the call that started it.
+	if got := tool.Attributes[telemetry.AttrProcess]; got != process.ID {
+		t.Errorf("the proc_run span's %s is %q, want %s", telemetry.AttrProcess, got, process.ID)
+	}
+	if got := tool.Attributes[telemetry.AttrPackage]; got != tr.folder {
+		t.Errorf("the proc_run span's %s is %q, want %s", telemetry.AttrPackage, got, tr.folder)
+	}
 	child, only := tr.daemon.Span("run")
 	if !only {
 		t.Fatalf("want exactly one run span, got %+v", tr.daemon.Spans())
+	}
+	if child.Status != "ok" {
+		t.Errorf("the run span's status is %q, want ok", child.Status)
+	}
+	if got := child.Attributes[telemetry.AttrTool]; got != "proc_run" {
+		t.Errorf("the run span's %s is %q, want proc_run", telemetry.AttrTool, got)
 	}
 	if got := child.Attributes[telemetry.AttrProcess]; got != process.ID {
 		t.Errorf("%s is %q, want %s", telemetry.AttrProcess, got, process.ID)
