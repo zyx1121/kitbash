@@ -105,24 +105,48 @@ func (s *Service) Write(ctx context.Context, req WriteRequest) (*WriteResult, *p
 	if err := writeNoFollow(clean, data); err != nil {
 		return nil, writeProblem(clean, err)
 	}
-	if _, err := s.git(ctx, repo, "add", "--", rel); err != nil {
+	rels := []string{rel}
+	if err := s.stage(ctx, repo, rels); err != nil {
 		return nil, gitProblem(clean, err)
 	}
 	// An identical write is a no operation, so the call stays idempotent.
-	if _, err := s.git(ctx, repo, "diff", "--cached", "--quiet", "--", rel); err == nil && before != nil {
+	if !s.staged(ctx, repo, rels) && before != nil {
 		return &WriteResult{Path: clean, Commit: *before}, nil
 	}
-	if _, err := s.git(ctx, repo, "commit", "-m", req.Message, "--", rel); err != nil {
-		return nil, gitProblem(clean, err)
-	}
-	after, err := s.lastCommit(ctx, repo, rel)
+	after, err := s.commitPaths(ctx, repo, req.Message, rels)
 	if err != nil {
 		return nil, gitProblem(clean, err)
 	}
-	if after == nil {
-		return nil, problem.Internal(clean, "the commit was not recorded", "")
-	}
 	return &WriteResult{Path: clean, Commit: *after}, nil
+}
+
+// stage adds repository relative paths to the index.
+func (s *Service) stage(ctx context.Context, repo string, rels []string) error {
+	_, err := s.git(ctx, repo, append([]string{"add", "--"}, rels...)...)
+	return err
+}
+
+// staged reports whether the index differs from HEAD for these paths.
+func (s *Service) staged(ctx context.Context, repo string, rels []string) bool {
+	_, err := s.git(ctx, repo, append([]string{"diff", "--cached", "--quiet", "--"}, rels...)...)
+	return err != nil
+}
+
+// commitPaths commits the staged paths as one commit and reads it back. Both
+// fs_write and the multi file write share it, so a folder written in one call
+// lands as one version.
+func (s *Service) commitPaths(ctx context.Context, repo, message string, rels []string) (*Commit, error) {
+	if _, err := s.git(ctx, repo, append([]string{"commit", "-m", message, "--"}, rels...)...); err != nil {
+		return nil, err
+	}
+	commit, err := s.lastCommit(ctx, repo, rels[0])
+	if err != nil {
+		return nil, err
+	}
+	if commit == nil {
+		return nil, errors.New("the commit was not recorded")
+	}
+	return commit, nil
 }
 
 // writeVisible applies the visibility rules to a write. Every ancestor of the

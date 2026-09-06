@@ -147,7 +147,7 @@ func connect(t *testing.T, f *fixture) *mcp.ClientSession {
 	t.Helper()
 	ctx := context.Background()
 	clientTransport, serverTransport := mcp.NewInMemoryTransports()
-	srv := server.New("test", f.files)
+	srv := server.New("test", server.Deps{Files: f.files})
 	serverSession, err := srv.Connect(ctx, serverTransport, nil)
 	if err != nil {
 		t.Fatalf("server connect: %v", err)
