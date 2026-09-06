@@ -9,6 +9,7 @@ package pkg
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -130,10 +131,17 @@ func (s *Service) Build(ctx context.Context, path string) (*BuildResult, *proble
 	}
 	digest, log, err := s.runner.Build(ctx, contextDir, containerfile, tag, labels)
 	if err != nil {
-		// The build log is the cause, and the cause goes to the server log:
-		// it carries host paths and the runtime's own output.
+		if errors.Is(err, podman.ErrBuildFailed) {
+			// A build that ran and failed is the caller's to fix, so the tail
+			// of the log goes back with the error instead of only to the
+			// server log. The full log still never leaves the host.
+			return nil, problem.BadRequest(folder, buildFailure(log),
+				"Fix the build context and call pkg_build again.")
+		}
+		// The runtime itself could not run the build, which the caller can do
+		// nothing about.
 		return nil, problem.Internal(folder, err.Error(),
-			"Read the Containerfile and the build context, fix the build, and try again.")
+			"Ask an administrator to check the container runtime on this host.")
 	}
 	return &BuildResult{
 		Path:   folder,
@@ -246,6 +254,15 @@ func findContainerfile(contextDir string) (string, *problem.Problem) {
 	return "", problem.NotFoundFix(contextDir,
 		"the build context has no Containerfile and no Dockerfile",
 		"Write a Containerfile into the build context with fs_write, then build again.")
+}
+
+// buildFailure is what the caller reads when a build fails: the same tail the
+// successful build returns, or a plain sentence when the build printed nothing.
+func buildFailure(log string) string {
+	if out := tail(log); out != "" {
+		return out
+	}
+	return "the build failed and printed nothing"
 }
 
 // shortSha is the twelve character commit the image tag carries.

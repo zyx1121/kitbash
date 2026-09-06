@@ -17,8 +17,9 @@ func RegisterPackages(s *mcp.Server, packages *pkg.Service) {
 		Description: "Build the Package at path from its current commit with the caller's rootless container " +
 			"runtime. The digest is the OCI image ID. The image is labelled kitbash.path, kitbash.name, " +
 			"kitbash.commit and kitbash.user, which is the whole build record. Only the tail of the build log " +
-			"is returned; the full log never leaves the host. Version 1 supports one container unit with a " +
-			"build context per Package.",
+			"is returned; the full log never leaves the host. A build that runs and fails returns that same " +
+			"tail as a bad-request. kitbash builds from a commit, so an uncommitted change under the path is " +
+			"a conflict. Version 1 supports one container unit with a build context per Package.",
 		InputSchema:  pkgBuildInputSchema,
 		OutputSchema: pkgBuildOutputSchema,
 	}, buildHandler(packages))

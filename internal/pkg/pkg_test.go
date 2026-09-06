@@ -2,6 +2,8 @@ package pkg_test
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -168,6 +170,86 @@ func TestBuildRefusesAnImageUnit(t *testing.T) {
 	}
 	if !strings.Contains(prob.Detail, "version 1 builds container units with a build context") {
 		t.Errorf("detail is %q, want the version 1 sentence", prob.Detail)
+	}
+}
+
+// A build that ran and failed is the caller's to fix, so the tail of the log
+// comes back with the error.
+func TestBuildFailureReturnsTheLogTail(t *testing.T) {
+	f := newFixture(t)
+	folder := f.commit(t, "ffmpeg",
+		fs.File{Path: "kitbash.yaml", Content: text(containerManifest)},
+		fs.File{Path: "Containerfile", Content: text("FROM alpine\nRUN exit 1\n")})
+	f.runner.Log = "STEP 1: FROM alpine\nSTEP 2: RUN exit 1\nerror: exit status 1\n"
+	f.runner.BuildErr = fmt.Errorf("podman build: exit status 1: %w", podman.ErrBuildFailed)
+
+	_, prob := f.packages.Build(context.Background(), folder)
+	if prob == nil {
+		t.Fatal("a failed build was reported as a success")
+	}
+	if prob.Slug() != problem.SlugBadRequest {
+		t.Fatalf("problem is %s, want bad-request", prob.Slug())
+	}
+	if prob.Status != 400 {
+		t.Errorf("status is %d, want 400", prob.Status)
+	}
+	if prob.Instance != folder {
+		t.Errorf("instance is %q, want %q", prob.Instance, folder)
+	}
+	if !strings.Contains(prob.Detail, "RUN exit 1") {
+		t.Errorf("detail is %q, want the tail of the build log", prob.Detail)
+	}
+	if prob.Fix != "Fix the build context and call pkg_build again." {
+		t.Errorf("fix is %q, want the build context advice", prob.Fix)
+	}
+}
+
+// The build log is bounded the same way whether the build worked or not.
+func TestBuildFailureLogTailIsBounded(t *testing.T) {
+	f := newFixture(t)
+	folder := f.commit(t, "ffmpeg",
+		fs.File{Path: "kitbash.yaml", Content: text(containerManifest)},
+		fs.File{Path: "Containerfile", Content: text("FROM alpine\n")})
+	var log strings.Builder
+	for i := range 200 {
+		fmt.Fprintf(&log, "step %d\n", i)
+	}
+	f.runner.Log = log.String()
+	f.runner.BuildErr = fmt.Errorf("podman build: exit status 1: %w", podman.ErrBuildFailed)
+
+	_, prob := f.packages.Build(context.Background(), folder)
+	if prob == nil {
+		t.Fatal("a failed build was reported as a success")
+	}
+	if lines := strings.Count(prob.Detail, "\n") + 1; lines > pkg.LogTailLines {
+		t.Errorf("the detail carries %d lines, want at most %d", lines, pkg.LogTailLines)
+	}
+	if len(prob.Detail) > pkg.LogTailBytes {
+		t.Errorf("the detail is %d bytes, want at most %d", len(prob.Detail), pkg.LogTailBytes)
+	}
+	if !strings.Contains(prob.Detail, "step 199") {
+		t.Errorf("detail is %q, want the end of the log", prob.Detail)
+	}
+}
+
+// A runtime that will not run at all is not the caller's fault, so the cause
+// stays in the server log.
+func TestBuildWithoutARuntimeIsInternal(t *testing.T) {
+	f := newFixture(t)
+	folder := f.commit(t, "ffmpeg",
+		fs.File{Path: "kitbash.yaml", Content: text(containerManifest)},
+		fs.File{Path: "Containerfile", Content: text("FROM alpine\n")})
+	f.runner.BuildErr = errors.New(`exec: "podman": executable file not found in $PATH`)
+
+	_, prob := f.packages.Build(context.Background(), folder)
+	if prob == nil {
+		t.Fatal("a missing runtime was reported as a success")
+	}
+	if prob.Slug() != problem.SlugInternal {
+		t.Errorf("problem is %s, want internal", prob.Slug())
+	}
+	if strings.Contains(prob.Detail, "podman") {
+		t.Errorf("detail is %q, want the runtime's own words kept out of it", prob.Detail)
 	}
 }
 

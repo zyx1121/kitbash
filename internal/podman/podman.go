@@ -9,8 +9,15 @@ package podman
 
 import (
 	"context"
+	"errors"
 	"time"
 )
+
+// ErrBuildFailed reports a build that ran and failed on its own terms: the
+// Containerfile or the build context is wrong. It is told apart from a runtime
+// that could not be started at all, because the first is the caller's to fix
+// and the second is the operator's.
+var ErrBuildFailed = errors.New("the build failed")
 
 // Binary is the container runtime kitbash shells out to, found on PATH.
 const Binary = "podman"

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -61,6 +62,12 @@ func (c *CLI) Build(ctx context.Context, contextDir, containerfile, tag string, 
 	runErr := cmd.Run()
 	log := combined.String()
 	if runErr != nil {
+		// An exit status means podman ran and the build did not succeed.
+		// Anything else means podman itself never got that far.
+		var exit *exec.ExitError
+		if errors.As(runErr, &exit) {
+			return "", log, fmt.Errorf("podman build %s: %v: %w", contextDir, exit, ErrBuildFailed)
+		}
 		return "", log, fmt.Errorf("podman build %s: %v: %s", contextDir, runErr, strings.TrimSpace(log))
 	}
 	id, err := os.ReadFile(idFile)
