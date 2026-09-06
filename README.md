@@ -34,7 +34,7 @@ claude mcp add kitbash -- ssh alice@kitbash.example.org
 
 ## Status
 
-M2 Packages done (v0.2.0). M3 Telemetry is next. Read [PLAN.md](PLAN.md): positioning, the four object model, kits, kitbashOS, and version 1 milestones. Machine readable definitions live in [`spec/`](spec/).
+M3 Telemetry done (v0.3.0). M4 Kits is next. Read [PLAN.md](PLAN.md): positioning, the four object model, kits, kitbashOS, and version 1 milestones. Machine readable definitions live in [`spec/`](spec/).
 
 ## Development
 
