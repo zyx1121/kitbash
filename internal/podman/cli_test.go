@@ -83,12 +83,19 @@ func TestSplitLines(t *testing.T) {
 	}
 }
 
-// The double dash keeps an entrypoint that takes its own flags out of podman's
-// option parsing.
+// The image's argv follows the container name with nothing between them.
+// podman stops parsing flags at the container name, so a double dash there is
+// the command to run, and the runtime looks for an executable called "--".
+// The entrypoint's own flags reach the entrypoint either way.
 func TestExecArgvHoldsStdinOpen(t *testing.T) {
 	argv := (&CLI{}).ExecArgv("kitbash-ffmpeg-ffmpeg", []string{"/bin/server", "--stdio"})
-	want := []string{Binary, "exec", "--interactive", "kitbash-ffmpeg-ffmpeg", "--", "/bin/server", "--stdio"}
+	want := []string{Binary, "exec", "--interactive", "kitbash-ffmpeg-ffmpeg", "/bin/server", "--stdio"}
 	if strings.Join(argv, " ") != strings.Join(want, " ") {
 		t.Errorf("ExecArgv is %v, want %v", argv, want)
+	}
+	for _, arg := range argv {
+		if arg == "--" {
+			t.Error("ExecArgv passes a double dash, which podman hands to the runtime as the command")
+		}
 	}
 }

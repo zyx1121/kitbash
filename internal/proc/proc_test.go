@@ -481,6 +481,48 @@ func TestStopUnknownID(t *testing.T) {
 	}
 }
 
+// A Process is looked up by id, so the advice when the id is missing or wrong
+// is about Processes, not about folders.
+func TestMissingIDPointsAtProcList(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	cases := []struct {
+		name string
+		id   string
+	}{
+		{name: "empty", id: ""},
+		{name: "unknown", id: "0192f000-0000-7000-8000-000000000000"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for tool, call := range map[string]func() *problem.Problem{
+				"proc_stop": func() *problem.Problem {
+					_, prob := f.processes.Stop(ctx, tc.id)
+					return prob
+				},
+				"proc_logs": func() *problem.Problem {
+					_, prob := f.processes.Logs(ctx, tc.id, 0)
+					return prob
+				},
+			} {
+				prob := call()
+				if prob == nil {
+					t.Fatalf("%s accepted the id %q", tool, tc.id)
+				}
+				if prob.Slug() != problem.SlugNotFound {
+					t.Errorf("%s returned %s, want not-found", tool, prob.Slug())
+				}
+				if !strings.Contains(prob.Fix, "proc_list") {
+					t.Errorf("%s says %q, want it to point at proc_list", tool, prob.Fix)
+				}
+				if strings.Contains(prob.Fix, "fs_list") {
+					t.Errorf("%s says %q, which is advice about folders", tool, prob.Fix)
+				}
+			}
+		})
+	}
+}
+
 func TestLogsCapTheLineCount(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()

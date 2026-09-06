@@ -290,11 +290,14 @@ func (c *CLI) Logs(ctx context.Context, name string, tail int) ([]string, error)
 	return SplitLines(out), nil
 }
 
-// ExecArgv is the argv that opens one more MCP session inside a container. The
-// double dash keeps the image's own argv out of podman's option parsing: an
-// entrypoint that takes a --flag is the container's business.
+// ExecArgv is the argv that opens one more MCP session inside a container.
+//
+// There is no double dash before the image's argv. podman stops parsing flags
+// at the container name, so everything after it is already positional, and a
+// dash dash there is passed to the runtime as the command to run: crun then
+// reports "executable file `--` not found in $PATH".
 func (c *CLI) ExecArgv(container string, argv []string) []string {
-	full := []string{Binary, "exec", "--interactive", container, "--"}
+	full := []string{Binary, "exec", "--interactive", container}
 	return append(full, argv...)
 }
 

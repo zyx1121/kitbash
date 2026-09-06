@@ -445,7 +445,8 @@ func (s *Service) byName(ctx context.Context, name string) (*podman.Container, *
 // byID finds one container by the kitbash.id label, which is the Process id.
 func (s *Service) byID(ctx context.Context, id string) (*podman.Container, *problem.Problem) {
 	if id == "" {
-		return nil, problem.NotFound(id, "no Process id was given")
+		return nil, problem.NotFoundFix(id, "no Process id was given",
+			"Call proc_list to see your Processes and their ids.")
 	}
 	containers, prob := s.containers(ctx, podman.Filter{
 		podman.LabelUser: s.files.User(),
