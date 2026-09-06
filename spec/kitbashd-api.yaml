@@ -1,0 +1,77 @@
+# kitbashd socket API
+#
+# kitbashd listens on one unix socket. kitbash-mcp is its only client through
+# M3. Identity is the socket's peer credentials (SO_PEERCRED): kitbashd maps
+# the uid to a user name and reads groups from the system. There is no token.
+# An admin is a member of kitbash-admin.
+#
+# Two protocols share the socket:
+# - OTLP/HTTP on the standard paths, protobuf or JSON, as the OpenTelemetry
+#   protocol specification defines them.
+# - A small JSON API under /kitbash/v1 for what OTLP has no verb for: query
+#   and settings. Errors are RFC 9457 problem details with the same slugs as
+#   spec/mcp-surface.yaml, and the HTTP status is the problem's status.
+
+version: 1
+socket: /run/kitbash/kitbashd.sock
+socket_owner: root:kitbash-users
+socket_mode: "0660"
+store: /var/lib/kitbash/kitbashd.db
+
+otlp:
+  paths:
+    traces: POST /v1/traces
+    logs: POST /v1/logs
+    metrics: POST /v1/metrics
+  content_types: [application/x-protobuf, application/json]
+  max_body_bytes: 4194304
+  identity:
+    description: >
+      kitbashd sets kitbash.user on every span, log record and metric point
+      from the peer uid, replacing whatever the producer sent. The other
+      attributes are stored as sent. Resource attributes are merged into each
+      record's attributes, record attributes winning.
+  response: >
+    200 with an empty Export*ServiceResponse on success. 400 problem details
+    for a body that does not decode. 413 for a body over max_body_bytes.
+    Partial success is not used: a request is stored whole or refused whole.
+
+api:
+  query:
+    method: POST
+    path: /kitbash/v1/query
+    request: The tel_query input of spec/mcp-surface.yaml, verbatim.
+    response: The tel_query output of spec/mcp-surface.yaml, verbatim.
+    authorization: >
+      A regular user's query is forced to user = caller; a request naming
+      another user is 403 not-permitted. An admin may name any user or none.
+    errors: [bad-request, not-permitted, internal]
+  retention_get:
+    method: GET
+    path: /kitbash/v1/retention
+    response: { traces: "30d", logs: "14d", metrics: "30d" }
+  retention_set:
+    method: PUT
+    path: /kitbash/v1/retention
+    request: The tel_retention input's set object, one or more signals, durations as ^[0-9]+(h|d)$.
+    response: The full retention after the change.
+    authorization: admin only, 403 not-permitted otherwise.
+    errors: [bad-request, not-permitted, internal]
+  health:
+    method: GET
+    path: /kitbash/v1/health
+    response: { version: "v0.3.0", store: "/var/lib/kitbash/kitbashd.db", uptimeSeconds: 12 }
+
+retention:
+  defaults: { traces: 30d, logs: 14d, metrics: 30d }
+  sweep: on start and every hour; deletes records whose time is older than now minus the window
+  storage: settings table in the same SQLite file; a value survives restarts
+
+client_behaviour:
+  description: >
+    kitbash-mcp exports asynchronously and never blocks a tool call on the
+    exporter. If the socket is absent or refuses, spans are dropped and one
+    line goes to the server log per session; tel_query and tel_retention then
+    return internal with fix "kitbashd is not running on this host; ask an
+    administrator to start it." KITBASH_SOCKET overrides the socket path
+    outside SSH sessions, for tests, the same rule as KITBASH_ROOTS.

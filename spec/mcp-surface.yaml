@@ -4,7 +4,7 @@
 # <family>_<verb> because MCP tool names allow [A-Za-z0-9_-] only; the dot form
 # used in PLAN.md is the same tool spoken aloud.
 #
-# fs is implemented in M1, pkg and proc in M2. The other families are declared
+# fs is implemented in M1, pkg and proc in M2, tel in M3. The other families are declared
 # here so the surface is designed as one piece and later milestones fill in the
 # implementation without renaming anything.
 #
@@ -23,8 +23,9 @@
 #   OCI digests.
 # - Errors are returned as an MCP tool result with isError: true whose single
 #   text content is a JSON object in RFC 9457 Problem Details form, see $error.
-# - Every call emits one span into Telemetry with user, tool, and where relevant
-#   package, process and path.
+# - Every call emits one span into Telemetry with kitbash.user, kitbash.tool
+#   and where relevant kitbash.package, kitbash.process and kitbash.path. The
+#   span is opened by middleware before the handler runs, so no call is untraced.
 
 version: 1
 mcp_protocol: "2025-06-18"
@@ -112,6 +113,52 @@ $defs:
       path: { type: string, description: "Relative to the target folder, no leading slash, no dot component" }
       content: { type: string, description: "UTF-8 text" }
       contentBase64: { type: string, contentEncoding: base64 }
+  telAttributes:
+    description: The four attributes plus tool and eval, in short form. Absent when the record did not carry them.
+    type: object
+    properties:
+      user: { type: string }
+      package: { type: string }
+      process: { type: string }
+      path: { type: string }
+      tool: { type: string }
+      eval: { type: boolean }
+  spanRecord:
+    type: object
+    required: [traceId, spanId, name, start, end, status, attributes]
+    properties:
+      traceId: { type: string, pattern: "^[a-f0-9]{32}$" }
+      spanId: { type: string, pattern: "^[a-f0-9]{16}$" }
+      parentSpanId: { type: string, pattern: "^[a-f0-9]{16}$" }
+      name: { type: string, description: "Tool name for surface spans, build or run for children" }
+      start: { type: string, format: date-time }
+      end: { type: string, format: date-time }
+      durationMs: { type: number }
+      status: { type: string, enum: [ok, error, unset] }
+      statusMessage: { type: string }
+      attributes: { $ref: "#/$defs/telAttributes" }
+      other: { type: object, description: "Remaining span attributes by their wire name" }
+  logRecord:
+    type: object
+    required: [time, severity, body, attributes]
+    properties:
+      time: { type: string, format: date-time }
+      severity: { type: string }
+      body: { type: string }
+      traceId: { type: string }
+      spanId: { type: string }
+      attributes: { $ref: "#/$defs/telAttributes" }
+      other: { type: object }
+  metricRecord:
+    type: object
+    required: [time, name, value, attributes]
+    properties:
+      time: { type: string, format: date-time }
+      name: { type: string }
+      value: { type: number }
+      unit: { type: string }
+      attributes: { $ref: "#/$defs/telAttributes" }
+      other: { type: object }
   commit:
     type: object
     required: [sha, author, time, message]
@@ -381,31 +428,69 @@ families:
 
   # ---------------------------------------------------------------- tel (M3)
   tel:
-    description: Telemetry. OTLP in, queryable out. Every record carries user, package, process and path attributes.
+    description: >
+      Telemetry. OTLP in, queryable out. Every record carries user, package,
+      process and, where relevant, path. kitbash-mcp forwards both tools to
+      kitbashd over its unix socket, see spec/kitbashd-api.yaml; the caller's
+      identity is the socket's peer credentials.
     implemented_in: M3
     tools:
       tel_query:
-        description: Query spans, metrics or logs by attributes and time range.
+        description: >
+          Query spans, logs or metrics by attributes and time range, newest
+          first. A member sees only their own records: user defaults to the
+          caller and naming another member is not-permitted. An admin may name
+          any member or omit user for the whole machine. since defaults to 24
+          hours ago, until to now. Metrics are accepted by the store but no
+          producer emits them before M4, so that signal returns an empty page.
         input:
           type: object
+          additionalProperties: false
           required: [signal]
           properties:
             signal: { type: string, enum: [traces, metrics, logs] }
-            user: { type: string }
-            package: { type: string }
-            process: { type: string }
-            path: { type: string }
+            user: { type: string, description: "Linux user name; admins only when it is not the caller" }
+            package: { type: string, description: "Package path, as kitbash.package" }
+            process: { type: string, description: "Process id, as kitbash.process" }
+            path: { type: string, description: "Files path, as kitbash.path; prefix match" }
+            tool: { type: string, description: "Surface tool name, as kitbash.tool" }
             eval: { type: boolean, description: "Only evaluation results written back by kits" }
             since: { type: string, format: date-time }
             until: { type: string, format: date-time }
-            limit: { type: integer, default: 100, maximum: 1000 }
-        output: { type: object, required: [signal, records], properties: { signal: { type: string }, records: { type: array, items: { type: object } }, truncated: { type: boolean } } }
-        errors: [not-permitted]
+            limit: { type: integer, minimum: 1, default: 100, maximum: 1000 }
+        output:
+          type: object
+          required: [signal, records, truncated]
+          properties:
+            signal: { type: string }
+            truncated: { type: boolean, description: "true when more records matched than limit" }
+            records:
+              type: array
+              items:
+                oneOf:
+                  - $ref: "#/$defs/spanRecord"
+                  - $ref: "#/$defs/logRecord"
+                  - $ref: "#/$defs/metricRecord"
+        errors: [bad-request, not-permitted, internal]
       tel_retention:
-        description: Read the retention window per signal. Admins may set it.
-        input: { type: object, properties: { set: { type: object, properties: { traces: { type: string }, metrics: { type: string }, logs: { type: string } } } } }
+        description: >
+          Read the retention window per signal, as a duration such as 720h or
+          30d. With set, an admin changes one or more windows; kitbashd deletes
+          older records on its next sweep. Defaults are traces 30d, logs 14d,
+          metrics 30d.
+        input:
+          type: object
+          additionalProperties: false
+          properties:
+            set:
+              type: object
+              additionalProperties: false
+              properties:
+                traces: { type: string, pattern: "^[0-9]+(h|d)$" }
+                metrics: { type: string, pattern: "^[0-9]+(h|d)$" }
+                logs: { type: string, pattern: "^[0-9]+(h|d)$" }
         output: { type: object, required: [traces, metrics, logs], properties: { traces: { type: string }, metrics: { type: string }, logs: { type: string } } }
-        errors: [not-permitted]
+        errors: [bad-request, not-permitted, internal]
 
   # ---------------------------------------------------------------- users (M5)
   users:
