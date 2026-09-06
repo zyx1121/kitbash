@@ -16,12 +16,15 @@ build() {
 	# Alpine pins GOTOOLCHAIN=local; let go fetch the toolchain go.mod asks for.
 	export GOTOOLCHAIN=auto GOFLAGS=-mod=mod GOMODCACHE="$srcdir/gomod"
 	CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=v$pkgver" -o kitbash-mcp ./cmd/kitbash-mcp
+	CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=v$pkgver" -o kitbashd ./cmd/kitbashd
 	# go leaves the module cache read only, which breaks abuild cleanup
 	chmod -R u+w "$srcdir/gomod"
 }
 
 package() {
 	install -Dm755 kitbash-mcp "$pkgdir"/usr/bin/kitbash-mcp
+	install -Dm755 kitbashd "$pkgdir"/usr/bin/kitbashd
+	install -Dm755 packaging/openrc/kitbashd.initd "$pkgdir"/etc/init.d/kitbashd
 	install -Dm755 deploy/kitbash-adduser "$pkgdir"/usr/bin/kitbash-adduser
 	install -Dm755 deploy/install.sh "$pkgdir"/usr/share/kitbash/install.sh
 	mkdir -p "$pkgdir"/usr/share/kitbash/org

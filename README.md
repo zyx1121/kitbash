@@ -38,16 +38,16 @@ M2 Packages done (v0.2.0). M3 Telemetry is next. Read [PLAN.md](PLAN.md): positi
 
 ## Development
 
-Go 1.26 and git are the only requirements. `make build` produces a static
-`bin/kitbash-mcp`, the binary sshd runs as the connecting user through
-`ForceCommand`.
+Go 1.26 and git are the only requirements. `make build` produces two static
+binaries: `bin/kitbash-mcp`, which sshd runs as the connecting user through
+`ForceCommand`, and `bin/kitbashd`, the resident daemon OpenRC starts at boot.
 
 | Target | What it does |
 |--------|--------------|
-| `make build` | Static binary for this host in `bin/kitbash-mcp` |
+| `make build` | Static binaries for this host in `bin/kitbash-mcp` and `bin/kitbashd` |
 | `make test` | `go test ./...`, including the MCP surface over an in memory transport |
 | `make lint` | `gofmt -l` and `go vet ./...` |
-| `make build-linux` | `bin/kitbash-mcp-linux-amd64`, the binary a kitbash host runs |
+| `make build-linux` | `bin/kitbash-mcp-linux-amd64` and `bin/kitbashd-linux-amd64`, the binaries a kitbash host runs |
 
 The server serves the roots `/org` and `/home/<user>`. Set `KITBASH_ROOTS` to a
 colon separated list of absolute paths to point it somewhere else, which is how
@@ -62,6 +62,14 @@ Telemetry is exported to kitbashd over `/run/kitbash/kitbashd.sock`, and
 are ignored inside an SSH session, so a member never chooses either. Without a
 daemon on the socket the whole surface still works; the records are dropped and
 one line goes to the server log for the session.
+
+kitbashd is the other end of that socket. It stores Telemetry in
+`/var/lib/kitbash/kitbashd.db`, and `KITBASH_SOCKET` and `KITBASH_STORE` move
+both somewhere writable, which is how a local run outside a kitbash host works:
+
+```
+KITBASH_SOCKET=/tmp/kitbashd.sock KITBASH_STORE=/tmp/kitbashd.db bin/kitbashd
+```
 
 ## License
 
