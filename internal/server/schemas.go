@@ -122,3 +122,194 @@ var (
   }
 }`)
 )
+
+// The schemas below are the pkg and proc families of spec/mcp-surface.yaml,
+// transcribed the same way.
+
+const buildEntryDef = `{
+  "type": "object",
+  "required": ["digest", "commit", "builtAt"],
+  "properties": {
+    "digest": { "type": "string" },
+    "commit": { "type": "string" },
+    "builtAt": { "type": "string", "format": "date-time" }
+  }
+}`
+
+const processDef = `{
+  "type": "object",
+  "required": ["id", "name", "package", "digest", "state"],
+  "properties": {
+    "id": { "type": "string" },
+    "name": { "type": "string" },
+    "package": { "type": "string" },
+    "digest": { "type": "string" },
+    "state": { "type": "string", "enum": ["starting", "running", "unhealthy", "stopped", "failed"] },
+    "expose": { "type": "string", "enum": ["mcp", "http", "none"] },
+    "startedAt": { "type": "string", "format": "date-time" }
+  }
+}`
+
+var (
+	pkgBuildInputSchema = json.RawMessage(`{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["path"],
+  "properties": {
+    "path": { "type": "string" }
+  }
+}`)
+
+	pkgBuildOutputSchema = json.RawMessage(`{
+  "type": "object",
+  "required": ["path", "digest", "commit"],
+  "properties": {
+    "path": { "type": "string" },
+    "digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "commit": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
+    "log": { "type": "string", "description": "Tail of the build log" }
+  }
+}`)
+
+	pkgImportInputSchema = json.RawMessage(`{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["path", "source"],
+  "properties": {
+    "path": { "type": "string", "description": "New folder to create" },
+    "source": { "type": "string", "description": "npm:<pkg>@<ver> today; oci://<ref>@sha256:... and pypi:<pkg>==<ver> once their kits exist" }
+  }
+}`)
+
+	pkgImportOutputSchema = json.RawMessage(`{
+  "type": "object",
+  "required": ["path", "commit"],
+  "properties": {
+    "path": { "type": "string" },
+    "commit": ` + commitDef + `
+  }
+}`)
+
+	pkgListInputSchema = json.RawMessage(`{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {}
+}`)
+
+	pkgListOutputSchema = json.RawMessage(`{
+  "type": "object",
+  "required": ["packages"],
+  "properties": {
+    "packages": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "name"],
+        "properties": {
+          "path": { "type": "string" },
+          "name": { "type": "string" },
+          "digest": { "type": "string" },
+          "builtAt": { "type": "string", "format": "date-time" },
+          "running": { "type": "integer", "description": "Number of Processes of this Package" }
+        }
+      }
+    }
+  }
+}`)
+
+	pkgInspectInputSchema = json.RawMessage(`{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["path"],
+  "properties": {
+    "path": { "type": "string" }
+  }
+}`)
+
+	pkgInspectOutputSchema = json.RawMessage(`{
+  "type": "object",
+  "required": ["path", "manifest", "builds"],
+  "properties": {
+    "path": { "type": "string" },
+    "manifest": { "type": "object" },
+    "builds": { "type": "array", "items": ` + buildEntryDef + ` }
+  }
+}`)
+
+	procRunInputSchema = json.RawMessage(`{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["package"],
+  "properties": {
+    "package": { "type": "string", "description": "Package path" },
+    "digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$", "description": "Defaults to the latest build" },
+    "name": { "type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$", "maxLength": 64, "description": "Defaults to the package name" }
+  }
+}`)
+
+	procRunOutputSchema = json.RawMessage(`{
+  "type": "object",
+  "required": ["id", "name", "package", "digest", "state"],
+  "properties": {
+    "id": { "type": "string", "description": "UUIDv7" },
+    "name": { "type": "string" },
+    "package": { "type": "string" },
+    "digest": { "type": "string" },
+    "state": { "type": "string", "enum": ["starting", "running", "unhealthy", "stopped", "failed"] },
+    "expose": { "type": "string", "enum": ["mcp", "http", "none"] },
+    "endpoint": { "type": "string", "description": "Internal URL when expose is http" },
+    "tools": { "type": "array", "items": { "type": "string" }, "description": "Surface tool names added when expose is mcp" }
+  }
+}`)
+
+	procListInputSchema = json.RawMessage(`{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {}
+}`)
+
+	procListOutputSchema = json.RawMessage(`{
+  "type": "object",
+  "required": ["processes"],
+  "properties": {
+    "processes": { "type": "array", "items": ` + processDef + ` }
+  }
+}`)
+
+	procStopInputSchema = json.RawMessage(`{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id"],
+  "properties": {
+    "id": { "type": "string" }
+  }
+}`)
+
+	procStopOutputSchema = json.RawMessage(`{
+  "type": "object",
+  "required": ["id", "state"],
+  "properties": {
+    "id": { "type": "string" },
+    "state": { "type": "string" }
+  }
+}`)
+
+	procLogsInputSchema = json.RawMessage(`{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id"],
+  "properties": {
+    "id": { "type": "string" },
+    "lines": { "type": "integer", "minimum": 1, "default": 200, "maximum": 5000 }
+  }
+}`)
+
+	procLogsOutputSchema = json.RawMessage(`{
+  "type": "object",
+  "required": ["id", "lines"],
+  "properties": {
+    "id": { "type": "string" },
+    "lines": { "type": "array", "items": { "type": "string" } }
+  }
+}`)
+)

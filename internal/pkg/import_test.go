@@ -1,0 +1,195 @@
+package pkg_test
+
+import (
+	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/zyx1121/kitbash/internal/bridge"
+	"github.com/zyx1121/kitbash/internal/manifest"
+	"github.com/zyx1121/kitbash/internal/pkg"
+	"github.com/zyx1121/kitbash/internal/problem"
+	"github.com/zyx1121/kitbash/internal/proc"
+)
+
+// stubKits stands in for the MCP bridge: a set of running import kits and
+// whatever the chosen one returns.
+type stubKits struct {
+	kits   []bridge.Kit
+	result string
+	called map[string]any
+}
+
+func (s *stubKits) Kits(context.Context) ([]bridge.Kit, *problem.Problem) {
+	return s.kits, nil
+}
+
+func (s *stubKits) CallTool(_ context.Context, _ *proc.Process, _ string, args map[string]any) (json.RawMessage, *problem.Problem) {
+	s.called = args
+	return json.RawMessage(s.result), nil
+}
+
+// kit builds one running import kit whose import tool accepts sources matching
+// pattern.
+func kit(path, pattern string) bridge.Kit {
+	return bridge.Kit{
+		Process: &proc.Process{ID: path, Package: path, State: proc.StateRunning, Expose: manifest.ExposeMCP},
+		Tool: manifest.Tool{
+			Name: bridge.ImportTool,
+			Input: map[string]any{
+				"type":     "object",
+				"required": []any{"source"},
+				"properties": map[string]any{
+					"source": map[string]any{"type": "string", "pattern": pattern},
+				},
+			},
+			Output: map[string]any{"type": "object"},
+		},
+	}
+}
+
+const importedManifest = `name: time
+description: A wrapped MCP server that answers what the time is right now.
+deploy:
+  units:
+    - type: container
+      build: .
+      expose: mcp
+`
+
+func newImporter(t *testing.T, kits *stubKits) (*pkg.Service, string) {
+	t.Helper()
+	f := newFixture(t)
+	return pkg.New(f.files, f.runner, kits), f.root
+}
+
+func TestImportWritesTheKitsFilesAsOneCommit(t *testing.T) {
+	body, _ := json.Marshal(map[string]any{"files": []map[string]any{
+		{"path": "kitbash.yaml", "content": importedManifest},
+		{"path": "README.md", "content": "# time\n"},
+		{"path": "src/Containerfile", "content": "FROM node:22-alpine\n"},
+	}})
+	kits := &stubKits{kits: []bridge.Kit{kit("/org/import-mcp", "^npm:")}, result: string(body)}
+	packages, root := newImporter(t, kits)
+	target := filepath.Join(root, "time")
+
+	out, prob := packages.Import(context.Background(), target, "npm:time-mcp@1.0.0")
+	if prob != nil {
+		t.Fatalf("Import: %s", prob.Detail)
+	}
+	if out.Path != target || len(out.Commit.Sha) != 40 {
+		t.Errorf("Import returned %+v, want the folder and its commit", out)
+	}
+	if out.Commit.Message != "Import npm:time-mcp@1.0.0" {
+		t.Errorf("the commit message is %q, want it to name the source", out.Commit.Message)
+	}
+	if kits.called["source"] != "npm:time-mcp@1.0.0" {
+		t.Errorf("the kit was called with %v, want the source", kits.called)
+	}
+	for _, name := range []string{"kitbash.yaml", "README.md", filepath.Join("src", "Containerfile")} {
+		if _, err := os.Stat(filepath.Join(target, name)); err != nil {
+			t.Errorf("%s was not written: %v", name, err)
+		}
+	}
+}
+
+func TestImportWithNoAcceptingKit(t *testing.T) {
+	kits := &stubKits{kits: []bridge.Kit{kit("/org/import-mcp", "^npm:")}}
+	packages, root := newImporter(t, kits)
+
+	_, prob := packages.Import(context.Background(), filepath.Join(root, "alpine"), "oci://alpine@sha256:0")
+	if prob == nil {
+		t.Fatal("a source no kit accepts was imported")
+	}
+	if prob.Slug() != problem.SlugNotFound {
+		t.Errorf("problem is %s, want not-found", prob.Slug())
+	}
+	if !strings.Contains(prob.Fix, "import-mcp") {
+		t.Errorf("fix is %q, want it to name an example kit", prob.Fix)
+	}
+}
+
+func TestImportWithTwoAcceptingKits(t *testing.T) {
+	kits := &stubKits{kits: []bridge.Kit{
+		kit("/org/import-mcp", "^npm:"),
+		kit("/org/import-npm", "^npm:"),
+	}}
+	packages, root := newImporter(t, kits)
+
+	_, prob := packages.Import(context.Background(), filepath.Join(root, "time"), "npm:time-mcp@1.0.0")
+	if prob == nil {
+		t.Fatal("two kits accepting the same source was not a conflict")
+	}
+	if prob.Slug() != problem.SlugConflict {
+		t.Errorf("problem is %s, want conflict", prob.Slug())
+	}
+	if !strings.Contains(prob.Fix, "proc_stop") {
+		t.Errorf("fix is %q, want it to say to stop one of them", prob.Fix)
+	}
+}
+
+func TestImportRefusesAnExistingFolder(t *testing.T) {
+	kits := &stubKits{kits: []bridge.Kit{kit("/org/import-mcp", "^npm:")}}
+	packages, root := newImporter(t, kits)
+	target := filepath.Join(root, "time")
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	_, prob := packages.Import(context.Background(), target, "npm:time-mcp@1.0.0")
+	if prob == nil {
+		t.Fatal("an existing folder was imported into")
+	}
+	if prob.Slug() != problem.SlugConflict {
+		t.Errorf("problem is %s, want conflict", prob.Slug())
+	}
+}
+
+func TestImportRequiresAManifestAmongTheFiles(t *testing.T) {
+	body, _ := json.Marshal(map[string]any{"files": []map[string]any{
+		{"path": "README.md", "content": "# time\n"},
+	}})
+	kits := &stubKits{kits: []bridge.Kit{kit("/org/import-mcp", "^npm:")}, result: string(body)}
+	packages, root := newImporter(t, kits)
+	target := filepath.Join(root, "time")
+
+	_, prob := packages.Import(context.Background(), target, "npm:time-mcp@1.0.0")
+	if prob == nil {
+		t.Fatal("a folder without a manifest was imported")
+	}
+	if prob.Slug() != problem.SlugInvalidManifest {
+		t.Errorf("problem is %s, want invalid-manifest", prob.Slug())
+	}
+	if _, err := os.Stat(target); err == nil {
+		t.Error("the folder was created even though the import was refused")
+	}
+}
+
+func TestImportRefusesAKitThatEscapesTheFolder(t *testing.T) {
+	cases := []struct{ name, path string }{
+		{name: "parent", path: "../escape.md"},
+		{name: "dot component", path: ".git/config"},
+		{name: "absolute", path: "/etc/passwd"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body, _ := json.Marshal(map[string]any{"files": []map[string]any{
+				{"path": "kitbash.yaml", "content": importedManifest},
+				{"path": tc.path, "content": "x\n"},
+			}})
+			kits := &stubKits{kits: []bridge.Kit{kit("/org/import-mcp", "^npm:")}, result: string(body)}
+			packages, root := newImporter(t, kits)
+
+			_, prob := packages.Import(context.Background(), filepath.Join(root, "time"), "npm:time-mcp@1.0.0")
+			if prob == nil {
+				t.Fatalf("the kit path %q was accepted", tc.path)
+			}
+			if prob.Slug() != problem.SlugInvalidPath {
+				t.Errorf("problem is %s, want invalid-path", prob.Slug())
+			}
+		})
+	}
+}

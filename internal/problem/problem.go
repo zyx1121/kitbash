@@ -75,6 +75,13 @@ func NotFound(instance, detail string) *Problem {
 		"Call fs_list on the parent folder to see what exists.")
 }
 
+// NotFoundFix is NotFound with advice specific to what is missing.
+func NotFoundFix(instance, detail, fix string) *Problem {
+	p := NotFound(instance, detail)
+	p.Fix = fix
+	return p
+}
+
 // NotVisible reports a folder without a usable kitbash.yaml. It is not found as
 // far as the MCP surface is concerned. An empty fix falls back to the advice
 // that makes the folder visible.
@@ -129,6 +136,14 @@ func InvalidManifest(instance, detail string) *Problem {
 		"Fix the manifest so it validates against spec/manifest.schema.json, then write it again.")
 }
 
+// InvalidManifestFix is InvalidManifest with advice specific to the part of
+// the manifest that is wrong.
+func InvalidManifestFix(instance, detail, fix string) *Problem {
+	p := InvalidManifest(instance, detail)
+	p.Fix = fix
+	return p
+}
+
 // TooLarge reports content beyond the size the surface carries in one call.
 func TooLarge(instance, detail, fix string) *Problem {
 	if fix == "" {
@@ -141,6 +156,13 @@ func TooLarge(instance, detail, fix string) *Problem {
 func Conflict(instance, detail string) *Problem {
 	return newProblem(SlugConflict, "Conflict", http.StatusConflict, instance, detail,
 		"Read the file again, merge the change, then write with the new expectedSha.")
+}
+
+// ConflictFix is Conflict with advice specific to the state that clashed.
+func ConflictFix(instance, detail, fix string) *Problem {
+	p := Conflict(instance, detail)
+	p.Fix = fix
+	return p
 }
 
 // logger writes the causes of internal errors where the operator can read them.
@@ -156,4 +178,14 @@ func Internal(instance, cause, fix string) *Problem {
 	logger.Printf("internal error at %s: %s", instance, cause)
 	return newProblem(SlugInternal, "Internal error", http.StatusInternalServerError, instance,
 		"kitbash could not complete this call; the cause is in the server log", fix)
+}
+
+// InternalDetail is Internal with a detail the caller can act on. The failure
+// is still inside kitbash or inside a Package it ran, so the cause goes to the
+// server log, but saying which of the two broke helps the agent decide what to
+// do next.
+func InternalDetail(instance, cause, detail, fix string) *Problem {
+	p := Internal(instance, cause, fix)
+	p.Detail = detail
+	return p
 }

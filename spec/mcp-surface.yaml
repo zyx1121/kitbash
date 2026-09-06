@@ -242,8 +242,12 @@ families:
           rootless container runtime. The digest is the OCI image ID. The image
           is labelled kitbash.path, kitbash.name, kitbash.commit and
           kitbash.user, which is the whole build record. Only the tail of the
-          build log is returned; the full log never leaves the host. Version 1
-          supports one container unit with a build context per Package.
+          build log is returned; the full log never leaves the host. A build
+          that runs and fails is bad-request carrying that same tail, because
+          the build context is the caller's to fix; a runtime that will not run
+          at all is internal. An uncommitted change under the path is conflict:
+          kitbash builds from a commit. Version 1 supports one container unit
+          with a build context per Package.
         input: { type: object, additionalProperties: false, required: [path], properties: { path: { type: string } } }
         output:
           type: object
@@ -253,7 +257,7 @@ families:
             digest: { type: string, pattern: "^sha256:[a-f0-9]{64}$" }
             commit: { type: string, pattern: "^[a-f0-9]{40}$" }
             log: { type: string, description: "Tail of the build log" }
-        errors: [not-found, not-visible, not-permitted, invalid-path, invalid-manifest, internal]
+        errors: [bad-request, not-found, not-visible, not-permitted, invalid-path, invalid-manifest, conflict, internal]
       pkg_import:
         description: >
           Wrap something external as a Package folder at path using a running
@@ -318,7 +322,11 @@ families:
           container is named kitbash-<package>-<name> and labelled kitbash.id,
           kitbash.user, kitbash.package, kitbash.name and kitbash.digest. With
           expose: mcp the manifest's tools join the caller's surface, see
-          $package_tools. Version 1 runs the first container unit.
+          $package_tools. A Process is identified by its Package path, not by
+          its container name: a name already held by a Process of another
+          Package is a conflict, and so is a tool name another running Process
+          already answers, which leaves the Process running with its tools off
+          the surface. Version 1 runs the first container unit.
         input:
           type: object
           additionalProperties: false
@@ -339,7 +347,7 @@ families:
             expose: { type: string, enum: [mcp, http, none] }
             endpoint: { type: string, description: "Internal URL when expose is http" }
             tools: { type: array, items: { type: string }, description: "Surface tool names added when expose is mcp" }
-        errors: [not-found, not-visible, not-permitted, invalid-path, invalid-manifest, internal]
+        errors: [not-found, not-visible, not-permitted, invalid-path, invalid-manifest, conflict, internal]
       proc_list:
         description: Processes owned by the caller, running or stopped. Admins see all from M5.
         input: { type: object, additionalProperties: false, properties: {} }

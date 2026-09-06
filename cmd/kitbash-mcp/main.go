@@ -14,7 +14,11 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/zyx1121/kitbash/internal/bridge"
 	"github.com/zyx1121/kitbash/internal/fs"
+	"github.com/zyx1121/kitbash/internal/pkg"
+	"github.com/zyx1121/kitbash/internal/podman"
+	"github.com/zyx1121/kitbash/internal/proc"
 	"github.com/zyx1121/kitbash/internal/server"
 )
 
@@ -43,8 +47,22 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	runner := podman.NewCLI()
+	processes := proc.New(files, runner)
+	tools := bridge.New(files, processes, runner)
+	defer tools.Close()
+	srv := server.New(version, server.Deps{
+		Files:     files,
+		Packages:  pkg.New(files, runner, tools),
+		Processes: processes,
+		Bridge:    tools,
+	})
+	// The tools of the caller's already running Processes join the surface
+	// before the first request is served, see PLAN.md section 2.3.
+	tools.Sync(ctx)
+
 	// A closed stdin is how an SSH session ends, not a failure.
-	if err := server.New(version, files).Run(ctx, &mcp.StdioTransport{}); err != nil &&
+	if err := srv.Run(ctx, &mcp.StdioTransport{}); err != nil &&
 		!errors.Is(err, io.EOF) && !errors.Is(err, context.Canceled) {
 		return err
 	}

@@ -1,5 +1,5 @@
-// Package server wires the fs family onto an MCP server. kitbash-mcp serves it
-// over stdio today; kitbashd will serve the same tools in M2.
+// Package server wires the tool families onto an MCP server. kitbash-mcp
+// serves them over stdio today; kitbashd will serve the same tools from M3.
 package server
 
 import (
@@ -8,15 +8,27 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/zyx1121/kitbash/internal/bridge"
 	"github.com/zyx1121/kitbash/internal/fs"
+	"github.com/zyx1121/kitbash/internal/pkg"
 	"github.com/zyx1121/kitbash/internal/problem"
+	"github.com/zyx1121/kitbash/internal/proc"
 )
 
 // Name is the MCP server name every client sees.
 const Name = "kitbash"
 
+// Deps are the services the surface is built from. Files is required; the
+// others are the M2 families, and a server built without them serves fs only.
+type Deps struct {
+	Files     *fs.Service
+	Packages  *pkg.Service
+	Processes *proc.Service
+	Bridge    *bridge.Bridge
+}
+
 // New builds the MCP server for one caller.
-func New(version string, files *fs.Service) *mcp.Server {
+func New(version string, deps Deps) *mcp.Server {
 	if version == "" {
 		version = "dev"
 	}
@@ -24,10 +36,21 @@ func New(version string, files *fs.Service) *mcp.Server {
 		Name:        Name,
 		Version:     version,
 		Title:       "kitbash",
-		Description: "Files, Packages, Processes and Telemetry for agents. M1 serves the fs family.",
+		Description: "Files, Packages, Processes and Telemetry for agents. M2 serves the fs, pkg and proc families.",
 	}, nil)
 	s.AddReceivingMiddleware(problemGuard)
-	Register(s, files)
+	if deps.Bridge != nil {
+		// The bridge publishes one tool per Package tool on this server, so it
+		// has to hold the server before any Process is added.
+		deps.Bridge.Attach(s)
+	}
+	Register(s, deps.Files)
+	if deps.Packages != nil {
+		RegisterPackages(s, deps.Packages)
+	}
+	if deps.Processes != nil {
+		RegisterProcesses(s, deps.Processes, deps.Bridge)
+	}
 	return s
 }
 
