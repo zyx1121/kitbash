@@ -57,6 +57,12 @@ the tests and a local run against a fixture tree work:
 KITBASH_ROOTS=/tmp/fixture/org:/tmp/fixture/home/tester bin/kitbash-mcp
 ```
 
+Telemetry is exported to kitbashd over `/run/kitbash/kitbashd.sock`, and
+`KITBASH_SOCKET` points it somewhere else under the same rule: both overrides
+are ignored inside an SSH session, so a member never chooses either. Without a
+daemon on the socket the whole surface still works; the records are dropped and
+one line goes to the server log for the session.
+
 ## License
 
 Private, all rights reserved.

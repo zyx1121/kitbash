@@ -20,6 +20,7 @@ import (
 	"github.com/zyx1121/kitbash/internal/podman"
 	"github.com/zyx1121/kitbash/internal/proc"
 	"github.com/zyx1121/kitbash/internal/server"
+	"github.com/zyx1121/kitbash/internal/telemetry"
 )
 
 // version is set at build time with -X main.version.
@@ -47,6 +48,20 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// Telemetry is opened before anything is served, so the first call is
+	// traced. It connects nothing here: a host without kitbashd costs the
+	// session one line in the server log and nothing else.
+	telem := telemetry.NewFromEnv(version)
+	defer func() {
+		// The session is over by now, so the last flush is given a deadline
+		// rather than the caller's patience.
+		ctx, cancel := context.WithTimeout(context.Background(), telemetry.ShutdownTimeout)
+		defer cancel()
+		if err := telem.Shutdown(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "kitbash-mcp: flushing telemetry: %v\n", err)
+		}
+	}()
+
 	runner := podman.NewCLI()
 	processes := proc.New(files, runner)
 	tools := bridge.New(files, processes, runner)
@@ -56,6 +71,7 @@ func run() error {
 		Packages:  pkg.New(files, runner, tools),
 		Processes: processes,
 		Bridge:    tools,
+		Telemetry: telem,
 	})
 	// The tools of the caller's already running Processes join the surface
 	// before the first request is served, see PLAN.md section 2.3.

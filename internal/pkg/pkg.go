@@ -20,6 +20,7 @@ import (
 	"github.com/zyx1121/kitbash/internal/podman"
 	"github.com/zyx1121/kitbash/internal/problem"
 	"github.com/zyx1121/kitbash/internal/safepath"
+	"github.com/zyx1121/kitbash/internal/telemetry"
 )
 
 // Containerfile names a build context may carry, most preferred first.
@@ -94,10 +95,30 @@ func New(files *fs.Service, runner podman.Runner, kits Kits) *Service {
 // Build answers pkg_build: it builds the Package at path from its current
 // commit and returns the image ID as the digest.
 func (s *Service) Build(ctx context.Context, path string) (*BuildResult, *problem.Problem) {
+	// A build is the one operation on the surface that runs another program
+	// for minutes, so it carries its own span under the tool's, and the log
+	// tail it produces is the one log record per build that PLAN.md section
+	// 2.4 promises.
+	ctx, span := telemetry.Start(ctx, "build")
+	defer span.End()
+	result, prob := s.build(ctx, span, path)
+	if prob != nil {
+		span.Fail(prob.Slug(), prob.Title)
+		return nil, prob
+	}
+	span.OK()
+	return result, nil
+}
+
+func (s *Service) build(ctx context.Context, span *telemetry.Span, path string) (*BuildResult, *problem.Problem) {
 	m, folder, prob := s.files.Manifest(ctx, path)
 	if prob != nil {
 		return nil, prob
 	}
+	// The Package is what the whole call is about, so it goes on the tool's
+	// span as well as this one: a query by package has to find pkg_build.
+	telemetry.SetPackage(ctx, folder)
+	telemetry.SetPath(ctx, folder)
 	unit, ok := m.Unit()
 	if !ok || unit.Type != manifest.UnitContainer || unit.Build == "" {
 		return nil, problem.InvalidManifest(folder,
@@ -135,6 +156,7 @@ func (s *Service) Build(ctx context.Context, path string) (*BuildResult, *proble
 			// A build that ran and failed is the caller's to fix, so the tail
 			// of the log goes back with the error instead of only to the
 			// server log. The full log still never leaves the host.
+			span.Error(buildFailure(log))
 			return nil, problem.BadRequest(folder, buildFailure(log),
 				"Fix the build context and call pkg_build again.")
 		}
@@ -143,6 +165,8 @@ func (s *Service) Build(ctx context.Context, path string) (*BuildResult, *proble
 		return nil, problem.Internal(folder, err.Error(),
 			"Ask an administrator to check the container runtime on this host.")
 	}
+	span.SetDigest(digest)
+	span.Info(tail(log))
 	return &BuildResult{
 		Path:   folder,
 		Digest: digest,
