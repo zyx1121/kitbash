@@ -2,7 +2,7 @@
 
 > An operating system for AI agents. Files, Packages, Processes, Telemetry. Nothing built for a human at a terminal.
 
-This is the single living document for the product. It replaces a design doc, an architecture doc and a roadmap. When a decision changes, this file changes. Status: draft v0.2, 2026-09-06.
+This is the single living document for the product. It replaces a design doc, an architecture doc and a roadmap. When a decision changes, this file changes. Status: draft v0.3, 2026-09-06.
 
 ## 1. Positioning
 
@@ -87,9 +87,15 @@ Every Process carries labels `kitbash.id`, `kitbash.user`, `kitbash.package`, `k
 
 Telemetry is an OTLP receiver and a store. Every span, metric point and log record must carry four attributes: `user`, `package`, `process`, and where relevant `path`. Filtering by `user` answers what a person did. Filtering by `package` answers how a tool behaves. No filter is the whole machine. These are three views of one store, not three stores.
 
+On the wire the four attributes are namespaced as the OpenTelemetry conventions require: `kitbash.user`, `kitbash.package`, `kitbash.process`, `kitbash.path`, plus `kitbash.tool` for the surface tool a span records and `kitbash.eval` for judgments written back by kits. The query surface speaks the short names. `kitbash.user` is never trusted from a producer: kitbashd stamps it from the peer credentials of the connection that delivered the record.
+
+**Producers.** Through M3 the only producer is kitbash-mcp, which opens one span per `tools/call` (built in and Package tools alike), a child span per build and per Process start, and one log record per build carrying the build log tail. It exports OTLP/HTTP over the kitbashd unix socket. Processes become producers in M4 through the same receiver on a host address the containers can reach. Nothing on the surface is untraced: the span is opened by middleware before any handler runs.
+
+**Reading.** `tel_query` returns records of one signal filtered by the four attributes and a time range. A member reads their own records; an admin reads everyone's. `tel_retention` reads the window per signal and lets an admin set it.
+
 Evaluation is not an object. An evaluation kit subscribes to Telemetry, computes whatever it computes, and writes the result back as Telemetry with an `eval` attribute. Asking how a package version is doing is the same query as asking what it did.
 
-Telemetry is the only object that grows without bound, so retention lives in the core: a default window per signal, configurable by admins, enforced by kitbashd.
+Telemetry is the only object that grows without bound, so retention lives in the core: a default window per signal, configurable by admins, enforced by kitbashd. Defaults: traces 30 days, logs 14 days, metrics 30 days. kitbashd sweeps once an hour and on start.
 
 ### 2.5 The manifest
 
@@ -179,21 +185,21 @@ A kit installs the same way as any Package and is versioned, traced and removabl
 
 ### 4.1 Base
 
-Alpine Linux plus one daemon, `kitbashd`, written in Go and shipped as a static binary in an apk. Through M2 the apk ships `kitbash-mcp`, the per session process sshd starts for each member, and the container runtime supervises Processes on kitbashd's behalf. The resident daemon arrives with the OTLP receiver in M3 and takes over supervision, boot restore and the approval queue from there. Alpine is chosen for its appliance lineage, its 8 MB root filesystem and its package manager. Go is chosen because a static binary has no musl versus glibc problem and no runtime to install.
+Alpine Linux plus one daemon, `kitbashd`, written in Go and shipped as a static binary in an apk. The apk ships two binaries: `kitbashd`, the resident daemon OpenRC starts at boot, and `kitbash-mcp`, the per session process sshd starts for each member. From M3 kitbashd is the OTLP receiver and the Telemetry store. The container runtime still supervises Processes on kitbashd's behalf; boot restore and the approval queue move into kitbashd in M5. Alpine is chosen for its appliance lineage, its 8 MB root filesystem and its package manager. Go is chosen because a static binary has no musl versus glibc problem and no runtime to install.
 
 Proxmox VE is the precedent for the packaging model: a standard base distribution plus one package that turns it into the appliance. An installable ISO or a LinuxKit image can come later without changing kitbashd.
 
 ### 4.2 What is on the host
 
-Seven components. Six are existing software.
+Seven components at most. Five are existing software, and the seventh is not installed today.
 
 1. Linux kernel
 2. OpenRC as minimal init
 3. sshd, used only as the MCP transport
 4. rootless podman with cgroups v2 and subuid ranges configured
 5. git
-6. OpenTelemetry collector, forwarding to kitbashd
-7. kitbashd
+6. kitbashd, which is also the OTLP receiver
+7. OpenTelemetry collector, only if a Process ever needs a protocol kitbashd does not speak; Alpine ships none and M3 installs none
 
 ### 4.3 What is removed
 
@@ -227,6 +233,8 @@ sshd applies `ForceCommand kitbash-mcp` to every regular user. The connection is
 
 Admins are members of the `kitbash-admin` group. They create users, manage `/org`, and approve queued operations, all through the same MCP surface.
 
+kitbash-mcp talks to kitbashd over a unix socket, `/run/kitbash/kitbashd.sock`, owned by root with group `kitbash-users` and mode 0660. kitbashd learns who is calling from the socket's peer credentials, the same kernel fact sshd relied on, and reads group membership from the system. There is no token and no second identity. The socket carries OTLP/HTTP on the standard paths and a small JSON API for queries and settings; the machine readable definition is [`spec/kitbashd-api.yaml`](spec/kitbashd-api.yaml).
+
 One break glass path exists for the operator: a serial console or a dedicated `ops` user with a real shell, disabled by default and enabled only from the console. Without it the first stuck machine is a reinstall.
 
 ### 4.6 The three infrastructure layers
@@ -239,7 +247,7 @@ Infrastructure is three layers, and the object model binds to the shape of an OC
 
 ### 4.7 Storage
 
-kitbashd uses an embedded SQLite database for its own state and for Telemetry. One machine, one file, no second daemon. If Telemetry volume outgrows SQLite the store becomes a pluggable interface and an observability kit takes over long term retention. Postgres and ClickHouse are explicitly out of scope for the host.
+kitbashd uses an embedded SQLite database for its own state and for Telemetry, at `/var/lib/kitbash/kitbashd.db`, opened through a pure Go driver so the binary stays static. One machine, one file, no second daemon. If Telemetry volume outgrows SQLite the store becomes a pluggable interface and an observability kit takes over long term retention. Postgres and ClickHouse are explicitly out of scope for the host.
 
 ## 5. Version 1
 
@@ -287,11 +295,11 @@ Each milestone is done when its acceptance sentence is true on a real machine, n
 The MCP tool surface is decided in `spec/mcp-surface.yaml`: six families, `fs` implemented in M1, the rest declared.
 
 - Whether `files` deploy units are needed in version 1 at all, or whether every Package is a container until a real case appears.
-- The retention defaults per signal.
 - Resource limits: rootless podman on OpenRC has no cgroup delegation, so `limits` are passed to the runtime and recorded but not enforced until kitbashd places member sessions in delegated cgroups.
 - Health: `health` is recorded but not probed until kitbashd supervises Processes. Liveness in M2 is PID 1 of the container.
 - A Process started in one MCP session appears on another session's surface when that session reconnects, not live.
 - Import kits run under the member who imports. Whether an admin can run a kit once for every member is an M5 question.
+- Metrics: the store and the receiver accept them from M3, but no producer emits any until Processes do in M4. `tel_query` with `signal: metrics` returns an empty page until then.
 
 ## 6. Vocabulary
 
