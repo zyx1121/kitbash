@@ -149,7 +149,10 @@ func (b *Bridge) Add(ctx context.Context, p *proc.Process) *problem.Problem {
 	// second Add for the same Process never collides with itself.
 	b.remove(p.ID)
 	var names []string
-	var taken []string
+	// Two different things can keep a tool off the surface, and they have
+	// different answers: someone else answers that name already, or the tool's
+	// own schema is one the surface cannot publish.
+	var taken, unusable []string
 	for _, tool := range tools {
 		surface := proc.ToolName(m.Name, tool.Name)
 		if reservedSurface(surface) {
@@ -164,18 +167,26 @@ func (b *Bridge) Add(ctx context.Context, p *proc.Process) *problem.Problem {
 		}
 		if err := b.addTool(p, surface, tool); err != nil {
 			b.logger.Printf("bridge: not publishing %s: %v", surface, err)
-			taken = append(taken, surface)
+			unusable = append(unusable, tool.Name)
 			continue
 		}
 		b.owners[surface] = p.ID
 		names = append(names, surface)
 	}
 	b.published[p.ID] = names
+	// The instance is the Process itself: the caller can stop it with the id
+	// in front of them, without looking it up first.
 	if len(taken) > 0 {
-		return problem.ConflictFix(p.Package, fmt.Sprintf(
-			"this Process is running, but %s could not join the surface because those names are already answered",
-			strings.Join(taken, ", ")),
+		return problem.ConflictFix(p.ID, fmt.Sprintf(
+			"the Process at %s is running, but %s could not join the surface because those names are already answered",
+			p.Package, strings.Join(taken, ", ")),
 			"Stop the Process that answers those names with proc_stop, or rename this Package, then run it again.")
+	}
+	if len(unusable) > 0 {
+		return problem.InvalidManifestFix(p.ID, fmt.Sprintf(
+			"the Process at %s is running, but the input schema of %s is not one the surface can publish",
+			p.Package, strings.Join(unusable, ", ")),
+			"Give each tool an input schema of type object that JSON Schema 2020-12 accepts, then run it again.")
 	}
 	return nil
 }

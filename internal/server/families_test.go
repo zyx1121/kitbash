@@ -257,6 +257,9 @@ func TestProcRunReportsToolsThatCouldNotJoinTheSurface(t *testing.T) {
 	if !strings.Contains(p.Detail, "running") {
 		t.Errorf("detail is %q, want it to say the Process is running", p.Detail)
 	}
+	// The instance is the Process id, and it is the id proc_stop takes: the
+	// caller can act on the conflict without calling proc_list first.
+	ok(t, call(t, s, "proc_stop", map[string]any{"id": p.Instance}), "proc_stop")
 
 	// Both Processes are running; only the surface is unchanged.
 	res := call(t, s, "proc_list", map[string]any{})

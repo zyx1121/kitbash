@@ -3,7 +3,6 @@ package proc_test
 import (
 	"context"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -213,50 +212,36 @@ func TestRunKeepsTheOldContainerWhenTheNewOneCannotStart(t *testing.T) {
 	}
 }
 
-// Exit 125 is the runtime refusing the command itself, and every option in it
-// came from the manifest.
-func TestRunUsageErrorNamesTheManifestOptions(t *testing.T) {
-	f := newFixture(t)
-	folder := f.pack(t, "ffmpeg", mcpManifest)
-	f.build(folder, "ffmpeg")
-	f.runner.RunErr = fmt.Errorf("podman run: exit status 125: %w", podman.ErrUsage)
+// A run the runtime refuses is not the caller's to fix: podman reports the
+// same exit status for an image that is gone, a name taken since the lookup
+// and an option it will not take, and the manifest's own options were checked
+// before anything was removed. The runtime's words stay in the server log.
+func TestRunRuntimeFailureIsInternal(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{name: "refused the command", err: errors.New("podman run: exit status 125: Error: no such image")},
+		{name: "no runtime", err: errors.New(`exec: "podman": executable file not found in $PATH`)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			folder := f.pack(t, "ffmpeg", mcpManifest)
+			f.build(folder, "ffmpeg")
+			f.runner.RunErr = tc.err
 
-	_, prob := f.processes.Run(context.Background(), folder, "", "")
-	if prob == nil {
-		t.Fatal("a refused run was reported as a success")
-	}
-	if prob.Slug() != problem.SlugInvalidManifest {
-		t.Fatalf("problem is %s, want invalid-manifest", prob.Slug())
-	}
-	for _, want := range []string{"limits.memory 512Mi", "limits.cpu 1", "restart never", "env LOG_LEVEL"} {
-		if !strings.Contains(prob.Detail, want) {
-			t.Errorf("detail is %q, want it to name %q", prob.Detail, want)
-		}
-	}
-	if strings.Contains(prob.Detail, "debug") {
-		t.Errorf("detail is %q, want env values kept out of it", prob.Detail)
-	}
-	if strings.Contains(prob.Detail, folder) || strings.Contains(prob.Detail, "podman") {
-		t.Errorf("detail is %q, want host paths and the argv kept out of it", prob.Detail)
-	}
-	if prob.Fix != "Change the deploy unit in kitbash.yaml, then run again." {
-		t.Errorf("fix is %q, want the deploy unit advice", prob.Fix)
-	}
-}
-
-// Anything else from the runtime is not the caller's to fix.
-func TestRunOtherRuntimeFailureIsInternal(t *testing.T) {
-	f := newFixture(t)
-	folder := f.pack(t, "ffmpeg", mcpManifest)
-	f.build(folder, "ffmpeg")
-	f.runner.RunErr = errors.New(`exec: "podman": executable file not found in $PATH`)
-
-	_, prob := f.processes.Run(context.Background(), folder, "", "")
-	if prob == nil {
-		t.Fatal("a failed run was reported as a success")
-	}
-	if prob.Slug() != problem.SlugInternal {
-		t.Errorf("problem is %s, want internal", prob.Slug())
+			_, prob := f.processes.Run(context.Background(), folder, "", "")
+			if prob == nil {
+				t.Fatal("a failed run was reported as a success")
+			}
+			if prob.Slug() != problem.SlugInternal {
+				t.Fatalf("problem is %s, want internal", prob.Slug())
+			}
+			if strings.Contains(prob.Detail, "podman") {
+				t.Errorf("detail is %q, want the runtime's own words kept out of it", prob.Detail)
+			}
+		})
 	}
 }
 

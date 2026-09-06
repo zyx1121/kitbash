@@ -8,12 +8,10 @@ package proc
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"regexp"
 	"sort"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/zyx1121/kitbash/internal/fs"
@@ -167,14 +165,10 @@ func (s *Service) Run(ctx context.Context, path, digest, name string) (*Process,
 	}
 
 	if _, err := s.runner.Run(ctx, opts); err != nil {
-		if errors.Is(err, podman.ErrUsage) {
-			// The runtime refused the command, and every option in it came
-			// from the manifest, so the caller is the one who can fix it.
-			return nil, problem.InvalidManifestFix(folder,
-				"the container runtime refused an option this Package declares; the deploy unit passed "+
-					unitOptions(unit),
-				"Change the deploy unit in kitbash.yaml, then run again.")
-		}
+		// The runtime says only that it refused the command: the same exit
+		// status covers an image that is gone and a name taken since the
+		// lookup. The manifest cases are caught by checkOptions above, before
+		// anything is removed, so what is left is not the caller's to fix.
 		return nil, problem.Internal(folder, err.Error(), "")
 	}
 
@@ -389,36 +383,6 @@ var (
 	memoryValue = regexp.MustCompile(`^[0-9]+[kmg]?$`)
 	cpuValue    = regexp.MustCompile(`^[0-9]+(\.[0-9]+)?$`)
 )
-
-// unitOptions names what the deploy unit asked the runtime for, without the
-// values of env, which may hold secrets, and without anything about this host.
-func unitOptions(unit manifest.Unit) string {
-	var parts []string
-	if unit.Limits.Memory != "" {
-		parts = append(parts, "limits.memory "+unit.Limits.Memory)
-	}
-	if unit.Limits.CPU != "" {
-		parts = append(parts, "limits.cpu "+unit.Limits.CPU)
-	}
-	if unit.Restart != "" {
-		parts = append(parts, "restart "+unit.Restart)
-	}
-	if unit.Expose == manifest.ExposeHTTP && unit.Port > 0 {
-		parts = append(parts, "port "+strconv.Itoa(unit.Port))
-	}
-	if len(unit.Env) > 0 {
-		keys := make([]string, 0, len(unit.Env))
-		for k := range unit.Env {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		parts = append(parts, "env "+strings.Join(keys, ", "))
-	}
-	if len(parts) == 0 {
-		return "no options of its own"
-	}
-	return strings.Join(parts, ", ")
-}
 
 // restartPolicy maps the manifest's spelling onto the runtime's.
 func restartPolicy(restart string) string {

@@ -131,6 +131,14 @@ func TestTwoProcessesCannotShareASurfaceName(t *testing.T) {
 	if !strings.Contains(prob.Detail, "twin_go") {
 		t.Errorf("detail is %q, want it to name the tool that could not join", prob.Detail)
 	}
+	// The instance is the Process itself, so the caller can stop it without
+	// looking it up first.
+	if prob.Instance != second.ID {
+		t.Errorf("instance is %q, want the new Process id %q", prob.Instance, second.ID)
+	}
+	if !strings.Contains(prob.Detail, second.Package) {
+		t.Errorf("detail is %q, want it to name the Package that is running", prob.Detail)
+	}
 	if tools := h.bridge.Tools(second.ID); len(tools) != 0 {
 		t.Errorf("the second Process published %v, want nothing", tools)
 	}
@@ -153,6 +161,51 @@ func TestTwoProcessesCannotShareASurfaceName(t *testing.T) {
 	h.bridge.Remove(first)
 	if names := toolNames(t, s); contains(names, "twin_go") {
 		t.Errorf("tools/list is %v, want twin_go gone", names)
+	}
+}
+
+// A schema the surface cannot publish is the Package's own problem, not a name
+// someone else holds, so it is reported as the manifest error it is.
+func TestAToolWithAnUnusableSchemaIsReportedSeparately(t *testing.T) {
+	h := newHarness(t, echo)
+	ctx := context.Background()
+	process := h.addPackage(t, "odd", `name: odd
+description: A Package whose one tool declares an input schema that is not an object.
+provides:
+  tools:
+    - name: go
+      description: A tool whose input schema the MCP surface cannot publish.
+      input: { type: string }
+      output: { type: object }
+deploy:
+  units:
+    - type: container
+      build: .
+      expose: mcp
+`, "odd")
+
+	prob := h.bridge.Add(ctx, process)
+	if prob == nil {
+		t.Fatal("a tool with an unusable input schema was published")
+	}
+	if prob.Slug() != problem.SlugInvalidManifest {
+		t.Errorf("problem is %s, want invalid-manifest", prob.Slug())
+	}
+	if prob.Instance != process.ID {
+		t.Errorf("instance is %q, want the Process id %q", prob.Instance, process.ID)
+	}
+	if !strings.Contains(prob.Detail, "go") {
+		t.Errorf("detail is %q, want it to name the tool", prob.Detail)
+	}
+	if !strings.Contains(prob.Fix, "type object") {
+		t.Errorf("fix is %q, want it to say what the schema must be", prob.Fix)
+	}
+	if tools := h.bridge.Tools(process.ID); len(tools) != 0 {
+		t.Errorf("the Process published %v, want nothing", tools)
+	}
+	s := h.connect(t)
+	if names := toolNames(t, s); contains(names, "odd_go") {
+		t.Errorf("tools/list is %v, want odd_go absent", names)
 	}
 }
 
