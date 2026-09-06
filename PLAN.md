@@ -2,7 +2,7 @@
 
 > An operating system for AI agents. Files, Packages, Processes, Telemetry. Nothing built for a human at a terminal.
 
-This is the single living document for the product. It replaces a design doc, an architecture doc and a roadmap. When a decision changes, this file changes. Status: draft v0.1, 2026-09-05.
+This is the single living document for the product. It replaces a design doc, an architecture doc and a roadmap. When a decision changes, this file changes. Status: draft v0.2, 2026-09-06.
 
 ## 1. Positioning
 
@@ -63,6 +63,8 @@ Every commit is a version. Files has no separate version object.
 
 A Package is a folder in Files whose manifest carries a `deploy` section. Building it produces an OCI image. The image digest is the Package version, and the build records which Files commit it came from. The chain commit to digest to process is the entire provenance story and needs no extra object.
 
+The digest of a locally built image is its OCI image ID, the sha256 of the image configuration. The build stamps the image with labels `kitbash.path`, `kitbash.name`, `kitbash.commit` and `kitbash.user`, so the image store is the build history and no second record is kept. Packages a member builds live in that member's image store; sharing a built image between members is M5 work.
+
 There are no package kinds. A skill, a tool server, a workflow engine and an observability kit are all Packages. What distinguishes them is what their manifest declares, not a category the platform maintains. Tags exist for humans to search by. Platform logic never reads tags.
 
 Packages can also be imported rather than built: an existing OCI image, an existing MCP server from npm or PyPI, or a plain CLI tool. Import is done by kits, see section 3. The host never installs third party software. Everything third party arrives as a Package.
@@ -76,6 +78,10 @@ A Process declares how it is exposed:
 - `mcp`: its tools appear on the user's MCP surface under the package namespace, for example `ffmpeg.transcode`.
 - `http`: it gets an internal port, optionally a hostname through the reverse proxy.
 - `none`: a batch job or a subscriber that only talks to Telemetry.
+
+**How `mcp` exposure works.** The image's entrypoint is a stdio MCP server. The Process runs it as PID 1 with stdin held open, which keeps the container alive and is the liveness signal. Every MCP session the owner opens execs one more instance of the same entrypoint inside the container and proxies calls to it, the same way an agent runs a stdio server on a laptop. The tools the surface publishes are the ones the manifest declares, with the manifest's schemas, so input is validated against the manifest before it reaches the container. A tool the server offers but the manifest does not declare is not on the surface. Tool names are `<package>_<tool>`; a Package whose name collides with a built in family (`fs`, `pkg`, `proc`, `tel`, `users`, `approvals`) cannot be run.
+
+Every Process carries labels `kitbash.id`, `kitbash.user`, `kitbash.package`, `kitbash.name` and `kitbash.digest`. The container runtime holds the Process state and kitbashd reads it back; there is no second record.
 
 ### 2.4 Telemetry
 
@@ -165,13 +171,15 @@ A kit installs the same way as any Package and is versioned, traced and removabl
 
 **Workflows are a kit.** A workflow engine is a Package that reads graph files from Files, calls tools on other Processes, and emits Telemetry. The core does not know what a workflow is. A workflow that references another workflow is the engine's concern, resolved by schema compatibility of inputs and outputs.
 
+**The import hook.** An import kit is a running Process whose manifest declares `provides.kit: [import]` and a tool named `import`. The tool's input schema has a `source` string, constrained by a pattern to the source syntax the kit understands, and its output is a list of files, each a relative path with text or base64 content. `pkg_import` walks the caller's running kits, picks the one whose `import` input schema accepts the source string, calls the tool, and writes the returned files into the target folder as one commit. The choice binds on schemas, not on a registry of kit names. Two kits accepting the same source is a conflict the caller resolves by stopping one.
+
 **Import kits are the package manager.** A human runs `apt install ffmpeg` and reads `--help`. An agent asks import-cli to wrap ffmpeg, gets a Package with tools that carry schemas, and calls `ffmpeg.transcode` with a structured result. import-mcp is nearly automatic because MCP servers already declare tool schemas. import-cli is the hard one: it drafts a manifest from `--help` and man pages, runs the tool to validate the schema, and only then admits the Package. That validation loop is work an agent can do itself.
 
 ## 4. kitbashOS
 
 ### 4.1 Base
 
-Alpine Linux plus one daemon, `kitbashd`, written in Go and shipped as a static binary in an apk. Alpine is chosen for its appliance lineage, its 8 MB root filesystem and its package manager. Go is chosen because a static binary has no musl versus glibc problem and no runtime to install.
+Alpine Linux plus one daemon, `kitbashd`, written in Go and shipped as a static binary in an apk. Through M2 the apk ships `kitbash-mcp`, the per session process sshd starts for each member, and the container runtime supervises Processes on kitbashd's behalf. The resident daemon arrives with the OTLP receiver in M3 and takes over supervision, boot restore and the approval queue from there. Alpine is chosen for its appliance lineage, its 8 MB root filesystem and its package manager. Go is chosen because a static binary has no musl versus glibc problem and no runtime to install.
 
 Proxmox VE is the precedent for the packaging model: a standard base distribution plus one package that turns it into the appliance. An installable ISO or a LinuxKit image can come later without changing kitbashd.
 
@@ -280,6 +288,10 @@ The MCP tool surface is decided in `spec/mcp-surface.yaml`: six families, `fs` i
 
 - Whether `files` deploy units are needed in version 1 at all, or whether every Package is a container until a real case appears.
 - The retention defaults per signal.
+- Resource limits: rootless podman on OpenRC has no cgroup delegation, so `limits` are passed to the runtime and recorded but not enforced until kitbashd places member sessions in delegated cgroups.
+- Health: `health` is recorded but not probed until kitbashd supervises Processes. Liveness in M2 is PID 1 of the container.
+- A Process started in one MCP session appears on another session's surface when that session reconnects, not live.
+- Import kits run under the member who imports. Whether an admin can run a kit once for every member is an M5 question.
 
 ## 6. Vocabulary
 
