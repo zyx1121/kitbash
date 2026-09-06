@@ -11,6 +11,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/zyx1121/kitbash/internal/manifest"
 	"github.com/zyx1121/kitbash/internal/problem"
@@ -87,12 +88,25 @@ func (s *Service) Roots() []string { return append([]string(nil), s.roots...) }
 // only way a path enters the surface, so every rule that keeps a caller inside
 // the roots lives here.
 //
-// M1 does not follow symlinks at all. A link anywhere under a root could point
-// outside it, and checking the target after the fact races the filesystem, so
-// any symlink in the path is refused instead.
+// kitbash follows no symlinks at all. There is no same root exception: a link
+// whose target stays inside the same root is refused exactly like a link that
+// escapes, because the target of a link is not the file the caller named and
+// checking a target after the fact races the filesystem.
+//
+// The walk below checks every component of the path at the time of the call.
+// Opens then add O_NOFOLLOW, which covers the final component only: a file
+// swapped for a link between this walk and the open is refused. An
+// intermediate directory swapped for a link after the walk is not covered by
+// O_NOFOLLOW, so the guarantee is the state the walk saw, plus a final
+// component that is never followed.
 func (s *Service) resolve(p string) (string, *problem.Problem) {
 	if p == "" {
 		return "", problem.InvalidPath(p, "the path is empty")
+	}
+	if strings.ContainsRune(p, 0) {
+		// A NUL byte truncates the path inside the C library, so the kernel
+		// would see a shorter path than the one that was validated here.
+		return "", problem.InvalidPath(p, "the path contains a NUL byte")
 	}
 	if !filepath.IsAbs(p) {
 		return "", problem.InvalidPath(p, "the path is not absolute")
@@ -114,7 +128,8 @@ func (s *Service) resolve(p string) (string, *problem.Problem) {
 }
 
 // checkSegments walks the path one component at a time below the root. Names
-// beginning with a dot are reserved, and no component may be a symlink.
+// beginning with a dot are reserved, and no component may be a symlink,
+// wherever that link points.
 func checkSegments(root, clean string) *problem.Problem {
 	rel, err := filepath.Rel(root, clean)
 	if err != nil {
@@ -137,9 +152,7 @@ func checkSegments(root, clean string) *problem.Problem {
 			return nil
 		}
 		if info.Mode()&os.ModeSymlink != 0 {
-			return problem.InvalidPathFix(clean,
-				fmt.Sprintf("%s is a symlink, and kitbash does not follow symlinks", current),
-				"Write the file itself instead of a link to it.")
+			return symlinkRefused(clean, current)
 		}
 	}
 	return nil
@@ -201,6 +214,41 @@ func statProblem(path string, err error) *problem.Problem {
 	default:
 		return problem.Internal(path, err.Error(), "")
 	}
+}
+
+// openNoFollow opens a caller supplied path without following a symlink at the
+// final component. resolve already refused every link its walk could see, but a
+// file swapped for a link after that walk would still be followed by a plain
+// open, so every open of a caller path goes through here.
+//
+// O_NONBLOCK is not optional: open(2) on a FIFO with no writer blocks forever,
+// and a caller can put a FIFO anywhere they can write. With it the open returns
+// at once and the caller can reject the file by its type. Regular files and
+// directories are unaffected by the flag.
+func openNoFollow(path string) (*os.File, error) {
+	return os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+}
+
+// openProblem maps a failed open of a caller path. O_NOFOLLOW reports ELOOP
+// when the final component turned out to be a symlink, which is the same
+// refusal resolve gives, not an internal failure. ENOTDIR is a path naming a
+// file where a folder must be, which is the caller's mistake as well.
+func openProblem(path string, err error) *problem.Problem {
+	if errors.Is(err, syscall.ELOOP) {
+		return symlinkRefused(path, path)
+	}
+	if errors.Is(err, syscall.ENOTDIR) {
+		return problem.InvalidPath(path, "a component of the path is a file, not a folder")
+	}
+	return statProblem(path, err)
+}
+
+// symlinkRefused is the single answer to a symlink on a caller path. kitbash
+// follows no symlinks at all, inside the same root as well as outside it.
+func symlinkRefused(instance, link string) *problem.Problem {
+	return problem.InvalidPathFix(instance,
+		fmt.Sprintf("%s is a symlink, and kitbash does not follow symlinks", link),
+		"Use the file itself instead of a link to it.")
 }
 
 // folderManifest returns the manifest of a visible folder. A folder is visible

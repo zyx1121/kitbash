@@ -2,6 +2,7 @@ package fs
 
 import (
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -51,7 +52,16 @@ func (s *Service) List(ctx context.Context, path string) (*ListResult, *problem.
 	if prob != nil {
 		return nil, prob
 	}
-	info, err := os.Stat(clean)
+	// The folder is opened with O_NOFOLLOW and listed through that descriptor,
+	// so a folder swapped for a symlink after resolve is refused, not followed.
+	// The open is non blocking and nothing is read until the descriptor is
+	// known to be a directory, so a FIFO here is refused, not waited on.
+	dir, err := openNoFollow(clean)
+	if err != nil {
+		return nil, openProblem(clean, err)
+	}
+	defer dir.Close()
+	info, err := dir.Stat()
 	if err != nil {
 		return nil, statProblem(clean, err)
 	}
@@ -67,7 +77,7 @@ func (s *Service) List(ctx context.Context, path string) (*ListResult, *problem.
 	if m != nil {
 		result.Manifest = m.Raw
 	}
-	entries, err := os.ReadDir(clean)
+	entries, err := dir.ReadDir(-1)
 	if err != nil {
 		return nil, statProblem(clean, err)
 	}
@@ -144,16 +154,27 @@ func fileEntry(path string, e os.DirEntry) (FileEntry, bool) {
 }
 
 // sniff reads the head of a file so the media type can be detected by content
-// when the extension says nothing.
+// when the extension says nothing. A symlink is never sniffed: O_NOFOLLOW
+// fails the open, and the media type falls back to the extension.
 func sniff(path string) []byte {
-	f, err := os.Open(path)
+	f, err := openNoFollow(path)
 	if err != nil {
 		return nil
 	}
 	defer f.Close()
+	head, _ := sniffFile(path, f)
+	return head
+}
+
+// sniffFile reads the head of an already open file. It reads at an absolute
+// offset, so the descriptor's own position is left where the caller put it.
+func sniffFile(path string, f *os.File) ([]byte, *problem.Problem) {
 	buf := make([]byte, 512)
-	n, _ := f.Read(buf)
-	return buf[:n]
+	n, err := f.ReadAt(buf, 0)
+	if err != nil && err != io.EOF {
+		return nil, statProblem(path, err)
+	}
+	return buf[:n], nil
 }
 
 func sortEntries(r *ListResult) {
