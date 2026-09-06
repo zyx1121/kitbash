@@ -10,6 +10,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"os"
 	"strings"
 	"time"
 
@@ -34,6 +36,13 @@ const (
 const (
 	DefaultLimit = 100
 	MaxLimit     = 1000
+)
+
+// FileMode and DirMode are what the store and its directory are kept at. The
+// socket is the only way to the records inside.
+const (
+	FileMode = 0o600
+	DirMode  = 0o700
 )
 
 // Attributes are the six kitbash attributes in their short form. A record
@@ -180,6 +189,13 @@ func Open(path string) (*Store, error) {
 	if err := db.Ping(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("store: open %s: %w", path, err)
+	}
+	// The file holds every member's Telemetry, so only the daemon reads it.
+	// This happens before the first write, so the journal and shared memory
+	// files SQLite creates from it inherit the same mode.
+	if err := os.Chmod(path, FileMode); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("store: chmod %s: %w", path, err)
 	}
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
@@ -335,6 +351,13 @@ func (s *Store) Insert(ctx context.Context, e Export) error {
 		}
 		defer stmt.Close()
 		for _, m := range e.Metrics {
+			// The receiver drops these before they reach here. The check is
+			// repeated because a value JSON cannot spell would make every
+			// later query of its window fail, which is too expensive a
+			// failure to leave to one caller getting it right.
+			if math.IsNaN(m.Value) || math.IsInf(m.Value, 0) {
+				return fmt.Errorf("store: the metric %q carries a value JSON cannot represent", m.Name)
+			}
 			other, err := encodeOther(m.Other)
 			if err != nil {
 				return err
@@ -587,50 +610,109 @@ func (s *Store) Sweep(ctx context.Context, now time.Time) (SweepCounts, error) {
 		if err != nil {
 			return counts, err
 		}
-		cutoff := now.Add(-d).UnixNano()
-		res, err := s.db.ExecContext(ctx,
-			fmt.Sprintf("DELETE FROM %s WHERE %s < ?", sweep.table, sweep.column), cutoff)
+		n, err := s.deleteOlder(ctx, sweep.table, sweep.column, now.Add(-d).UnixNano())
+		*sweep.count = n
 		if err != nil {
-			return counts, fmt.Errorf("store: sweep %s: %w", sweep.table, err)
+			return counts, err
+		}
+	}
+	return counts, nil
+}
+
+// SweepBatch is how many records one delete statement removes. The store has
+// a single writer, so an unbounded delete over a large table would hold it for
+// the whole scan and every export would wait behind it. Deleting in batches
+// gives the exports waiting on the connection a turn between statements.
+const SweepBatch = 5000
+
+// deleteOlder removes records before the cutoff, a batch at a time, and
+// returns how many went. A batch that fails still reports what was already
+// deleted, because those records are gone whatever the caller does next.
+func (s *Store) deleteOlder(ctx context.Context, table, column string, cutoff int64) (int64, error) {
+	// A subquery rather than DELETE ... LIMIT, which needs a compile time
+	// option not every SQLite build carries.
+	statement := fmt.Sprintf("DELETE FROM %s WHERE id IN (SELECT id FROM %s WHERE %s < ? ORDER BY id LIMIT %d)",
+		table, table, column, SweepBatch)
+	var total int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return total, err
+		}
+		res, err := s.db.ExecContext(ctx, statement, cutoff)
+		if err != nil {
+			return total, fmt.Errorf("store: sweep %s: %w", table, err)
 		}
 		n, err := res.RowsAffected()
 		if err != nil {
-			return counts, fmt.Errorf("store: sweep %s: %w", sweep.table, err)
+			return total, fmt.Errorf("store: sweep %s: %w", table, err)
 		}
-		*sweep.count = n
+		total += n
+		if n < SweepBatch {
+			return total, nil
+		}
 	}
-	return counts, nil
 }
 
 // settingKey names the retention row of one signal.
 func settingKey(signal string) string { return "retention." + signal }
 
+// MinRetention is the shortest window an admin can set. A window of zero
+// would delete every record on the next sweep, including the one being
+// written, which is not a retention policy but a way to lose Telemetry.
+const MinRetention = time.Hour
+
+// MaxRetention is the longest window the arithmetic below can represent.
+var MaxRetention = time.Duration(math.MaxInt64)
+
 // ParseDuration reads a retention window. The accepted form is the one
 // spec/mcp-surface.yaml declares, ^[0-9]+(h|d)$, and d is 24h.
+//
+// The multiplication is checked before it happens. A window that overflows
+// time.Duration would wrap to a small one, and the next sweep would delete
+// records the admin had just asked kitbash to keep for centuries.
 func ParseDuration(s string) (time.Duration, error) {
 	if len(s) < 2 {
-		return 0, fmt.Errorf("store: %q is not a duration such as 720h or 30d", s)
+		return 0, invalidDuration(s)
 	}
 	unit := s[len(s)-1]
 	digits := s[:len(s)-1]
+
+	var scale int64
+	switch unit {
+	case 'h':
+		scale = int64(time.Hour)
+	case 'd':
+		scale = int64(24 * time.Hour)
+	default:
+		return 0, invalidDuration(s)
+	}
+
 	var n int64
 	for _, c := range digits {
 		if c < '0' || c > '9' {
-			return 0, fmt.Errorf("store: %q is not a duration such as 720h or 30d", s)
+			return 0, invalidDuration(s)
+		}
+		if n > (math.MaxInt64-int64(c-'0'))/10 {
+			return 0, tooLongDuration(s)
 		}
 		n = n*10 + int64(c-'0')
-		if n > 1<<40 {
-			return 0, fmt.Errorf("store: %q is longer than kitbash keeps anything", s)
+		if n > math.MaxInt64/scale {
+			return 0, tooLongDuration(s)
 		}
 	}
-	switch unit {
-	case 'h':
-		return time.Duration(n) * time.Hour, nil
-	case 'd':
-		return time.Duration(n) * 24 * time.Hour, nil
-	default:
-		return 0, fmt.Errorf("store: %q is not a duration such as 720h or 30d", s)
+	d := time.Duration(n * scale)
+	if d < MinRetention {
+		return 0, fmt.Errorf("store: a retention window of %q is shorter than the minimum of %s", s, MinRetention)
 	}
+	return d, nil
+}
+
+func invalidDuration(s string) error {
+	return fmt.Errorf("store: %q is not a duration such as 720h or 30d", s)
+}
+
+func tooLongDuration(s string) error {
+	return fmt.Errorf("store: a retention window of %q is longer than kitbash can represent", s)
 }
 
 // status keeps an unknown status out of the column the query surface promises.

@@ -39,6 +39,55 @@ const QueryWindow = 24 * time.Hour
 // ProblemContentType is the media type of every error this API returns.
 const ProblemContentType = "application/problem+json"
 
+// MaxConnections is how many connections the daemon serves at once. Every
+// member session holds one, so the cap is far above what a host with fifty
+// members needs, and it stops one caller from spending every file descriptor
+// the daemon has.
+const MaxConnections = 256
+
+// Timeouts bound how long one connection may hold a file descriptor. Without
+// them an idle keep alive connection lives forever and a body dribbled a byte
+// at a time keeps a handler running as long as the caller likes.
+type Timeouts struct {
+	// ReadHeader is how long the request line and headers may take.
+	ReadHeader time.Duration
+	// Read is how long the whole request, body included, may take.
+	Read time.Duration
+	// Write is how long a response may take.
+	Write time.Duration
+	// Idle is how long a kept alive connection may sit between requests.
+	Idle time.Duration
+}
+
+// DefaultTimeouts are what kitbashd serves with. An export of 4 MiB over a
+// unix socket takes milliseconds, so thirty seconds is generous.
+func DefaultTimeouts() Timeouts {
+	return Timeouts{
+		ReadHeader: 5 * time.Second,
+		Read:       30 * time.Second,
+		Write:      30 * time.Second,
+		Idle:       60 * time.Second,
+	}
+}
+
+// withDefaults fills in whatever the caller left at zero.
+func (t Timeouts) withDefaults() Timeouts {
+	d := DefaultTimeouts()
+	if t.ReadHeader <= 0 {
+		t.ReadHeader = d.ReadHeader
+	}
+	if t.Read <= 0 {
+		t.Read = d.Read
+	}
+	if t.Write <= 0 {
+		t.Write = d.Write
+	}
+	if t.Idle <= 0 {
+		t.Idle = d.Idle
+	}
+	return t
+}
+
 // logger writes where the operator reads, the same shape internal/problem uses.
 var logger = log.New(os.Stderr, "kitbashd: ", log.LstdFlags)
 
@@ -54,6 +103,10 @@ type Options struct {
 	Admin AdminFunc
 	// Now overrides the clock, for tests. Nil means time.Now.
 	Now func() time.Time
+	// Timeouts bound one connection. A zero field takes its default.
+	Timeouts Timeouts
+	// MaxConnections caps concurrent connections. Zero means the default.
+	MaxConnections int
 }
 
 // Caller is the identity behind one request.
@@ -65,22 +118,29 @@ type Caller struct {
 
 // Server answers the socket API for every caller.
 type Server struct {
-	store   *store.Store
-	version string
-	admin   AdminFunc
-	now     func() time.Time
-	started time.Time
-	mux     *http.ServeMux
+	store    *store.Store
+	version  string
+	admin    AdminFunc
+	now      func() time.Time
+	started  time.Time
+	mux      *http.ServeMux
+	timeouts Timeouts
+	maxConns int
 }
 
 // New builds the server. The store is not owned by it: whoever opened the file
 // closes it.
 func New(st *store.Store, opts Options) *Server {
 	s := &Server{
-		store:   st,
-		version: opts.Version,
-		admin:   opts.Admin,
-		now:     opts.Now,
+		store:    st,
+		version:  opts.Version,
+		admin:    opts.Admin,
+		now:      opts.Now,
+		timeouts: opts.Timeouts.withDefaults(),
+		maxConns: opts.MaxConnections,
+	}
+	if s.maxConns <= 0 {
+		s.maxConns = MaxConnections
 	}
 	if s.version == "" {
 		s.version = "dev"
@@ -117,15 +177,22 @@ func (s *Server) Handler() http.Handler {
 
 // Serve answers requests on ln until ctx is done, then drains in flight
 // requests and returns. The listener is closed either way.
+//
+// Every connection is bounded in two ways: the listener accepts no more than
+// MaxConnections at once, and each one is subject to the timeouts. A daemon
+// that runs for months cannot afford a connection that never ends.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	srv := &http.Server{
 		Handler:           s.Handler(),
 		ConnContext:       withPeer,
-		ReadHeaderTimeout: 10 * time.Second,
+		ReadHeaderTimeout: s.timeouts.ReadHeader,
+		ReadTimeout:       s.timeouts.Read,
+		WriteTimeout:      s.timeouts.Write,
+		IdleTimeout:       s.timeouts.Idle,
 		ErrorLog:          logger,
 	}
 	errs := make(chan error, 1)
-	go func() { errs <- srv.Serve(ln) }()
+	go func() { errs <- srv.Serve(limit(ln, s.maxConns)) }()
 
 	select {
 	case err := <-errs:

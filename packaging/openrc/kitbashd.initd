@@ -14,8 +14,13 @@ error_log="/var/log/kitbashd.log"
 respawn_delay=5
 respawn_max=0
 
+# One connection per member session, plus room for the exports in flight. The
+# daemon caps itself at 256 connections; this is the kernel's matching bound.
+rc_ulimit="-n 1024"
+
 depend() {
-	need localmount net
+	# A unix socket needs a filesystem, not a network.
+	need localmount
 }
 
 start_pre() {

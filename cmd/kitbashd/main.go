@@ -42,11 +42,11 @@ const (
 // nobody else can, see PLAN.md section 4.5.
 const socketGroup = "kitbash-users"
 
-// Modes of what the daemon creates.
+// Modes of what the daemon creates. The store's own modes are store.DirMode
+// and store.FileMode.
 const (
-	storeDirMode = 0o700
-	socketMode   = 0o660
-	runDirMode   = 0o755
+	socketMode = 0o660
+	runDirMode = 0o755
 )
 
 var logger = log.New(os.Stderr, "kitbashd: ", log.LstdFlags)
@@ -69,9 +69,15 @@ func run() error {
 	}
 
 	// The store directory is the daemon's alone: it holds every member's
-	// Telemetry, and the socket is the only way in.
-	if err := os.MkdirAll(filepath.Dir(*storePath), storeDirMode); err != nil {
-		return fmt.Errorf("store directory %s: %w", filepath.Dir(*storePath), err)
+	// Telemetry, and the socket is the only way in. A directory that already
+	// exists is narrowed too, because an upgrade from a looser layout must
+	// not leave the records readable.
+	storeDir := filepath.Dir(*storePath)
+	if err := os.MkdirAll(storeDir, store.DirMode); err != nil {
+		return fmt.Errorf("store directory %s: %w", storeDir, err)
+	}
+	if err := os.Chmod(storeDir, store.DirMode); err != nil {
+		return fmt.Errorf("store directory %s: %w", storeDir, err)
 	}
 	st, err := store.Open(*storePath)
 	if err != nil {

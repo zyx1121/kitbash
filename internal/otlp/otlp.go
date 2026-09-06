@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
@@ -91,19 +92,22 @@ func trimSpace(s string) string {
 // unmarshal reads one request message in either format. protojson is strict
 // about unknown fields on purpose: a body kitbashd does not understand is a
 // bad request, not a silently truncated record.
-func unmarshal(f Format, body []byte, msg proto.Message) error {
+//
+// The signal names what failed to decode. A Go type name never appears in an
+// error a member reads: it says nothing the agent can act on.
+func unmarshal(f Format, body []byte, msg proto.Message, signal string) error {
 	if f == JSON {
 		body, err := hexIdentifiers(body)
 		if err != nil {
 			return err
 		}
 		if err := protojson.Unmarshal(body, msg); err != nil {
-			return fmt.Errorf("otlp: body is not a JSON %T: %w", msg, err)
+			return fmt.Errorf("otlp: body is not a JSON %s export request: %w", signal, err)
 		}
 		return nil
 	}
 	if err := proto.Unmarshal(body, msg); err != nil {
-		return fmt.Errorf("otlp: body is not a protobuf %T: %w", msg, err)
+		return fmt.Errorf("otlp: body is not a protobuf %s export request: %w", signal, err)
 	}
 	return nil
 }
@@ -124,10 +128,14 @@ func marshal(f Format, msg proto.Message) ([]byte, error) {
 	return b, nil
 }
 
-// DecodeTraces turns an ExportTraceServiceRequest into spans.
+// DecodeTraces turns an ExportTraceServiceRequest into spans. A span whose
+// identifiers are not the width the spanRecord schema promises makes the whole
+// request a bad request: the surface publishes those identifiers with a
+// pattern, so storing a short one would break the schema an agent matches
+// against.
 func DecodeTraces(f Format, body []byte) ([]store.Span, error) {
 	var req coltrace.ExportTraceServiceRequest
-	if err := unmarshal(f, body, &req); err != nil {
+	if err := unmarshal(f, body, &req, "traces"); err != nil {
 		return nil, err
 	}
 	var spans []store.Span
@@ -135,25 +143,59 @@ func DecodeTraces(f Format, body []byte) ([]store.Span, error) {
 		resource := keyValues(rs.GetResource().GetAttributes())
 		for _, ss := range rs.GetScopeSpans() {
 			for _, s := range ss.GetSpans() {
-				spans = append(spans, span(s, resource))
+				decoded, err := span(s, resource)
+				if err != nil {
+					return nil, err
+				}
+				spans = append(spans, decoded)
 			}
 		}
 	}
 	return spans, nil
 }
 
-func span(s *tracepb.Span, resource map[string]any) store.Span {
+func span(s *tracepb.Span, resource map[string]any) (store.Span, error) {
+	traceID, err := identifier("trace id", s.GetTraceId(), traceIDHexLen, false)
+	if err != nil {
+		return store.Span{}, err
+	}
+	spanID, err := identifier("span id", s.GetSpanId(), spanIDHexLen, false)
+	if err != nil {
+		return store.Span{}, err
+	}
+	parentID, err := identifier("parent span id", s.GetParentSpanId(), spanIDHexLen, true)
+	if err != nil {
+		return store.Span{}, err
+	}
 	return store.Span{
-		TraceID:       hex.EncodeToString(s.GetTraceId()),
-		SpanID:        hex.EncodeToString(s.GetSpanId()),
-		ParentSpanID:  hex.EncodeToString(s.GetParentSpanId()),
+		TraceID:       traceID,
+		SpanID:        spanID,
+		ParentSpanID:  parentID,
 		Name:          s.GetName(),
 		StartNS:       int64(s.GetStartTimeUnixNano()),
 		EndNS:         int64(s.GetEndTimeUnixNano()),
 		Status:        statusCode(s.GetStatus().GetCode()),
 		StatusMessage: s.GetStatus().GetMessage(),
 		Attributes:    attributes(resource, s.GetAttributes()),
+	}, nil
+}
+
+// identifier renders a trace or span id as hex of exactly the width the query
+// surface publishes. Anything else is refused rather than padded: a producer
+// that sends half an identifier is not sending the one it means.
+func identifier(what string, raw []byte, hexLen int, optional bool) (string, error) {
+	if len(raw) == 0 {
+		if optional {
+			return "", nil
+		}
+		return "", fmt.Errorf("otlp: a record carries no %s; a %s is %d hex characters", what, what, hexLen)
 	}
+	encoded := hex.EncodeToString(raw)
+	if len(encoded) != hexLen {
+		return "", fmt.Errorf("otlp: a record carries a %s of %d hex characters; a %s is %d",
+			what, len(encoded), what, hexLen)
+	}
+	return encoded, nil
 }
 
 // statusCode maps the OTLP status to the three values the query surface
@@ -172,7 +214,7 @@ func statusCode(code tracepb.Status_StatusCode) string {
 // DecodeLogs turns an ExportLogsServiceRequest into log records.
 func DecodeLogs(f Format, body []byte) ([]store.Log, error) {
 	var req collogs.ExportLogsServiceRequest
-	if err := unmarshal(f, body, &req); err != nil {
+	if err := unmarshal(f, body, &req, "logs"); err != nil {
 		return nil, err
 	}
 	var logs []store.Log
@@ -180,14 +222,21 @@ func DecodeLogs(f Format, body []byte) ([]store.Log, error) {
 		resource := keyValues(rl.GetResource().GetAttributes())
 		for _, sl := range rl.GetScopeLogs() {
 			for _, l := range sl.GetLogRecords() {
-				logs = append(logs, logRecord(l, resource))
+				decoded, err := logRecord(l, resource)
+				if err != nil {
+					return nil, err
+				}
+				logs = append(logs, decoded)
 			}
 		}
 	}
 	return logs, nil
 }
 
-func logRecord(l *logspb.LogRecord, resource map[string]any) store.Log {
+// logRecord decodes one log record. Its identifiers are optional, because a
+// log record that belongs to no span is a normal thing to send, but one that
+// is present is held to the same width as a span's.
+func logRecord(l *logspb.LogRecord, resource map[string]any) (store.Log, error) {
 	// A producer that only stamps the observed time still gets a time.
 	ts := l.GetTimeUnixNano()
 	if ts == 0 {
@@ -197,14 +246,22 @@ func logRecord(l *logspb.LogRecord, resource map[string]any) store.Log {
 	if severity == "" && l.GetSeverityNumber() != logspb.SeverityNumber_SEVERITY_NUMBER_UNSPECIFIED {
 		severity = l.GetSeverityNumber().String()
 	}
+	traceID, err := identifier("trace id", l.GetTraceId(), traceIDHexLen, true)
+	if err != nil {
+		return store.Log{}, err
+	}
+	spanID, err := identifier("span id", l.GetSpanId(), spanIDHexLen, true)
+	if err != nil {
+		return store.Log{}, err
+	}
 	return store.Log{
 		TimeNS:     int64(ts),
 		Severity:   severity,
 		Body:       text(l.GetBody()),
-		TraceID:    hex.EncodeToString(l.GetTraceId()),
-		SpanID:     hex.EncodeToString(l.GetSpanId()),
+		TraceID:    traceID,
+		SpanID:     spanID,
 		Attributes: attributes(resource, l.GetAttributes()),
-	}
+	}, nil
 }
 
 // DecodeMetrics turns an ExportMetricsServiceRequest into metric points.
@@ -216,9 +273,16 @@ func logRecord(l *logspb.LogRecord, resource map[string]any) store.Log {
 // happened and how much", not a full metrics backend, and no producer emits
 // metrics before M4, see PLAN.md section 5.5. An observability kit that needs
 // buckets subscribes to the fan out instead.
+//
+// A data point whose value is not finite is skipped rather than stored. JSON
+// has no NaN and no infinity, so such a point would be unreadable the moment
+// anyone queried the window it landed in, and one producer sending it would
+// take the answer away from every other member. The rest of the request is
+// stored: a broken point is the producer's bug, not a reason to lose the
+// batch it travelled with.
 func DecodeMetrics(f Format, body []byte) ([]store.Metric, error) {
 	var req colmetrics.ExportMetricsServiceRequest
-	if err := unmarshal(f, body, &req); err != nil {
+	if err := unmarshal(f, body, &req, "metrics"); err != nil {
 		return nil, err
 	}
 	var metrics []store.Metric
@@ -236,6 +300,9 @@ func DecodeMetrics(f Format, body []byte) ([]store.Metric, error) {
 func points(m *metricspb.Metric, resource map[string]any) []store.Metric {
 	var out []store.Metric
 	point := func(ts uint64, value float64, attrs []*commonpb.KeyValue) {
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return
+		}
 		out = append(out, store.Metric{
 			TimeNS:     int64(ts),
 			Name:       m.GetName(),

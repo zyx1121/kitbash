@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/zyx1121/kitbash/internal/otlp"
@@ -130,8 +131,8 @@ func (s *Server) export(w http.ResponseWriter, r *http.Request, decode decoder) 
 
 func tooLarge(instance string) *problem.Problem {
 	return problem.TooLarge(instance,
-		fmt.Sprintf("an export request may carry at most %d bytes", otlp.MaxBodyBytes),
-		"Export in smaller batches.")
+		fmt.Sprintf("a request body may carry at most %d bytes", otlp.MaxBodyBytes),
+		"Send a smaller body, and export Telemetry in smaller batches.")
 }
 
 // queryRequest is the tel_query input of spec/mcp-surface.yaml.
@@ -164,7 +165,7 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req queryRequest
-	if prob := decodeBody(r, &req); prob != nil {
+	if prob := decodeBody(w, r, &req); prob != nil {
 		writeProblem(w, prob)
 		return
 	}
@@ -259,7 +260,7 @@ func (s *Server) retention(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var set store.RetentionSet
-		if prob := decodeBody(r, &set); prob != nil {
+		if prob := decodeBody(w, r, &set); prob != nil {
 			writeProblem(w, prob)
 			return
 		}
@@ -303,13 +304,42 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 
 // decodeBody reads one JSON request body. An unknown field is refused rather
 // than ignored: a client sending a field this version does not know is asking
-// for something it will not get.
-func decodeBody(r *http.Request, into any) *problem.Problem {
-	dec := json.NewDecoder(io.LimitReader(r.Body, otlp.MaxBodyBytes))
+// for something it will not get. A body over the limit is too-large, the same
+// answer the OTLP paths give.
+//
+// The decoder's own message names Go types and struct fields, which mean
+// nothing to an agent, so it goes to the server log and the caller is told
+// which field it got wrong instead.
+func decodeBody(w http.ResponseWriter, r *http.Request, into any) *problem.Problem {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, otlp.MaxBodyBytes))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(into); err != nil {
-		return problem.BadRequest(r.URL.Path, fmt.Sprintf("the request body is not the JSON this path expects: %v", err),
+		var limit *http.MaxBytesError
+		if errors.As(err, &limit) {
+			return tooLarge(r.URL.Path)
+		}
+		logger.Printf("bad request body at %s: %v", r.URL.Path, err)
+		return problem.BadRequest(r.URL.Path, detailOf(err),
 			"Send arguments that match the tool's input schema in spec/mcp-surface.yaml.")
 	}
 	return nil
+}
+
+// detailOf turns a JSON decoding failure into something an agent can act on,
+// without the Go type names encoding/json puts in its messages.
+func detailOf(err error) string {
+	var unknown *json.SyntaxError
+	if errors.As(err, &unknown) {
+		return "the request body is not valid JSON"
+	}
+	var wrongType *json.UnmarshalTypeError
+	if errors.As(err, &wrongType) && wrongType.Field != "" {
+		return fmt.Sprintf("the field %q has the wrong type", wrongType.Field)
+	}
+	// The only remaining case worth naming is an unknown field, whose message
+	// is the field name in quotes and nothing about Go.
+	if field, ok := strings.CutPrefix(err.Error(), "json: unknown field "); ok {
+		return fmt.Sprintf("the field %s is not part of this request", field)
+	}
+	return "the request body is not the JSON this path expects"
 }

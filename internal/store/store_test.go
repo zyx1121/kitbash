@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"math"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -318,13 +320,21 @@ func TestParseDuration(t *testing.T) {
 	}{
 		{"720h", 720 * time.Hour, true},
 		{"30d", 30 * 24 * time.Hour, true},
-		{"0h", 0, true},
+		{"1h", time.Hour, true},
 		{"10m", 0, false},
 		{"d", 0, false},
 		{"", 0, false},
 		{"-1d", 0, false},
 		{"1.5d", 0, false},
 		{"30D", 0, false},
+		// A window of zero would delete everything on the next sweep.
+		{"0h", 0, false},
+		{"0d", 0, false},
+		// These overflow time.Duration. Wrapping would turn centuries into
+		// minutes and the next sweep would delete what was meant to be kept.
+		{"213504d", 0, false},
+		{"5124096h", 0, false},
+		{"99999999999999999999d", 0, false},
 	}
 	for _, tc := range cases {
 		got, err := ParseDuration(tc.in)
@@ -348,5 +358,85 @@ func TestInsertEmpty(t *testing.T) {
 	s := open(t)
 	if err := s.Insert(context.Background(), Export{}); err != nil {
 		t.Fatalf("Insert of an empty export: %v", err)
+	}
+}
+
+func TestInsertRefusesNonFiniteMetric(t *testing.T) {
+	s := open(t)
+	ctx := context.Background()
+	for _, value := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		err := s.Insert(ctx, Export{Metrics: []Metric{{TimeNS: base.UnixNano(), Name: "calls", Value: value}}})
+		if err == nil {
+			t.Errorf("Insert stored the value %v, which JSON cannot represent", value)
+		}
+	}
+	page, err := s.Query(ctx, SignalMetrics, Filter{})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(page.Metrics) != 0 {
+		t.Errorf("metrics = %d, want none stored", len(page.Metrics))
+	}
+}
+
+func TestSweepBatches(t *testing.T) {
+	s := open(t)
+	ctx := context.Background()
+
+	// More rows than one delete statement removes, so the loop has to run
+	// more than once.
+	var export Export
+	old := base.Add(-72 * time.Hour).UnixNano()
+	for i := range SweepBatch + 10 {
+		export.Logs = append(export.Logs, Log{TimeNS: old + int64(i), Severity: "INFO", Body: "old"})
+	}
+	export.Logs = append(export.Logs, Log{TimeNS: base.UnixNano(), Severity: "INFO", Body: "new"})
+	if err := s.Insert(ctx, export); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+
+	window := "24h"
+	if _, err := s.SetRetention(ctx, RetentionSet{Logs: &window}); err != nil {
+		t.Fatalf("SetRetention: %v", err)
+	}
+	counts, err := s.Sweep(ctx, base)
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if counts.Logs != int64(SweepBatch+10) {
+		t.Errorf("swept %d logs, want %d across batches", counts.Logs, SweepBatch+10)
+	}
+	page, err := s.Query(ctx, SignalLogs, Filter{})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(page.Logs) != 1 || page.Logs[0].Body != "new" {
+		t.Errorf("logs left = %d, want only the recent one", len(page.Logs))
+	}
+}
+
+func TestStoreFileIsPrivate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "kitbashd.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	if err := s.Insert(context.Background(), Export{Logs: []Log{{TimeNS: base.UnixNano(), Body: "hello"}}}); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	// The journal and shared memory files carry the same records, so they are
+	// checked too.
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		info, err := os.Stat(path + suffix)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			t.Fatalf("stat %s: %v", path+suffix, err)
+		}
+		if mode := info.Mode().Perm(); mode != FileMode {
+			t.Errorf("%s has mode %04o, want %04o", path+suffix, mode, FileMode)
+		}
 	}
 }

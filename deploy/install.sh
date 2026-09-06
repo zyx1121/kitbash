@@ -111,3 +111,4 @@ sshd -t
 rc-service -q sshd restart
 
 log "done. add members with: kitbash-adduser <name> '<ssh public key>' [admin]"
+log "the admin argument puts the member in kitbash-admin, which tel_retention and reading another member's Telemetry both require"

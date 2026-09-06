@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math"
 
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 
@@ -68,7 +69,13 @@ func keyValues(kvs []*commonpb.KeyValue) map[string]any {
 		if kv.GetKey() == "" {
 			continue
 		}
-		out[kv.GetKey()] = value(kv.GetValue())
+		// A value with no JSON spelling, such as NaN, is left out entirely
+		// rather than stored as null.
+		converted := value(kv.GetValue())
+		if converted == nil {
+			continue
+		}
+		out[kv.GetKey()] = converted
 	}
 	return out
 }
@@ -84,6 +91,13 @@ func value(v *commonpb.AnyValue) any {
 	case *commonpb.AnyValue_IntValue:
 		return kind.IntValue
 	case *commonpb.AnyValue_DoubleValue:
+		// NaN and infinity have no JSON spelling, so an attribute carrying
+		// one is dropped and the record is kept without it. Storing it would
+		// make every later query of that window unanswerable, which costs
+		// every member the answer for one producer's bug.
+		if math.IsNaN(kind.DoubleValue) || math.IsInf(kind.DoubleValue, 0) {
+			return nil
+		}
 		return kind.DoubleValue
 	case *commonpb.AnyValue_BytesValue:
 		return base64.StdEncoding.EncodeToString(kind.BytesValue)

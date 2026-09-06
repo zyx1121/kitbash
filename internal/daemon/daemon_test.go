@@ -34,11 +34,19 @@ type harness struct {
 	store  *store.Store
 	server *Server
 	user   string
+	socket string
 }
 
 // serve starts a daemon whose admin answer is fixed, which is how a test gets
 // an administrator without creating a group on the host.
 func serve(t *testing.T, admin bool) *harness {
+	t.Helper()
+	return serveWith(t, Options{Admin: func(*user.User) (bool, error) { return admin, nil }})
+}
+
+// serveWith starts a daemon with the options a test needs, filling in the ones
+// every test shares.
+func serveWith(t *testing.T, opts Options) *harness {
 	t.Helper()
 	dir := t.TempDir()
 	st, err := store.Open(filepath.Join(dir, "kitbashd.db"))
@@ -51,10 +59,13 @@ func serve(t *testing.T, admin bool) *harness {
 	if err != nil {
 		t.Fatalf("user.Current: %v", err)
 	}
-	srv := New(st, Options{
-		Version: "v0.3.0-test",
-		Admin:   func(*user.User) (bool, error) { return admin, nil },
-	})
+	if opts.Version == "" {
+		opts.Version = "v0.3.0-test"
+	}
+	if opts.Admin == nil {
+		opts.Admin = func(*user.User) (bool, error) { return false, nil }
+	}
+	srv := New(st, opts)
 
 	socket := filepath.Join(dir, "kitbashd.sock")
 	ln, err := net.Listen("unix", socket)
@@ -84,7 +95,7 @@ func serve(t *testing.T, admin bool) *harness {
 		},
 		Timeout: 10 * time.Second,
 	}
-	return &harness{t: t, client: client, store: st, server: srv, user: me.Username}
+	return &harness{t: t, client: client, store: st, server: srv, user: me.Username, socket: socket}
 }
 
 // do sends one request to the daemon. The host name is ignored: the transport
