@@ -5,7 +5,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/zyx1121/kitbash/internal/fs"
 	"github.com/zyx1121/kitbash/internal/problem"
@@ -179,5 +181,91 @@ func TestGitFailureOutputDoesNotReachTheAgent(t *testing.T) {
 		if strings.Contains(rendered, "exit status") || strings.Contains(rendered, "git log") {
 			t.Errorf("%s handed the git invocation to the agent: %s", c.tool, rendered)
 		}
+	}
+}
+
+// A FIFO with no writer blocks open(2) forever. A caller can plant one
+// anywhere they can write, so every tool must answer instead of hanging the
+// session on it.
+func TestFifoIsRefusedWithoutBlocking(t *testing.T) {
+	service, _, folder := hardened(t)
+	ctx := context.Background()
+	pipe := filepath.Join(folder, "pipe.md")
+	if err := syscall.Mkfifo(pipe, 0o644); err != nil {
+		t.Skipf("this filesystem has no FIFOs: %v", err)
+	}
+
+	for _, c := range []struct {
+		tool string
+		call func() *problem.Problem
+	}{
+		{"fs_read", func() *problem.Problem {
+			_, prob := service.Read(ctx, pipe, fs.ReadOptions{})
+			return prob
+		}},
+		{"fs_list", func() *problem.Problem {
+			_, prob := service.List(ctx, pipe)
+			return prob
+		}},
+		{"fs_history", func() *problem.Problem {
+			_, prob := service.History(ctx, pipe, 0)
+			return prob
+		}},
+		{"fs_write", func() *problem.Problem {
+			content := "into a pipe\n"
+			_, prob := service.Write(ctx, fs.WriteRequest{Path: pipe, Content: &content, Message: "into a pipe"})
+			return prob
+		}},
+	} {
+		done := make(chan *problem.Problem, 1)
+		go func() { done <- c.call() }()
+		select {
+		case prob := <-done:
+			wantSlug(t, prob, c.tool, problem.SlugInvalidPath)
+		case <-time.After(10 * time.Second):
+			// The goroutine is stuck in open(2) and cannot be reclaimed, so the
+			// run has to stop here rather than carry on with a wedged worker.
+			t.Fatalf("%s blocked on a FIFO instead of refusing it", c.tool)
+		}
+	}
+}
+
+// A folder whose kitbash.yaml is a symlink is not visible. Following it would
+// lend the name and the description of a manifest the caller never named to a
+// folder that carries none, and put that folder's files on the surface.
+func TestSymlinkedManifestLeavesTheFolderInvisible(t *testing.T) {
+	service, root, _ := hardened(t)
+	ctx := context.Background()
+
+	// A real manifest outside every root, and a folder inside the root that
+	// carries nothing but a link to it.
+	outside := t.TempDir()
+	writeFile(t, filepath.Join(outside, "kitbash.yaml"), "name: borrowed\ndescription: A manifest that lives outside every root.\n")
+	borrowed := filepath.Join(root, "borrower")
+	if err := os.MkdirAll(borrowed, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	writeFile(t, filepath.Join(borrowed, "secret.md"), secret+"\n")
+	if err := os.Symlink(filepath.Join(outside, "kitbash.yaml"), filepath.Join(borrowed, "kitbash.yaml")); err != nil {
+		t.Fatalf("creating the manifest symlink: %v", err)
+	}
+
+	roots, prob := service.List(ctx, "")
+	if prob != nil {
+		t.Fatalf("listing the roots: %s", prob.Detail)
+	}
+	for _, f := range roots.Folders {
+		if f.Path == borrowed {
+			t.Errorf("a folder whose manifest is a symlink was listed as %q", f.Name)
+		}
+	}
+
+	_, prob = service.List(ctx, borrowed)
+	wantSlug(t, prob, "fs_list", problem.SlugNotVisible)
+
+	res, prob := service.Read(ctx, filepath.Join(borrowed, "secret.md"), fs.ReadOptions{})
+	wantSlug(t, prob, "fs_read", problem.SlugNotVisible)
+	if res != nil {
+		t.Fatalf("fs_read returned content from an invisible folder: %q", res.Text)
 	}
 }

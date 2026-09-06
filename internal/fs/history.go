@@ -35,6 +35,10 @@ func (s *Service) History(ctx context.Context, path string, limit int) (*History
 	if info.Mode()&os.ModeSymlink != 0 {
 		return nil, symlinkRefused(clean, clean)
 	}
+	if !info.IsDir() && !info.Mode().IsRegular() {
+		// A FIFO or a device is not something the surface has a history for.
+		return nil, problem.InvalidPath(clean, "the path is not a regular file")
+	}
 	folder := clean
 	if !info.IsDir() {
 		folder = filepath.Dir(clean)

@@ -44,9 +44,11 @@ func (s *Service) Read(ctx context.Context, path string, opts ReadOptions) (*Rea
 		return nil, prob
 	}
 	// O_NOFOLLOW closes the window between the walk resolve just made and this
-	// open: a symlink swapped in for the file is refused, never followed. The
-	// whole call is then served from this one descriptor, so the bytes
-	// returned are the bytes of the file that was checked.
+	// open: a file swapped for a symlink is refused, never followed. The whole
+	// call is then served from this one descriptor, so the bytes returned are
+	// the bytes of the file that was checked. The open is non blocking and the
+	// type of the descriptor is judged before a single byte is read, so a FIFO
+	// planted by the caller is refused instead of hanging the session.
 	f, err := openNoFollow(clean)
 	if err != nil {
 		return nil, openProblem(clean, err)

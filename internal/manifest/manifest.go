@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
 	"golang.org/x/text/language"
@@ -165,14 +166,33 @@ func validationMessages(err error) []string {
 	return out
 }
 
+// ErrNotRegular is returned by Load when kitbash.yaml is not a regular file: a
+// symlink, a FIFO, a device. kitbash follows no symlinks, so a folder whose
+// manifest is a link to a manifest elsewhere is not visible, and a manifest
+// that would block the read is refused rather than waited on.
+var ErrNotRegular = errors.New("kitbash.yaml is not a regular file")
+
 // Load reads and validates the manifest of one folder, refusing to read more
 // than MaxBytes of it.
+//
+// O_NOFOLLOW keeps a symlinked manifest from lending its name and description
+// to a folder that carries none, which would put that folder on the surface
+// with the contents of a folder the caller never named. O_NONBLOCK keeps a
+// FIFO from hanging the open.
 func Load(dir string) (*Manifest, error) {
-	f, err := os.Open(filepath.Join(dir, FileName))
+	path := filepath.Join(dir, FileName)
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s: %w", path, ErrNotRegular)
+	}
 	data, err := io.ReadAll(io.LimitReader(f, MaxBytes+1))
 	if err != nil {
 		return nil, err

@@ -53,7 +53,9 @@ func (s *Service) List(ctx context.Context, path string) (*ListResult, *problem.
 		return nil, prob
 	}
 	// The folder is opened with O_NOFOLLOW and listed through that descriptor,
-	// so a symlink swapped in for it after resolve is refused, not followed.
+	// so a folder swapped for a symlink after resolve is refused, not followed.
+	// The open is non blocking and nothing is read until the descriptor is
+	// known to be a directory, so a FIFO here is refused, not waited on.
 	dir, err := openNoFollow(clean)
 	if err != nil {
 		return nil, openProblem(clean, err)

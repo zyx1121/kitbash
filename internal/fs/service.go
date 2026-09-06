@@ -91,9 +91,14 @@ func (s *Service) Roots() []string { return append([]string(nil), s.roots...) }
 // kitbash follows no symlinks at all. There is no same root exception: a link
 // whose target stays inside the same root is refused exactly like a link that
 // escapes, because the target of a link is not the file the caller named and
-// checking a target after the fact races the filesystem. Every component of
-// the path is checked here, and every open of a caller path is made with
-// O_NOFOLLOW so a link swapped in after this walk is refused as well.
+// checking a target after the fact races the filesystem.
+//
+// The walk below checks every component of the path at the time of the call.
+// Opens then add O_NOFOLLOW, which covers the final component only: a file
+// swapped for a link between this walk and the open is refused. An
+// intermediate directory swapped for a link after the walk is not covered by
+// O_NOFOLLOW, so the guarantee is the state the walk saw, plus a final
+// component that is never followed.
 func (s *Service) resolve(p string) (string, *problem.Problem) {
 	if p == "" {
 		return "", problem.InvalidPath(p, "the path is empty")
@@ -211,20 +216,29 @@ func statProblem(path string, err error) *problem.Problem {
 	}
 }
 
-// openNoFollow opens a caller supplied path without ever following a symlink
-// at the final component. resolve already refused every link it could see, but
-// a link swapped in after that walk would still be followed by a plain open,
-// so every open of a caller path goes through here.
+// openNoFollow opens a caller supplied path without following a symlink at the
+// final component. resolve already refused every link its walk could see, but a
+// file swapped for a link after that walk would still be followed by a plain
+// open, so every open of a caller path goes through here.
+//
+// O_NONBLOCK is not optional: open(2) on a FIFO with no writer blocks forever,
+// and a caller can put a FIFO anywhere they can write. With it the open returns
+// at once and the caller can reject the file by its type. Regular files and
+// directories are unaffected by the flag.
 func openNoFollow(path string) (*os.File, error) {
-	return os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	return os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 }
 
 // openProblem maps a failed open of a caller path. O_NOFOLLOW reports ELOOP
 // when the final component turned out to be a symlink, which is the same
-// refusal resolve gives, not an internal failure.
+// refusal resolve gives, not an internal failure. ENOTDIR is a path naming a
+// file where a folder must be, which is the caller's mistake as well.
 func openProblem(path string, err error) *problem.Problem {
 	if errors.Is(err, syscall.ELOOP) {
 		return symlinkRefused(path, path)
+	}
+	if errors.Is(err, syscall.ENOTDIR) {
+		return problem.InvalidPath(path, "a component of the path is a file, not a folder")
 	}
 	return statProblem(path, err)
 }

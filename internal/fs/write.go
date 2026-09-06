@@ -141,12 +141,30 @@ func (s *Service) writeVisible(folder, name string) *problem.Problem {
 	return nil
 }
 
+// errNotRegular is the refusal of a target that exists but is not a plain
+// file: a FIFO, a socket, a device.
+var errNotRegular = errors.New("the path is not a regular file")
+
 // writeNoFollow replaces a file without ever following a symlink at the final
 // component, which a caller could have planted between the check and the write.
+//
+// O_NONBLOCK is not optional: open(2) on a FIFO for writing blocks until a
+// reader appears, so a FIFO planted by the caller would hang the session. With
+// it the open fails or returns at once, and the type of the descriptor is
+// checked before anything is written.
 func writeNoFollow(path string, data []byte) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0o644)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0o644)
 	if err != nil {
 		return err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		f.Close()
+		return errNotRegular
 	}
 	if _, err := f.Write(data); err != nil {
 		f.Close()
@@ -163,6 +181,11 @@ func writeProblem(path string, err error) *problem.Problem {
 	}
 	if errors.Is(err, syscall.ELOOP) {
 		return symlinkRefused(path, path)
+	}
+	// ENXIO is a FIFO opened for writing with no reader on the other end.
+	if errors.Is(err, errNotRegular) || errors.Is(err, syscall.ENXIO) {
+		return problem.InvalidPathFix(path, "the path is not a regular file",
+			"fs_write replaces plain files. Choose a path that is a file or does not exist yet.")
 	}
 	return statProblem(path, err)
 }

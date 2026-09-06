@@ -2,8 +2,12 @@ package manifest_test
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/zyx1121/kitbash/internal/manifest"
 )
@@ -81,5 +85,51 @@ func TestVisible(t *testing.T) {
 	dir := t.TempDir()
 	if _, ok := manifest.Visible(dir); ok {
 		t.Error("a folder without a manifest is not visible")
+	}
+}
+
+// kitbash follows no symlinks, and the manifest is no exception. A link would
+// lend the name and the description of a manifest elsewhere to a folder that
+// carries none, which is how an invisible folder would reach the surface.
+func TestLoadRefusesASymlinkedManifest(t *testing.T) {
+	elsewhere := t.TempDir()
+	real := filepath.Join(elsewhere, manifest.FileName)
+	if err := os.WriteFile(real, []byte("name: borrowed\ndescription: A manifest that lives somewhere else.\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	dir := t.TempDir()
+	if err := os.Symlink(real, filepath.Join(dir, manifest.FileName)); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	if _, err := manifest.Load(dir); !errors.Is(err, syscall.ELOOP) {
+		t.Errorf("Load followed the link, or failed with %v, want ELOOP", err)
+	}
+	if m, ok := manifest.Visible(dir); ok {
+		t.Errorf("a folder whose manifest is a symlink is visible as %q", m.Name)
+	}
+}
+
+// A manifest that is a FIFO must not hang the visibility check either.
+func TestLoadRefusesAManifestThatIsNotARegularFile(t *testing.T) {
+	dir := t.TempDir()
+	if err := syscall.Mkfifo(filepath.Join(dir, manifest.FileName), 0o644); err != nil {
+		t.Skipf("this filesystem has no FIFOs: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := manifest.Load(dir)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, manifest.ErrNotRegular) {
+			t.Errorf("Load failed with %v, want ErrNotRegular", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Load blocked on a FIFO instead of refusing it")
+	}
+	if _, ok := manifest.Visible(dir); ok {
+		t.Error("a folder whose manifest is a FIFO is visible")
 	}
 }
