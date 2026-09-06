@@ -61,6 +61,7 @@ $package_tools:
     forwarded to the container over podman exec. A tool the server offers but
     the manifest does not declare is not published. Package names equal to a
     family name (fs, pkg, proc, tel, users, approvals) are refused at proc_run.
+    Tool names keep the server's spelling (MCP allows [A-Za-z0-9_-]); package names carry no underscore, so the first underscore in a surface name is the split.
     The set is read from the caller's running Processes when a session starts
     and kept current within the session; other sessions see changes when they
     reconnect.

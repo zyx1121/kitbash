@@ -77,9 +77,9 @@
       "properties": {
         "name": {
           "type": "string",
-          "description": "Tool name within the Package namespace. Exposed to agents as <package>.<name>.",
-          "pattern": "^[a-z][a-z0-9_]*$",
-          "maxLength": 48
+          "description": "Tool name within the Package namespace, exactly as the server names it. MCP allows letters, digits, underscore and hyphen. Exposed to agents as <package>_<name>; package names carry no underscore, so the first underscore is the split.",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]*$",
+          "maxLength": 63
         },
         "description": { "type": "string", "minLength": 10, "maxLength": 280 },
         "input": { "$ref": "#/$defs/schemaRef" },
