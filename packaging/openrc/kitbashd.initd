@@ -1,0 +1,28 @@
+#!/sbin/openrc-run
+# kitbashd: the OTLP receiver and Telemetry store, see PLAN.md section 4.1.
+# It listens on one unix socket and reads the caller from its peer credentials,
+# so nothing here opens a port and nothing here handles authentication.
+
+name="kitbashd"
+description="kitbash daemon: OTLP receiver and Telemetry store"
+
+supervisor="supervise-daemon"
+command="/usr/bin/kitbashd"
+pidfile="/run/kitbash/kitbashd.pid"
+output_log="/var/log/kitbashd.log"
+error_log="/var/log/kitbashd.log"
+respawn_delay=5
+respawn_max=0
+
+depend() {
+	need localmount net
+}
+
+start_pre() {
+	# The socket directory is world traversable; the socket itself is
+	# root:kitbash-users 0660 and kitbashd sets that after it binds.
+	checkpath --directory --mode 0755 --owner root:root /run/kitbash
+	# The store holds every member's Telemetry, so only root reads it.
+	checkpath --directory --mode 0700 --owner root:root /var/lib/kitbash
+	checkpath --file --mode 0640 --owner root:root /var/log/kitbashd.log
+}

@@ -58,7 +58,19 @@ if [ -n "${KITBASH_APK:-}" ] && [ -f "$KITBASH_APK" ]; then
 fi
 command -v kitbash-mcp >/dev/null || log "warning: kitbash-mcp not installed yet; sshd ForceCommand will fail until it is"
 
-# 8. /org: shared and root owned. Every top level folder under it is its own
+# 8. kitbashd: the OTLP receiver and Telemetry store. It owns the socket every
+#    member session exports to, so it starts before sshd is reconfigured.
+if command -v kitbashd >/dev/null && [ -x /etc/init.d/kitbashd ]; then
+  log "enabling kitbashd"
+  rc-update -q add kitbashd default 2>/dev/null || true
+  rc-service -q kitbashd restart
+  for _ in 1 2 3 4 5; do [ -S /run/kitbash/kitbashd.sock ] && break; sleep 1; done
+  [ -S /run/kitbash/kitbashd.sock ] || log "warning: kitbashd did not create /run/kitbash/kitbashd.sock; see /var/log/kitbashd.log"
+else
+  log "warning: kitbashd not installed yet; Telemetry is unavailable until it is"
+fi
+
+# 9. /org: shared and root owned. Every top level folder under it is its own
 #    git repository (PLAN.md 2.1); /org itself is a plain directory.
 mkdir -p /org
 seed="${KITBASH_ORG_SEED:-/usr/share/kitbash/org}"
@@ -81,7 +93,7 @@ chmod 750 /org
 find /org -type d -exec chmod 750 {} +
 find /org -type f -exec chmod 640 {} +
 
-# 9. sshd: regular users get the MCP surface and nothing else.
+# 10. sshd: regular users get the MCP surface and nothing else.
 cat > /etc/ssh/sshd_config.d/60-kitbash.conf <<'S'
 # kitbash: SSH is the MCP transport. Members never get a shell.
 PasswordAuthentication no

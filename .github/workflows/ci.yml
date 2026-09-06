@@ -25,3 +25,9 @@ jobs:
           name: kitbash-mcp-linux-amd64
           path: bin/kitbash-mcp-linux-amd64
           if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kitbashd-linux-amd64
+          path: bin/kitbashd-linux-amd64
+          if-no-files-found: error

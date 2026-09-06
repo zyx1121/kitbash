@@ -1,5 +1,4 @@
-BINARY  := kitbash-mcp
-PKG     := ./cmd/kitbash-mcp
+BINARIES := kitbash-mcp kitbashd
 VERSION ?= $(shell git describe --tags --always 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
@@ -7,9 +6,11 @@ LDFLAGS := -s -w -X main.version=$(VERSION)
 
 all: lint test build
 
-## build: static binary for this host
+## build: static binaries for this host
 build:
-	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o bin/$(BINARY) $(PKG)
+	@for b in $(BINARIES); do \
+		CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o bin/$$b ./cmd/$$b || exit 1; \
+	done
 
 ## test: every package
 test:
@@ -23,9 +24,11 @@ lint:
 	fi
 	go vet ./...
 
-## build-linux: the binary kitbash hosts run
+## build-linux: the binaries kitbash hosts run
 build-linux:
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "$(LDFLAGS)" -o bin/$(BINARY)-linux-amd64 $(PKG)
+	@for b in $(BINARIES); do \
+		CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "$(LDFLAGS)" -o bin/$$b-linux-amd64 ./cmd/$$b || exit 1; \
+	done
 
 clean:
 	rm -rf bin
