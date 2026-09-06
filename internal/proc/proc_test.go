@@ -109,8 +109,10 @@ func TestRunLabelsAndNamesTheContainer(t *testing.T) {
 	if process.Container != "kitbash-ffmpeg-ffmpeg" {
 		t.Errorf("container is %q, want kitbash-ffmpeg-ffmpeg", process.Container)
 	}
-	if len(process.Tools) != 1 || process.Tools[0] != "ffmpeg_transcode" {
-		t.Errorf("tools are %v, want ffmpeg_transcode", process.Tools)
+	// The tools a Process adds are the ones the bridge published, which this
+	// service does not know and does not guess at.
+	if len(process.Tools) != 0 {
+		t.Errorf("tools are %v, want none from the service", process.Tools)
 	}
 
 	if len(f.runner.Runs) != 1 {
@@ -316,6 +318,56 @@ func TestRunReplacesOnANewDigest(t *testing.T) {
 	}
 }
 
+// A container name is readable, not unique: two folders may carry the same
+// manifest name. The Package path is the identity, so the second Package is
+// told to pick another name rather than taking the first one's container.
+func TestTwoPackagesWithTheSameNameDoNotShareOneContainer(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	a := f.pack(t, "a", mcpManifest)
+	b := f.pack(t, "b", mcpManifest)
+	f.build(a, "ffmpeg")
+	f.build(b, "ffmpeg")
+
+	first, prob := f.processes.Run(ctx, a, "", "")
+	if prob != nil {
+		t.Fatalf("Run a: %s", prob.Detail)
+	}
+	_, prob = f.processes.Run(ctx, b, "", "")
+	if prob == nil {
+		t.Fatal("the second Package took the first Package's container")
+	}
+	if prob.Slug() != problem.SlugConflict {
+		t.Fatalf("problem is %s, want conflict", prob.Slug())
+	}
+	if !strings.Contains(prob.Detail, a) {
+		t.Errorf("detail is %q, want it to name the Package that owns the name", prob.Detail)
+	}
+	if !strings.Contains(prob.Fix, "different name") {
+		t.Errorf("fix is %q, want it to say to pass a different name", prob.Fix)
+	}
+	if len(f.runner.Removed) != 0 {
+		t.Errorf("the first Package's container was removed: %v", f.runner.Removed)
+	}
+
+	list, prob := f.processes.List(ctx)
+	if prob != nil {
+		t.Fatalf("List: %s", prob.Detail)
+	}
+	if len(list.Processes) != 1 || list.Processes[0].ID != first.ID {
+		t.Errorf("the Process list is %+v, want only the first Process", list.Processes)
+	}
+
+	// The second Package runs perfectly well under a name of its own.
+	second, prob := f.processes.Run(ctx, b, "", "other")
+	if prob != nil {
+		t.Fatalf("Run b under another name: %s", prob.Detail)
+	}
+	if second.Container == first.Container {
+		t.Errorf("both Processes are in container %s", second.Container)
+	}
+}
+
 func TestRunRefusesAReservedPackageName(t *testing.T) {
 	f := newFixture(t)
 	folder := f.pack(t, "proc", `name: proc
@@ -457,10 +509,15 @@ func TestStateMapping(t *testing.T) {
 	}{
 		{name: "running", container: podman.Container{State: "running"}, want: proc.StateRunning},
 		{name: "created", container: podman.Container{State: "created"}, want: proc.StateStarting},
-		{name: "initialized", container: podman.Container{State: "initialized"}, want: proc.StateStarting},
+		{name: "configured", container: podman.Container{State: "configured"}, want: proc.StateStarting},
 		{name: "exited cleanly", container: podman.Container{State: "exited"}, want: proc.StateStopped},
 		{name: "exited badly", container: podman.Container{State: "exited", ExitCode: 2}, want: proc.StateFailed},
+		{name: "stopped", container: podman.Container{State: "stopped"}, want: proc.StateStopped},
+		{name: "stopping", container: podman.Container{State: "stopping"}, want: proc.StateStopped},
+		{name: "removing", container: podman.Container{State: "removing"}, want: proc.StateStopped},
 		{name: "paused", container: podman.Container{State: "paused"}, want: proc.StateUnhealthy},
+		// A word the runtime has never spoken is not a healthy Process.
+		{name: "unknown", container: podman.Container{State: "wedged"}, want: proc.StateFailed},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

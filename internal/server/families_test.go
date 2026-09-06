@@ -200,6 +200,96 @@ func TestBuildRunListAndStopOverTheSurface(t *testing.T) {
 	}
 }
 
+// twinManifest is a Package whose tools land on the same surface name as
+// another Package's, which is what two folders with one manifest name do.
+const twinManifest = `name: twin
+description: A Package that publishes one tool, for the surface name conflict.
+provides:
+  tools:
+    - name: go
+      description: A tool that exists to occupy a name on the caller's surface.
+      input: { type: object }
+      output: { type: object }
+deploy:
+  units:
+    - type: container
+      build: .
+      expose: mcp
+`
+
+// The second Process runs, but its tools cannot join a surface that already
+// answers those names, and proc_run says so rather than quietly shadowing the
+// first Package.
+func TestProcRunReportsToolsThatCouldNotJoinTheSurface(t *testing.T) {
+	w := newWhole(t)
+	s := connectWhole(t, w)
+
+	run := func(folder, name string) *mcp.CallToolResult {
+		t.Helper()
+		ok(t, call(t, s, "fs_write", map[string]any{
+			"path":    filepath.Join(folder, "kitbash.yaml"),
+			"content": twinManifest,
+			"message": "Add a twin Package",
+		}), "fs_write")
+		ok(t, call(t, s, "fs_write", map[string]any{
+			"path":    filepath.Join(folder, "Containerfile"),
+			"content": "FROM alpine\n",
+			"message": "Add the Containerfile",
+		}), "fs_write")
+		ok(t, call(t, s, "pkg_build", map[string]any{"path": folder}), "pkg_build")
+		return call(t, s, "proc_run", map[string]any{"package": folder, "name": name})
+	}
+
+	first := run(filepath.Join(w.root, "twin-a"), "twin")
+	ok(t, first, "proc_run")
+	if tools := structured[proc.Process](t, first).Tools; len(tools) != 1 || tools[0] != "twin_go" {
+		t.Fatalf("the first Process published %v, want twin_go", tools)
+	}
+
+	second := run(filepath.Join(w.root, "twin-b"), "other")
+	p := problemOf(t, second)
+	if p.Slug() != problem.SlugConflict {
+		t.Errorf("problem is %s, want conflict", p.Slug())
+	}
+	if !strings.Contains(p.Detail, "twin_go") {
+		t.Errorf("detail is %q, want it to name the tool", p.Detail)
+	}
+	if !strings.Contains(p.Detail, "running") {
+		t.Errorf("detail is %q, want it to say the Process is running", p.Detail)
+	}
+
+	// Both Processes are running; only the surface is unchanged.
+	res := call(t, s, "proc_list", map[string]any{})
+	ok(t, res, "proc_list")
+	if list := structured[proc.ListResult](t, res); len(list.Processes) != 2 {
+		t.Errorf("proc_list is %+v, want both Processes", list.Processes)
+	}
+	names := toolNames(t, s)
+	seen := 0
+	for _, name := range names {
+		if name == "twin_go" {
+			seen++
+		}
+	}
+	if seen != 1 {
+		t.Errorf("tools/list carries twin_go %d times: %v", seen, names)
+	}
+}
+
+// toolNames lists the surface as it stands.
+func toolNames(t *testing.T, s *mcp.ClientSession) []string {
+	t.Helper()
+	tools, err := s.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("tools/list: %v", err)
+	}
+	var names []string
+	for _, tool := range tools.Tools {
+		names = append(names, tool.Name)
+	}
+	return names
+}
+
 func TestPkgImportWithoutAKitIsNotFound(t *testing.T) {
 	w := newWhole(t)
 	s := connectWhole(t, w)

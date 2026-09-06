@@ -83,9 +83,11 @@ func TestSplitLines(t *testing.T) {
 	}
 }
 
+// The double dash keeps an entrypoint that takes its own flags out of podman's
+// option parsing.
 func TestExecArgvHoldsStdinOpen(t *testing.T) {
 	argv := (&CLI{}).ExecArgv("kitbash-ffmpeg-ffmpeg", []string{"/bin/server", "--stdio"})
-	want := []string{Binary, "exec", "--interactive", "kitbash-ffmpeg-ffmpeg", "/bin/server", "--stdio"}
+	want := []string{Binary, "exec", "--interactive", "kitbash-ffmpeg-ffmpeg", "--", "/bin/server", "--stdio"}
 	if strings.Join(argv, " ") != strings.Join(want, " ") {
 		t.Errorf("ExecArgv is %v, want %v", argv, want)
 	}

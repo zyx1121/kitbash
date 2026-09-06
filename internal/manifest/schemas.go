@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
+
+	"github.com/zyx1121/kitbash/internal/safepath"
 )
 
 // MaxSchemaBytes caps one schema file. A tool schema is metadata, and the
@@ -47,13 +49,9 @@ func resolveSchema(dir, tool, field string, schema map[string]any) (map[string]a
 		return schema, nil
 	}
 	where := fmt.Sprintf("tool %s %s schema", tool, field)
-	if err := checkRef(dir, ref); err != nil {
-		return nil, &ErrInvalid{Messages: []string{where + ": " + err.Error()}}
-	}
-	path := filepath.Join(dir, ref)
-	f, err := os.Open(path)
+	f, err := openSchema(dir, ref)
 	if err != nil {
-		return nil, &ErrInvalid{Messages: []string{fmt.Sprintf("%s: %s cannot be read", where, ref)}}
+		return nil, &ErrInvalid{Messages: []string{where + ": " + err.Error()}}
 	}
 	defer f.Close()
 	data, err := io.ReadAll(io.LimitReader(f, MaxSchemaBytes+1))
@@ -75,33 +73,31 @@ func resolveSchema(dir, tool, field string, schema map[string]any) (map[string]a
 	return object, nil
 }
 
-// checkRef applies the path rules a schema reference lives under. They are the
-// fs rules, stated again here because a manifest is data the core reads
-// without the fs service in the way.
-func checkRef(dir, ref string) error {
-	if ref == "" || filepath.IsAbs(ref) {
-		return fmt.Errorf("%q is not a relative path inside this folder", ref)
+// openSchema opens one schema file inside the Package folder. The reference
+// obeys the same path rules as every other path the surface takes, and the
+// file has to be a regular file opened without blocking: a named pipe called
+// schemas/x.json would otherwise hold a session open forever.
+func openSchema(dir, ref string) (*os.File, error) {
+	if ref == "." {
+		return nil, fmt.Errorf("%q is not a schema file", ref)
 	}
-	current := dir
-	for _, segment := range strings.Split(filepath.ToSlash(ref), "/") {
-		switch {
-		case segment == "":
-			return fmt.Errorf("%q has an empty path component", ref)
-		case segment == "..":
-			return fmt.Errorf("%q leaves this folder", ref)
-		case strings.HasPrefix(segment, "."):
-			return fmt.Errorf("%q has a component beginning with a dot, which is reserved", ref)
-		}
-		current = filepath.Join(current, segment)
-		info, err := os.Lstat(current)
-		if err != nil {
-			return fmt.Errorf("%q does not exist", ref)
-		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("%q passes through a symlink, and kitbash does not follow symlinks", ref)
-		}
+	path, err := safepath.Inside(dir, ref)
+	if err != nil {
+		return nil, err
 	}
-	return nil
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("%q does not exist", ref)
+		}
+		return nil, fmt.Errorf("%q cannot be read", ref)
+	}
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		f.Close()
+		return nil, fmt.Errorf("%q is not a regular file", ref)
+	}
+	return f, nil
 }
 
 // ValidateInput reports whether a JSON document satisfies the tool's input
@@ -138,6 +134,27 @@ func validateAgainst(schema map[string]any, data []byte) error {
 // self contained, so the identifier only has to be stable.
 const toolSchemaURL = "https://kitbash.zyx.tw/tool-schema.json"
 
+// noLoader refuses every reference a schema makes to somewhere else. The
+// validator's default loader reads file:// and http:// URLs, so a tool schema
+// could name a host file and have its contents echoed back in a validation
+// message. A tool schema is self contained: the only references kitbash
+// resolves are the {"$ref": "schemas/x.json"} in the manifest, which
+// ResolveSchemas reads itself under the folder rules.
+type noLoader struct{}
+
+func (noLoader) Load(url string) (any, error) {
+	return nil, fmt.Errorf("this schema refers to %s, and kitbash resolves no references outside the schema itself", url)
+}
+
+// NewCompiler is the only compiler kitbash builds: 2020-12, and no reach off
+// the page.
+func NewCompiler() *jsonschema.Compiler {
+	c := jsonschema.NewCompiler()
+	c.DefaultDraft(jsonschema.Draft2020)
+	c.UseLoader(noLoader{})
+	return c
+}
+
 func compile(schema map[string]any) (*jsonschema.Schema, error) {
 	encoded, err := json.Marshal(schema)
 	if err != nil {
@@ -147,8 +164,7 @@ func compile(schema map[string]any) (*jsonschema.Schema, error) {
 	if err != nil {
 		return nil, fmt.Errorf("the schema is not valid JSON: %w", err)
 	}
-	c := jsonschema.NewCompiler()
-	c.DefaultDraft(jsonschema.Draft2020)
+	c := NewCompiler()
 	if err := c.AddResource(toolSchemaURL, doc); err != nil {
 		return nil, fmt.Errorf("the schema cannot be compiled: %w", err)
 	}

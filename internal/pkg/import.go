@@ -12,6 +12,7 @@ import (
 	"github.com/zyx1121/kitbash/internal/manifest"
 	"github.com/zyx1121/kitbash/internal/problem"
 	"github.com/zyx1121/kitbash/internal/proc"
+	"github.com/zyx1121/kitbash/internal/safepath"
 )
 
 // Kits is what pkg_import needs from the MCP bridge: the caller's running
@@ -126,6 +127,11 @@ func importFiles(path string, raw json.RawMessage) ([]fs.File, *problem.Problem)
 	files := make([]fs.File, 0, len(out.Files))
 	manifestFound := false
 	for _, file := range out.Files {
+		if file.Path == "." {
+			return nil, problem.InvalidPathFix(path,
+				"the import kit returned the folder itself as a file",
+				"Ask the kit's author to return one path per file.")
+		}
 		if prob := checkImportPath(path, file.Path); prob != nil {
 			return nil, prob
 		}
@@ -149,18 +155,10 @@ func importFiles(path string, raw json.RawMessage) ([]fs.File, *problem.Problem)
 // applies them again when it writes; saying here that the kit is at fault is
 // what makes the error actionable.
 func checkImportPath(folder, rel string) *problem.Problem {
-	instance := filepath.Join(folder, rel)
-	if rel == "" || filepath.IsAbs(rel) {
-		return problem.InvalidPathFix(folder,
-			fmt.Sprintf("the import kit returned %q, which is not a relative path", rel),
-			"Ask the kit's author to return paths relative to the target folder.")
-	}
-	for _, segment := range strings.Split(filepath.ToSlash(rel), "/") {
-		if segment == "" || segment == ".." || strings.HasPrefix(segment, ".") {
-			return problem.InvalidPathFix(instance,
-				fmt.Sprintf("the import kit returned %q, which has a %q component", rel, segment),
-				"Ask the kit's author to return plain relative paths with no dot component.")
-		}
+	if _, err := safepath.Inside(folder, rel); err != nil {
+		return problem.InvalidPathFix(filepath.Join(folder, filepath.Base(rel)),
+			fmt.Sprintf("the import kit returned a path kitbash will not write: %s", err),
+			"Ask the kit's author to return plain relative paths inside the target folder.")
 	}
 	return nil
 }

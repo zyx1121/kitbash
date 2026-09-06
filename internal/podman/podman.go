@@ -45,12 +45,16 @@ const (
 	LabelExpose  = "kitbash.expose"
 )
 
-// Container states the runtime reports.
+// Container states the runtime reports, lowercased.
 const (
-	StateRunning     = "running"
-	StateCreated     = "created"
-	StateInitialized = "initialized"
-	StateExited      = "exited"
+	StateRunning    = "running"
+	StateCreated    = "created"
+	StateConfigured = "configured"
+	StateExited     = "exited"
+	StateStopped    = "stopped"
+	StateStopping   = "stopping"
+	StateRemoving   = "removing"
+	StatePaused     = "paused"
 )
 
 // Filter selects images or containers by label. An empty filter matches

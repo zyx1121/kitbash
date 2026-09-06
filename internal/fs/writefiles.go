@@ -6,10 +6,19 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/zyx1121/kitbash/internal/manifest"
 	"github.com/zyx1121/kitbash/internal/problem"
+	"github.com/zyx1121/kitbash/internal/safepath"
+)
+
+// MaxFiles and MaxTotalBytes bound one multi file write. An import kit is a
+// Package like any other, so what it hands back is input: a folder arriving as
+// a thousand files, or as one enormous one, is refused before any of it is
+// written.
+const (
+	MaxFiles      = 256
+	MaxTotalBytes = 8 << 20
 )
 
 // File is one file of a multi file write. Exactly one of Content and
@@ -50,6 +59,11 @@ func (s *Service) WriteFiles(ctx context.Context, folder string, files []File, m
 		return nil, problem.BadRequest(clean, "no files were given to write",
 			"Send at least one file.")
 	}
+	if len(files) > MaxFiles {
+		return nil, problem.TooLarge(clean,
+			fmt.Sprintf("the write holds %d files, over the %d file limit", len(files), MaxFiles),
+			"Write the folder in several calls, or import a smaller Package.")
+	}
 	repo, ok := s.topFolder(clean)
 	if !ok {
 		return nil, problem.InvalidPath(clean,
@@ -68,6 +82,7 @@ func (s *Service) WriteFiles(ctx context.Context, folder string, files []File, m
 	}
 	planned := make([]pending, 0, len(files))
 	seen := map[string]bool{}
+	total := 0
 	for _, file := range files {
 		if prob := checkRelative(clean, file.Path); prob != nil {
 			return nil, prob
@@ -93,6 +108,12 @@ func (s *Service) WriteFiles(ctx context.Context, folder string, files []File, m
 			return nil, problem.TooLarge(full,
 				fmt.Sprintf("the content is %d bytes, over the %d byte limit", len(data), MaxBytes),
 				"Split the file, or build the content inside a Package instead.")
+		}
+		total += len(data)
+		if total > MaxTotalBytes {
+			return nil, problem.TooLarge(clean,
+				fmt.Sprintf("the write is over the %d byte limit for one folder", MaxTotalBytes),
+				"Write the folder in several calls, or import a smaller Package.")
 		}
 		if filepath.Base(full) == manifest.FileName {
 			if _, err := manifest.Parse(data); err != nil {
@@ -162,30 +183,16 @@ func (s *Service) Exists(_ context.Context, path string) (bool, *problem.Problem
 }
 
 // checkRelative applies the path rules to one entry of a file list. resolve
-// catches dot components and symlinks once the path is joined; this catches
-// the ways a relative path escapes the folder before that.
+// applies the root rules once the path is joined; this says which entry of the
+// list broke, and refuses the ways a relative path escapes the folder.
 func checkRelative(folder, rel string) *problem.Problem {
-	instance := filepath.Join(folder, rel)
-	if rel == "" {
-		return problem.InvalidPath(folder, "a file in the list has an empty path")
+	if rel == "." {
+		return problem.InvalidPathFix(folder, "a file in the list names the folder itself",
+			"Send one path per file, such as src/main.go.")
 	}
-	if filepath.IsAbs(rel) {
-		return problem.InvalidPathFix(instance, fmt.Sprintf("%q is not a relative path", rel),
-			"Send paths relative to the folder, without a leading slash.")
-	}
-	for _, segment := range strings.Split(filepath.ToSlash(rel), "/") {
-		switch {
-		case segment == "" || segment == ".":
-			return problem.InvalidPathFix(instance, fmt.Sprintf("%q has an empty path component", rel),
-				"Send a clean relative path, such as src/main.go.")
-		case segment == "..":
-			return problem.InvalidPathFix(instance, fmt.Sprintf("%q leaves the folder", rel),
-				"Send paths inside the folder only.")
-		case strings.HasPrefix(segment, "."):
-			return problem.InvalidPathFix(instance,
-				fmt.Sprintf("the path component %q begins with a dot", segment),
-				"Names beginning with a dot are reserved.")
-		}
+	if _, err := safepath.Inside(folder, rel); err != nil {
+		return problem.InvalidPathFix(filepath.Join(folder, filepath.Base(rel)), err.Error(),
+			"Send plain relative paths inside the folder, such as src/main.go.")
 	}
 	return nil
 }

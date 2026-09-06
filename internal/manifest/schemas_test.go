@@ -4,7 +4,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/zyx1121/kitbash/internal/manifest"
 )
@@ -124,6 +126,37 @@ func TestResolveSchemasRefusesASymlinkedSchema(t *testing.T) {
 	}
 	if _, err := m.ResolveSchemas(dir); err == nil {
 		t.Fatal("a symlinked schema was accepted")
+	}
+}
+
+// A schema file that is a named pipe blocks on open, which would hang the
+// session that read it. It is opened without blocking and refused for not
+// being a regular file.
+func TestResolveSchemasRefusesANamedPipe(t *testing.T) {
+	m, dir := withTools(t, "schemas/probe.in.json")
+	if err := os.MkdirAll(filepath.Join(dir, "schemas"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pipe := filepath.Join(dir, "schemas", "probe.in.json")
+	if err := syscall.Mkfifo(pipe, 0o600); err != nil {
+		t.Skipf("this filesystem does not do named pipes: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := m.ResolveSchemas(dir)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("a named pipe was accepted as a schema file")
+		}
+		if !strings.Contains(err.Error(), "regular file") {
+			t.Errorf("error is %q, want it to say the file is not a regular file", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ResolveSchemas blocked on a named pipe")
 	}
 }
 

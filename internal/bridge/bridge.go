@@ -59,6 +59,7 @@ type Bridge struct {
 	mu        sync.Mutex
 	server    *mcp.Server
 	published map[string][]string           // Process id to the surface tool names it added
+	owners    map[string]string             // surface tool name to the Process id that answers it
 	sessions  map[string]*mcp.ClientSession // Process id to its open session
 }
 
@@ -70,6 +71,7 @@ func New(files *fs.Service, processes *proc.Service, runner podman.Runner) *Brid
 		runner:    runner,
 		logger:    log.New(os.Stderr, "kitbash: ", log.LstdFlags),
 		published: map[string][]string{},
+		owners:    map[string]string{},
 		sessions:  map[string]*mcp.ClientSession{},
 	}
 	b.transport = b.execTransport
@@ -107,8 +109,10 @@ func (b *Bridge) Sync(ctx context.Context) {
 			continue
 		}
 		if prob := b.Add(ctx, &p); prob != nil {
-			// A Package whose folder went out of the surface is skipped, not
-			// fatal: the rest of the surface still works.
+			// A Package whose folder went out of the surface, whose manifest
+			// now names a built in family, or whose names another Process
+			// already answers is skipped, not fatal: the rest of the surface
+			// still works, and the reason is in the server log.
 			b.logger.Printf("bridge: skipping Process %s at %s: %s", p.ID, p.Package, prob.Detail)
 		}
 	}
@@ -123,6 +127,14 @@ func (b *Bridge) Add(ctx context.Context, p *proc.Process) *problem.Problem {
 	if prob != nil {
 		return prob
 	}
+	// proc_run refuses a reserved Package name, but a manifest can be rewritten
+	// after the Process started, and this session reads the manifest as it is
+	// now. A Package that renamed itself into a built in family would take
+	// fs_list off the surface, so the check belongs here too.
+	if manifest.Reserved(m.Name) {
+		return problem.InvalidManifest(folder, fmt.Sprintf(
+			"the Package name %q is a built in tool family, so its tools cannot join the surface", m.Name))
+	}
 	tools, err := m.ResolveSchemas(folder)
 	if err != nil {
 		return problem.InvalidManifest(folder, err.Error())
@@ -133,18 +145,47 @@ func (b *Bridge) Add(ctx context.Context, p *proc.Process) *problem.Problem {
 	if b.server == nil {
 		return problem.Internal(p.Package, "the bridge is not attached to a server", "")
 	}
+	// This Process gives up the names it held before it publishes again, so a
+	// second Add for the same Process never collides with itself.
 	b.remove(p.ID)
 	var names []string
+	var taken []string
 	for _, tool := range tools {
 		surface := proc.ToolName(m.Name, tool.Name)
-		if err := b.addTool(p, surface, tool); err != nil {
-			b.logger.Printf("bridge: not publishing %s: %v", surface, err)
+		if reservedSurface(surface) {
+			b.logger.Printf("bridge: not publishing %s: the name is inside a built in tool family", surface)
+			taken = append(taken, surface)
 			continue
 		}
+		if owner, held := b.owners[surface]; held && owner != p.ID {
+			b.logger.Printf("bridge: not publishing %s: Process %s already answers it", surface, owner)
+			taken = append(taken, surface)
+			continue
+		}
+		if err := b.addTool(p, surface, tool); err != nil {
+			b.logger.Printf("bridge: not publishing %s: %v", surface, err)
+			taken = append(taken, surface)
+			continue
+		}
+		b.owners[surface] = p.ID
 		names = append(names, surface)
 	}
 	b.published[p.ID] = names
+	if len(taken) > 0 {
+		return problem.ConflictFix(p.Package, fmt.Sprintf(
+			"this Process is running, but %s could not join the surface because those names are already answered",
+			strings.Join(taken, ", ")),
+			"Stop the Process that answers those names with proc_stop, or rename this Package, then run it again.")
+	}
 	return nil
+}
+
+// reservedSurface reports whether a surface name sits inside a built in tool
+// family. Package names carry no underscore, so the first underscore is the
+// split between the namespace and the tool, see spec/mcp-surface.yaml.
+func reservedSurface(surface string) bool {
+	namespace, _, found := strings.Cut(surface, "_")
+	return !found || manifest.Reserved(namespace)
 }
 
 // Remove unpublishes the tools of one Process and closes its session. It is
@@ -168,10 +209,20 @@ func (b *Bridge) Close() {
 	}
 }
 
-// remove drops one Process from the surface. The caller holds the lock.
+// remove drops one Process from the surface. It unpublishes only the names
+// this Process owns: another Process may have taken a name since, and removing
+// it would take that one off the surface instead. The caller holds the lock.
 func (b *Bridge) remove(id string) {
-	if names := b.published[id]; len(names) > 0 && b.server != nil {
-		b.server.RemoveTools(names...)
+	var mine []string
+	for _, surface := range b.published[id] {
+		if b.owners[surface] != id {
+			continue
+		}
+		delete(b.owners, surface)
+		mine = append(mine, surface)
+	}
+	if len(mine) > 0 && b.server != nil {
+		b.server.RemoveTools(mine...)
 	}
 	delete(b.published, id)
 	b.closeSession(id)
@@ -256,12 +307,17 @@ func (b *Bridge) call(ctx context.Context, p *proc.Process, tool manifest.Tool, 
 	}
 	if res.IsError {
 		return nil, problem.BadRequest(surface, remoteText(res),
-			"Read the Package's own error, fix the arguments, and call the tool again.")
+			"The Package refused the call; read the detail.")
+	}
+	if res.StructuredContent == nil {
+		// A tool that answers in prose is answering, not misbehaving. There is
+		// nothing to validate against the manifest, so the content goes
+		// through as it came.
+		return &mcp.CallToolResult{Content: res.Content}, nil
 	}
 	structured, err := json.Marshal(res.StructuredContent)
-	if err != nil || res.StructuredContent == nil {
-		return nil, problem.InternalDetail(surface,
-			fmt.Sprintf("the Package returned no structured content for %s", tool.Name),
+	if err != nil {
+		return nil, problem.InternalDetail(surface, err.Error(),
 			"the Package returned output that does not match its manifest",
 			"Ask the Package's author to return the output its manifest declares.")
 	}

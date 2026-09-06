@@ -145,11 +145,18 @@ func (s *Service) Run(ctx context.Context, path, digest, name string) (*Process,
 	}
 	var replaced *Process
 	if existing != nil {
+		if owner := existing.Labels[podman.LabelPackage]; owner != folder {
+			// The container name is readable rather than unique: two folders
+			// may carry the same manifest name. The Package path is the
+			// identity, so this Process belongs to someone else.
+			return nil, problem.ConflictFix(folder, fmt.Sprintf(
+				"a Process named %s already exists for %s", name, owner),
+				"Pass a different name to proc_run, or stop that Process first.")
+		}
 		if existing.Labels[podman.LabelDigest] == image.ID && existing.State == podman.StateRunning {
 			// Already converged. Repeating the call is safe and changes
 			// nothing, which is the invariant in PLAN.md section 2.6.
 			process := s.describe(*existing, unit)
-			process.Tools = toolNames(m, unit)
 			return &process, nil
 		}
 		previous := s.describe(*existing, unit)
@@ -179,7 +186,6 @@ func (s *Service) Run(ctx context.Context, path, digest, name string) (*Process,
 		return nil, problem.Internal(folder, "the container was started but is not in the container list", "")
 	}
 	process := s.describe(*started, unit)
-	process.Tools = toolNames(m, unit)
 	process.Replaced = replaced
 	return &process, nil
 }
@@ -309,34 +315,27 @@ func (s *Service) describe(container podman.Container, unit manifest.Unit) Proce
 }
 
 // State maps a container state onto the five states the surface publishes.
-// Health probing arrives with the daemon, so unhealthy is only reported for a
-// state the runtime cannot explain, see PLAN.md section 5.5.
+// Health probing arrives with the daemon, so paused is the only state reported
+// unhealthy today, see PLAN.md section 5.5. A state the runtime has never
+// spoken is reported failed rather than healthy: not knowing is not fine.
 func State(container podman.Container) string {
 	switch container.State {
 	case podman.StateRunning:
 		return StateRunning
-	case podman.StateCreated, podman.StateInitialized:
+	case podman.StateCreated, podman.StateConfigured:
 		return StateStarting
+	case podman.StateStopped, podman.StateStopping, podman.StateRemoving:
+		return StateStopped
+	case podman.StatePaused:
+		return StateUnhealthy
 	case podman.StateExited:
 		if container.ExitCode == 0 {
 			return StateStopped
 		}
 		return StateFailed
 	default:
-		return StateUnhealthy
+		return StateFailed
 	}
-}
-
-// toolNames are the surface names a Process with expose: mcp adds.
-func toolNames(m *manifest.Manifest, unit manifest.Unit) []string {
-	if unit.Expose != manifest.ExposeMCP {
-		return nil
-	}
-	var names []string
-	for _, tool := range m.Tools() {
-		names = append(names, ToolName(m.Name, tool.Name))
-	}
-	return names
 }
 
 // ToolName is how a Package tool appears on the caller's surface. MCP tool

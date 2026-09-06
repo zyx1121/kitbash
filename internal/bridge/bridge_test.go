@@ -301,6 +301,39 @@ func TestRemoteErrorBecomesABadRequest(t *testing.T) {
 	if !strings.Contains(p.Detail, "no such file") {
 		t.Errorf("detail is %q, want the Package's own message", p.Detail)
 	}
+	if p.Fix != "The Package refused the call; read the detail." {
+		t.Errorf("fix is %q, want it to point at the Package's own message", p.Fix)
+	}
+}
+
+// Not every tool answers with a structure. A text only result has nothing to
+// validate against the manifest, so it goes through as it came.
+func TestTextOnlyResultPassesThrough(t *testing.T) {
+	h := newHarness(t, func(_ context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: "the file is 12 seconds long"}},
+		}, nil
+	})
+	h.run(t)
+	s := h.connect(t)
+
+	res, err := s.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "ffmpeg_transcode",
+		Arguments: map[string]any{"path": "/org/media/clip.mov"},
+	})
+	if err != nil {
+		t.Fatalf("calling the tool: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("a text only answer was reported as an error: %+v", res.Content)
+	}
+	if len(res.Content) != 1 {
+		t.Fatalf("the result carries %d content blocks, want the one the Package sent", len(res.Content))
+	}
+	text, ok := res.Content[0].(*mcp.TextContent)
+	if !ok || text.Text != "the file is 12 seconds long" {
+		t.Errorf("the content is %+v, want the Package's own text", res.Content[0])
+	}
 }
 
 func TestOutputThatBreaksTheManifestIsReported(t *testing.T) {

@@ -12,7 +12,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -20,6 +19,7 @@ import (
 	"github.com/zyx1121/kitbash/internal/manifest"
 	"github.com/zyx1121/kitbash/internal/podman"
 	"github.com/zyx1121/kitbash/internal/problem"
+	"github.com/zyx1121/kitbash/internal/safepath"
 )
 
 // Containerfile names a build context may carry, most preferred first.
@@ -222,15 +222,15 @@ func (s *Service) Inspect(ctx context.Context, path string) (*InspectResult, *pr
 
 // buildContext resolves deploy.units[0].build against the Package folder. A
 // Package cannot reach outside its own tree at build time, which is rule 4 of
-// PLAN.md section 2.5.
+// PLAN.md section 2.5, and a symlink is a way out of the tree that looks like
+// a way in, so safepath walks it rather than comparing strings.
 func buildContext(folder, build string) (string, *problem.Problem) {
-	dir := filepath.Clean(filepath.Join(folder, build))
-	rel, err := filepath.Rel(folder, dir)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+	dir, err := safepath.Inside(folder, build)
+	if err != nil {
 		return "", problem.InvalidManifest(folder,
-			fmt.Sprintf("the build context %q is outside the Package folder", build))
+			fmt.Sprintf("the build context %q is outside the Package folder: %s", build, err))
 	}
-	info, err := os.Stat(dir)
+	info, err := os.Lstat(dir)
 	if err != nil || !info.IsDir() {
 		return "", problem.NotFoundFix(dir,
 			fmt.Sprintf("the build context %q is not a folder", build),
@@ -244,7 +244,10 @@ func buildContext(folder, build string) (string, *problem.Problem) {
 // writes by habit.
 func findContainerfile(contextDir string) (string, *problem.Problem) {
 	for _, name := range containerfiles {
-		candidate := filepath.Join(contextDir, name)
+		candidate, err := safepath.Inside(contextDir, name)
+		if err != nil {
+			continue
+		}
 		info, err := os.Lstat(candidate)
 		if err != nil || !info.Mode().IsRegular() {
 			continue

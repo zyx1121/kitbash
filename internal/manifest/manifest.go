@@ -58,8 +58,7 @@ func schema() (*jsonschema.Schema, error) {
 			compileErr = fmt.Errorf("reading embedded manifest schema: %w", err)
 			return
 		}
-		c := jsonschema.NewCompiler()
-		c.DefaultDraft(jsonschema.Draft2020)
+		c := NewCompiler()
 		if err := c.AddResource(spec.ManifestSchemaURL, doc); err != nil {
 			compileErr = fmt.Errorf("adding embedded manifest schema: %w", err)
 			return

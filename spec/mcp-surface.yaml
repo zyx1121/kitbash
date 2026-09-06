@@ -322,7 +322,11 @@ families:
           container is named kitbash-<package>-<name> and labelled kitbash.id,
           kitbash.user, kitbash.package, kitbash.name and kitbash.digest. With
           expose: mcp the manifest's tools join the caller's surface, see
-          $package_tools. Version 1 runs the first container unit.
+          $package_tools. A Process is identified by its Package path, not by
+          its container name: a name already held by a Process of another
+          Package is a conflict, and so is a tool name another running Process
+          already answers, which leaves the Process running with its tools off
+          the surface. Version 1 runs the first container unit.
         input:
           type: object
           additionalProperties: false
@@ -343,7 +347,7 @@ families:
             expose: { type: string, enum: [mcp, http, none] }
             endpoint: { type: string, description: "Internal URL when expose is http" }
             tools: { type: array, items: { type: string }, description: "Surface tool names added when expose is mcp" }
-        errors: [not-found, not-visible, not-permitted, invalid-path, invalid-manifest, internal]
+        errors: [not-found, not-visible, not-permitted, invalid-path, invalid-manifest, conflict, internal]
       proc_list:
         description: Processes owned by the caller, running or stopped. Admins see all from M5.
         input: { type: object, additionalProperties: false, properties: {} }

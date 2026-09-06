@@ -60,7 +60,9 @@ func RegisterProcesses(s *mcp.Server, processes *proc.Service, b *bridge.Bridge)
 			"to that digest. Idempotent: same name and digest returns the running Process, a different " +
 			"digest replaces it. The container is named kitbash-<package>-<name> and labelled kitbash.id, " +
 			"kitbash.user, kitbash.package, kitbash.name and kitbash.digest. With expose: mcp the manifest's " +
-			"tools join the caller's surface. Version 1 runs the first container unit.",
+			"tools join the caller's surface. A Process is identified by its Package path, so a name held " +
+			"by a Process of another Package is a conflict, and so is a tool name another running Process " +
+			"already answers. Version 1 runs the first container unit.",
 		InputSchema:  procRunInputSchema,
 		OutputSchema: procRunOutputSchema,
 	}, runHandler(processes, b))
@@ -165,11 +167,17 @@ func runHandler(processes *proc.Service, b *bridge.Bridge) mcp.ToolHandlerFor[ru
 			// A run that replaced an older Process takes its tools off the
 			// surface before it puts its own on.
 			b.Remove(out.Replaced)
-			if prob := b.Add(ctx, out); prob != nil {
-				// The Process is running either way; only its tools are
-				// missing, so the run is reported as the success it was.
-				out.Tools = nil
+			prob := b.Add(ctx, out)
+			// The Process reports the tools that are on the surface, which is
+			// what the bridge published and not what the manifest declares.
+			out.Tools = b.Tools(out.ID)
+			if prob != nil {
+				// The Process is running; its tools are not all on the
+				// surface, and the caller is the one who can resolve that.
+				return errorResult(prob), nil, nil
 			}
+		} else {
+			out.Tools = nil
 		}
 		return structuredResult(out)
 	}
