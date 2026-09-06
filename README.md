@@ -34,7 +34,7 @@ claude mcp add kitbash -- ssh alice@kitbash.example.org
 
 ## Status
 
-M1 Boot in progress. Read [PLAN.md](PLAN.md): positioning, the four object model, kits, kitbashOS, and version 1 milestones. Machine readable definitions live in [`spec/`](spec/).
+M1 Boot done (v0.1.0). M2 Packages in progress. Read [PLAN.md](PLAN.md): positioning, the four object model, kits, kitbashOS, and version 1 milestones. Machine readable definitions live in [`spec/`](spec/).
 
 ## Development
 
