@@ -8,9 +8,12 @@ package proc
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/zyx1121/kitbash/internal/fs"
@@ -115,6 +118,27 @@ func (s *Service) Run(ctx context.Context, path, digest, name string) (*Process,
 	}
 	container := ContainerName(m.Name, name)
 
+	// The whole run command is built and checked before anything is removed.
+	// Replacing a Process destroys the old container, so every failure that
+	// can be found without the runtime has to be found first.
+	opts := podman.RunOptions{
+		Name:        container,
+		Image:       image.ID,
+		Labels:      s.labels(folder, name, image.ID, unit.Expose),
+		Env:         unit.Env,
+		Restart:     restartPolicy(unit.Restart),
+		CPUs:        unit.Limits.CPU,
+		Memory:      memoryLimit(unit.Limits.Memory),
+		Detach:      true,
+		Interactive: true,
+	}
+	if unit.Expose == manifest.ExposeHTTP && unit.Port > 0 {
+		opts.Publish = []int{unit.Port}
+	}
+	if prob := checkOptions(folder, opts); prob != nil {
+		return nil, prob
+	}
+
 	existing, prob := s.byName(ctx, container)
 	if prob != nil {
 		return nil, prob
@@ -135,21 +159,15 @@ func (s *Service) Run(ctx context.Context, path, digest, name string) (*Process,
 		}
 	}
 
-	opts := podman.RunOptions{
-		Name:        container,
-		Image:       image.ID,
-		Labels:      s.labels(folder, name, image.ID, unit.Expose),
-		Env:         unit.Env,
-		Restart:     restartPolicy(unit.Restart),
-		CPUs:        unit.Limits.CPU,
-		Memory:      unit.Limits.Memory,
-		Detach:      true,
-		Interactive: true,
-	}
-	if unit.Expose == manifest.ExposeHTTP && unit.Port > 0 {
-		opts.Publish = []int{unit.Port}
-	}
 	if _, err := s.runner.Run(ctx, opts); err != nil {
+		if errors.Is(err, podman.ErrUsage) {
+			// The runtime refused the command, and every option in it came
+			// from the manifest, so the caller is the one who can fix it.
+			return nil, problem.InvalidManifestFix(folder,
+				"the container runtime refused an option this Package declares; the deploy unit passed "+
+					unitOptions(unit),
+				"Change the deploy unit in kitbash.yaml, then run again.")
+		}
 		return nil, problem.Internal(folder, err.Error(), "")
 	}
 
@@ -324,6 +342,84 @@ func toolNames(m *manifest.Manifest, unit manifest.Unit) []string {
 // ToolName is how a Package tool appears on the caller's surface. MCP tool
 // names allow no dots, so the dot form in PLAN.md is spelled with underscore.
 func ToolName(pkg, tool string) string { return pkg + "_" + tool }
+
+// memorySuffixes maps the manifest's Kubernetes style memory suffix onto the
+// runtime's own. spec/manifest.schema.json allows Ki, Mi and Gi only, so the
+// table is the whole conversion.
+var memorySuffixes = map[string]string{"Ki": "k", "Mi": "m", "Gi": "g"}
+
+// memoryLimit converts one limits.memory value. An unknown suffix is passed
+// through for the runtime to reject, which the manifest schema already
+// prevents from happening.
+func memoryLimit(memory string) string {
+	if len(memory) < 3 {
+		return memory
+	}
+	suffix, ok := memorySuffixes[memory[len(memory)-2:]]
+	if !ok {
+		return memory
+	}
+	return memory[:len(memory)-2] + suffix
+}
+
+// checkOptions is the second belt under spec/manifest.schema.json: it catches a
+// run command the runtime would refuse, before a replacement removes the
+// Process that is running now.
+func checkOptions(folder string, opts podman.RunOptions) *problem.Problem {
+	if opts.Memory != "" && !memoryValue.MatchString(opts.Memory) {
+		return problem.InvalidManifestFix(folder,
+			fmt.Sprintf("limits.memory %q is not a size the container runtime takes", opts.Memory),
+			"Write limits.memory as a number with Ki, Mi or Gi, such as 512Mi.")
+	}
+	if opts.CPUs != "" && !cpuValue.MatchString(opts.CPUs) {
+		return problem.InvalidManifestFix(folder,
+			fmt.Sprintf("limits.cpu %q is not a number of cores", opts.CPUs),
+			"Write limits.cpu as a number, such as 1 or 0.5.")
+	}
+	switch opts.Restart {
+	case "always", "on-failure", "no":
+	default:
+		return problem.InvalidManifestFix(folder,
+			fmt.Sprintf("restart %q is not a policy the container runtime takes", opts.Restart),
+			"Write restart as always, on-failure or never.")
+	}
+	return nil
+}
+
+var (
+	memoryValue = regexp.MustCompile(`^[0-9]+[kmg]?$`)
+	cpuValue    = regexp.MustCompile(`^[0-9]+(\.[0-9]+)?$`)
+)
+
+// unitOptions names what the deploy unit asked the runtime for, without the
+// values of env, which may hold secrets, and without anything about this host.
+func unitOptions(unit manifest.Unit) string {
+	var parts []string
+	if unit.Limits.Memory != "" {
+		parts = append(parts, "limits.memory "+unit.Limits.Memory)
+	}
+	if unit.Limits.CPU != "" {
+		parts = append(parts, "limits.cpu "+unit.Limits.CPU)
+	}
+	if unit.Restart != "" {
+		parts = append(parts, "restart "+unit.Restart)
+	}
+	if unit.Expose == manifest.ExposeHTTP && unit.Port > 0 {
+		parts = append(parts, "port "+strconv.Itoa(unit.Port))
+	}
+	if len(unit.Env) > 0 {
+		keys := make([]string, 0, len(unit.Env))
+		for k := range unit.Env {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		parts = append(parts, "env "+strings.Join(keys, ", "))
+	}
+	if len(parts) == 0 {
+		return "no options of its own"
+	}
+	return strings.Join(parts, ", ")
+}
 
 // restartPolicy maps the manifest's spelling onto the runtime's.
 func restartPolicy(restart string) string {

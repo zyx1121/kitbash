@@ -136,6 +136,14 @@ func InvalidManifest(instance, detail string) *Problem {
 		"Fix the manifest so it validates against spec/manifest.schema.json, then write it again.")
 }
 
+// InvalidManifestFix is InvalidManifest with advice specific to the part of
+// the manifest that is wrong.
+func InvalidManifestFix(instance, detail, fix string) *Problem {
+	p := InvalidManifest(instance, detail)
+	p.Fix = fix
+	return p
+}
+
 // TooLarge reports content beyond the size the surface carries in one call.
 func TooLarge(instance, detail, fix string) *Problem {
 	if fix == "" {

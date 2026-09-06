@@ -2,6 +2,8 @@ package proc_test
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -121,8 +123,8 @@ func TestRunLabelsAndNamesTheContainer(t *testing.T) {
 	if run.Restart != "no" {
 		t.Errorf("restart is %q, want the runtime spelling of never", run.Restart)
 	}
-	if run.CPUs != "1" || run.Memory != "512Mi" {
-		t.Errorf("limits are %q and %q, want 1 and 512Mi", run.CPUs, run.Memory)
+	if run.CPUs != "1" || run.Memory != "512m" {
+		t.Errorf("limits are %q and %q, want 1 and 512m", run.CPUs, run.Memory)
 	}
 	if run.Env["LOG_LEVEL"] != "debug" {
 		t.Errorf("env is %v, want LOG_LEVEL debug", run.Env)
@@ -144,6 +146,115 @@ func TestRunLabelsAndNamesTheContainer(t *testing.T) {
 	}
 	if run.Labels[podman.LabelID] != process.ID {
 		t.Errorf("the id label is %q, want the Process id %q", run.Labels[podman.LabelID], process.ID)
+	}
+}
+
+// The manifest writes memory the Kubernetes way and the container runtime
+// reads it its own way, so the suffix is converted on the way through.
+func TestRunConvertsTheMemorySuffix(t *testing.T) {
+	cases := []struct {
+		manifest string
+		want     string
+	}{
+		{manifest: "512Mi", want: "512m"},
+		{manifest: "256Ki", want: "256k"},
+		{manifest: "2Gi", want: "2g"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.manifest, func(t *testing.T) {
+			f := newFixture(t)
+			folder := f.pack(t, "ffmpeg", `name: ffmpeg
+description: Transcode and probe media files. Use for any audio or video conversion.
+deploy:
+  units:
+    - type: container
+      build: .
+      limits: { memory: "`+tc.manifest+`" }
+`)
+			f.build(folder, "ffmpeg")
+			if _, prob := f.processes.Run(context.Background(), folder, "", ""); prob != nil {
+				t.Fatalf("Run: %s", prob.Detail)
+			}
+			if got := f.runner.Runs[0].Memory; got != tc.want {
+				t.Errorf("the runtime was asked for %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// Replacing a Process destroys the running container, so nothing is removed
+// until the run that would take its place is known to be startable.
+func TestRunKeepsTheOldContainerWhenTheNewOneCannotStart(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	folder := f.pack(t, "ffmpeg", mcpManifest)
+	f.build(folder, "ffmpeg")
+	first, prob := f.processes.Run(ctx, folder, "", "")
+	if prob != nil {
+		t.Fatalf("Run: %s", prob.Detail)
+	}
+
+	absent := "sha256:" + strings.Repeat("b", 64)
+	if _, prob := f.processes.Run(ctx, folder, absent, ""); prob == nil {
+		t.Fatal("a Process was run from a digest that was never built")
+	}
+	if len(f.runner.Removed) != 0 {
+		t.Errorf("the running Process was removed: %v", f.runner.Removed)
+	}
+
+	list, prob := f.processes.List(ctx)
+	if prob != nil {
+		t.Fatalf("List: %s", prob.Detail)
+	}
+	if len(list.Processes) != 1 || list.Processes[0].ID != first.ID {
+		t.Errorf("the Process list is %+v, want the first Process still there", list.Processes)
+	}
+}
+
+// Exit 125 is the runtime refusing the command itself, and every option in it
+// came from the manifest.
+func TestRunUsageErrorNamesTheManifestOptions(t *testing.T) {
+	f := newFixture(t)
+	folder := f.pack(t, "ffmpeg", mcpManifest)
+	f.build(folder, "ffmpeg")
+	f.runner.RunErr = fmt.Errorf("podman run: exit status 125: %w", podman.ErrUsage)
+
+	_, prob := f.processes.Run(context.Background(), folder, "", "")
+	if prob == nil {
+		t.Fatal("a refused run was reported as a success")
+	}
+	if prob.Slug() != problem.SlugInvalidManifest {
+		t.Fatalf("problem is %s, want invalid-manifest", prob.Slug())
+	}
+	for _, want := range []string{"limits.memory 512Mi", "limits.cpu 1", "restart never", "env LOG_LEVEL"} {
+		if !strings.Contains(prob.Detail, want) {
+			t.Errorf("detail is %q, want it to name %q", prob.Detail, want)
+		}
+	}
+	if strings.Contains(prob.Detail, "debug") {
+		t.Errorf("detail is %q, want env values kept out of it", prob.Detail)
+	}
+	if strings.Contains(prob.Detail, folder) || strings.Contains(prob.Detail, "podman") {
+		t.Errorf("detail is %q, want host paths and the argv kept out of it", prob.Detail)
+	}
+	if prob.Fix != "Change the deploy unit in kitbash.yaml, then run again." {
+		t.Errorf("fix is %q, want the deploy unit advice", prob.Fix)
+	}
+}
+
+// Anything else from the runtime is not the caller's to fix.
+func TestRunOtherRuntimeFailureIsInternal(t *testing.T) {
+	f := newFixture(t)
+	folder := f.pack(t, "ffmpeg", mcpManifest)
+	f.build(folder, "ffmpeg")
+	f.runner.RunErr = errors.New(`exec: "podman": executable file not found in $PATH`)
+
+	_, prob := f.processes.Run(context.Background(), folder, "", "")
+	if prob == nil {
+		t.Fatal("a failed run was reported as a success")
+	}
+	if prob.Slug() != problem.SlugInternal {
+		t.Errorf("problem is %s, want internal", prob.Slug())
 	}
 }
 

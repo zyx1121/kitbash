@@ -34,6 +34,11 @@ func (c *CLI) run(ctx context.Context, args ...string) (string, error) {
 		if msg == "" {
 			msg = strings.TrimSpace(stdout.String())
 		}
+		var exit *exec.ExitError
+		if errors.As(err, &exit) && exit.ExitCode() == UsageExitCode {
+			return stdout.String(), fmt.Errorf("podman %s: %v: %s: %w",
+				strings.Join(args, " "), err, msg, ErrUsage)
+		}
 		return stdout.String(), fmt.Errorf("podman %s: %v: %s", strings.Join(args, " "), err, msg)
 	}
 	return stdout.String(), nil

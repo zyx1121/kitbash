@@ -19,6 +19,15 @@ import (
 // and the second is the operator's.
 var ErrBuildFailed = errors.New("the build failed")
 
+// UsageExitCode is what podman exits with when it refuses the command itself,
+// before any container runs: an option it does not understand, or a value it
+// will not take.
+const UsageExitCode = 125
+
+// ErrUsage reports that refusal. The options kitbash passes come from the
+// manifest, so a usage error is something the caller can fix.
+var ErrUsage = errors.New("the container runtime refused the command")
+
 // Binary is the container runtime kitbash shells out to, found on PATH.
 const Binary = "podman"
 
