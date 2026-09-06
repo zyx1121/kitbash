@@ -43,7 +43,16 @@ func (s *Service) Read(ctx context.Context, path string, opts ReadOptions) (*Rea
 	if prob != nil {
 		return nil, prob
 	}
-	info, err := os.Stat(clean)
+	// O_NOFOLLOW closes the window between the walk resolve just made and this
+	// open: a symlink swapped in for the file is refused, never followed. The
+	// whole call is then served from this one descriptor, so the bytes
+	// returned are the bytes of the file that was checked.
+	f, err := openNoFollow(clean)
+	if err != nil {
+		return nil, openProblem(clean, err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
 	if err != nil {
 		return nil, statProblem(clean, err)
 	}
@@ -57,7 +66,11 @@ func (s *Service) Read(ctx context.Context, path string, opts ReadOptions) (*Rea
 		return nil, prob
 	}
 
-	mediaType := MediaType(clean, sniff(clean))
+	head, prob := sniffFile(clean, f)
+	if prob != nil {
+		return nil, prob
+	}
+	mediaType := MediaType(clean, head)
 	meta := ReadMeta{Path: clean, MediaType: mediaType, Size: info.Size()}
 	// A failing history lookup is a real failure, not an empty sha: it means
 	// the caller cannot see the repository at all.
@@ -69,7 +82,7 @@ func (s *Service) Read(ctx context.Context, path string, opts ReadOptions) (*Rea
 
 	switch {
 	case IsText(mediaType):
-		text, truncated, prob := readText(clean, info.Size(), opts)
+		text, truncated, prob := readText(clean, f, info.Size(), opts)
 		if prob != nil {
 			return nil, prob
 		}
@@ -82,7 +95,7 @@ func (s *Service) Read(ctx context.Context, path string, opts ReadOptions) (*Rea
 				fmt.Sprintf("the image is %d bytes, over the %d byte limit", info.Size(), MaxBytes),
 				"Store a smaller rendition of the image next to it and read that instead.")
 		}
-		data, err := os.ReadFile(clean)
+		data, err := io.ReadAll(f)
 		if err != nil {
 			return nil, statProblem(clean, err)
 		}
@@ -94,7 +107,7 @@ func (s *Service) Read(ctx context.Context, path string, opts ReadOptions) (*Rea
 				fmt.Sprintf("the document is %d bytes, over the %d byte limit", info.Size(), MaxBytes),
 				"Split the document, or read a text export of it instead.")
 		}
-		text, err := extractPDF(clean)
+		text, err := extractPDF(f, info.Size())
 		if err != nil {
 			return nil, problem.Internal(clean,
 				"the text of this PDF could not be extracted: "+err.Error(),
@@ -108,15 +121,16 @@ func (s *Service) Read(ctx context.Context, path string, opts ReadOptions) (*Rea
 	}
 }
 
-// readText reads a text file whole, or the window the caller asked for.
-func readText(path string, size int64, opts ReadOptions) (string, bool, *problem.Problem) {
+// readText reads a text file whole, or the window the caller asked for, from
+// the descriptor Read already opened with O_NOFOLLOW.
+func readText(path string, f *os.File, size int64, opts ReadOptions) (string, bool, *problem.Problem) {
 	if !opts.Window {
 		if size > MaxBytes {
 			return "", false, problem.TooLarge(path,
 				fmt.Sprintf("the file is %d bytes, over the %d byte limit", size, MaxBytes),
 				"Read it in windows: pass offset and limit.")
 		}
-		data, err := os.ReadFile(path)
+		data, err := io.ReadAll(f)
 		if err != nil {
 			return "", false, statProblem(path, err)
 		}
@@ -127,38 +141,32 @@ func readText(path string, size int64, opts ReadOptions) (string, bool, *problem
 	if limit <= 0 || limit > MaxBytes {
 		limit = MaxBytes
 	}
-	f, err := os.Open(path)
-	if err != nil {
-		return "", false, statProblem(path, err)
-	}
-	defer f.Close()
-	if opts.Offset > 0 {
-		if _, err := f.Seek(opts.Offset, io.SeekStart); err != nil {
-			return "", false, statProblem(path, err)
-		}
+	offset := opts.Offset
+	if offset < 0 {
+		offset = 0
 	}
 	buf := make([]byte, limit)
-	n, err := io.ReadFull(f, buf)
-	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+	n, err := f.ReadAt(buf, offset)
+	if err != nil && err != io.EOF {
 		return "", false, statProblem(path, err)
 	}
-	truncated := opts.Offset+int64(n) < size
+	truncated := offset+int64(n) < size
 	return string(buf[:n]), truncated, nil
 }
 
-// extractPDF pulls the plain text out of a PDF, best effort.
-func extractPDF(path string) (text string, err error) {
+// extractPDF pulls the plain text out of a PDF, best effort. It reads the
+// descriptor Read opened with O_NOFOLLOW rather than opening the path again.
+func extractPDF(f *os.File, size int64) (text string, err error) {
 	defer func() {
 		// The extractor panics on some malformed documents.
 		if r := recover(); r != nil {
 			err = fmt.Errorf("%v", r)
 		}
 	}()
-	f, r, err := pdf.Open(path)
+	r, err := pdf.NewReader(f, size)
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
 	plain, err := r.GetPlainText()
 	if err != nil {
 		return "", err

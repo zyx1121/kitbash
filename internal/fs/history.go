@@ -26,9 +26,14 @@ func (s *Service) History(ctx context.Context, path string, limit int) (*History
 	if limit <= 0 {
 		limit = DefaultHistoryLimit
 	}
-	info, err := os.Stat(clean)
+	// Lstat, not Stat: a symlink swapped in after resolve is refused here
+	// rather than resolved to whatever it points at.
+	info, err := os.Lstat(clean)
 	if err != nil {
 		return nil, statProblem(clean, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return nil, symlinkRefused(clean, clean)
 	}
 	folder := clean
 	if !info.IsDir() {
@@ -49,7 +54,9 @@ func (s *Service) History(ctx context.Context, path string, limit int) (*History
 	}
 	commits, err := s.history(ctx, repo, rel, limit)
 	if err != nil {
-		return nil, problem.Internal(clean, err.Error(), "")
+		// gitProblem, not a raw detail: git's own output never reaches the
+		// agent, it goes to the server log through problem.Internal.
+		return nil, gitProblem(clean, err)
 	}
 	result.Commits = append(result.Commits, commits...)
 	return result, nil

@@ -45,7 +45,9 @@ func (s *Service) Write(ctx context.Context, req WriteRequest) (*WriteResult, *p
 		return nil, problem.InvalidPath(clean,
 			"a file must live inside a top level folder, which is the git repository it is committed to")
 	}
-	if info, err := os.Stat(clean); err == nil && info.IsDir() {
+	// Lstat, not Stat: the target is judged as it is on disk, never through a
+	// link. writeNoFollow refuses the link itself further down.
+	if info, err := os.Lstat(clean); err == nil && info.IsDir() {
 		return nil, problem.InvalidPath(clean, "the path is a folder, not a file")
 	}
 
@@ -160,13 +162,16 @@ func writeProblem(path string, err error) *problem.Problem {
 		return sharedReadOnly(path)
 	}
 	if errors.Is(err, syscall.ELOOP) {
-		return problem.InvalidPathFix(path, "the path is a symlink, and kitbash does not follow symlinks",
-			"Write the file itself instead of a link to it.")
+		return symlinkRefused(path, path)
 	}
 	return statProblem(path, err)
 }
 
-// gitProblem maps a failed git invocation.
+// gitProblem maps a failed git invocation. It is the only mapper for an error
+// out of Service.git, because that error carries git's standard error, which
+// names host paths and internals the caller has no business seeing. Everything
+// that is not a plain refusal by the operating system goes to problem.Internal,
+// which writes the cause to the server log and returns a generic detail.
 func gitProblem(path string, err error) *problem.Problem {
 	if isPermissionDenied(err) {
 		return sharedReadOnly(path)
@@ -210,7 +215,7 @@ func (s *Service) ensureRepo(ctx context.Context, repo string) *problem.Problem 
 		return nil
 	}
 	if _, err := s.git(ctx, repo, "init", "--quiet", "--initial-branch=main"); err != nil {
-		return problem.Internal(repo, err.Error(), "")
+		return gitProblem(repo, err)
 	}
 	return nil
 }

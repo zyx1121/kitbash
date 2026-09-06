@@ -45,6 +45,11 @@ func isRepo(dir string) bool {
 }
 
 // git runs one git command inside repo and returns its standard output.
+//
+// Its error carries git's standard error for the server log only. Never put
+// that message in a problem detail: map it with gitProblem, which sends it to
+// problem.Internal, so the agent gets a generic detail and the operator gets
+// the cause.
 func (s *Service) git(ctx context.Context, repo string, args ...string) (string, error) {
 	// /org and its folders are owned by root, so a member's git refuses to
 	// operate on them unless the repository is declared safe.
