@@ -13,18 +13,21 @@ import (
 	"github.com/zyx1121/kitbash/internal/pkg"
 	"github.com/zyx1121/kitbash/internal/problem"
 	"github.com/zyx1121/kitbash/internal/proc"
+	"github.com/zyx1121/kitbash/internal/telemetry"
 )
 
 // Name is the MCP server name every client sees.
 const Name = "kitbash"
 
 // Deps are the services the surface is built from. Files is required; the
-// others are the M2 families, and a server built without them serves fs only.
+// others are the M2 and M3 families, and a server built without them serves
+// fs only.
 type Deps struct {
 	Files     *fs.Service
 	Packages  *pkg.Service
 	Processes *proc.Service
 	Bridge    *bridge.Bridge
+	Telemetry *telemetry.Provider
 }
 
 // New builds the MCP server for one caller.
@@ -36,9 +39,13 @@ func New(version string, deps Deps) *mcp.Server {
 		Name:        Name,
 		Version:     version,
 		Title:       "kitbash",
-		Description: "Files, Packages, Processes and Telemetry for agents. M2 serves the fs, pkg and proc families.",
+		Description: "Files, Packages, Processes and Telemetry for agents. M3 serves the fs, pkg, proc and tel families.",
 	}, nil)
 	s.AddReceivingMiddleware(problemGuard)
+	// Middleware added later wraps middleware added earlier, so tracing goes
+	// on last: the span is open before the arguments are validated and closes
+	// after problemGuard has turned every failure into problem details.
+	s.AddReceivingMiddleware(tracing(deps.Telemetry, deps.Files, deps.Bridge))
 	if deps.Bridge != nil {
 		// The bridge publishes one tool per Package tool on this server, so it
 		// has to hold the server before any Process is added.
@@ -50,6 +57,9 @@ func New(version string, deps Deps) *mcp.Server {
 	}
 	if deps.Processes != nil {
 		RegisterProcesses(s, deps.Processes, deps.Bridge)
+	}
+	if deps.Telemetry != nil {
+		RegisterTelemetry(s, deps.Telemetry.Client())
 	}
 	return s
 }
@@ -195,6 +205,16 @@ func structuredResult(value any) (*mcp.CallToolResult, any, error) {
 	return &mcp.CallToolResult{
 		Content:           []mcp.Content{&mcp.TextContent{Text: string(encoded)}},
 		StructuredContent: json.RawMessage(encoded),
+	}, nil, nil
+}
+
+// rawResult is structuredResult for a body that is already JSON and belongs to
+// someone else, such as an answer kitbashd composed. It is passed through
+// byte for byte rather than decoded and re-encoded here.
+func rawResult(body json.RawMessage) (*mcp.CallToolResult, any, error) {
+	return &mcp.CallToolResult{
+		Content:           []mcp.Content{&mcp.TextContent{Text: string(body)}},
+		StructuredContent: body,
 	}, nil, nil
 }
 

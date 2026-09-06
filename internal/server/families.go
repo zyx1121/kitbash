@@ -2,12 +2,14 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/zyx1121/kitbash/internal/bridge"
 	"github.com/zyx1121/kitbash/internal/pkg"
 	"github.com/zyx1121/kitbash/internal/proc"
+	"github.com/zyx1121/kitbash/internal/telemetry"
 )
 
 // RegisterPackages adds the pkg family to an existing MCP server.
@@ -91,6 +93,31 @@ func RegisterProcesses(s *mcp.Server, processes *proc.Service, b *bridge.Bridge)
 	}, logsHandler(processes))
 }
 
+// RegisterTelemetry adds the tel family to an existing MCP server. Both tools
+// are forwarded to kitbashd over its unix socket, which is where the store
+// lives; kitbash-mcp keeps no telemetry of its own.
+func RegisterTelemetry(s *mcp.Server, client *telemetry.Client) {
+	mcp.AddTool(s, &mcp.Tool{
+		Name: "tel_query",
+		Description: "Query spans, logs or metrics by attributes and time range, newest first. A member sees " +
+			"only their own records: user defaults to the caller and naming another member is not-permitted. " +
+			"An admin may name any member or omit user for the whole machine. since defaults to 24 hours ago, " +
+			"until to now. Metrics are accepted by the store but no producer emits them before M4, so that " +
+			"signal returns an empty page.",
+		InputSchema:  telQueryInputSchema,
+		OutputSchema: telQueryOutputSchema,
+	}, queryHandler(client))
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name: "tel_retention",
+		Description: "Read the retention window per signal, as a duration such as 720h or 30d. With set, an " +
+			"admin changes one or more windows; kitbashd deletes older records on its next sweep. Defaults " +
+			"are traces 30d, logs 14d, metrics 30d.",
+		InputSchema:  telRetentionInputSchema,
+		OutputSchema: telRetentionOutputSchema,
+	}, retentionHandler(client))
+}
+
 type pathInput struct {
 	Path string `json:"path"`
 }
@@ -115,6 +142,10 @@ type idInput struct {
 type logsInput struct {
 	ID    string `json:"id"`
 	Lines int    `json:"lines,omitempty"`
+}
+
+type retentionInput struct {
+	Set json.RawMessage `json:"set,omitempty"`
 }
 
 func buildHandler(packages *pkg.Service) mcp.ToolHandlerFor[pathInput, any] {
@@ -203,6 +234,29 @@ func stopHandler(processes *proc.Service, b *bridge.Bridge) mcp.ToolHandlerFor[i
 			b.Remove(out.Process)
 		}
 		return structuredResult(out)
+	}
+}
+
+// queryHandler forwards the input to kitbashd as it arrived. The tool's input
+// schema and the daemon's request schema are the same one, so reshaping it
+// here could only lose something.
+func queryHandler(client *telemetry.Client) mcp.ToolHandlerFor[json.RawMessage, any] {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, in json.RawMessage) (*mcp.CallToolResult, any, error) {
+		out, prob := client.Query(ctx, in)
+		if prob != nil {
+			return errorResult(prob), nil, nil
+		}
+		return rawResult(out)
+	}
+}
+
+func retentionHandler(client *telemetry.Client) mcp.ToolHandlerFor[retentionInput, any] {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, in retentionInput) (*mcp.CallToolResult, any, error) {
+		out, prob := client.Retention(ctx, in.Set)
+		if prob != nil {
+			return errorResult(prob), nil, nil
+		}
+		return rawResult(out)
 	}
 }
 

@@ -18,6 +18,7 @@ import (
 	"github.com/zyx1121/kitbash/internal/manifest"
 	"github.com/zyx1121/kitbash/internal/podman"
 	"github.com/zyx1121/kitbash/internal/problem"
+	"github.com/zyx1121/kitbash/internal/telemetry"
 	"github.com/zyx1121/kitbash/internal/uuid"
 )
 
@@ -94,10 +95,27 @@ func New(files *fs.Service, runner podman.Runner) *Service {
 // converges an existing one with the same name onto that digest. Calling it
 // twice with the same name and digest returns the same Process.
 func (s *Service) Run(ctx context.Context, path, digest, name string) (*Process, *problem.Problem) {
+	// Starting a Process is the second operation worth a span of its own, see
+	// PLAN.md section 2.4. The Process id and the digest are known only once
+	// the container is up, so they land on the span at the end.
+	ctx, span := telemetry.Start(ctx, "run")
+	defer span.End()
+	process, prob := s.run(ctx, span, path, digest, name)
+	if prob != nil {
+		span.Fail(prob.Slug(), prob.Title)
+		return nil, prob
+	}
+	span.SetProcess(process.ID)
+	span.SetDigest(process.Digest)
+	return process, nil
+}
+
+func (s *Service) run(ctx context.Context, span *telemetry.Span, path, digest, name string) (*Process, *problem.Problem) {
 	m, folder, prob := s.files.Manifest(ctx, path)
 	if prob != nil {
 		return nil, prob
 	}
+	span.SetPackage(folder)
 	if manifest.Reserved(m.Name) {
 		return nil, problem.InvalidManifest(folder, fmt.Sprintf(
 			"the Package name %q is a built in tool family, so its tools would collide with the surface", m.Name))

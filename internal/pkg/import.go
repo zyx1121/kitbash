@@ -13,6 +13,7 @@ import (
 	"github.com/zyx1121/kitbash/internal/problem"
 	"github.com/zyx1121/kitbash/internal/proc"
 	"github.com/zyx1121/kitbash/internal/safepath"
+	"github.com/zyx1121/kitbash/internal/telemetry"
 )
 
 // Kits is what pkg_import needs from the MCP bridge: the caller's running
@@ -76,6 +77,9 @@ func (s *Service) Import(ctx context.Context, path, source string) (*ImportResul
 	if prob != nil {
 		return nil, prob
 	}
+	// The Package the call is about is the one it just created, so the span
+	// names it rather than nothing.
+	telemetry.SetPackage(ctx, written.Path)
 	return &ImportResult{Path: written.Path, Commit: written.Commit}, nil
 }
 

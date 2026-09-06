@@ -60,6 +60,7 @@ type Bridge struct {
 	server    *mcp.Server
 	published map[string][]string           // Process id to the surface tool names it added
 	owners    map[string]string             // surface tool name to the Process id that answers it
+	packages  map[string]string             // Process id to the Package path it runs
 	sessions  map[string]*mcp.ClientSession // Process id to its open session
 }
 
@@ -72,6 +73,7 @@ func New(files *fs.Service, processes *proc.Service, runner podman.Runner) *Brid
 		logger:    log.New(os.Stderr, "kitbash: ", log.LstdFlags),
 		published: map[string][]string{},
 		owners:    map[string]string{},
+		packages:  map[string]string{},
 		sessions:  map[string]*mcp.ClientSession{},
 	}
 	b.transport = b.execTransport
@@ -174,6 +176,7 @@ func (b *Bridge) Add(ctx context.Context, p *proc.Process) *problem.Problem {
 		names = append(names, surface)
 	}
 	b.published[p.ID] = names
+	b.packages[p.ID] = p.Package
 	// The instance is the Process itself: the caller can stop it with the id
 	// in front of them, without looking it up first.
 	if len(taken) > 0 {
@@ -236,7 +239,25 @@ func (b *Bridge) remove(id string) {
 		b.server.RemoveTools(mine...)
 	}
 	delete(b.published, id)
+	delete(b.packages, id)
 	b.closeSession(id)
+}
+
+// Owner is the Package path and the Process id that answer one surface tool
+// name, and false when the name is a built in tool. The tracing middleware
+// asks so the span of a proxied call carries kitbash.package and
+// kitbash.process without the Package having to send them.
+func (b *Bridge) Owner(surface string) (path, process string, ok bool) {
+	if b == nil {
+		return "", "", false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	id, held := b.owners[surface]
+	if !held {
+		return "", "", false
+	}
+	return b.packages[id], id, true
 }
 
 // closeSession ends the client session for one Process. The caller holds the
