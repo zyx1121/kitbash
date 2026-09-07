@@ -9,6 +9,9 @@ package proc
 import (
 	"context"
 	"fmt"
+	"log"
+	"net"
+	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -80,15 +83,43 @@ type LogsResult struct {
 	Lines []string `json:"lines"`
 }
 
-// Service answers the proc family for one caller.
-type Service struct {
-	files  *fs.Service
-	runner podman.Runner
+// Registry is the Process registry of kitbashd, see spec/kitbashd-api.yaml.
+// Registering mints the Telemetry token a Process exports with; unregistering
+// revokes it. It is an interface here so this package depends on the daemon's
+// contract rather than on a socket.
+type Registry interface {
+	RegisterProcess(ctx context.Context, reg telemetry.Registration) (string, *problem.Problem)
+	UnregisterProcess(ctx context.Context, id string) *problem.Problem
+	ListProcesses(ctx context.Context) ([]telemetry.Registered, *problem.Problem)
 }
 
-// New builds the Service the server runs with.
-func New(files *fs.Service, runner podman.Runner) *Service {
-	return &Service{files: files, runner: runner}
+// Service answers the proc family for one caller.
+type Service struct {
+	files    *fs.Service
+	runner   podman.Runner
+	registry Registry
+	logger   *log.Logger
+}
+
+// New builds the Service the server runs with. The registry may be nil, in
+// which case every Process starts untraced: the container runtime does not
+// depend on kitbashd and a host without it still runs Packages.
+func New(files *fs.Service, runner podman.Runner, registry Registry) *Service {
+	return &Service{
+		files:    files,
+		runner:   runner,
+		registry: registry,
+		logger:   log.New(os.Stderr, "kitbash: ", log.LstdFlags),
+	}
+}
+
+// SetLogger replaces where the service says what it could not do, such as a
+// Process that started untraced. Tests read those lines; the server leaves it
+// at stderr, which is the session's own log.
+func (s *Service) SetLogger(logger *log.Logger) {
+	if logger != nil {
+		s.logger = logger
+	}
 }
 
 // Run answers proc_run: it starts a Process from a Package digest, or
@@ -151,8 +182,31 @@ func (s *Service) run(ctx context.Context, span *telemetry.Span, path, digest, n
 		Detach:      true,
 		Interactive: true,
 	}
-	if unit.Expose == manifest.ExposeHTTP && unit.Port > 0 {
-		opts.Publish = []int{unit.Port}
+	// The host port is chosen here rather than by the runtime, because the
+	// endpoint has to be known before the Process is registered: registering
+	// twice would mint a second token and leave the container holding the
+	// first, see client_behaviour.processes in spec/kitbashd-api.yaml.
+	var endpoint string
+	if unit.Expose == manifest.ExposeHTTP {
+		if unit.Port <= 0 {
+			// Without a port there is nothing to publish and no endpoint to
+			// register, so the Process would be exposed in name only.
+			return nil, problem.InvalidManifestFix(folder,
+				"expose: http declares no port, so the Process has no endpoint to be reached on",
+				"Give deploy.units[0] the port the container listens on, or set expose to none.")
+		}
+		mapping := podman.PortMapping{ContainerPort: unit.Port}
+		if host, err := freePort(); err == nil {
+			mapping.HostPort = host
+			endpoint = "http://127.0.0.1:" + strconv.Itoa(host)
+			opts.Labels[podman.LabelEndpoint] = endpoint
+		} else {
+			// No free port to hold means the runtime picks one and this
+			// Process is registered without an endpoint: it produces
+			// Telemetry but receives no fan out until it is run again.
+			s.logger.Printf("proc: choosing a host port for %s: %v", folder, err)
+		}
+		opts.Publish = []podman.PortMapping{mapping}
 	}
 	if prob := checkOptions(folder, opts); prob != nil {
 		return nil, prob
@@ -183,6 +237,33 @@ func (s *Service) run(ctx context.Context, span *telemetry.Span, path, digest, n
 		if err := s.runner.Remove(ctx, container, true); err != nil {
 			return nil, problem.Internal(folder, err.Error(), "")
 		}
+		// The container is gone, so the token it held has to go with it. This
+		// happens after the removal: a Process that is still running keeps
+		// exporting until it does not exist.
+		s.unregister(ctx, previous.ID)
+	}
+
+	// The Process is registered before the container starts, so the token is
+	// in the environment the container is created with, see PLAN.md 2.4.
+	id := opts.Labels[podman.LabelID]
+	env, registered := s.telemetryEnv(ctx, unit.Env, telemetry.Registration{
+		ID:            id,
+		Package:       folder,
+		Name:          name,
+		Expose:        unit.Expose,
+		Endpoint:      endpoint,
+		Subscriptions: m.Subscriptions(),
+	})
+	opts.Env = env
+	// A registration whose container never started is worse than no
+	// registration: it names an endpoint on this host, so kitbashd would fan
+	// the member's records out to whatever takes that loopback port next.
+	orphan := func() {
+		if !registered {
+			return
+		}
+		s.logger.Printf("proc: Process %s did not start; unregistering it", id)
+		s.unregister(ctx, id)
 	}
 
 	if _, err := s.runner.Run(ctx, opts); err != nil {
@@ -190,14 +271,17 @@ func (s *Service) run(ctx context.Context, span *telemetry.Span, path, digest, n
 		// status covers an image that is gone and a name taken since the
 		// lookup. The manifest cases are caught by checkOptions above, before
 		// anything is removed, so what is left is not the caller's to fix.
+		orphan()
 		return nil, problem.Internal(folder, err.Error(), "")
 	}
 
 	started, prob := s.byName(ctx, container)
 	if prob != nil {
+		orphan()
 		return nil, prob
 	}
 	if started == nil {
+		orphan()
 		return nil, problem.Internal(folder, "the container was started but is not in the container list", "")
 	}
 	process := s.describe(*started, unit)
@@ -231,8 +315,143 @@ func (s *Service) Stop(ctx context.Context, id string) (*StopResult, *problem.Pr
 	if err := s.runner.Stop(ctx, container.Name, StopTimeout); err != nil {
 		return nil, problem.Internal(id, err.Error(), "")
 	}
+	// The token outlives nothing: once the container is stopped it cannot
+	// export, so the registration goes with it.
+	s.unregister(ctx, id)
 	process.State = StateStopped
 	return &StopResult{ID: id, State: StateStopped, Process: &process}, nil
+}
+
+// Reconcile makes kitbashd's Process registry agree with the containers that
+// are running here. It registers every running Process the daemon does not
+// know and returns those ids, together with the ids the daemon holds that no
+// longer run here. A stale registration is left alone: proc_stop removes the
+// ones this host retired, and a registration whose endpoint is gone only costs
+// kitbashd a failed delivery.
+//
+// Re-registering mints a new token, which the running container does not have,
+// so its exports fail until the Process is run again. That gap is accepted in
+// version 1 and the caller logs it, see client_behaviour.processes in
+// spec/kitbashd-api.yaml.
+func (s *Service) Reconcile(ctx context.Context, running []Process) (registered, stale []string, prob *problem.Problem) {
+	if s.registry == nil {
+		return nil, nil, nil
+	}
+	known, prob := s.registry.ListProcesses(ctx)
+	if prob != nil {
+		return nil, nil, prob
+	}
+	// An admin's list is the whole machine, so the entries of other members
+	// are not this session's to compare against: a Process of theirs is
+	// neither missing from the registry nor stale because it is not running
+	// here.
+	mine := make([]telemetry.Registered, 0, len(known))
+	byID := map[string]telemetry.Registered{}
+	for _, entry := range known {
+		if entry.Owner != "" && entry.Owner != s.files.User() {
+			continue
+		}
+		mine = append(mine, entry)
+		byID[entry.ID] = entry
+	}
+	here := map[string]bool{}
+	for i := range running {
+		p := running[i]
+		if p.State != StateRunning {
+			continue
+		}
+		// Only a running Process makes a registration current. One that is
+		// stopped has none of its own, and kitbashd holding one for it is the
+		// stale case below.
+		here[p.ID] = true
+		if _, ok := byID[p.ID]; ok {
+			continue
+		}
+		reg := telemetry.Registration{
+			ID:       p.ID,
+			Package:  p.Package,
+			Name:     p.Name,
+			Expose:   p.Expose,
+			Endpoint: p.Endpoint,
+		}
+		if m, folder, prob := s.files.Manifest(ctx, p.Package); prob == nil {
+			reg.Package = folder
+			reg.Subscriptions = m.Subscriptions()
+		}
+		if _, prob := s.registry.RegisterProcess(ctx, reg); prob != nil {
+			s.logger.Printf("proc: registering Process %s at %s: %s", p.ID, p.Package, prob.Detail)
+			continue
+		}
+		registered = append(registered, p.ID)
+	}
+	for _, entry := range mine {
+		if !here[entry.ID] {
+			stale = append(stale, entry.ID)
+		}
+	}
+	return registered, stale, nil
+}
+
+// telemetryEnv registers the Process and returns the environment its container
+// is started with: the manifest's own, plus the five variables of
+// spec/kitbashd-api.yaml. The manifest cannot override them; they are the
+// Process's identity, not its configuration. The second return says whether
+// the registration happened, so a container that never starts can be taken
+// back off the registry.
+//
+// A registration that fails is not a reason to refuse to start the Process.
+// The container runtime does not depend on kitbashd, so the Process starts
+// with no token and produces no Telemetry of its own, and the session says so
+// once in the server log.
+func (s *Service) telemetryEnv(ctx context.Context, env map[string]string, reg telemetry.Registration) (map[string]string, bool) {
+	merged := make(map[string]string, len(env)+5)
+	for k, v := range env {
+		merged[k] = v
+	}
+	if s.registry == nil {
+		s.logger.Printf("proc: kitbashd is not running; Process %s starts untraced", reg.ID)
+		return merged, false
+	}
+	token, prob := s.registry.RegisterProcess(ctx, reg)
+	if prob != nil {
+		s.logger.Printf("proc: kitbashd is not running; Process %s starts untraced: %s", reg.ID, prob.Detail)
+		return merged, false
+	}
+	merged[telemetry.EnvEndpoint] = telemetry.EndpointForProcesses()
+	merged[telemetry.EnvToken] = token
+	merged[telemetry.EnvProcess] = reg.ID
+	merged[telemetry.EnvPackage] = reg.Package
+	merged[telemetry.EnvUser] = s.files.User()
+	return merged, true
+}
+
+// unregister revokes one Process's token. A daemon that is not there is not a
+// failure of the call that stopped the container: the container is gone either
+// way and the token dies with the daemon's next start.
+func (s *Service) unregister(ctx context.Context, id string) {
+	if s.registry == nil || id == "" {
+		return
+	}
+	if prob := s.registry.UnregisterProcess(ctx, id); prob != nil {
+		s.logger.Printf("proc: unregistering Process %s: %s", id, prob.Detail)
+	}
+}
+
+// freePort picks a loopback port nothing is listening on by binding it and
+// letting it go. Another program may take it in between; the runtime then
+// refuses the run and the caller runs again, which is cheaper than the second
+// registration a runtime chosen port would cost.
+func freePort() (int, error) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
+	}
+	defer listener.Close()
+	addr, ok := listener.Addr().(*net.TCPAddr)
+	if !ok {
+		return 0, fmt.Errorf("the loopback listener has no TCP address")
+	}
+	return addr.Port, nil
 }
 
 // Logs answers proc_logs: the raw stdout and stderr of a Process.
@@ -319,8 +538,12 @@ func (s *Service) describe(container podman.Container, unit manifest.Unit) Proce
 		process.StartedAt = container.StartedAt.UTC().Format(time.RFC3339)
 	}
 	if process.Expose == manifest.ExposeHTTP {
+		// The label is the endpoint this Process was registered with, so a
+		// later session re-registers the same one. A container started before
+		// the label existed still answers through its published port.
+		process.Endpoint = container.Labels[podman.LabelEndpoint]
 		for _, port := range container.Ports {
-			if port.HostPort > 0 {
+			if process.Endpoint == "" && port.HostPort > 0 {
 				process.Endpoint = "http://127.0.0.1:" + strconv.Itoa(port.HostPort)
 				break
 			}

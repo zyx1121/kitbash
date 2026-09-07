@@ -26,13 +26,29 @@ deploy:
 `
 
 // imageManifest is a Package that names an existing image instead of a build
-// context. Version 1 refuses to build it.
+// context. It is built through a generated one line Containerfile so the
+// result carries kitbash's own labels and its own image ID.
 const imageManifest = `name: alpine
-description: An existing image pinned by digest, which version 1 cannot build.
+description: An existing image pinned by digest, relabelled as a Package.
 deploy:
   units:
     - type: container
       image: docker.io/library/alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000
+`
+
+// imageRef is the image imageManifest names.
+const imageRef = "docker.io/library/alpine@sha256:" +
+	"0000000000000000000000000000000000000000000000000000000000000000"
+
+// filesManifest is a Package whose unit is not a container. Version 1 builds
+// container units only.
+const filesManifest = `name: notes
+description: A folder of files this Package publishes without a container.
+deploy:
+  units:
+    - type: files
+      source: notes.md
+      target: /srv/notes.md
 `
 
 type fixture struct {
@@ -157,19 +173,71 @@ func TestBuildRefusesADirtyTree(t *testing.T) {
 	}
 }
 
-func TestBuildRefusesAnImageUnit(t *testing.T) {
+// A unit that names an existing image is relabelled through a one line
+// Containerfile, so it gets its own image ID and the same build record a
+// context build gets. The image is pinned by digest, so podman pulls exactly
+// what the manifest names.
+func TestBuildRelabelsAnImageUnit(t *testing.T) {
 	f := newFixture(t)
 	folder := f.commit(t, "alpine", fs.File{Path: "kitbash.yaml", Content: text(imageManifest)})
 
+	result, prob := f.packages.Build(context.Background(), folder)
+	if prob != nil {
+		t.Fatalf("Build: %s", prob.Detail)
+	}
+	if len(f.runner.Builds) != 1 {
+		t.Fatalf("the runtime was asked for %d builds, want 1", len(f.runner.Builds))
+	}
+	build := f.runner.Builds[0]
+	if build.Content != "FROM "+imageRef+"\n" {
+		t.Errorf("the generated Containerfile is %q, want one FROM line naming the image", build.Content)
+	}
+	if filepath.Dir(build.Containerfile) != build.ContextDir {
+		t.Errorf("the Containerfile %q is not in the build context %q", build.Containerfile, build.ContextDir)
+	}
+	if strings.HasPrefix(build.ContextDir, folder) {
+		t.Errorf("the build context is %q, want a temporary directory outside the Package", build.ContextDir)
+	}
+	// The Containerfile is generated for one build and does not outlive it.
+	if _, err := os.Stat(build.ContextDir); !os.IsNotExist(err) {
+		t.Errorf("the generated build context %q was left behind", build.ContextDir)
+	}
+	want := map[string]string{
+		podman.LabelPath:   folder,
+		podman.LabelName:   "alpine",
+		podman.LabelCommit: result.Commit,
+		podman.LabelUser:   "tester",
+	}
+	for k, v := range want {
+		if build.Labels[k] != v {
+			t.Errorf("label %s is %q, want %q", k, build.Labels[k], v)
+		}
+	}
+	if !strings.HasPrefix(build.Tag, pkg.TagPrefix+"alpine:") {
+		t.Errorf("tag is %q, want it under %salpine", build.Tag, pkg.TagPrefix)
+	}
+	if result.Digest == "" || result.Log == "" {
+		t.Errorf("result is %+v, want a digest and the build log tail", result)
+	}
+}
+
+// A files unit is not a container, and version 1 builds container units only.
+func TestBuildRefusesAFilesUnit(t *testing.T) {
+	f := newFixture(t)
+	folder := f.commit(t, "notes", fs.File{Path: "kitbash.yaml", Content: text(filesManifest)})
+
 	_, prob := f.packages.Build(context.Background(), folder)
 	if prob == nil {
-		t.Fatal("an image unit was built")
+		t.Fatal("a files unit was built")
 	}
 	if prob.Slug() != problem.SlugInvalidManifest {
 		t.Errorf("problem is %s, want invalid-manifest", prob.Slug())
 	}
-	if !strings.Contains(prob.Detail, "version 1 builds container units with a build context") {
+	if !strings.Contains(prob.Detail, "version 1 builds container units") {
 		t.Errorf("detail is %q, want the version 1 sentence", prob.Detail)
+	}
+	if len(f.runner.Builds) != 0 {
+		t.Error("the runtime was asked to build a files unit")
 	}
 }
 

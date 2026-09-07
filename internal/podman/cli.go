@@ -23,7 +23,9 @@ type CLI struct{}
 func NewCLI() *CLI { return &CLI{} }
 
 // run executes one podman command and returns its standard output. The error
-// carries the command line and the runtime's stderr, for the server log.
+// carries the command line and the runtime's stderr, for the server log. The
+// command line is redacted first: a Process is started with its Telemetry
+// token, and a token that reaches a log is a token that has to be revoked.
 func (c *CLI) run(ctx context.Context, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, Binary, args...)
 	var stdout, stderr bytes.Buffer
@@ -34,9 +36,32 @@ func (c *CLI) run(ctx context.Context, args ...string) (string, error) {
 		if msg == "" {
 			msg = strings.TrimSpace(stdout.String())
 		}
-		return stdout.String(), fmt.Errorf("podman %s: %v: %s", strings.Join(args, " "), err, msg)
+		return stdout.String(), fmt.Errorf("podman %s: %v: %s", redact(args), err, msg)
 	}
 	return stdout.String(), nil
+}
+
+// redact renders a command line with every environment value removed. The keys
+// stay, because which variable was set is what a reader of the log needs; the
+// values are the caller's secrets.
+func redact(args []string) string {
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		out = append(out, args[i])
+		if args[i] != "--env" || i+1 >= len(args) {
+			continue
+		}
+		key, _, found := strings.Cut(args[i+1], "=")
+		if !found {
+			// --env KEY passes a variable through from this process, so there
+			// is no value on the command line to hide.
+			out = append(out, args[i+1])
+		} else {
+			out = append(out, key+"=<redacted>")
+		}
+		i++
+	}
+	return strings.Join(out, " ")
 }
 
 // Build builds an image and reads its ID back from an --iidfile, which is the
@@ -171,7 +196,20 @@ func (c *CLI) Run(ctx context.Context, opts RunOptions) (string, error) {
 	for _, k := range sortedKeys(opts.Labels) {
 		args = append(args, "--label", k+"="+opts.Labels[k])
 	}
-	for _, k := range sortedKeys(opts.Env) {
+	// The environment goes through a file rather than the command line: one of
+	// its entries is the Process's Telemetry token, and a command line is
+	// readable in /proc/<pid>/cmdline by anyone on the host.
+	envFile, inline, cleanup, err := writeEnvFile(opts.Env)
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if err != nil {
+		return "", err
+	}
+	if envFile != "" {
+		args = append(args, "--env-file", envFile)
+	}
+	for _, k := range inline {
 		args = append(args, "--env", k+"="+opts.Env[k])
 	}
 	if opts.Restart != "" {
@@ -185,8 +223,13 @@ func (c *CLI) Run(ctx context.Context, opts RunOptions) (string, error) {
 	}
 	for _, port := range opts.Publish {
 		// The loopback address only: a Process is reachable from this host,
-		// never from the network, until a reverse proxy fronts it.
-		args = append(args, "--publish", "127.0.0.1::"+strconv.Itoa(port))
+		// never from the network, until a reverse proxy fronts it. An empty
+		// host port leaves the choice to the runtime.
+		host := ""
+		if port.HostPort > 0 {
+			host = strconv.Itoa(port.HostPort)
+		}
+		args = append(args, "--publish", "127.0.0.1:"+host+":"+strconv.Itoa(port.ContainerPort))
 	}
 	args = append(args, opts.Image)
 	out, err := c.run(ctx, args...)
@@ -194,6 +237,42 @@ func (c *CLI) Run(ctx context.Context, opts RunOptions) (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(out), nil
+}
+
+// writeEnvFile writes the environment of one container into a file only the
+// caller can read, and returns its path, the keys that could not go into it,
+// and the cleanup that removes it. The file is gone before Run returns; the
+// container keeps the environment podman read out of it.
+//
+// An env file is a list of KEY=value lines, so a value with a line break has
+// no spelling in one. Those keys stay on the command line, where they are
+// visible: they can only come from a manifest, never from kitbash itself, and
+// the five variables kitbash sets carry no line breaks.
+func writeEnvFile(env map[string]string) (path string, inline []string, cleanup func(), err error) {
+	if len(env) == 0 {
+		return "", nil, nil, nil
+	}
+	var body strings.Builder
+	for _, k := range sortedKeys(env) {
+		if strings.ContainsAny(env[k], "\n\r") {
+			inline = append(inline, k)
+			continue
+		}
+		body.WriteString(k + "=" + env[k] + "\n")
+	}
+	if body.Len() == 0 {
+		return "", inline, nil, nil
+	}
+	dir, err := os.MkdirTemp("", "kitbash-env-")
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("creating the environment file: %w", err)
+	}
+	remove := func() { os.RemoveAll(dir) }
+	file := filepath.Join(dir, "env")
+	if err := os.WriteFile(file, []byte(body.String()), 0o600); err != nil {
+		return "", nil, remove, fmt.Errorf("writing the environment file: %w", err)
+	}
+	return file, inline, remove, nil
 }
 
 // containerJSON is the part of podman ps --format json kitbash reads.

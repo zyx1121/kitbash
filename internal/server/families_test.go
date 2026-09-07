@@ -63,7 +63,7 @@ func newWhole(t *testing.T) *whole {
 func connectWhole(t *testing.T, w *whole) *mcp.ClientSession {
 	t.Helper()
 	ctx := context.Background()
-	processes := proc.New(w.files, w.runner)
+	processes := proc.New(w.files, w.runner, nil)
 	tools := bridge.New(w.files, processes, w.runner)
 	srv := server.New("test", server.Deps{
 		Files:     w.files,

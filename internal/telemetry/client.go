@@ -67,13 +67,32 @@ func (c *Client) do(ctx context.Context, method, path string, body json.RawMessa
 	if c == nil {
 		return nil, problem.Internal(instance, "telemetry is not configured for this session", NotRunningFix)
 	}
+	status, payload, prob := c.send(ctx, method, path, body, instance)
+	if prob != nil {
+		return nil, prob
+	}
+	if status >= 300 {
+		return nil, c.failure(instance, statusText(status), payload)
+	}
+	if !json.Valid(payload) {
+		return nil, problem.Internal(instance,
+			fmt.Sprintf("%s answered %s with a body that is not JSON", path, statusText(status)), "")
+	}
+	return json.RawMessage(payload), nil
+}
+
+// send performs one request and returns the status and the body. Only a
+// transport failure is a problem here: a status is an answer, and what it
+// means is the caller's to decide, because a 404 refuses a query and closes a
+// Process unregistration.
+func (c *Client) send(ctx context.Context, method, path string, body []byte, instance string) (int, []byte, *problem.Problem) {
 	var reader io.Reader
 	if body != nil {
 		reader = bytes.NewReader(body)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, "http://kitbashd"+path, reader)
 	if err != nil {
-		return nil, problem.Internal(instance, err.Error(), "")
+		return 0, nil, problem.Internal(instance, err.Error(), "")
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
@@ -85,37 +104,36 @@ func (c *Client) do(ctx context.Context, method, path string, body json.RawMessa
 		// A socket that is absent or refuses is the same story to the agent:
 		// this host has no Telemetry right now and only an operator can
 		// change that.
-		return nil, problem.Internal(instance,
+		return 0, nil, problem.Internal(instance,
 			fmt.Sprintf("%s %s over %s: %v", method, path, c.socket, err), NotRunningFix)
 	}
 	defer res.Body.Close()
 	payload, err := io.ReadAll(io.LimitReader(res.Body, maxResponseBytes))
 	if err != nil {
-		return nil, problem.Internal(instance, err.Error(), NotRunningFix)
+		return res.StatusCode, nil, problem.Internal(instance, err.Error(), NotRunningFix)
 	}
-	if res.StatusCode >= 300 {
-		return nil, c.failure(instance, res, payload)
-	}
-	if !json.Valid(payload) {
-		return nil, problem.Internal(instance,
-			fmt.Sprintf("%s answered %s with a body that is not JSON", path, res.Status), "")
-	}
-	return json.RawMessage(payload), nil
+	return res.StatusCode, payload, nil
 }
 
 // failure turns a refusal into the problem the agent sees. kitbashd answers in
 // the same problem details the surface speaks, so a 403 from the daemon
 // reaches the agent unchanged, slug and fix and all.
-func (c *Client) failure(instance string, res *http.Response, payload []byte) *problem.Problem {
+func (c *Client) failure(instance, status string, payload []byte) *problem.Problem {
 	if p, err := decodeProblem(payload); err == nil {
 		return p
 	}
 	detail := strings.TrimSpace(string(payload))
 	if detail == "" {
-		detail = res.Status
+		detail = status
 	}
 	return problem.Internal(instance,
-		fmt.Sprintf("kitbashd answered %s: %s", res.Status, detail), "")
+		fmt.Sprintf("kitbashd answered %s: %s", status, detail), "")
+}
+
+// statusText spells a status the way an HTTP response line does, which is what
+// the detail of an unreadable refusal carries.
+func statusText(status int) string {
+	return fmt.Sprintf("%d %s", status, http.StatusText(status))
 }
 
 // decodeProblem reads an RFC 9457 body kitbashd sent, refusing anything that

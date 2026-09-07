@@ -34,6 +34,11 @@ const (
 	LabelPackage = "kitbash.package"
 	LabelDigest  = "kitbash.digest"
 	LabelExpose  = "kitbash.expose"
+	// LabelEndpoint is the internal URL of a Process with expose: http. It is
+	// on the container because the host port is chosen before the container
+	// exists, so a later session re-registers the Process with the endpoint it
+	// was started on rather than guessing one.
+	LabelEndpoint = "kitbash.endpoint"
 )
 
 // Container states the runtime reports, lowercased.
@@ -67,6 +72,14 @@ type Port struct {
 	Protocol      string
 }
 
+// PortMapping is one port to publish. HostPort 0 leaves the choice to the
+// runtime; a caller that has to know the endpoint before the container exists
+// names the host port itself.
+type PortMapping struct {
+	HostPort      int
+	ContainerPort int
+}
+
 // Container is one container in the caller's runtime, running or not.
 type Container struct {
 	ID        string
@@ -90,7 +103,7 @@ type RunOptions struct {
 	Restart     string
 	CPUs        string
 	Memory      string
-	Publish     []int
+	Publish     []PortMapping
 	Detach      bool
 	Interactive bool
 }

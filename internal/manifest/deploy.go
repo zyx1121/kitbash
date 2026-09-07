@@ -117,6 +117,26 @@ func (m *Manifest) Kit() []string {
 	return hooks
 }
 
+// Subscriptions returns provides.subscriptions, the streams this Package wants
+// delivered. Only telemetry exists today, see PLAN.md section 2.4.
+func (m *Manifest) Subscriptions() []string {
+	provides, ok := m.Raw["provides"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	list, ok := provides["subscriptions"].([]any)
+	if !ok {
+		return nil
+	}
+	var streams []string
+	for _, entry := range list {
+		if stream, ok := entry.(string); ok {
+			streams = append(streams, stream)
+		}
+	}
+	return streams
+}
+
 // HasKit reports whether the Package implements one lifecycle hook.
 func (m *Manifest) HasKit(hook string) bool {
 	for _, got := range m.Kit() {

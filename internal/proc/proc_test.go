@@ -13,6 +13,8 @@ import (
 	"github.com/zyx1121/kitbash/internal/podman"
 	"github.com/zyx1121/kitbash/internal/problem"
 	"github.com/zyx1121/kitbash/internal/proc"
+	"github.com/zyx1121/kitbash/internal/telemetry"
+	"github.com/zyx1121/kitbash/internal/telemetry/teltest"
 )
 
 const mcpManifest = `name: ffmpeg
@@ -47,10 +49,28 @@ type fixture struct {
 	files     *fs.Service
 	runner    *podman.Fake
 	processes *proc.Service
+	daemon    *teltest.Daemon
 	root      string
 }
 
+// newFixture runs the proc family against a fake kitbashd on a socket of its
+// own, which is what a kitbash host looks like: every Process is registered
+// before it starts.
 func newFixture(t *testing.T) *fixture {
+	t.Helper()
+	daemon, err := teltest.Start()
+	if err != nil {
+		t.Fatalf("teltest.Start: %v", err)
+	}
+	t.Cleanup(daemon.Close)
+	f := newFixtureWithSocket(t, daemon.Socket)
+	f.daemon = daemon
+	return f
+}
+
+// newFixtureWithSocket points the service at a socket the caller names, which
+// is how a host without a running kitbashd is exercised.
+func newFixtureWithSocket(t *testing.T, socket string) *fixture {
 	t.Helper()
 	root := t.TempDir()
 	files, err := fs.New("tester", []string{root})
@@ -58,7 +78,12 @@ func newFixture(t *testing.T) *fixture {
 		t.Fatalf("fs.New: %v", err)
 	}
 	runner := podman.NewFake()
-	return &fixture{files: files, runner: runner, processes: proc.New(files, runner), root: root}
+	return &fixture{
+		files:     files,
+		runner:    runner,
+		processes: proc.New(files, runner, telemetry.NewClient(socket)),
+		root:      root,
+	}
 }
 
 // pack writes a Package folder and returns its path.
@@ -402,8 +427,12 @@ func TestRunPublishesAnEndpointForHTTP(t *testing.T) {
 	if prob != nil {
 		t.Fatalf("Run: %s", prob.Detail)
 	}
-	if got := f.runner.Runs[0].Publish; len(got) != 1 || got[0] != 8080 {
+	got := f.runner.Runs[0].Publish
+	if len(got) != 1 || got[0].ContainerPort != 8080 {
 		t.Errorf("published %v, want the container port 8080", got)
+	}
+	if got[0].HostPort == 0 {
+		t.Error("the host port was left to the runtime, so the endpoint was not known before the container started")
 	}
 	want := "http://127.0.0.1:" + f.runner.HostPort("kitbash-dashboard-dashboard")
 	if process.Endpoint != want {

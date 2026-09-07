@@ -327,7 +327,9 @@ const telAttributesDef = `{
     "process": { "type": "string" },
     "path": { "type": "string" },
     "tool": { "type": "string" },
-    "eval": { "type": "boolean" }
+    "eval": { "type": "boolean" },
+    "producer": { "type": "string", "description": "Member name or Process id that wrote the record" },
+    "subject": { "type": "object", "description": "For evaluation records: traceId and spanId of the judged span", "properties": { "traceId": { "type": "string" }, "spanId": { "type": "string" } } }
   }
 }`
 
@@ -389,6 +391,7 @@ var (
     "path": { "type": "string", "description": "Files path, as kitbash.path; prefix match" },
     "tool": { "type": "string", "description": "Surface tool name, as kitbash.tool" },
     "eval": { "type": "boolean", "description": "Only evaluation results written back by kits" },
+    "producer": { "type": "string", "description": "Member name or Process id that wrote the record" },
     "since": { "type": "string", "format": "date-time" },
     "until": { "type": "string", "format": "date-time" },
     "limit": { "type": "integer", "minimum": 1, "default": 100, "maximum": 1000 }

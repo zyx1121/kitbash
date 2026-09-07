@@ -87,6 +87,18 @@ func (b *Bridge) Attach(s *mcp.Server) {
 	b.server = s
 }
 
+// SetLogger replaces where the bridge reports what it could not publish and
+// what it had to register again. Tests read those lines; the server leaves it
+// at stderr, which is the session's own log.
+func (b *Bridge) SetLogger(logger *log.Logger) {
+	if logger == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.logger = logger
+}
+
 // SetTransport replaces how the bridge reaches a Process. Tests use it to run
 // the Package in process instead of in a container.
 func (b *Bridge) SetTransport(t Transport) {
@@ -105,6 +117,7 @@ func (b *Bridge) Sync(ctx context.Context) {
 		b.logger.Printf("bridge: listing Processes: %s", prob.Detail)
 		return
 	}
+	b.reconcile(ctx, list.Processes)
 	for i := range list.Processes {
 		p := list.Processes[i]
 		if p.State != proc.StateRunning || p.Expose != manifest.ExposeMCP {
@@ -117,6 +130,25 @@ func (b *Bridge) Sync(ctx context.Context) {
 			// still works, and the reason is in the server log.
 			b.logger.Printf("bridge: skipping Process %s at %s: %s", p.ID, p.Package, prob.Detail)
 		}
+	}
+}
+
+// reconcile tells kitbashd about the Processes that are running here and that
+// it does not know, which is how a restarted daemon learns the running set,
+// see client_behaviour.processes in spec/kitbashd-api.yaml. A re-registered
+// Process holds the token from before, so its own exports stay refused until
+// it is run again; that is said plainly in the log rather than hidden.
+func (b *Bridge) reconcile(ctx context.Context, running []proc.Process) {
+	registered, stale, prob := b.processes.Reconcile(ctx, running)
+	if prob != nil {
+		b.logger.Printf("bridge: reading the Process registry: %s", prob.Detail)
+		return
+	}
+	for _, id := range registered {
+		b.logger.Printf("bridge: re-registered %s; its exports resume when it is run again", id)
+	}
+	for _, id := range stale {
+		b.logger.Printf("bridge: kitbashd still holds Process %s, which no longer runs here", id)
 	}
 }
 
