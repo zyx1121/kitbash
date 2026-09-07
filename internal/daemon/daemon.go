@@ -3,8 +3,10 @@
 // spec/kitbashd-api.yaml. It holds no MCP types; kitbash-mcp is a client of
 // this HTTP surface, not a caller of these functions.
 //
-// Identity is the socket's peer credentials. Nothing a producer sends decides
-// who it is, see PLAN.md section 2.4.
+// It serves two listeners: the unix socket, where identity is the peer
+// credentials, and the Process receiver on TCP, where identity is a bearer
+// token minted at registration. Nothing a producer sends decides who it is,
+// see PLAN.md section 2.4.
 package daemon
 
 import (
@@ -17,6 +19,7 @@ import (
 	"os"
 	"os/user"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/zyx1121/kitbash/internal/problem"
@@ -116,7 +119,8 @@ type Caller struct {
 	Admin bool
 }
 
-// Server answers the socket API for every caller.
+// Server answers the socket API for every caller, and the OTLP paths of the
+// Process receiver for every Process with a token.
 type Server struct {
 	store    *store.Store
 	version  string
@@ -124,8 +128,15 @@ type Server struct {
 	now      func() time.Time
 	started  time.Time
 	mux      *http.ServeMux
+	otlpMux  *http.ServeMux
 	timeouts Timeouts
 	maxConns int
+	fanout   *fanout
+
+	// bound is what health reports as its listeners, written when a listener
+	// starts serving and read by every health request.
+	boundMu sync.Mutex
+	bound   listeners
 }
 
 // New builds the server. The store is not owned by it: whoever opened the file
@@ -138,6 +149,7 @@ func New(st *store.Store, opts Options) *Server {
 		now:      opts.Now,
 		timeouts: opts.Timeouts.withDefaults(),
 		maxConns: opts.MaxConnections,
+		fanout:   newFanout(),
 	}
 	if s.maxConns <= 0 {
 		s.maxConns = MaxConnections
@@ -159,21 +171,84 @@ func New(st *store.Store, opts Options) *Server {
 // routes registers every path spec/kitbashd-api.yaml declares. A path is
 // registered without its method so a wrong method answers with problem details
 // like everything else, rather than the mux's plain text 405.
+//
+// There are two muxes because there are two listeners. The socket carries the
+// whole API and identifies its caller by peer credentials; the Process
+// receiver carries the three OTLP paths and identifies its caller by token.
+// Nothing under /kitbash/v1 is reachable over TCP.
 func (s *Server) routes() {
 	s.mux = http.NewServeMux()
-	s.mux.HandleFunc("/v1/traces", s.method(http.MethodPost, s.exportTraces))
-	s.mux.HandleFunc("/v1/logs", s.method(http.MethodPost, s.exportLogs))
-	s.mux.HandleFunc("/v1/metrics", s.method(http.MethodPost, s.exportMetrics))
-	s.mux.HandleFunc("/kitbash/v1/query", s.method(http.MethodPost, s.query))
-	s.mux.HandleFunc("/kitbash/v1/retention", s.retention)
-	s.mux.HandleFunc("/kitbash/v1/health", s.method(http.MethodGet, s.health))
+	s.otlpPaths(s.mux, s.socketIdentity)
+	s.mux.HandleFunc(queryPath, s.method(http.MethodPost, s.query))
+	s.mux.HandleFunc(retentionPath, s.retention)
+	s.mux.HandleFunc(processesPath, s.processes)
+	s.mux.HandleFunc(processesPath+"/", s.unregisterProcess)
+	s.mux.HandleFunc(healthPath, s.method(http.MethodGet, s.health))
 	s.mux.HandleFunc("/", s.notFound)
+
+	s.otlpMux = http.NewServeMux()
+	s.otlpPaths(s.otlpMux, s.tokenIdentity)
+	s.otlpMux.HandleFunc("/", s.notServedOverTCP)
+}
+
+// The paths of the JSON API, as spec/kitbashd-api.yaml names them.
+const (
+	queryPath     = "/kitbash/v1/query"
+	retentionPath = "/kitbash/v1/retention"
+	processesPath = "/kitbash/v1/processes"
+	healthPath    = "/kitbash/v1/health"
+)
+
+// otlpPaths registers the three OTLP paths on one mux, with the identity that
+// listener reads.
+func (s *Server) otlpPaths(mux *http.ServeMux, ident identifier) {
+	mux.HandleFunc(pathTraces, s.method(http.MethodPost, s.export(ident, decodeTraces)))
+	mux.HandleFunc(pathLogs, s.method(http.MethodPost, s.export(ident, decodeLogs)))
+	mux.HandleFunc(pathMetrics, s.method(http.MethodPost, s.export(ident, decodeMetrics)))
 }
 
 // Handler is the whole API, for a test that serves it over its own listener.
 func (s *Server) Handler() http.Handler {
 	return recovered(s.mux)
 }
+
+// TCPHandler is the Process receiver, for a test that serves it over its own
+// listener.
+func (s *Server) TCPHandler() http.Handler {
+	return recovered(s.otlpMux)
+}
+
+// Close stops the fan out workers. The store is not owned by the server, so
+// nothing here closes it.
+func (s *Server) Close() {
+	s.fanout.close()
+}
+
+// listeners is what health reports about where the daemon is bound.
+func (s *Server) listeners() listeners {
+	s.boundMu.Lock()
+	defer s.boundMu.Unlock()
+	return s.bound
+}
+
+// bind records a listener's address for health and clears it when that
+// listener stops.
+func (s *Server) bind(kind, address string) {
+	s.boundMu.Lock()
+	defer s.boundMu.Unlock()
+	switch kind {
+	case listenerSocket:
+		s.bound.Socket = address
+	case listenerTCP:
+		s.bound.TCP = address
+	}
+}
+
+// The two listeners health names.
+const (
+	listenerSocket = "socket"
+	listenerTCP    = "tcp"
+)
 
 // Serve answers requests on ln until ctx is done, then drains in flight
 // requests and returns. The listener is closed either way.
@@ -182,8 +257,27 @@ func (s *Server) Handler() http.Handler {
 // MaxConnections at once, and each one is subject to the timeouts. A daemon
 // that runs for months cannot afford a connection that never ends.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
+	return s.serve(ctx, ln, listenerSocket, s.Handler())
+}
+
+// ServeTCP answers the Process receiver on ln until ctx is done. It is the
+// same OTLP path as the socket with the same limits, and the token in the
+// Authorization header is the whole identity, see PLAN.md section 4.5.
+//
+// The host firewall decides who may reach this port. kitbashd installs none:
+// an unknown token is refused here, and that is the only claim this listener
+// makes.
+func (s *Server) ServeTCP(ctx context.Context, ln net.Listener) error {
+	return s.serve(ctx, ln, listenerTCP, s.TCPHandler())
+}
+
+// serve runs one listener with the timeouts and the connection cap both
+// listeners share.
+func (s *Server) serve(ctx context.Context, ln net.Listener, kind string, handler http.Handler) error {
+	s.bind(kind, ln.Addr().String())
+	defer s.bind(kind, "")
 	srv := &http.Server{
-		Handler:           s.Handler(),
+		Handler:           handler,
 		ConnContext:       withPeer,
 		ReadHeaderTimeout: s.timeouts.ReadHeader,
 		ReadTimeout:       s.timeouts.Read,

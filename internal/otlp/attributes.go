@@ -11,22 +11,34 @@ import (
 	"github.com/zyx1121/kitbash/internal/store"
 )
 
-// The wire names of the six kitbash attributes, see PLAN.md section 2.4. The
-// query surface speaks their short names; these are what a producer sends.
+// The wire names of the kitbash attributes, see PLAN.md section 2.4. The query
+// surface speaks their short names; these are what a producer sends.
 const (
-	AttrUser    = "kitbash.user"
-	AttrPackage = "kitbash.package"
-	AttrProcess = "kitbash.process"
-	AttrPath    = "kitbash.path"
-	AttrTool    = "kitbash.tool"
-	AttrEval    = "kitbash.eval"
+	AttrUser     = "kitbash.user"
+	AttrPackage  = "kitbash.package"
+	AttrProcess  = "kitbash.process"
+	AttrPath     = "kitbash.path"
+	AttrTool     = "kitbash.tool"
+	AttrEval     = "kitbash.eval"
+	AttrProducer = "kitbash.producer"
+)
+
+// The subject of an evaluation record: the span a judgment is about, see
+// PLAN.md section 2.4. Both stay in Other, because nothing filters on them and
+// a typed column would have to be indexed to earn its place.
+const (
+	AttrSubjectTraceID = "kitbash.subject.trace_id"
+	AttrSubjectSpanID  = "kitbash.subject.span_id"
 )
 
 // attributes merges the resource attributes of a record with its own, the
-// record winning, and lifts the six kitbash attributes into typed columns. A
+// record winning, and lifts the kitbash attributes into typed columns. A
 // kitbash attribute of the wrong type stays in Other rather than being coerced:
 // the store would otherwise answer a query with a value the producer never
 // sent.
+//
+// kitbash.producer is lifted like the rest and then overwritten by the
+// receiver, so a producer naming itself something else changes nothing.
 func attributes(resource map[string]any, record []*commonpb.KeyValue) store.Attributes {
 	merged := make(map[string]any, len(resource)+len(record))
 	for k, v := range resource {
@@ -38,11 +50,12 @@ func attributes(resource map[string]any, record []*commonpb.KeyValue) store.Attr
 
 	var attrs store.Attributes
 	for key, target := range map[string]*string{
-		AttrUser:    &attrs.User,
-		AttrPackage: &attrs.Package,
-		AttrProcess: &attrs.Process,
-		AttrPath:    &attrs.Path,
-		AttrTool:    &attrs.Tool,
+		AttrUser:     &attrs.User,
+		AttrPackage:  &attrs.Package,
+		AttrProcess:  &attrs.Process,
+		AttrPath:     &attrs.Path,
+		AttrTool:     &attrs.Tool,
+		AttrProducer: &attrs.Producer,
 	} {
 		if s, ok := merged[key].(string); ok {
 			*target = s

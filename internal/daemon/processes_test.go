@@ -1,0 +1,823 @@
+package daemon
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"google.golang.org/protobuf/proto"
+
+	coltrace "go.opentelemetry.io/proto/otlp/collector/trace/v1"
+	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
+	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
+
+	"github.com/zyx1121/kitbash/internal/otlp"
+	"github.com/zyx1121/kitbash/internal/problem"
+	"github.com/zyx1121/kitbash/internal/store"
+	"github.com/zyx1121/kitbash/internal/uuid"
+)
+
+// serveTCP starts the Process receiver of this daemon on a loopback port and
+// returns its base URL. It is the same server the socket tests use, so a test
+// exercises both listeners of one daemon.
+func (h *harness) serveTCP() string {
+	h.t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		h.t.Fatalf("listen: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- h.server.ServeTCP(ctx, ln) }()
+	h.t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				h.t.Errorf("ServeTCP: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			h.t.Error("ServeTCP did not return after the context was cancelled")
+		}
+	})
+	return "http://" + ln.Addr().String()
+}
+
+// exportTCP sends one export to the Process receiver with the token a Process
+// holds. An empty token sends no Authorization header at all.
+func (h *harness) exportTCP(base, path, token string, body []byte) (*http.Response, []byte) {
+	h.t.Helper()
+	req, err := http.NewRequest(http.MethodPost, base+path, bytes.NewReader(body))
+	if err != nil {
+		h.t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", otlp.ContentTypeProtobuf)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	res, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	if err != nil {
+		h.t.Fatalf("POST %s: %v", path, err)
+	}
+	defer res.Body.Close()
+	got, err := io.ReadAll(res.Body)
+	if err != nil {
+		h.t.Fatalf("read body: %v", err)
+	}
+	return res, got
+}
+
+// register registers one Process over the socket and returns its token.
+func (h *harness) register(req processRequest) (string, *http.Response, []byte) {
+	h.t.Helper()
+	res, body := h.postJSON(http.MethodPost, processesPath, req)
+	if res.StatusCode != http.StatusOK {
+		return "", res, body
+	}
+	var got processResponse
+	if err := json.Unmarshal(body, &got); err != nil {
+		h.t.Fatalf("body %q: %v", body, err)
+	}
+	if got.ID != req.ID {
+		h.t.Errorf("id = %q, want %q", got.ID, req.ID)
+	}
+	return got.Token, res, body
+}
+
+// registration is one valid processes_register input, with an endpoint only
+// when the Process is a subscriber.
+func registration(endpoint string) processRequest {
+	req := processRequest{
+		ID:      uuid.V7(),
+		Package: "/org/sensorium",
+		Name:    "sensorium",
+		Expose:  ExposeNone,
+	}
+	if endpoint != "" {
+		req.Expose = ExposeHTTP
+		req.Endpoint = endpoint
+		req.Subscriptions = []string{store.SubscriptionTelemetry}
+	}
+	return req
+}
+
+// processExport is one span as a Process would send it, claiming a user, a
+// package and a process kitbashd must replace unless the eval rules apply.
+func processExport(name string, claims map[string]any, eval bool, start time.Time) []byte {
+	attrs := []*commonpb.KeyValue{{
+		Key:   otlp.AttrTool,
+		Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: name}},
+	}}
+	for key, value := range claims {
+		switch v := value.(type) {
+		case string:
+			attrs = append(attrs, &commonpb.KeyValue{
+				Key:   key,
+				Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: v}},
+			})
+		case bool:
+			attrs = append(attrs, &commonpb.KeyValue{
+				Key:   key,
+				Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_BoolValue{BoolValue: v}},
+			})
+		}
+	}
+	if eval {
+		attrs = append(attrs, &commonpb.KeyValue{
+			Key:   otlp.AttrEval,
+			Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_BoolValue{BoolValue: true}},
+		})
+	}
+	req := &coltrace.ExportTraceServiceRequest{
+		ResourceSpans: []*tracepb.ResourceSpans{{
+			ScopeSpans: []*tracepb.ScopeSpans{{
+				Spans: []*tracepb.Span{{
+					TraceId:           bytes.Repeat([]byte{0x1a}, 16),
+					SpanId:            bytes.Repeat([]byte{0x2b}, 8),
+					Name:              name,
+					StartTimeUnixNano: uint64(start.UnixNano()),
+					EndTimeUnixNano:   uint64(start.Add(time.Millisecond).UnixNano()),
+					Attributes:        attrs,
+				}},
+			}},
+		}},
+	}
+	body, err := proto.Marshal(req)
+	if err != nil {
+		panic(err)
+	}
+	return body
+}
+
+// spans reads what the store holds, newest first.
+func (h *harness) spans() []store.Span {
+	h.t.Helper()
+	page, err := h.store.Query(context.Background(), store.SignalTraces, store.Filter{})
+	if err != nil {
+		h.t.Fatalf("Query: %v", err)
+	}
+	return page.Spans
+}
+
+// TestRegisterMintsATokenTheStoreOnlyHashes is the must-do of the Process
+// receiver: the token is returned once and the store holds no copy of it.
+func TestRegisterMintsATokenTheStoreOnlyHashes(t *testing.T) {
+	h := serve(t, false)
+	req := registration("")
+	token, res, body := h.register(req)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("register status = %d, body %s", res.StatusCode, body)
+	}
+	if len(token) < 40 {
+		t.Fatalf("token = %q, want at least 32 bytes of entropy", token)
+	}
+
+	p, found, err := h.store.ProcessByToken(context.Background(), token)
+	if err != nil || !found {
+		t.Fatalf("ProcessByToken: %v, found %v", err, found)
+	}
+	if p.Owner != h.user || p.Admin {
+		t.Errorf("process = %+v, want the peer as a member owner", p)
+	}
+	if _, found, _ := h.store.ProcessByToken(context.Background(), store.HashToken(token)); found {
+		t.Error("the stored hash works as a token; the store must hold nothing replayable")
+	}
+
+	// The list carries the record and no token.
+	res, body = h.do(http.MethodGet, processesPath, "", nil)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("list status = %d, body %s", res.StatusCode, body)
+	}
+	if strings.Contains(string(body), token) {
+		t.Errorf("the list carries the token: %s", body)
+	}
+	var list processList
+	if err := json.Unmarshal(body, &list); err != nil {
+		t.Fatalf("body %q: %v", body, err)
+	}
+	if len(list.Processes) != 1 || list.Processes[0].ID != req.ID {
+		t.Fatalf("list = %+v", list.Processes)
+	}
+}
+
+// TestRegisterAgainRevokesTheOldToken is proc_run for a Process that was run
+// before: the same id keeps one record, and only the newest token exports.
+func TestRegisterAgainRevokesTheOldToken(t *testing.T) {
+	h := serve(t, false)
+	base := h.serveTCP()
+	req := registration("")
+
+	first, _, _ := h.register(req)
+	second, _, _ := h.register(req)
+	if first == second {
+		t.Fatal("the second registration returned the same token")
+	}
+
+	export := processExport("echo", nil, false, time.Now().Add(-time.Minute))
+	res, body := h.exportTCP(base, pathTraces, first, export)
+	if res.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("the revoked token exported %d, want 401", res.StatusCode)
+	}
+	if slug := h.problemOf(res, body).Slug(); slug != problem.SlugNotPermitted {
+		t.Errorf("slug = %q, want %q", slug, problem.SlugNotPermitted)
+	}
+	res, body = h.exportTCP(base, pathTraces, second, export)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("the new token exported %d, body %s", res.StatusCode, body)
+	}
+}
+
+// TestRegisterAnotherOwnersIDConflicts keeps one member from taking over
+// another member's Process by naming its id.
+func TestRegisterAnotherOwnersIDConflicts(t *testing.T) {
+	h := serve(t, false)
+	req := registration("")
+	_, hash, err := store.NewToken()
+	if err != nil {
+		t.Fatalf("NewToken: %v", err)
+	}
+	if err := h.store.RegisterProcess(context.Background(), store.Process{
+		ID: req.ID, Owner: "someone-else", Package: "/home/someone-else/echo",
+		Expose: ExposeNone, RegisteredAt: time.Now(),
+	}, hash); err != nil {
+		t.Fatalf("RegisterProcess: %v", err)
+	}
+
+	_, res, body := h.register(req)
+	if res.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", res.StatusCode)
+	}
+	if slug := h.problemOf(res, body).Slug(); slug != problem.SlugConflict {
+		t.Errorf("slug = %q, want %q", slug, problem.SlugConflict)
+	}
+}
+
+// TestUnregisterRevokesTheToken is proc_stop: the container may still be
+// exporting, and it is refused from the moment the Process is gone.
+func TestUnregisterRevokesTheToken(t *testing.T) {
+	h := serve(t, false)
+	base := h.serveTCP()
+	req := registration("")
+	token, _, _ := h.register(req)
+
+	res, body := h.do(http.MethodDelete, processesPath+"/"+req.ID, "", nil)
+	if res.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete status = %d, body %s", res.StatusCode, body)
+	}
+	res, _ = h.exportTCP(base, pathTraces, token, processExport("echo", nil, false, time.Now()))
+	if res.StatusCode != http.StatusUnauthorized {
+		t.Errorf("the revoked token exported %d, want 401", res.StatusCode)
+	}
+
+	res, body = h.do(http.MethodDelete, processesPath+"/"+req.ID, "", nil)
+	if res.StatusCode != http.StatusNotFound {
+		t.Errorf("deleting again = %d, want 404", res.StatusCode)
+	}
+	if slug := h.problemOf(res, body).Slug(); slug != problem.SlugNotFound {
+		t.Errorf("slug = %q, want %q", slug, problem.SlugNotFound)
+	}
+}
+
+// TestUnregisterAnotherOwnersProcessIsRefused is the member boundary on the
+// delete path.
+func TestUnregisterAnotherOwnersProcessIsRefused(t *testing.T) {
+	h := serve(t, false)
+	id := uuid.V7()
+	_, hash, _ := store.NewToken()
+	if err := h.store.RegisterProcess(context.Background(), store.Process{
+		ID: id, Owner: "someone-else", Package: "/home/someone-else/echo",
+		Expose: ExposeNone, RegisteredAt: time.Now(),
+	}, hash); err != nil {
+		t.Fatalf("RegisterProcess: %v", err)
+	}
+	res, body := h.do(http.MethodDelete, processesPath+"/"+id, "", nil)
+	if res.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", res.StatusCode)
+	}
+	if slug := h.problemOf(res, body).Slug(); slug != problem.SlugNotPermitted {
+		t.Errorf("slug = %q, want %q", slug, problem.SlugNotPermitted)
+	}
+}
+
+// TestProcessExportIsStampedFromTheToken is the must-do of the TCP receiver: a
+// Process is whoever its token says, and what it claims about itself is
+// replaced.
+func TestProcessExportIsStampedFromTheToken(t *testing.T) {
+	h := serve(t, false)
+	base := h.serveTCP()
+	req := registration("")
+	token, _, _ := h.register(req)
+
+	claims := map[string]any{
+		otlp.AttrUser:    "someone-else",
+		otlp.AttrPackage: "/org/not-this-one",
+		otlp.AttrProcess: "not-this-process",
+	}
+	res, body := h.exportTCP(base, pathTraces, token, processExport("echo", claims, false, time.Now().Add(-time.Minute)))
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body %s", res.StatusCode, body)
+	}
+
+	spans := h.spans()
+	if len(spans) != 1 {
+		t.Fatalf("spans = %d, want 1", len(spans))
+	}
+	got := spans[0]
+	if got.User != h.user {
+		t.Errorf("user = %q, want the owner %q", got.User, h.user)
+	}
+	if got.Package != req.Package || got.Process != req.ID {
+		t.Errorf("package = %q, process = %q, want the token's", got.Package, got.Process)
+	}
+	if got.Producer != req.ID {
+		t.Errorf("producer = %q, want the Process id %q", got.Producer, req.ID)
+	}
+}
+
+// TestTCPRefusesWithoutAToken is the other half: no token, no records, and the
+// JSON API is not served on this listener at all.
+func TestTCPRefusesWithoutAToken(t *testing.T) {
+	h := serve(t, false)
+	base := h.serveTCP()
+	export := processExport("echo", nil, false, time.Now())
+
+	for _, token := range []string{"", "not-a-token"} {
+		res, body := h.exportTCP(base, pathTraces, token, export)
+		if res.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("token %q exported %d, want 401", token, res.StatusCode)
+		}
+		p := h.problemOf(res, body)
+		if p.Slug() != problem.SlugNotPermitted {
+			t.Errorf("slug = %q, want %q", p.Slug(), problem.SlugNotPermitted)
+		}
+	}
+	if spans := h.spans(); len(spans) != 0 {
+		t.Errorf("a refused export stored %d spans", len(spans))
+	}
+
+	res, _ := h.exportTCP(base, healthPath, "", nil)
+	if res.StatusCode != http.StatusNotFound {
+		t.Errorf("the JSON API answered %d over TCP, want 404", res.StatusCode)
+	}
+}
+
+// TestEvalClaimsOnlyFromAnAdminsProcess is the evaluation rule of PLAN.md
+// section 2.4: a judgment written by an admin's kit keeps the subject's
+// identity, and everybody else's is stamped like any other record.
+func TestEvalClaimsOnlyFromAnAdminsProcess(t *testing.T) {
+	claims := map[string]any{
+		otlp.AttrUser:              "judged-member",
+		otlp.AttrPackage:           "/org/ffmpeg",
+		otlp.AttrProcess:           "0192f2c0-1234-7abc-8def-0123456789ab",
+		otlp.AttrPath:              "/org/ffmpeg",
+		otlp.AttrSubjectTraceID:    strings.Repeat("ab", 16),
+		otlp.AttrSubjectSpanID:     strings.Repeat("cd", 8),
+		"kitbash.eval.score":       "0.9",
+		otlp.AttrProducer + ".lie": "ignored",
+	}
+
+	t.Run("admin", func(t *testing.T) {
+		h := serve(t, true)
+		base := h.serveTCP()
+		req := registration("")
+		token, _, _ := h.register(req)
+		res, body := h.exportTCP(base, pathTraces, token,
+			processExport("judgement", claims, true, time.Now().Add(-time.Minute)))
+		if res.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, body %s", res.StatusCode, body)
+		}
+		got := h.spans()[0]
+		if got.User != "judged-member" || got.Package != "/org/ffmpeg" {
+			t.Errorf("an admin's judgement was stamped over: %+v", got.Attributes)
+		}
+		if got.Process != "0192f2c0-1234-7abc-8def-0123456789ab" || got.Path != "/org/ffmpeg" {
+			t.Errorf("process = %q, path = %q, want the claims as sent", got.Process, got.Path)
+		}
+		if got.Producer != req.ID {
+			t.Errorf("producer = %q, want the kit's Process id", got.Producer)
+		}
+		if s := subjectOf(got.Other); s == nil || s.TraceID != strings.Repeat("ab", 16) {
+			t.Errorf("subject = %+v, want the judged span", s)
+		}
+
+		// The query surface publishes the subject as an object.
+		res, body = h.postJSON(http.MethodPost, queryPath, queryRequest{Signal: store.SignalTraces})
+		if res.StatusCode != http.StatusOK {
+			t.Fatalf("query status = %d, body %s", res.StatusCode, body)
+		}
+		var page struct {
+			Records []spanRecord `json:"records"`
+		}
+		if err := json.Unmarshal(body, &page); err != nil {
+			t.Fatalf("body %q: %v", body, err)
+		}
+		if len(page.Records) != 1 {
+			t.Fatalf("records = %d", len(page.Records))
+		}
+		attrs := page.Records[0].Attributes
+		if attrs.Subject == nil || attrs.Subject.SpanID != strings.Repeat("cd", 8) {
+			t.Errorf("attributes.subject = %+v", attrs.Subject)
+		}
+		if attrs.Producer != req.ID || attrs.Eval == nil || !*attrs.Eval {
+			t.Errorf("attributes = %+v", attrs)
+		}
+	})
+
+	t.Run("member", func(t *testing.T) {
+		h := serve(t, false)
+		base := h.serveTCP()
+		req := registration("")
+		token, _, _ := h.register(req)
+		res, body := h.exportTCP(base, pathTraces, token,
+			processExport("judgement", claims, true, time.Now().Add(-time.Minute)))
+		if res.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, body %s", res.StatusCode, body)
+		}
+		got := h.spans()[0]
+		if got.User != h.user {
+			t.Errorf("user = %q, want the member %q; a member's kit may not claim another", got.User, h.user)
+		}
+		if got.Package != req.Package || got.Process != req.ID {
+			t.Errorf("package = %q, process = %q, want the token's", got.Package, got.Process)
+		}
+	})
+
+	t.Run("session", func(t *testing.T) {
+		h := serve(t, true)
+		res, body := h.do(http.MethodPost, pathTraces, otlp.ContentTypeProtobuf,
+			processExport("judgement", claims, true, time.Now().Add(-time.Minute)))
+		if res.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, body %s", res.StatusCode, body)
+		}
+		got := h.spans()[0]
+		if got.User != h.user {
+			t.Errorf("user = %q, want the peer %q; a session is stamped whatever it claims", got.User, h.user)
+		}
+		if got.Producer != h.user {
+			t.Errorf("producer = %q, want the member name", got.Producer)
+		}
+	})
+}
+
+// TestQueryFiltersByProducer is the new filter of tel_query: it separates a
+// judgment from the act it judges, which share every other attribute.
+func TestQueryFiltersByProducer(t *testing.T) {
+	h := serve(t, false)
+	base := h.serveTCP()
+	req := registration("")
+	token, _, _ := h.register(req)
+
+	if res, body := h.do(http.MethodPost, pathTraces, otlp.ContentTypeProtobuf,
+		exportRequest("fs_list", h.user, time.Now().Add(-time.Minute))); res.StatusCode != http.StatusOK {
+		t.Fatalf("session export = %d, body %s", res.StatusCode, body)
+	}
+	if res, body := h.exportTCP(base, pathTraces, token,
+		processExport("echo", nil, false, time.Now().Add(-time.Minute))); res.StatusCode != http.StatusOK {
+		t.Fatalf("process export = %d, body %s", res.StatusCode, body)
+	}
+
+	for producer, want := range map[string]string{h.user: "fs_list", req.ID: "echo"} {
+		res, body := h.postJSON(http.MethodPost, queryPath,
+			queryRequest{Signal: store.SignalTraces, Producer: producer})
+		if res.StatusCode != http.StatusOK {
+			t.Fatalf("query status = %d, body %s", res.StatusCode, body)
+		}
+		var page struct {
+			Records []spanRecord `json:"records"`
+		}
+		if err := json.Unmarshal(body, &page); err != nil {
+			t.Fatalf("body %q: %v", body, err)
+		}
+		if len(page.Records) != 1 || page.Records[0].Name != want {
+			t.Fatalf("producer %q returned %+v, want the %s span", producer, page.Records, want)
+		}
+		if page.Records[0].Attributes.Producer != producer {
+			t.Errorf("producer = %q, want %q", page.Records[0].Attributes.Producer, producer)
+		}
+	}
+}
+
+// TestEndpointMustBeLoopback is the rule that keeps the fan out from being
+// pointed at the network by a registration.
+func TestEndpointMustBeLoopback(t *testing.T) {
+	h := serve(t, false)
+	for _, endpoint := range []string{
+		"http://10.10.10.116:4318",
+		"http://example.org:80",
+		"https://127.0.0.1:4318",
+		"http://127.0.0.1:4318/collect",
+		"http://localhost:4318",
+		"http://127.0.0.1",
+		"http://[::1]:4318",
+		"tcp://127.0.0.1:4318",
+	} {
+		req := registration("http://127.0.0.1:40275")
+		req.Endpoint = endpoint
+		_, res, body := h.register(req)
+		if res.StatusCode != http.StatusBadRequest {
+			t.Errorf("endpoint %q registered %d, want 400", endpoint, res.StatusCode)
+			continue
+		}
+		if slug := h.problemOf(res, body).Slug(); slug != problem.SlugBadRequest {
+			t.Errorf("endpoint %q slug = %q", endpoint, slug)
+		}
+	}
+
+	// The rest of the input is checked the same way.
+	for _, req := range []processRequest{
+		{ID: "not-a-uuid", Package: "/org/x", Expose: ExposeNone},
+		{ID: uuid.V7(), Package: "relative/path", Expose: ExposeNone},
+		{ID: uuid.V7(), Package: "/org/x", Expose: "sideways"},
+		{ID: uuid.V7(), Package: "/org/x", Expose: ExposeNone, Subscriptions: []string{"everything"}},
+	} {
+		_, res, _ := h.register(req)
+		if res.StatusCode != http.StatusBadRequest {
+			t.Errorf("%+v registered %d, want 400", req, res.StatusCode)
+		}
+	}
+}
+
+// subscriberStub is a Process that subscribes to the fan out: it records what
+// it receives and can be made slow.
+type subscriberStub struct {
+	server   *httptest.Server
+	requests chan fanoutRequest
+	release  chan struct{}
+	slow     bool
+}
+
+// fanoutRequest is one delivery a subscriber received.
+type fanoutRequest struct {
+	path string
+	body map[string]any
+}
+
+func newSubscriber(t *testing.T, slow bool) *subscriberStub {
+	t.Helper()
+	sub := &subscriberStub{
+		requests: make(chan fanoutRequest, 64),
+		release:  make(chan struct{}),
+		slow:     slow,
+	}
+	sub.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var decoded map[string]any
+		json.Unmarshal(body, &decoded)
+		select {
+		case sub.requests <- fanoutRequest{path: r.URL.Path, body: decoded}:
+		default:
+		}
+		if sub.slow {
+			<-sub.release
+		}
+		w.Header().Set("Content-Type", otlp.ContentTypeJSON)
+		w.Write([]byte("{}"))
+	}))
+	t.Cleanup(func() {
+		close(sub.release)
+		sub.server.Close()
+	})
+	return sub
+}
+
+// await reads the next delivery, or fails the test if none arrives.
+func (s *subscriberStub) await(t *testing.T) fanoutRequest {
+	t.Helper()
+	select {
+	case req := <-s.requests:
+		return req
+	case <-time.After(5 * time.Second):
+		t.Fatal("the subscriber received nothing")
+		return fanoutRequest{}
+	}
+}
+
+// silent fails the test if anything arrives within the window.
+func (s *subscriberStub) silent(t *testing.T, window time.Duration) {
+	t.Helper()
+	select {
+	case req := <-s.requests:
+		t.Fatalf("the subscriber received %s, which it is not eligible for", req.path)
+	case <-time.After(window):
+	}
+}
+
+// addSubscriber registers a subscriber owned by whoever the test names, which
+// is how one daemon gets records of two members' Processes.
+func (h *harness) addSubscriber(owner string, admin bool, endpoint string) string {
+	h.t.Helper()
+	id := uuid.V7()
+	_, hash, err := store.NewToken()
+	if err != nil {
+		h.t.Fatalf("NewToken: %v", err)
+	}
+	if err := h.store.RegisterProcess(context.Background(), store.Process{
+		ID:            id,
+		Owner:         owner,
+		Admin:         admin,
+		Package:       "/org/sensorium",
+		Expose:        ExposeHTTP,
+		Endpoint:      endpoint,
+		Subscriptions: []string{store.SubscriptionTelemetry},
+		RegisteredAt:  time.Now(),
+	}, hash); err != nil {
+		h.t.Fatalf("RegisterProcess: %v", err)
+	}
+	if err := h.server.LoadSubscribers(context.Background()); err != nil {
+		h.t.Fatalf("LoadSubscribers: %v", err)
+	}
+	return id
+}
+
+// TestFanOutFollowsTheReadingRule is the fan out of PLAN.md section 2.4: an
+// admin's subscriber receives every member's records, a member's receives only
+// their own, and the records arrive as OTLP JSON on the standard path.
+func TestFanOutFollowsTheReadingRule(t *testing.T) {
+	h := serve(t, false)
+	adminSub := newSubscriber(t, false)
+	memberSub := newSubscriber(t, false)
+	otherSub := newSubscriber(t, false)
+
+	h.addSubscriber("an-admin", true, adminSub.server.URL)
+	h.addSubscriber(h.user, false, memberSub.server.URL)
+	h.addSubscriber("someone-else", false, otherSub.server.URL)
+
+	res, body := h.do(http.MethodPost, pathTraces, otlp.ContentTypeProtobuf,
+		exportRequest("fs_list", h.user, time.Now().Add(-time.Minute)))
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("export status = %d, body %s", res.StatusCode, body)
+	}
+
+	for name, sub := range map[string]*subscriberStub{"admin": adminSub, "owner": memberSub} {
+		got := sub.await(t)
+		if got.path != pathTraces {
+			t.Errorf("%s subscriber received %s, want %s", name, got.path, pathTraces)
+		}
+		span := onlySpan(t, got.body)
+		if span["traceId"] != strings.Repeat("ab", 16) {
+			t.Errorf("%s subscriber received traceId %v, want hex", name, span["traceId"])
+		}
+		if span["startTimeUnixNano"] == nil {
+			t.Errorf("%s subscriber received no start time: %v", name, span)
+		}
+		attrs := attributeMap(span)
+		if attrs[otlp.AttrUser] != h.user || attrs[otlp.AttrProducer] != h.user {
+			t.Errorf("%s subscriber received attributes %v, want the stamped ones", name, attrs)
+		}
+	}
+	otherSub.silent(t, 300*time.Millisecond)
+}
+
+// TestFanOutSkipsTheProducingSubscriber keeps an observability kit from being
+// fed its own exports, which would never stop.
+func TestFanOutSkipsTheProducingSubscriber(t *testing.T) {
+	h := serve(t, true)
+	base := h.serveTCP()
+	itself := newSubscriber(t, false)
+	other := newSubscriber(t, false)
+
+	req := registration(itself.server.URL)
+	token, res, body := h.register(req)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("register status = %d, body %s", res.StatusCode, body)
+	}
+	h.addSubscriber(h.user, false, other.server.URL)
+
+	res, body = h.exportTCP(base, pathTraces, token,
+		processExport("echo", nil, false, time.Now().Add(-time.Minute)))
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("export status = %d, body %s", res.StatusCode, body)
+	}
+
+	got := other.await(t)
+	if attributeMap(onlySpan(t, got.body))[otlp.AttrProducer] != req.ID {
+		t.Errorf("the other subscriber received %v", got.body)
+	}
+	itself.silent(t, 300*time.Millisecond)
+}
+
+// TestFanOutNeverDelaysTheProducer is the promise the queue exists for: a
+// subscriber that does not answer cannot hold up the 200 that says the records
+// are stored.
+func TestFanOutNeverDelaysTheProducer(t *testing.T) {
+	h := serve(t, false)
+	slow := newSubscriber(t, true)
+	h.addSubscriber(h.user, false, slow.server.URL)
+
+	start := time.Now()
+	for range 3 {
+		res, body := h.do(http.MethodPost, pathTraces, otlp.ContentTypeProtobuf,
+			exportRequest("fs_list", h.user, time.Now().Add(-time.Minute)))
+		if res.StatusCode != http.StatusOK {
+			t.Fatalf("export status = %d, body %s", res.StatusCode, body)
+		}
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("three exports took %s while a subscriber hung; the fan out must not block them", elapsed)
+	}
+	slow.await(t)
+}
+
+// TestQueueDropsTheOldest is what a full queue does: it loses the oldest
+// request rather than the producer's time, and it counts what it lost.
+func TestQueueDropsTheOldest(t *testing.T) {
+	sub := &subscriber{
+		id:    "a-process",
+		queue: make(chan delivery, QueueDepth),
+		stop:  make(chan struct{}),
+		done:  make(chan struct{}),
+	}
+	// Nothing drains the queue, so everything past its depth must be dropped
+	// without blocking.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := range QueueDepth * 2 {
+			sub.enqueue(delivery{path: pathTraces, body: []byte(strings.Repeat("x", i%8))})
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("enqueue blocked on a full queue")
+	}
+	if len(sub.queue) != QueueDepth {
+		t.Errorf("queue holds %d, want it full at %d", len(sub.queue), QueueDepth)
+	}
+	if dropped := sub.dropped.Load(); dropped != QueueDepth {
+		t.Errorf("dropped = %d, want the %d that did not fit", dropped, QueueDepth)
+	}
+}
+
+// TestHealthReportsListenersAndSubscribers is the operator's answer to whether
+// the Process receiver is up and whether anything is subscribed.
+func TestHealthReportsListenersAndSubscribers(t *testing.T) {
+	h := serve(t, false)
+	base := h.serveTCP()
+	sub := newSubscriber(t, false)
+	h.addSubscriber(h.user, false, sub.server.URL)
+
+	res, body := h.do(http.MethodGet, healthPath, "", nil)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body %s", res.StatusCode, body)
+	}
+	var got healthResponse
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("body %q: %v", body, err)
+	}
+	if !strings.HasSuffix(got.Listeners.Socket, "kitbashd.sock") {
+		t.Errorf("listeners.socket = %q", got.Listeners.Socket)
+	}
+	if got.Listeners.TCP != strings.TrimPrefix(base, "http://") {
+		t.Errorf("listeners.tcp = %q, want %q", got.Listeners.TCP, base)
+	}
+	if got.Subscribers != 1 {
+		t.Errorf("subscribers = %d, want 1", got.Subscribers)
+	}
+}
+
+// onlySpan reads the one span of a fanned out export request.
+func onlySpan(t *testing.T, body map[string]any) map[string]any {
+	t.Helper()
+	resource, ok := body["resourceSpans"].([]any)
+	if !ok || len(resource) != 1 {
+		t.Fatalf("body = %v, want one resourceSpans", body)
+	}
+	scope, ok := resource[0].(map[string]any)["scopeSpans"].([]any)
+	if !ok || len(scope) != 1 {
+		t.Fatalf("body = %v, want one scopeSpans", body)
+	}
+	spans, ok := scope[0].(map[string]any)["spans"].([]any)
+	if !ok || len(spans) != 1 {
+		t.Fatalf("body = %v, want one span", body)
+	}
+	return spans[0].(map[string]any)
+}
+
+// attributeMap flattens the OTLP KeyValue list of a record.
+func attributeMap(span map[string]any) map[string]string {
+	out := map[string]string{}
+	list, _ := span["attributes"].([]any)
+	for _, item := range list {
+		kv, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		key, _ := kv["key"].(string)
+		value, _ := kv["value"].(map[string]any)
+		if s, ok := value["stringValue"].(string); ok {
+			out[key] = s
+		}
+		if b, ok := value["boolValue"].(bool); ok && b {
+			out[key] = "true"
+		}
+	}
+	return out
+}

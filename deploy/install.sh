@@ -94,6 +94,13 @@ find /org -type d -exec chmod 750 {} +
 find /org -type f -exec chmod 640 {} +
 
 # 10. sshd: regular users get the MCP surface and nothing else.
+#     Port 22 is the only port this installer configures. kitbashd also opens
+#     TCP 4318, the Process receiver: rootless containers reach the host there
+#     and export Telemetry with the token kitbashd minted for them. Every
+#     request on it needs that token, but the port is bound on every address
+#     because host.containers.internal resolves to the host's primary one, so
+#     scope it in the host firewall to the container network and whatever else
+#     must reach it. kitbash installs no firewall; that is the operator's.
 cat > /etc/ssh/sshd_config.d/60-kitbash.conf <<'S'
 # kitbash: SSH is the MCP transport. Members never get a shell.
 PasswordAuthentication no

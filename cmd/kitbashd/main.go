@@ -25,17 +25,25 @@ import (
 // version is set at build time with -X main.version.
 var version = "dev"
 
-// The socket and the store as spec/kitbashd-api.yaml declares them.
+// The socket, the store and the Process receiver as spec/kitbashd-api.yaml
+// declares them. The receiver binds every address because rootless networking
+// delivers host.containers.internal to the host's primary address and not to
+// loopback; the host firewall scopes who else may reach it, and the token
+// decides whose records arrive, see PLAN.md section 4.5.
 const (
-	defaultSocket = "/run/kitbash/kitbashd.sock"
-	defaultStore  = "/var/lib/kitbash/kitbashd.db"
+	defaultSocket     = "/run/kitbash/kitbashd.sock"
+	defaultStore      = "/var/lib/kitbash/kitbashd.db"
+	defaultOTLPListen = "0.0.0.0:4318"
 )
 
 // Environment overrides, the same rule KITBASH_ROOTS follows for kitbash-mcp:
-// they exist for tests and for running outside a kitbash host.
+// they exist for tests and for running outside a kitbash host. An empty
+// KITBASH_OTLP_LISTEN is not an override; pass -otlp-listen "" to serve the
+// socket alone.
 const (
-	socketEnv = "KITBASH_SOCKET"
-	storeEnv  = "KITBASH_STORE"
+	socketEnv     = "KITBASH_SOCKET"
+	storeEnv      = "KITBASH_STORE"
+	otlpListenEnv = "KITBASH_OTLP_LISTEN"
 )
 
 // SocketGroup owns the socket with root, so every member may connect and
@@ -61,6 +69,8 @@ func main() {
 func run() error {
 	socket := flag.String("socket", env(socketEnv, defaultSocket), "unix socket to listen on")
 	storePath := flag.String("store", env(storeEnv, defaultStore), "SQLite file holding Telemetry")
+	otlpListen := flag.String("otlp-listen", env(otlpListenEnv, defaultOTLPListen),
+		"address of the Process receiver, empty to serve the socket alone")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
 	if *showVersion {
@@ -93,21 +103,62 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	var otlpLn net.Listener
+	if *otlpListen != "" {
+		otlpLn, err = net.Listen("tcp", *otlpListen)
+		if err != nil {
+			ln.Close()
+			return fmt.Errorf("listen on %s: %w", *otlpListen, err)
+		}
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	srv := daemon.New(st, daemon.Options{Version: version})
+	defer srv.Close()
 	if _, err := srv.Sweep(ctx); err != nil {
 		// A store that cannot be swept can still receive and answer, so this
 		// is a warning rather than a refusal to start.
 		logger.Printf("retention sweep on start failed: %v", err)
 	}
 	go srv.SweepLoop(ctx, daemon.SweepEvery)
+	// The Processes that survived a restart are still registered, so the fan
+	// out starts delivering to them again without waiting for a session.
+	if err := srv.LoadSubscribers(ctx); err != nil {
+		logger.Printf("could not load the fan out subscribers: %v", err)
+	}
 
-	logger.Printf("listening on %s, store %s, version %s", *socket, *storePath, version)
-	if err := srv.Serve(ctx, ln); err != nil {
-		return err
+	// Both listeners stop together: whichever returns first cancels the
+	// other, so a daemon that has lost one receiver does not keep serving on
+	// the other as if nothing happened.
+	serve, cancel := context.WithCancel(ctx)
+	defer cancel()
+	errs := make(chan error, 2)
+	listeners := 1
+	go func() {
+		defer cancel()
+		errs <- srv.Serve(serve, ln)
+	}()
+	if otlpLn != nil {
+		listeners++
+		go func() {
+			defer cancel()
+			errs <- srv.ServeTCP(serve, otlpLn)
+		}()
+		logger.Printf("listening on %s and %s, store %s, version %s", *socket, *otlpListen, *storePath, version)
+	} else {
+		logger.Printf("listening on %s, store %s, version %s", *socket, *storePath, version)
+	}
+
+	var failed error
+	for range listeners {
+		if err := <-errs; err != nil && failed == nil {
+			failed = err
+		}
+	}
+	if failed != nil {
+		return failed
 	}
 	logger.Printf("stopped")
 	return nil
