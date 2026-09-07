@@ -2,7 +2,7 @@
 
 > An operating system for AI agents. Files, Packages, Processes, Telemetry. Nothing built for a human at a terminal.
 
-This is the single living document for the product. It replaces a design doc, an architecture doc and a roadmap. When a decision changes, this file changes. Status: draft v0.3, 2026-09-06.
+This is the single living document for the product. It replaces a design doc, an architecture doc and a roadmap. When a decision changes, this file changes. Status: draft v0.4, 2026-09-07.
 
 ## 1. Positioning
 
@@ -89,7 +89,15 @@ Telemetry is an OTLP receiver and a store. Every span, metric point and log reco
 
 On the wire the four attributes are namespaced as the OpenTelemetry conventions require: `kitbash.user`, `kitbash.package`, `kitbash.process`, `kitbash.path`, plus `kitbash.tool` for the surface tool a span records and `kitbash.eval` for judgments written back by kits. The query surface speaks the short names. `kitbash.user` is never trusted from a producer: kitbashd stamps it from the peer credentials of the connection that delivered the record.
 
-**Producers.** Through M3 the only producer is kitbash-mcp, which opens one span per `tools/call` (built in and Package tools alike), a child span per build and per Process start, and one log record per build carrying the build log tail. It exports OTLP/HTTP over the kitbashd unix socket. Processes become producers in M4 through the same receiver on a host address the containers can reach. Nothing on the surface is untraced: the span is opened by middleware before any handler runs.
+**Producers.** kitbash-mcp opens one span per `tools/call` (built in and Package tools alike), a child span per build and per Process start, and one log record per build carrying the build log tail. It exports OTLP/HTTP over the kitbashd unix socket. Nothing on the surface is untraced: the span is opened by middleware before any handler runs.
+
+From M4 every Process is a producer too. kitbashd also listens for OTLP/HTTP on the host address containers reach, and each Process is started with `KITBASH_TELEMETRY_ENDPOINT`, `KITBASH_TELEMETRY_TOKEN`, `KITBASH_PROCESS`, `KITBASH_PACKAGE` and `KITBASH_USER` in its environment. The token is minted by kitbashd when the Process is registered at `proc_run` and revoked when it stops; it names exactly one Process, and kitbashd stamps `kitbash.user`, `kitbash.package` and `kitbash.process` from it. A Process that never reads the token is simply an untraced producer of nothing; its lifecycle is still traced by kitbash-mcp.
+
+Every record also carries `kitbash.producer`, stamped by kitbashd: the member for a session record, the Process id for a Process record. `kitbash.user` is the member the record is about. The two differ only for evaluation records, see below.
+
+**Fan out.** A Process whose manifest declares `provides.subscriptions: [telemetry]`, `expose: http` and a `port` receives every record kitbashd stores, as OTLP/HTTP JSON POSTed to the standard paths on its endpoint, after the record is stored and stamped. Delivery is best effort and asynchronous with a bounded queue per subscriber; a subscriber that is down loses records and the gap is logged, the store is the source of truth. A subscriber run by an admin receives the whole machine. A subscriber run by a member receives that member's records only, the same rule as `tel_query`.
+
+**Evaluation.** An evaluation kit is a subscriber that writes judgments back through the Process receiver with `kitbash.eval: true`. A judgment is about a subject, named by `kitbash.subject.trace_id` and `kitbash.subject.span_id`, and it carries the subject's `kitbash.user`, `kitbash.package`, `kitbash.process` and `kitbash.path` so that the query that asks what a Package did also returns how it was judged. kitbashd accepts those claims on an evaluation record only when the producing Process was run by an admin; a member's evaluation kit has them forced to the member's own. `kitbash.producer` always names the kit's Process, so a judgment is never mistaken for the act it judges.
 
 **Reading.** `tel_query` returns records of one signal filtered by the four attributes and a time range. A member reads their own records; an admin reads everyone's. `tel_retention` reads the window per signal and lets an admin set it.
 
@@ -177,6 +185,18 @@ A kit installs the same way as any Package and is versioned, traced and removabl
 
 **Workflows are a kit.** A workflow engine is a Package that reads graph files from Files, calls tools on other Processes, and emits Telemetry. The core does not know what a workflow is. A workflow that references another workflow is the engine's concern, resolved by schema compatibility of inputs and outputs.
 
+**The contract, hook by hook.** A kit talks to kitbashd the way every Package does: through its manifest, its MCP tools and the Telemetry receiver. There is no plugin API.
+
+| Hook | The kit declares | kitbashd does |
+|------|------------------|---------------|
+| import | `kit: [import]` and a tool `import` whose `source` pattern is the route | `pkg_import` picks the kit whose schema accepts the source and writes the files it returns |
+| build | `kit: [build]` and a tool `build` with input `{path, context}` and output `{digest, log}` | declared for version 1; the built in OCI path builds every Package until a manifest can name a builder |
+| run | `kit: [run]` and a tool `run` with input `{package, digest, name, unit}` and output `{id, state, endpoint}` | declared for version 1; the built in rootless podman runner runs every Process until a manifest can name a runner |
+| observe | `kit: [observe]`, `subscriptions: [telemetry]`, `expose: http`, `port` | POSTs every stored record to the Process as OTLP/HTTP JSON, see 2.4 Fan out |
+| evaluate | `kit: [evaluate]` and usually the observe declarations as well | accepts records with `kitbash.eval: true` and subject attributes through the Process receiver, see 2.4 Evaluation |
+
+Build and run dispatch to an installed kit is the one part of the contract version 1 declares without exercising: nothing needs a second builder or runner yet, and the manifest field that would name one is not added until something does.
+
 **The import hook.** An import kit is a running Process whose manifest declares `provides.kit: [import]` and a tool named `import`. The tool's input schema has a `source` string, constrained by a pattern to the source syntax the kit understands, and its output is a list of files, each a relative path with text or base64 content. `pkg_import` walks the caller's running kits, picks the one whose `import` input schema accepts the source string, calls the tool, and writes the returned files into the target folder as one commit. The choice binds on schemas, not on a registry of kit names. Two kits accepting the same source is a conflict the caller resolves by stopping one.
 
 **Import kits are the package manager.** A human runs `apt install ffmpeg` and reads `--help`. An agent asks import-cli to wrap ffmpeg, gets a Package with tools that carry schemas, and calls `ffmpeg.transcode` with a structured result. import-mcp is nearly automatic because MCP servers already declare tool schemas. import-cli is the hard one: it drafts a manifest from `--help` and man pages, runs the tool to validate the schema, and only then admits the Package. That validation loop is work an agent can do itself.
@@ -229,11 +249,11 @@ Every organization member is a Linux user with an SSH public key. Their agent co
 ssh alice@kitbash.example.org
 ```
 
-sshd applies `ForceCommand kitbash-mcp` to every regular user. The connection is an MCP stdio session. Authentication, encryption and multi user isolation are sshd's job. kitbashd contains no authentication code in version 1. OIDC or an HTTP MCP endpoint can be added later without touching the object model.
+sshd applies `ForceCommand kitbash-mcp` to every regular user. The connection is an MCP stdio session. Authentication, encryption and multi user isolation are sshd's job. kitbashd contains no authentication code for members in version 1. OIDC or an HTTP MCP endpoint can be added later without touching the object model. Processes are the one identity kitbashd checks itself: a bearer token per Process on the Telemetry receiver, minted at `proc_run`, because a container's network address says nothing about who runs it.
 
 Admins are members of the `kitbash-admin` group. They create users, manage `/org`, and approve queued operations, all through the same MCP surface.
 
-kitbash-mcp talks to kitbashd over a unix socket, `/run/kitbash/kitbashd.sock`, owned by root with group `kitbash-users` and mode 0660. kitbashd learns who is calling from the socket's peer credentials, the same kernel fact sshd relied on, and reads group membership from the system. There is no token and no second identity. The socket carries OTLP/HTTP on the standard paths and a small JSON API for queries and settings; the machine readable definition is [`spec/kitbashd-api.yaml`](spec/kitbashd-api.yaml).
+kitbash-mcp talks to kitbashd over a unix socket, `/run/kitbash/kitbashd.sock`, owned by root with group `kitbash-users` and mode 0660. Processes talk to kitbashd over TCP on the host's address, port 4318, because rootless networking delivers `host.containers.internal` to that address and not to loopback; the host firewall scopes who else can reach it, and the token decides whose records they are. kitbashd learns who is calling from the socket's peer credentials, the same kernel fact sshd relied on, and reads group membership from the system. There is no token and no second identity. The socket carries OTLP/HTTP on the standard paths and a small JSON API for queries and settings; the machine readable definition is [`spec/kitbashd-api.yaml`](spec/kitbashd-api.yaml).
 
 One break glass path exists for the operator: a serial console or a dedicated `ops` user with a real shell, disabled by default and enabled only from the console. Without it the first stuck machine is a reinstall.
 
@@ -299,7 +319,9 @@ The MCP tool surface is decided in `spec/mcp-surface.yaml`: six families, `fs` i
 - Health: `health` is recorded but not probed until kitbashd supervises Processes. Liveness in M2 is PID 1 of the container.
 - A Process started in one MCP session appears on another session's surface when that session reconnects, not live.
 - Import kits run under the member who imports. Whether an admin can run a kit once for every member is an M5 question.
-- Metrics: the store and the receiver accept them from M3, but no producer emits any until Processes do in M4. `tel_query` with `signal: metrics` returns an empty page until then.
+- Metrics: the store and the receiver accept them from M3; the first producers are the M4 kits.
+- Build and run kits: the contract is declared, dispatch is not implemented, and the manifest has no field to name a builder or runner. Add the field when a second builder or runner exists.
+- Fan out is best effort. A subscriber that must not miss a record should read the store through `tel_query` and treat the push as a wake up.
 
 ## 6. Vocabulary
 
