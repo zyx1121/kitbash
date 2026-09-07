@@ -8,8 +8,9 @@ WORKDIR /app
 # pulls a layer and never needs a container runtime of its own.
 RUN apk add --no-cache skopeo
 
-# Versions are pinned exactly in package.json, so no lock file is needed and
-# npm resolves the same tree every build.
+# The direct versions are pinned in package.json. Transitive versions are not,
+# so two builds of this image can differ; what a Process is pinned to is the
+# image digest, not this file.
 COPY package.json ./
 RUN npm install --omit=dev --no-audit --no-fund
 

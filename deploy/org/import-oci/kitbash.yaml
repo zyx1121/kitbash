@@ -20,12 +20,14 @@ provides:
         properties:
           source:
             type: string
-            pattern: "^oci://[a-z0-9]([a-z0-9._-]*[a-z0-9])?(:[0-9]+)?(/[a-z0-9]([a-z0-9._-]*[a-z0-9])?)+@sha256:[a-f0-9]{64}$"
+            pattern: "^oci://((localhost|[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+)(:[0-9]+)?|[a-z0-9]([a-z0-9-]*[a-z0-9])?:[0-9]+)(/[a-z0-9]([a-z0-9._-]*[a-z0-9])?)+@sha256:[a-f0-9]{64}$"
             description: >-
               The image to wrap, as oci://<registry>/<repository>@sha256:<digest>.
-              The registry host is required and the image is pinned by digest,
-              which must be the manifest digest skopeo inspect reports. A tag
-              such as :latest names a moving target and is refused.
+              The registry host is required and is recognized the way a container
+              runtime recognizes one: a dotted name, a name with a port, or
+              localhost. The image is pinned by digest, which must be the
+              manifest digest skopeo inspect reports. A tag such as :latest names
+              a moving target and is refused.
       output:
         type: object
         required: [files]
@@ -52,3 +54,6 @@ deploy:
     - type: container
       build: .
       expose: mcp
+      # This kit talks to a registry a caller names and parses what it answers,
+      # so it gets the same bound as import-mcp rather than the machine's.
+      limits: { memory: 512Mi }

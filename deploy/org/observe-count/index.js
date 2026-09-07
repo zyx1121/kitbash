@@ -30,6 +30,20 @@ const HOST = "0.0.0.0";
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
 const DEFAULT_INTERVAL_MS = 10 * 1000;
 const EXPORT_TIMEOUT_MS = 5 * 1000;
+// The budget for the last export when the Process is stopping, the same three
+// seconds kitbash-mcp gives its own shutdown flush.
+const SHUTDOWN_TIMEOUT_MS = 3 * 1000;
+// kitbash-mcp's AttributeValueLimit. An attribute arrives from a producer this
+// kit does not control, and a member name is a map key here, so it is truncated
+// on the way in rather than kept whole.
+const ATTRIBUTE_VALUE_LIMIT = 1 << 10;
+// How many members the map holds before the rest share one bucket, and how many
+// of them /healthz serialises. Without both, one producer sending a fresh
+// kitbash.user per record is an unbounded map and an unbounded response.
+const MAX_USERS = 1024;
+const HEALTHZ_USERS = 50;
+const OTHER = "other";
+const UNKNOWN = "unknown";
 // AGGREGATION_TEMPORALITY_CUMULATIVE. The counters run from process start and
 // are never reset, so a restart is visible as the reset it is.
 const CUMULATIVE = 2;
@@ -58,17 +72,54 @@ const selfProcess = (process.env.KITBASH_PROCESS ?? "").trim();
 
 const totals = { spans: 0, logs: 0, metrics: 0 };
 const byUser = new Map();
-const state = { received: 0, ignored: 0, exported: 0, exportFailures: 0, failing: false, lastError: null };
+const state = { received: 0, ignored: 0, exported: 0, exportFailures: 0, skipped: 0, overflowUsers: 0, failing: false, lastError: null };
+
+// Truncated the way kitbash-mcp truncates an attribute, and stripped of control
+// characters so a member name cannot carry an escape sequence into a log line
+// or into the /healthz response.
+function clipValue(text) {
+  if (typeof text !== "string") return "";
+  const flat = text
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return flat.length <= ATTRIBUTE_VALUE_LIMIT ? flat : flat.slice(0, ATTRIBUTE_VALUE_LIMIT);
+}
+
+// The bucket a record counts towards. Past MAX_USERS distinct members the rest
+// share one bucket: the totals stay exact, only the split stops growing.
+function bucketFor(user) {
+  const name = clipValue(user);
+  if (name === "") return UNKNOWN;
+  if (byUser.has(name)) return name;
+  // One slot of the cap belongs to the overflow bucket, so the map never holds
+  // more than MAX_USERS keys in all.
+  if (byUser.size >= MAX_USERS - 1) {
+    state.overflowUsers += 1;
+    return OTHER;
+  }
+  return name;
+}
 
 function count(signal, user, n = 1) {
   totals[signal] += n;
-  const name = typeof user === "string" && user !== "" ? user : "unknown";
+  const name = bucketFor(user);
   let bucket = byUser.get(name);
   if (!bucket) {
     bucket = { spans: 0, logs: 0, metrics: 0 };
     byUser.set(name, bucket);
   }
   bucket[signal] += n;
+}
+
+// The members with the most records, which is what an agent asking how much
+// Telemetry each person produces wants. The totals above are always exact.
+function topUsers() {
+  return Object.fromEntries(
+    [...byUser.entries()]
+      .sort(([, a], [, b]) => b.spans + b.logs + b.metrics - (a.spans + a.logs + a.metrics))
+      .slice(0, HEALTHZ_USERS),
+  );
 }
 
 // ---------------------------------------------------------------- OTLP JSON
@@ -105,6 +156,12 @@ function isOwn(attrs) {
   return selfProcess !== "" && attrs["kitbash.producer"] === selfProcess;
 }
 
+// Every level of an OTLP document is a repeated field, and a body that puts a
+// string where one belongs would otherwise iterate one character at a time.
+function list(value) {
+  return Array.isArray(value) ? value : [];
+}
+
 function dataPointsOf(metric) {
   for (const kind of ["sum", "gauge", "histogram", "exponentialHistogram", "summary"]) {
     const body = metric?.[kind];
@@ -114,10 +171,10 @@ function dataPointsOf(metric) {
 }
 
 function ingestTraces(document) {
-  for (const resourceSpans of document?.resourceSpans ?? []) {
+  for (const resourceSpans of list(document?.resourceSpans)) {
     const resource = attributes(resourceSpans?.resource?.attributes);
-    for (const scopeSpans of resourceSpans?.scopeSpans ?? []) {
-      for (const span of scopeSpans?.spans ?? []) {
+    for (const scopeSpans of list(resourceSpans?.scopeSpans)) {
+      for (const span of list(scopeSpans?.spans)) {
         const attrs = merge(resource, span?.attributes);
         if (isOwn(attrs)) {
           state.ignored += 1;
@@ -130,10 +187,10 @@ function ingestTraces(document) {
 }
 
 function ingestLogs(document) {
-  for (const resourceLogs of document?.resourceLogs ?? []) {
+  for (const resourceLogs of list(document?.resourceLogs)) {
     const resource = attributes(resourceLogs?.resource?.attributes);
-    for (const scopeLogs of resourceLogs?.scopeLogs ?? []) {
-      for (const record of scopeLogs?.logRecords ?? []) {
+    for (const scopeLogs of list(resourceLogs?.scopeLogs)) {
+      for (const record of list(scopeLogs?.logRecords)) {
         const attrs = merge(resource, record?.attributes);
         if (isOwn(attrs)) {
           state.ignored += 1;
@@ -146,10 +203,10 @@ function ingestLogs(document) {
 }
 
 function ingestMetrics(document) {
-  for (const resourceMetrics of document?.resourceMetrics ?? []) {
+  for (const resourceMetrics of list(document?.resourceMetrics)) {
     const resource = attributes(resourceMetrics?.resource?.attributes);
-    for (const scopeMetrics of resourceMetrics?.scopeMetrics ?? []) {
-      for (const metric of scopeMetrics?.metrics ?? []) {
+    for (const scopeMetrics of list(resourceMetrics?.scopeMetrics)) {
+      for (const metric of list(scopeMetrics?.metrics)) {
         for (const point of dataPointsOf(metric)) {
           const attrs = merge(resource, point?.attributes);
           if (isOwn(attrs)) {
@@ -179,12 +236,22 @@ function counterMetric(name, value, timeUnixNano) {
   };
 }
 
+// One export at a time. The counters are cumulative, so a tick that arrives
+// while a slow receiver is still reading the last one is skipped rather than
+// queued: the next export carries the same numbers.
+let exporting = false;
+
 async function exportCounts() {
   const endpoint = (process.env.KITBASH_TELEMETRY_ENDPOINT ?? "").trim();
   const token = (process.env.KITBASH_TELEMETRY_TOKEN ?? "").trim();
   // A Process that was given no endpoint is an untraced producer of nothing,
   // PLAN.md 2.4. It still counts, and /healthz still answers.
   if (endpoint === "" || token === "") return;
+  if (exporting) {
+    state.skipped += 1;
+    return;
+  }
+  exporting = true;
 
   const timeUnixNano = `${BigInt(Date.now()) * 1_000_000n}`;
   const body = JSON.stringify({
@@ -227,6 +294,8 @@ async function exportCounts() {
       state.failing = true;
       console.error(`[observe-count] cannot write counters back to ${endpoint}: ${state.lastError}`);
     }
+  } finally {
+    exporting = false;
   }
 }
 
@@ -311,11 +380,17 @@ const server = createServer(async (request, response) => {
       process: selfProcess || null,
       intervalMs,
       totals,
-      users: Object.fromEntries(byUser),
+      // The busiest members only, so this response has a bounded size whatever
+      // a producer sends. userCount says how many there are in all.
+      users: topUsers(),
+      userCount: byUser.size,
+      usersTruncated: byUser.size > HEALTHZ_USERS,
+      overflowUsers: state.overflowUsers,
       received: state.received,
       ignored: state.ignored,
       exported: state.exported,
       exportFailures: state.exportFailures,
+      skipped: state.skipped,
       exporting: !state.failing,
       lastError: state.lastError,
     });
@@ -365,10 +440,20 @@ const timer = setInterval(() => {
   exportCounts().catch((err) => console.error(`[observe-count] export failed unexpectedly: ${err?.stack ?? err}`));
 }, intervalMs);
 
-function shutdown(signal) {
+let stopping = false;
+
+// One last export on the way out, so the counts of the final interval are not
+// lost with the Process, bounded by the same three seconds kitbash-mcp gives
+// its own flush.
+async function shutdown(signal) {
+  if (stopping) return;
+  stopping = true;
   console.error(`[observe-count] ${signal}, stopping`);
   clearInterval(timer);
-  server.close(() => process.exit(0));
+  server.close();
+  const deadline = new Promise((resolve) => setTimeout(resolve, SHUTDOWN_TIMEOUT_MS));
+  await Promise.race([exportCounts().catch(() => {}), deadline]);
+  process.exit(0);
 }
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));

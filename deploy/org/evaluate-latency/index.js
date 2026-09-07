@@ -34,7 +34,21 @@ const BATCH_WINDOW_MS = 2 * 1000;
 // A burst larger than this is written immediately rather than held, so the
 // queue cannot grow without bound between windows.
 const MAX_BATCH = 512;
+// What the queue holds while a write is in flight or failing. Past this the
+// oldest judgments are dropped: the store is the source of truth and a
+// judgment that cannot be written is worth less than the kit staying alive.
+const MAX_PENDING = 4096;
 const EXPORT_TIMEOUT_MS = 5 * 1000;
+// The budget for the last flush when the Process is stopping, the same three
+// seconds kitbash-mcp gives its own shutdown flush.
+const SHUTDOWN_TIMEOUT_MS = 3 * 1000;
+// kitbash-mcp's AttributeValueLimit. Every attribute copied onto a judgment
+// arrives from a producer this kit does not control, and a record larger than
+// kitbashd's request cap is a record the whole batch dies with.
+const ATTRIBUTE_VALUE_LIMIT = 1 << 10;
+// A span whose clock is nonsense is not judged. A day is far past anything a
+// tool call takes and well short of what a bad timestamp produces.
+const MAX_DURATION_MS = 24 * 60 * 60 * 1000;
 // SEVERITY_NUMBER_WARN.
 const WARN = 13;
 const SELF = "evaluate-latency";
@@ -53,7 +67,7 @@ function readThreshold() {
 const thresholdMs = readThreshold();
 const selfProcess = (process.env.KITBASH_PROCESS ?? "").trim();
 
-const state = { received: 0, spans: 0, judged: 0, written: 0, batches: 0, failures: 0, failing: false, lastError: null };
+const state = { received: 0, spans: 0, judged: 0, written: 0, batches: 0, failures: 0, dropped: 0, dropping: false, failing: false, lastError: null };
 
 // ---------------------------------------------------------------- OTLP JSON
 
@@ -66,14 +80,32 @@ function anyValue(value) {
   return undefined;
 }
 
-function attributes(list) {
+function attributes(entries) {
   const out = {};
-  if (!Array.isArray(list)) return out;
-  for (const entry of list) {
+  if (!Array.isArray(entries)) return out;
+  for (const entry of entries) {
     if (!entry || typeof entry.key !== "string") continue;
     out[entry.key] = anyValue(entry.value);
   }
   return out;
+}
+
+// Every level of an OTLP document is a repeated field, and a body that puts a
+// string where one belongs would otherwise iterate one character at a time.
+function list(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+// Truncated the way kitbash-mcp truncates an attribute, and stripped of control
+// characters. Without this a subject attribute of a few megabytes becomes a
+// judgment kitbashd refuses, and the whole batch it travels in is lost.
+function clipValue(text) {
+  if (typeof text !== "string") return "";
+  const flat = text
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return flat.length <= ATTRIBUTE_VALUE_LIMIT ? flat : flat.slice(0, ATTRIBUTE_VALUE_LIMIT);
 }
 
 // Resource attributes are merged into every record, the record winning, the
@@ -111,7 +143,11 @@ function durationMsOf(span) {
   if (start === undefined || end === undefined || end < start) return undefined;
   // Microsecond resolution is more than a judgment needs and keeps the number
   // readable in the body of the record.
-  return Number((end - start) / 1000n) / 1000;
+  const ms = Number((end - start) / 1000n) / 1000;
+  // A BigInt difference wider than a double, or a clock nobody set, gives a
+  // number that is not a duration. There is nothing to judge in it.
+  if (!Number.isFinite(ms) || ms < 0 || ms > MAX_DURATION_MS) return undefined;
+  return ms;
 }
 
 // ---------------------------------------------------------------- judging
@@ -120,9 +156,11 @@ const pending = [];
 let batchTimer = null;
 
 function judge(span, attrs) {
-  const tool = attrs["kitbash.tool"];
+  // Clipped before it is used anywhere: it goes into an attribute, into the
+  // body of the record and into this kit's stderr.
+  const tool = clipValue(attrs["kitbash.tool"]);
   // Not a surface span: a build or run child carries no tool.
-  if (typeof tool !== "string" || tool === "") return;
+  if (tool === "") return;
   // A judgment is not judged, whatever kitbash.eval says.
   if (attrs["kitbash.eval"] !== undefined) return;
 
@@ -147,10 +185,11 @@ function judge(span, attrs) {
   // The subject's own four attributes, copied so the judgment answers the same
   // query as the call. kitbashd keeps them only when this kit runs as an admin;
   // for a member's kit they are stamped as the member's own, which is the same
-  // value anyway.
+  // value anyway. Each is clipped: a subject that carried a huge attribute must
+  // not turn into a judgment kitbashd refuses along with its whole batch.
   for (const key of ["kitbash.user", "kitbash.package", "kitbash.process", "kitbash.path"]) {
-    const value = attrs[key];
-    if (typeof value === "string" && value !== "") attributesOut.push({ key, value: { stringValue: value } });
+    const value = clipValue(attrs[key]);
+    if (value !== "") attributesOut.push({ key, value: { stringValue: value } });
   }
 
   const timeUnixNano = `${BigInt(Date.now()) * 1_000_000n}`;
@@ -164,26 +203,53 @@ function judge(span, attrs) {
   });
   state.judged += 1;
 
+  if (pending.length > MAX_PENDING) {
+    const dropped = pending.splice(0, pending.length - MAX_PENDING);
+    state.dropped += dropped.length;
+    if (!state.dropping) {
+      state.dropping = true;
+      console.error(`[evaluate-latency] more judgments than can be written, dropping the oldest; the store is the source of truth`);
+    }
+  }
+
   if (pending.length >= MAX_BATCH) {
-    flush();
+    void flush();
     return;
   }
   if (batchTimer === null) {
     batchTimer = setTimeout(() => {
       batchTimer = null;
-      flush();
+      void flush();
     }, BATCH_WINDOW_MS);
   }
 }
 
-function flush() {
+// One write at a time. A batch judged while the last one is still in flight
+// stays queued and goes out as soon as that write finishes, so a slow receiver
+// costs a delay rather than a pile of concurrent requests.
+let writing = false;
+
+async function flush() {
   if (batchTimer !== null) {
     clearTimeout(batchTimer);
     batchTimer = null;
   }
-  if (pending.length === 0) return;
-  const records = pending.splice(0, pending.length);
-  write(records).catch((err) => console.error(`[evaluate-latency] writing judgments failed unexpectedly: ${err?.stack ?? err}`));
+  if (pending.length === 0 || writing) return;
+  writing = true;
+  try {
+    while (pending.length > 0) {
+      const records = pending.splice(0, MAX_BATCH);
+      await write(records);
+    }
+    if (state.dropping) {
+      state.dropping = false;
+      console.error(`[evaluate-latency] the queue is empty again after dropping ${state.dropped} judgments`);
+    }
+  } catch (err) {
+    console.error(`[evaluate-latency] writing judgments failed unexpectedly: ${err?.stack ?? err}`);
+  } finally {
+    writing = false;
+  }
 }
 
 async function write(records) {
@@ -230,10 +296,10 @@ async function write(records) {
 // ---------------------------------------------------------------- ingest
 
 function ingestTraces(document) {
-  for (const resourceSpans of document?.resourceSpans ?? []) {
+  for (const resourceSpans of list(document?.resourceSpans)) {
     const resource = attributes(resourceSpans?.resource?.attributes);
-    for (const scopeSpans of resourceSpans?.scopeSpans ?? []) {
-      for (const span of scopeSpans?.spans ?? []) {
+    for (const scopeSpans of list(resourceSpans?.scopeSpans)) {
+      for (const span of list(scopeSpans?.spans)) {
         state.spans += 1;
         judge(span, merge(resource, span?.attributes));
       }
@@ -332,6 +398,7 @@ const server = createServer(async (request, response) => {
       written: state.written,
       batches: state.batches,
       pending: pending.length,
+      dropped: state.dropped,
       failures: state.failures,
       writing: !state.failing,
       lastError: state.lastError,
@@ -378,10 +445,26 @@ server.on("clientError", (err, socket) => {
   if (socket.writable) socket.end("HTTP/1.1 400 Bad Request\r\nconnection: close\r\n\r\n");
 });
 
-function shutdown(signal) {
-  console.error(`[evaluate-latency] ${signal}, stopping`);
-  flush();
-  server.close(() => process.exit(0));
+let stopping = false;
+
+// The judgments still in the window are written on the way out, bounded by the
+// same three seconds kitbash-mcp gives its own flush. Whatever does not make it
+// is lost, which is what best effort means here.
+async function shutdown(signal) {
+  if (stopping) return;
+  stopping = true;
+  console.error(`[evaluate-latency] ${signal}, stopping with ${pending.length} judgments queued`);
+  server.close();
+  const deadline = new Promise((resolve) => setTimeout(resolve, SHUTDOWN_TIMEOUT_MS));
+  await Promise.race([drain(), deadline]);
+  process.exit(0);
+}
+
+// A write may already be in flight, and flush declines to start a second one,
+// so wait for the current one before writing what is left.
+async function drain() {
+  while (writing) await new Promise((resolve) => setTimeout(resolve, 25));
+  await flush();
 }
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));

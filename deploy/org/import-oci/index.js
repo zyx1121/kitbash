@@ -23,6 +23,7 @@
 import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -41,6 +42,8 @@ const MAX_INSPECT_OUTPUT = 4 * 1024 * 1024;
 // A Package whose name equals a built in tool family cannot be run, PLAN.md 2.3.
 const RESERVED_NAMES = new Set(["fs", "pkg", "proc", "tel", "users", "approvals"]);
 const DESCRIPTION_LABELS = ["org.opencontainers.image.description", "org.opencontainers.image.title"];
+// What one field of the inspect may contribute to the README or to a log line.
+const MAX_FIELD = 128;
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -90,10 +93,23 @@ const internal = (detail, fix, instance, title = "Import failed") =>
 
 // ---------------------------------------------------------------- helpers
 
+// Everything a registry reports is a stranger's text on its way into a
+// manifest, a README or a log line. Control characters are removed rather than
+// escaped, because none of the three has a use for them and a stray escape or
+// terminal sequence in a description is a trap for whoever reads it next.
 function clip(text, max = MAX_DESCRIPTION) {
   if (typeof text !== "string") return "";
-  const flat = text.replace(/\s+/g, " ").trim();
+  const flat = text
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
   return flat.length <= max ? flat : `${flat.slice(0, max - 3).trimEnd()}...`;
+}
+
+// One field of the inspect, clipped short enough to sit on a README line.
+function field(value, fallback = "unknown") {
+  const text = clip(value, MAX_FIELD);
+  return text === "" ? fallback : text;
 }
 
 // Package names in a manifest are ^[a-z0-9]+(-[a-z0-9]+)*$, at most 64 characters.
@@ -145,19 +161,31 @@ function inspect(ref) {
   const args = [...leading, "inspect", "--no-tags", `docker://${ref}`];
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"], env: process.env });
+    // chunk is a Buffer, so read counts bytes. The decoder holds back the tail
+    // of a multi-byte character that straddles two chunks instead of turning it
+    // into U+FFFD; concatenating the Buffers directly would corrupt every
+    // description that is not ASCII, and setting an encoding on the stream
+    // would silently make the cap below a character count.
+    const outDecoder = new StringDecoder("utf8");
+    const errDecoder = new StringDecoder("utf8");
     let out = "";
     let err = "";
+    let read = 0;
     let overflowed = false;
 
     child.stdout.on("data", (chunk) => {
-      out += chunk;
-      if (out.length > MAX_INSPECT_OUTPUT && !overflowed) {
-        overflowed = true;
-        child.kill("SIGKILL");
+      read += chunk.length;
+      if (read > MAX_INSPECT_OUTPUT) {
+        if (!overflowed) {
+          overflowed = true;
+          child.kill("SIGKILL");
+        }
+        return;
       }
+      out += outDecoder.write(chunk);
     });
     child.stderr.on("data", (chunk) => {
-      err += chunk;
+      err += errDecoder.write(chunk);
       if (err.length > 64 * 1024) err = err.slice(-64 * 1024);
     });
 
@@ -192,9 +220,10 @@ function inspect(ref) {
         return;
       }
       if (code === 0) {
-        resolve(out);
+        resolve(out + outDecoder.end());
         return;
       }
+      err += errDecoder.end();
       console.error(`[import-oci] skopeo exited ${code} for ${ref}:\n${err}`);
       reject(classify(ref, err));
     });
@@ -266,9 +295,12 @@ function generateFiles({ ref, repository, digest, lastSegment, inspected }) {
     deploy: { units: [{ type: "container", image, expose: "none" }] },
   };
 
-  const architecture = typeof inspected.Architecture === "string" ? inspected.Architecture : "unknown";
-  const os = typeof inspected.Os === "string" ? inspected.Os : "unknown";
-  const created = typeof inspected.Created === "string" ? inspected.Created : "unknown";
+  // Three more fields out of the same stranger's document. They are clipped for
+  // the same reason the description is: a README line is not a place to paste
+  // whatever a registry chose to put in a label.
+  const architecture = field(inspected.Architecture);
+  const os = field(inspected.Os);
+  const created = field(inspected.Created);
 
   const readme = [
     `# ${packageName}`,
@@ -324,15 +356,16 @@ async function importSource(source) {
   // that were inspected. A registry that answers with another manifest has
   // answered a different question.
   if (inspected.Digest !== digest) {
-    console.error(`[import-oci] ${ref} reported digest ${JSON.stringify(inspected.Digest)}`);
+    const reported = field(inspected.Digest, "no digest at all");
+    console.error(`[import-oci] ${ref} reported digest ${JSON.stringify(reported)}`);
     throw badRequest(
-      `The registry describes ${repository} at ${inspected.Digest ?? "no digest at all"}, not at ${digest}, so the import would not be reproducible.`,
+      `The registry describes ${repository} at ${reported}, not at ${digest}, so the import would not be reproducible.`,
       "Import the digest skopeo inspect reports for this image.",
       ref,
     );
   }
 
-  console.error(`[import-oci] ${ref} inspected: ${inspected.Os ?? "?"}/${inspected.Architecture ?? "?"}, created ${inspected.Created ?? "?"}`);
+  console.error(`[import-oci] ${ref} inspected: ${field(inspected.Os, "?")}/${field(inspected.Architecture, "?")}, created ${field(inspected.Created, "?")}`);
   return generateFiles({ ref, repository, digest, lastSegment, inspected });
 }
 

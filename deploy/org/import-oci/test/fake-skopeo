@@ -1,0 +1,79 @@
+#!/bin/sh
+# Stands in for skopeo so the kit can be driven without a registry. Argument 3
+# is docker://<ref>. IMPORT_OCI_FAKE_UTF8 names a file the driver writes for the
+# one case whose payload has to be laid out byte by byte.
+ref="$3"
+case "$ref" in
+  *sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40)
+    # What the real skopeo reported for docker.io/library/alpine. Labels is
+    # null for library images, so this is the description fallback path.
+    cat <<'JSON'
+{
+  "Name": "docker.io/library/alpine",
+  "Digest": "sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40",
+  "RepoTags": [],
+  "Created": "2026-06-22T19:20:09.106506185Z",
+  "DockerVersion": "",
+  "Labels": null,
+  "Architecture": "amd64",
+  "Os": "linux",
+  "Layers": ["sha256:aaaa"],
+  "Env": ["PATH=/usr/local/sbin:/usr/local/bin"]
+}
+JSON
+    exit 0
+    ;;
+  *sha256:1111111111111111111111111111111111111111111111111111111111111111)
+    # Labels present, and both the description and the fields the README
+    # carries carry control characters, escaped here the way JSON carries them.
+    cat <<'JSON'
+{
+  "Name": "ghcr.io/acme/tools/pdf-render",
+  "Digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "Created": "2026-01-02T03:04:05Z\u001b[31m",
+  "Labels": {
+    "org.opencontainers.image.title": "pdf render",
+    "org.opencontainers.image.description": "Renders a PDF page\u0007 to PNG on stdout.\nReads the page number from argv."
+  },
+  "Architecture": "arm64",
+  "Os": "linux"
+}
+JSON
+    exit 0
+    ;;
+  *sha256:2222222222222222222222222222222222222222222222222222222222222222)
+    # The registry answers about another manifest than the one asked for.
+    cat <<'JSON'
+{
+  "Name": "docker.io/library/alpine",
+  "Digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+  "Created": "2026-06-22T19:20:09.106506185Z",
+  "Labels": null,
+  "Architecture": "amd64",
+  "Os": "linux"
+}
+JSON
+    exit 0
+    ;;
+  *sha256:4444444444444444444444444444444444444444444444444444444444444444)
+    echo "time=\"2026-09-07T00:00:00Z\" level=fatal msg=\"Error parsing image name \\\"$ref\\\": reading manifest in docker.io/library/alpine: manifest unknown\"" >&2
+    exit 1
+    ;;
+  *sha256:5555555555555555555555555555555555555555555555555555555555555555)
+    # What Docker Hub answers when the reference is the image config digest.
+    echo "FATA[0001] Error reading manifest in docker.io/library/alpine: manifest schema unsupported" >&2
+    exit 1
+    ;;
+  *sha256:6666666666666666666666666666666666666666666666666666666666666666)
+    # A description of multi-byte characters, written in two pieces split in the
+    # middle of one character so the reader has to join them itself.
+    head -c "$IMPORT_OCI_FAKE_SPLIT" "$IMPORT_OCI_FAKE_UTF8"
+    sleep 0.2
+    tail -c "+$((IMPORT_OCI_FAKE_SPLIT + 1))" "$IMPORT_OCI_FAKE_UTF8"
+    exit 0
+    ;;
+  *)
+    echo "FATA[0000] Error: pinging container registry: dial tcp: lookup failed" >&2
+    exit 1
+    ;;
+esac
