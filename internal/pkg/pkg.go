@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -120,15 +121,14 @@ func (s *Service) build(ctx context.Context, span *telemetry.Span, path string) 
 	telemetry.SetPackage(ctx, folder)
 	telemetry.SetPath(ctx, folder)
 	unit, ok := m.Unit()
-	if !ok || unit.Type != manifest.UnitContainer || unit.Build == "" {
+	if !ok || unit.Type != manifest.UnitContainer {
 		return nil, problem.InvalidManifest(folder,
-			"version 1 builds container units with a build context")
+			"version 1 builds container units")
 	}
-	contextDir, prob := buildContext(folder, unit.Build)
-	if prob != nil {
-		return nil, prob
+	contextDir, containerfile, cleanup, prob := s.source(folder, unit)
+	if cleanup != nil {
+		defer cleanup()
 	}
-	containerfile, prob := findContainerfile(contextDir)
 	if prob != nil {
 		return nil, prob
 	}
@@ -242,6 +242,47 @@ func (s *Service) Inspect(ctx context.Context, path string) (*InspectResult, *pr
 		})
 	}
 	return result, nil
+}
+
+// source is what the build reads: the unit's own context, or, for a unit that
+// names an existing image, a generated one line Containerfile in a temporary
+// directory. The second return of cleanup removes that directory; it is never
+// nil to check before calling.
+//
+// A unit with image is not pulled and tagged, it is built: the result then
+// carries kitbash.path and its own image ID, so a Package that wraps an
+// upstream image has the same build record as one that has a context. The
+// manifest schema pins image by digest, so the FROM line is reproducible.
+func (s *Service) source(folder string, unit manifest.Unit) (contextDir, containerfile string, cleanup func(), prob *problem.Problem) {
+	switch {
+	case unit.Build != "":
+		contextDir, prob := buildContext(folder, unit.Build)
+		if prob != nil {
+			return "", "", nil, prob
+		}
+		containerfile, prob := findContainerfile(contextDir)
+		if prob != nil {
+			return "", "", nil, prob
+		}
+		return contextDir, containerfile, nil, nil
+	case unit.Image != "":
+		dir, err := os.MkdirTemp("", "kitbash-image-")
+		if err != nil {
+			return "", "", nil, problem.Internal(folder, err.Error(),
+				"Ask an administrator to check the disk on this host.")
+		}
+		remove := func() { os.RemoveAll(dir) }
+		file := filepath.Join(dir, containerfiles[0])
+		if err := os.WriteFile(file, []byte("FROM "+unit.Image+"\n"), 0o644); err != nil {
+			return "", "", remove, problem.Internal(folder, err.Error(),
+				"Ask an administrator to check the disk on this host.")
+		}
+		return dir, file, remove, nil
+	default:
+		return "", "", nil, problem.InvalidManifestFix(folder,
+			"the container unit has neither a build context nor an image",
+			"Give deploy.units[0] a build context or an image pinned by digest.")
+	}
 }
 
 // buildContext resolves deploy.units[0].build against the Package folder. A

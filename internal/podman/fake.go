@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"os"
 	"sort"
 	"strconv"
 	"sync"
@@ -46,10 +47,13 @@ type Fake struct {
 	now        time.Time
 }
 
-// BuildCall is one recorded build.
+// BuildCall is one recorded build. Content is what the Containerfile held when
+// the build ran, which is the only way to assert on a Containerfile kitbash
+// generated into a temporary directory and removed again.
 type BuildCall struct {
 	ContextDir    string
 	Containerfile string
+	Content       string
 	Tag           string
 	Labels        map[string]string
 }
@@ -105,9 +109,13 @@ func (f *Fake) id(kind string) string {
 func (f *Fake) Build(_ context.Context, contextDir, containerfile, tag string, labels map[string]string) (string, string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// The file is read now rather than later: a generated Containerfile lives
+	// in a temporary directory the caller removes as soon as the build returns.
+	content, _ := os.ReadFile(containerfile)
 	f.Builds = append(f.Builds, BuildCall{
 		ContextDir:    contextDir,
 		Containerfile: containerfile,
+		Content:       string(content),
 		Tag:           tag,
 		Labels:        labels,
 	})
@@ -143,8 +151,7 @@ func (f *Fake) ImageEntrypoint(_ context.Context, ref string) ([]string, []strin
 	return []string{"/usr/local/bin/server"}, nil, nil
 }
 
-// Run adds a running container, publishing every requested port on a host port
-// derived from the sequence so the endpoint a test reads is predictable.
+// Run adds a running container, publishing every requested port.
 func (f *Fake) Run(_ context.Context, opts RunOptions) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -161,10 +168,18 @@ func (f *Fake) Run(_ context.Context, opts RunOptions) (string, error) {
 		Image:     opts.Image,
 	}
 	for i, port := range opts.Publish {
+		// A caller that named the host port gets that one back, the way the
+		// runtime would publish it; one that left the choice open gets a port
+		// derived from the sequence so the endpoint a test reads is
+		// predictable.
+		host := port.HostPort
+		if host == 0 {
+			host = 34000 + i
+		}
 		container.Ports = append(container.Ports, Port{
 			HostIP:        "127.0.0.1",
-			HostPort:      34000 + i,
-			ContainerPort: port,
+			HostPort:      host,
+			ContainerPort: port.ContainerPort,
 			Protocol:      "tcp",
 		})
 	}

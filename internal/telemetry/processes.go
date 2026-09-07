@@ -1,0 +1,166 @@
+package telemetry
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+
+	"github.com/zyx1121/kitbash/internal/problem"
+)
+
+// ProcessesPath is the Process registry of spec/kitbashd-api.yaml. Registering
+// a Process is what mints its Telemetry token, so a Process that was never
+// registered is a producer of nothing.
+const ProcessesPath = "/kitbash/v1/processes"
+
+// The environment every Process is started with, see the
+// environment_given_to_every_process block of spec/kitbashd-api.yaml. The
+// manifest cannot override these: they are the Process's identity, not its
+// configuration.
+const (
+	EnvEndpoint = "KITBASH_TELEMETRY_ENDPOINT"
+	EnvToken    = "KITBASH_TELEMETRY_TOKEN"
+	EnvProcess  = "KITBASH_PROCESS"
+	EnvPackage  = "KITBASH_PACKAGE"
+	EnvUser     = "KITBASH_USER"
+)
+
+// ProcessEndpoint is the address a rootless container reaches kitbashd's OTLP
+// receiver on. It is not the unix socket: rootless networking delivers
+// host.containers.internal to the host's primary address, so a Process exports
+// over TCP with a token while a session exports over the socket.
+const ProcessEndpoint = "http://host.containers.internal:4318"
+
+// ProcessEndpointEnv overrides that address. It exists for tests, so it is
+// honoured only when the process is not serving an SSH session, the same rule
+// as SocketEnv and fs.RootsEnv.
+const ProcessEndpointEnv = "KITBASH_TELEMETRY_ENDPOINT_FOR_PROCESSES"
+
+// EndpointForProcesses is the OTLP endpoint this host gives its Processes.
+func EndpointForProcesses() string {
+	if env := os.Getenv(ProcessEndpointEnv); env != "" && os.Getenv(sshEnv) == "" {
+		return env
+	}
+	return ProcessEndpoint
+}
+
+// Registration is one Process as kitbashd records it. It is the request body
+// of processes_register in spec/kitbashd-api.yaml; the owner is not in it,
+// because kitbashd reads that from the socket's peer credentials.
+type Registration struct {
+	ID            string   `json:"id"`
+	Package       string   `json:"package"`
+	Name          string   `json:"name"`
+	Expose        string   `json:"expose"`
+	Endpoint      string   `json:"endpoint,omitempty"`
+	Subscriptions []string `json:"subscriptions,omitempty"`
+}
+
+// Registered is one Process kitbashd knows about, as processes_list returns
+// it. Tokens are returned once, at registration, and are never listed.
+type Registered struct {
+	ID            string   `json:"id"`
+	Package       string   `json:"package"`
+	Name          string   `json:"name"`
+	Expose        string   `json:"expose,omitempty"`
+	Endpoint      string   `json:"endpoint,omitempty"`
+	Subscriptions []string `json:"subscriptions,omitempty"`
+	User          string   `json:"user,omitempty"`
+}
+
+// registerResponse is what processes_register answers.
+type registerResponse struct {
+	ID    string `json:"id"`
+	Token string `json:"token"`
+}
+
+// processList is the object form of a Process list. The array form is accepted
+// too, so this client holds no opinion on which one kitbashd answers with.
+type processList struct {
+	Processes []Registered `json:"processes"`
+}
+
+// RegisterProcess registers one Process and returns its Telemetry token. The
+// token is returned once and is the only proof the Process has that it may
+// export, so the caller injects it into the container and keeps no copy.
+//
+// A host without kitbashd is not a reason to refuse to start a container: the
+// container runtime does not depend on the daemon. The caller logs the problem
+// and starts the Process untraced.
+func (c *Client) RegisterProcess(ctx context.Context, reg Registration) (string, *problem.Problem) {
+	if c == nil {
+		return "", problem.Internal(reg.ID, "telemetry is not configured for this session", NotRunningFix)
+	}
+	body, err := json.Marshal(reg)
+	if err != nil {
+		return "", problem.Internal(reg.ID, err.Error(), "")
+	}
+	status, payload, prob := c.send(ctx, http.MethodPost, ProcessesPath, body, reg.ID)
+	if prob != nil {
+		return "", prob
+	}
+	if status >= 300 {
+		return "", c.failure(reg.ID, statusText(status), payload)
+	}
+	var answer registerResponse
+	if err := json.Unmarshal(payload, &answer); err != nil {
+		return "", problem.Internal(reg.ID,
+			fmt.Sprintf("%s answered with a body that is not a registration: %v", ProcessesPath, err), "")
+	}
+	if answer.Token == "" {
+		return "", problem.Internal(reg.ID,
+			fmt.Sprintf("%s answered without a token", ProcessesPath), "")
+	}
+	return answer.Token, nil
+}
+
+// UnregisterProcess revokes a Process's token. A Process kitbashd does not
+// know is already unregistered, so 404 is not a failure for the caller: a stop
+// after a daemon restart has to succeed.
+func (c *Client) UnregisterProcess(ctx context.Context, id string) *problem.Problem {
+	if c == nil {
+		return problem.Internal(id, "telemetry is not configured for this session", NotRunningFix)
+	}
+	if id == "" {
+		return problem.Internal(id, "no Process id was given to unregister", "")
+	}
+	status, payload, prob := c.send(ctx, http.MethodDelete, ProcessesPath+"/"+id, nil, id)
+	if prob != nil {
+		return prob
+	}
+	if status == http.StatusNotFound {
+		return nil
+	}
+	if status >= 300 {
+		return c.failure(id, statusText(status), payload)
+	}
+	return nil
+}
+
+// ListProcesses is every Process kitbashd has registered for the caller. The
+// session compares it with the containers that are actually running, see
+// client_behaviour.processes in spec/kitbashd-api.yaml.
+func (c *Client) ListProcesses(ctx context.Context) ([]Registered, *problem.Problem) {
+	if c == nil {
+		return nil, problem.Internal("processes", "telemetry is not configured for this session", NotRunningFix)
+	}
+	status, payload, prob := c.send(ctx, http.MethodGet, ProcessesPath, nil, "processes")
+	if prob != nil {
+		return nil, prob
+	}
+	if status >= 300 {
+		return nil, c.failure("processes", statusText(status), payload)
+	}
+	var wrapped processList
+	if err := json.Unmarshal(payload, &wrapped); err == nil {
+		return wrapped.Processes, nil
+	}
+	var bare []Registered
+	if err := json.Unmarshal(payload, &bare); err != nil {
+		return nil, problem.Internal("processes",
+			fmt.Sprintf("%s answered with a body that is not a Process list: %v", ProcessesPath, err), "")
+	}
+	return bare, nil
+}

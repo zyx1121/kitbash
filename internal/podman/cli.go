@@ -185,8 +185,13 @@ func (c *CLI) Run(ctx context.Context, opts RunOptions) (string, error) {
 	}
 	for _, port := range opts.Publish {
 		// The loopback address only: a Process is reachable from this host,
-		// never from the network, until a reverse proxy fronts it.
-		args = append(args, "--publish", "127.0.0.1::"+strconv.Itoa(port))
+		// never from the network, until a reverse proxy fronts it. An empty
+		// host port leaves the choice to the runtime.
+		host := ""
+		if port.HostPort > 0 {
+			host = strconv.Itoa(port.HostPort)
+		}
+		args = append(args, "--publish", "127.0.0.1:"+host+":"+strconv.Itoa(port.ContainerPort))
 	}
 	args = append(args, opts.Image)
 	out, err := c.run(ctx, args...)

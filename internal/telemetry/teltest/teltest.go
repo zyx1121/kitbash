@@ -8,6 +8,7 @@
 package teltest
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -58,6 +59,17 @@ type Call struct {
 	Body   string
 }
 
+// Registration is one Process the fake has registered, as the request body of
+// processes_register carries it.
+type Registration struct {
+	ID            string   `json:"id"`
+	Package       string   `json:"package"`
+	Name          string   `json:"name"`
+	Expose        string   `json:"expose,omitempty"`
+	Endpoint      string   `json:"endpoint,omitempty"`
+	Subscriptions []string `json:"subscriptions,omitempty"`
+}
+
 // Response is what the daemon answers on the JSON API.
 type Response struct {
 	Status      int
@@ -82,6 +94,15 @@ type Daemon struct {
 	query        Response
 	retention    Response
 	pause        time.Duration
+
+	// The Process registry: what was registered, in arrival order, what was
+	// unregistered, and the answer that replaces the registry's own.
+	registrations map[string]Registration
+	minted        map[string]string
+	order         []string
+	unregistered  []string
+	processes     Response
+	tokens        int
 }
 
 // Start listens on a unix socket in a temporary directory of its own. The
@@ -115,12 +136,17 @@ func StartAt(socket string) (*Daemon, error) {
 			Body: `{"signal":"traces","records":[],"truncated":false}`},
 		retention: Response{Status: http.StatusOK, ContentType: "application/json",
 			Body: `{"traces":"30d","logs":"14d","metrics":"30d"}`},
+		registrations: map[string]Registration{},
+		minted:        map[string]string{},
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/traces", d.traces)
 	mux.HandleFunc("POST /v1/logs", d.logRecords)
 	mux.HandleFunc("/kitbash/v1/query", d.jsonAPI)
 	mux.HandleFunc("/kitbash/v1/retention", d.jsonAPI)
+	mux.HandleFunc("POST /kitbash/v1/processes", d.register)
+	mux.HandleFunc("GET /kitbash/v1/processes", d.listProcesses)
+	mux.HandleFunc("DELETE /kitbash/v1/processes/{id}", d.unregister)
 	d.server = &http.Server{Handler: mux}
 	go func() {
 		if err := d.server.Serve(listener); err != nil &&
@@ -300,7 +326,166 @@ func (d *Daemon) jsonAPI(w http.ResponseWriter, r *http.Request) {
 		answer = d.retention
 	}
 	d.mu.Unlock()
+	write(w, answer)
+}
 
+// AnswerProcesses replaces what the Process registry returns, which is how a
+// daemon that refuses a registration is exercised. The zero Response restores
+// the registry's own behaviour.
+func (d *Daemon) AnswerProcesses(r Response) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.processes = r
+}
+
+// AddProcess seeds the registry, standing in for a Process registered in an
+// earlier session.
+func (d *Daemon) AddProcess(reg Registration) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.store(reg)
+}
+
+// Registrations are the Processes the registry holds, in the order they were
+// registered.
+func (d *Daemon) Registrations() []Registration {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	out := make([]Registration, 0, len(d.order))
+	for _, id := range d.order {
+		out = append(out, d.registrations[id])
+	}
+	return out
+}
+
+// Registration is the registry entry for one Process id.
+func (d *Daemon) Registration(id string) (Registration, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	reg, ok := d.registrations[id]
+	return reg, ok
+}
+
+// Token is the token minted for one Process id, so a test can hold the
+// environment of a container to the token its registration returned.
+func (d *Daemon) Token(id string) string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.minted[id]
+}
+
+// Unregistered are the Process ids a DELETE named, in arrival order, including
+// the ones the registry did not know.
+func (d *Daemon) Unregistered() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]string(nil), d.unregistered...)
+}
+
+// store records one registration. The caller holds the lock.
+func (d *Daemon) store(reg Registration) {
+	if _, held := d.registrations[reg.ID]; !held {
+		d.order = append(d.order, reg.ID)
+	}
+	d.registrations[reg.ID] = reg
+}
+
+// register answers processes_register: it records the Process and mints a
+// token for it. Registering an id again replaces the record and mints a new
+// token, the way spec/kitbashd-api.yaml says the daemon does.
+func (d *Daemon) register(w http.ResponseWriter, r *http.Request) {
+	d.wait()
+	body, err := readAll(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	d.mu.Lock()
+	d.calls = append(d.calls, Call{Method: r.Method, Path: r.URL.Path, Body: string(body)})
+	if override, ok := d.override(); ok {
+		d.mu.Unlock()
+		write(w, override)
+		return
+	}
+	var reg Registration
+	if err := json.Unmarshal(body, &reg); err != nil || reg.ID == "" {
+		d.mu.Unlock()
+		write(w, Problem(http.StatusBadRequest, "bad-request", "Bad request",
+			"the body is not a Process registration", ""))
+		return
+	}
+	d.store(reg)
+	d.tokens++
+	token := fmt.Sprintf("%x", sha256.Sum256([]byte(fmt.Sprintf("%s-%d", reg.ID, d.tokens))))
+	d.minted[reg.ID] = token
+	d.mu.Unlock()
+	answer, _ := json.Marshal(map[string]string{"id": reg.ID, "token": token})
+	write(w, Response{Status: http.StatusOK, ContentType: "application/json", Body: string(answer)})
+}
+
+// listProcesses answers processes_list, without tokens.
+func (d *Daemon) listProcesses(w http.ResponseWriter, r *http.Request) {
+	d.wait()
+	d.mu.Lock()
+	d.calls = append(d.calls, Call{Method: r.Method, Path: r.URL.Path})
+	if override, ok := d.override(); ok {
+		d.mu.Unlock()
+		write(w, override)
+		return
+	}
+	list := make([]Registration, 0, len(d.order))
+	for _, id := range d.order {
+		list = append(list, d.registrations[id])
+	}
+	d.mu.Unlock()
+	answer, _ := json.Marshal(map[string]any{"processes": list})
+	write(w, Response{Status: http.StatusOK, ContentType: "application/json", Body: string(answer)})
+}
+
+// unregister answers processes_unregister: 204 for a Process it knew, 404 for
+// one it did not.
+func (d *Daemon) unregister(w http.ResponseWriter, r *http.Request) {
+	d.wait()
+	id := r.PathValue("id")
+	d.mu.Lock()
+	d.calls = append(d.calls, Call{Method: r.Method, Path: r.URL.Path})
+	d.unregistered = append(d.unregistered, id)
+	if override, ok := d.override(); ok {
+		d.mu.Unlock()
+		write(w, override)
+		return
+	}
+	_, known := d.registrations[id]
+	if known {
+		delete(d.registrations, id)
+		kept := d.order[:0]
+		for _, held := range d.order {
+			if held != id {
+				kept = append(kept, held)
+			}
+		}
+		d.order = kept
+	}
+	d.mu.Unlock()
+	if !known {
+		write(w, Problem(http.StatusNotFound, "not-found", "Not found",
+			"no Process of yours has this id", ""))
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// override is the answer AnswerProcesses installed, if any. The caller holds
+// the lock.
+func (d *Daemon) override() (Response, bool) {
+	if d.processes.Status == 0 {
+		return Response{}, false
+	}
+	return d.processes, true
+}
+
+// write sends one canned response.
+func write(w http.ResponseWriter, answer Response) {
 	contentType := answer.ContentType
 	if contentType == "" {
 		contentType = "application/json"

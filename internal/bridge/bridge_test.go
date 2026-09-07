@@ -82,7 +82,7 @@ func newHarness(t *testing.T, tool mcp.ToolHandler) *harness {
 
 	runner := podman.NewFake()
 	h := &harness{files: files, runner: runner, folder: folder, root: root}
-	h.processes = proc.New(files, runner)
+	h.processes = proc.New(files, runner, nil)
 	h.bridge = bridge.New(files, h.processes, runner)
 	h.server = server.New("test", server.Deps{
 		Files:     files,

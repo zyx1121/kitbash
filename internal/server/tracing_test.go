@@ -49,7 +49,7 @@ func newTraced(t *testing.T, socket string) *traced {
 	}
 
 	ctx := context.Background()
-	processes := proc.New(w.files, w.runner)
+	processes := proc.New(w.files, w.runner, nil)
 	tools := bridge.New(w.files, processes, w.runner)
 	// The Package runs in this process instead of in a container, the way
 	// internal/bridge tests reach one.

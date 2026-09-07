@@ -63,7 +63,10 @@ func run() error {
 	}()
 
 	runner := podman.NewCLI()
-	processes := proc.New(files, runner)
+	// The Process registry is the same client tel_query forwards through: a
+	// Process is registered with kitbashd before its container starts, which
+	// is what mints its Telemetry token, see PLAN.md section 2.4.
+	processes := proc.New(files, runner, telem.Client())
 	tools := bridge.New(files, processes, runner)
 	defer tools.Close()
 	srv := server.New(version, server.Deps{
