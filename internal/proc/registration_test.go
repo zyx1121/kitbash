@@ -3,6 +3,7 @@ package proc_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log"
 	"path/filepath"
 	"strconv"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/zyx1121/kitbash/internal/manifest"
 	"github.com/zyx1121/kitbash/internal/podman"
+	"github.com/zyx1121/kitbash/internal/problem"
 	"github.com/zyx1121/kitbash/internal/proc"
 	"github.com/zyx1121/kitbash/internal/telemetry"
 	"github.com/zyx1121/kitbash/internal/telemetry/teltest"
@@ -370,6 +372,123 @@ func TestReconcileRegistersWhatKitbashdDoesNotKnow(t *testing.T) {
 	// costs until then.
 	if _, held := f.daemon.Registration("gone"); !held {
 		t.Error("a stale registration was removed, which is kitbashd's to keep")
+	}
+}
+
+// A registration whose container never started names an endpoint on this host,
+// so kitbashd would fan the member's records out to whatever takes that
+// loopback port next. It goes back off the registry.
+func TestARegistrationWhoseContainerFailedToStartIsWithdrawn(t *testing.T) {
+	f := newFixture(t)
+	folder := f.pack(t, "observer", observerManifest)
+	f.build(folder, "observer")
+	f.runner.RunErr = errors.New("the runtime refused the command")
+
+	_, prob := f.processes.Run(context.Background(), folder, "", "")
+	if prob == nil {
+		t.Fatal("a run the runtime refused was reported as a success")
+	}
+	// The runtime's own words go to the server log, never to the agent: the
+	// command line they describe carries the Process's Telemetry token.
+	if prob.Detail != "kitbash could not complete this call; the cause is in the server log" {
+		t.Errorf("detail is %q, want the runtime's output kept out of it", prob.Detail)
+	}
+	registered := f.daemon.Registrations()
+	if len(registered) != 0 {
+		t.Errorf("kitbashd still holds %+v, want nothing for a container that never started", registered)
+	}
+	unregistered := f.daemon.Unregistered()
+	if len(unregistered) != 1 {
+		t.Fatalf("unregistered %v, want the one Process that failed to start", unregistered)
+	}
+	if got := f.runner.Runs[0].Labels[podman.LabelID]; got != unregistered[0] {
+		t.Errorf("unregistered %s, want the id the run carried, %s", unregistered[0], got)
+	}
+}
+
+// expose: http without a port has no endpoint to publish or to register, so
+// the manifest says one thing and the Process would do another.
+func TestHTTPWithoutAPortIsAnInvalidManifest(t *testing.T) {
+	const noPort = `name: dashboard
+description: A web interface whose manifest forgot to say which port it listens on.
+deploy:
+  units:
+    - type: container
+      build: .
+      expose: http
+`
+	f := newFixture(t)
+	folder := f.pack(t, "dashboard", noPort)
+	f.build(folder, "dashboard")
+
+	_, prob := f.processes.Run(context.Background(), folder, "", "")
+	if prob == nil {
+		t.Fatal("an http Process with no port was started")
+	}
+	if prob.Slug() != problem.SlugInvalidManifest {
+		t.Errorf("problem is %s, want invalid-manifest", prob.Slug())
+	}
+	if len(f.runner.Runs) != 0 {
+		t.Error("the runtime was asked to start a Process with nothing to publish")
+	}
+	if n := len(f.daemon.Registrations()); n != 0 {
+		t.Errorf("kitbashd holds %d registrations for a Process that was refused", n)
+	}
+}
+
+// An admin's Process list is the whole machine. Another member's Process is
+// neither missing from the registry nor stale because it is not running here.
+func TestReconcileLeavesOtherMembersRegistrationsAlone(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.daemon.AddProcess(teltest.Registration{
+		ID: "theirs", Package: "/home/other/echo", Name: "echo", User: "other",
+	})
+
+	list, prob := f.processes.List(ctx)
+	if prob != nil {
+		t.Fatalf("List: %s", prob.Detail)
+	}
+	registered, stale, prob := f.processes.Reconcile(ctx, list.Processes)
+	if prob != nil {
+		t.Fatalf("Reconcile: %s", prob.Detail)
+	}
+	if len(registered) != 0 || len(stale) != 0 {
+		t.Errorf("reconciled %v and %v, want another member's Process left alone", registered, stale)
+	}
+}
+
+// A Process that is stopped holds no registration of its own, so one kitbashd
+// still has for it is stale rather than current.
+func TestReconcileCountsOnlyRunningProcessesAsKnown(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	folder := f.pack(t, "ffmpeg", mcpManifest)
+	f.build(folder, "ffmpeg")
+	process, prob := f.processes.Run(ctx, folder, "", "")
+	if prob != nil {
+		t.Fatalf("Run: %s", prob.Detail)
+	}
+	if _, prob := f.processes.Stop(ctx, process.ID); prob != nil {
+		t.Fatalf("Stop: %s", prob.Detail)
+	}
+	// kitbashd never heard the stop, which is what a daemon that was down for
+	// it looks like.
+	f.daemon.AddProcess(teltest.Registration{ID: process.ID, Package: folder, Name: "ffmpeg"})
+
+	list, prob := f.processes.List(ctx)
+	if prob != nil {
+		t.Fatalf("List: %s", prob.Detail)
+	}
+	registered, stale, prob := f.processes.Reconcile(ctx, list.Processes)
+	if prob != nil {
+		t.Fatalf("Reconcile: %s", prob.Detail)
+	}
+	if len(registered) != 0 {
+		t.Errorf("registered %v, want nothing for a Process that is stopped", registered)
+	}
+	if len(stale) != 1 || stale[0] != process.ID {
+		t.Errorf("stale is %v, want the stopped Process %s", stale, process.ID)
 	}
 }
 

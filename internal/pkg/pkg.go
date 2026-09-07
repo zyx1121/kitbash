@@ -273,7 +273,9 @@ func (s *Service) source(folder string, unit manifest.Unit) (contextDir, contain
 		}
 		remove := func() { os.RemoveAll(dir) }
 		file := filepath.Join(dir, containerfiles[0])
-		if err := os.WriteFile(file, []byte("FROM "+unit.Image+"\n"), 0o644); err != nil {
+		// The generated context is the caller's alone: nothing else on the
+		// host has to read a file that exists for one build.
+		if err := os.WriteFile(file, []byte("FROM "+unit.Image+"\n"), 0o600); err != nil {
 			return "", "", remove, problem.Internal(folder, err.Error(),
 				"Ask an administrator to check the disk on this host.")
 		}
