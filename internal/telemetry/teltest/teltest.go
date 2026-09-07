@@ -68,10 +68,12 @@ type Registration struct {
 	Expose        string   `json:"expose,omitempty"`
 	Endpoint      string   `json:"endpoint,omitempty"`
 	Subscriptions []string `json:"subscriptions,omitempty"`
-	// User is the owner kitbashd recorded from the socket's peer
-	// credentials. It is never sent by a client; a test seeds it to stand in
-	// for another member's Process in an admin's list.
-	User string `json:"user,omitempty"`
+	// Owner is the member kitbashd recorded from the socket's peer
+	// credentials, and Admin whether they were an admin at registration. A
+	// client sends neither; a test seeds Owner to stand in for another
+	// member's Process in an admin's list.
+	Owner string `json:"owner,omitempty"`
+	Admin bool   `json:"admin,omitempty"`
 }
 
 // Response is what the daemon answers on the JSON API.

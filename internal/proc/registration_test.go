@@ -441,8 +441,10 @@ deploy:
 func TestReconcileLeavesOtherMembersRegistrationsAlone(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
+	// kitbashd names the member under owner, which is what an admin's list
+	// carries for a Process that is not the caller's.
 	f.daemon.AddProcess(teltest.Registration{
-		ID: "theirs", Package: "/home/other/echo", Name: "echo", User: "other",
+		ID: "theirs", Package: "/home/other/echo", Name: "echo", Owner: "other",
 	})
 
 	list, prob := f.processes.List(ctx)

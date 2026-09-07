@@ -103,13 +103,16 @@ func TestListProcessesReadsWhatTheDaemonHolds(t *testing.T) {
 		ID: "two", Package: "/home/tester/observer", Name: "observer", Expose: "http",
 		Endpoint: "http://127.0.0.1:40275", Subscriptions: []string{"telemetry"},
 	})
+	daemon.AddProcess(teltest.Registration{
+		ID: "three", Package: "/home/other/echo", Name: "echo", Owner: "other", Admin: true,
+	})
 
 	list, prob := client.ListProcesses(context.Background())
 	if prob != nil {
 		t.Fatalf("ListProcesses: %s", prob.Detail)
 	}
-	if len(list) != 2 {
-		t.Fatalf("the daemon holds %d Processes, want 2", len(list))
+	if len(list) != 3 {
+		t.Fatalf("the daemon holds %d Processes, want 3", len(list))
 	}
 	if list[0].ID != "one" || list[0].Package != "/home/tester/echo" || list[0].Expose != "mcp" {
 		t.Errorf("the first Process is %+v, want the echo Process", list[0])
@@ -117,6 +120,36 @@ func TestListProcessesReadsWhatTheDaemonHolds(t *testing.T) {
 	if list[1].Endpoint != "http://127.0.0.1:40275" ||
 		len(list[1].Subscriptions) != 1 || list[1].Subscriptions[0] != "telemetry" {
 		t.Errorf("the second Process is %+v, want its endpoint and subscription", list[1])
+	}
+	// The member a Process belongs to is under owner, which is what tells an
+	// admin's list apart from a member's own.
+	if list[2].Owner != "other" || !list[2].Admin {
+		t.Errorf("the third Process is %+v, want it owned by other and marked admin", list[2])
+	}
+}
+
+// kitbashd names the member under owner. The older spelling is still read, so
+// a daemon that has not caught up does not silently become anonymous, which
+// would make every Process look like the caller's.
+func TestAListedProcessAcceptsBothSpellingsOfItsOwner(t *testing.T) {
+	cases := map[string]string{
+		"owner": `{"id":"one","package":"/home/other/echo","name":"echo","owner":"other"}`,
+		"user":  `{"id":"one","package":"/home/other/echo","name":"echo","user":"other"}`,
+		"both":  `{"id":"one","package":"/home/other/echo","name":"echo","owner":"other","user":"ignored"}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			var got telemetry.Registered
+			if err := json.Unmarshal([]byte(body), &got); err != nil {
+				t.Fatalf("decoding: %v", err)
+			}
+			if got.Owner != "other" {
+				t.Errorf("owner is %q, want other", got.Owner)
+			}
+			if got.ID != "one" || got.Package != "/home/other/echo" {
+				t.Errorf("the Process is %+v, want its id and Package kept", got)
+			}
+		})
 	}
 }
 

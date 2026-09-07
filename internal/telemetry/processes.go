@@ -60,6 +60,10 @@ type Registration struct {
 
 // Registered is one Process kitbashd knows about, as processes_list returns
 // it. Tokens are returned once, at registration, and are never listed.
+//
+// Owner is the member kitbashd recorded from the socket's peer credentials at
+// registration. A member's list is their own, so it is an admin's list that
+// carries Processes with an owner other than the caller.
 type Registered struct {
 	ID            string   `json:"id"`
 	Package       string   `json:"package"`
@@ -67,7 +71,28 @@ type Registered struct {
 	Expose        string   `json:"expose,omitempty"`
 	Endpoint      string   `json:"endpoint,omitempty"`
 	Subscriptions []string `json:"subscriptions,omitempty"`
-	User          string   `json:"user,omitempty"`
+	Owner         string   `json:"owner,omitempty"`
+	Admin         bool     `json:"admin,omitempty"`
+	RegisteredAt  string   `json:"registeredAt,omitempty"`
+}
+
+// UnmarshalJSON reads a listed Process, accepting user as a spelling of owner.
+// The daemon answers owner; the older spelling costs one line to keep and the
+// alternative is an owner filter that silently sees nothing.
+func (r *Registered) UnmarshalJSON(data []byte) error {
+	type listed Registered
+	var raw struct {
+		listed
+		User string `json:"user"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*r = Registered(raw.listed)
+	if r.Owner == "" {
+		r.Owner = raw.User
+	}
+	return nil
 }
 
 // registerResponse is what processes_register answers.

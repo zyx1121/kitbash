@@ -348,7 +348,7 @@ func (s *Service) Reconcile(ctx context.Context, running []Process) (registered,
 	mine := make([]telemetry.Registered, 0, len(known))
 	byID := map[string]telemetry.Registered{}
 	for _, entry := range known {
-		if entry.User != "" && entry.User != s.files.User() {
+		if entry.Owner != "" && entry.Owner != s.files.User() {
 			continue
 		}
 		mine = append(mine, entry)
