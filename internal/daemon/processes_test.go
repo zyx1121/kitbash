@@ -246,7 +246,7 @@ func TestRegisterAnotherOwnersIDConflicts(t *testing.T) {
 	if err := h.store.RegisterProcess(context.Background(), store.Process{
 		ID: req.ID, Owner: "someone-else", Package: "/home/someone-else/echo",
 		Expose: ExposeNone, RegisteredAt: time.Now(),
-	}, hash); err != nil {
+	}, hash, 0); err != nil {
 		t.Fatalf("RegisterProcess: %v", err)
 	}
 
@@ -256,6 +256,37 @@ func TestRegisterAnotherOwnersIDConflicts(t *testing.T) {
 	}
 	if slug := h.problemOf(res, body).Slug(); slug != problem.SlugConflict {
 		t.Errorf("slug = %q, want %q", slug, problem.SlugConflict)
+	}
+}
+
+// TestRegistrationsAreCappedPerMember bounds what one member costs the daemon:
+// every registration is a live token and, when it subscribes, a queue.
+func TestRegistrationsAreCappedPerMember(t *testing.T) {
+	h := serve(t, false)
+	var last processRequest
+	for i := range MaxProcessesPerMember {
+		last = registration("")
+		if _, res, body := h.register(last); res.StatusCode != http.StatusOK {
+			t.Fatalf("registration %d = %d, body %s", i, res.StatusCode, body)
+		}
+	}
+
+	_, res, body := h.register(registration(""))
+	if res.StatusCode != http.StatusConflict {
+		t.Fatalf("the registration past the cap = %d, want 409", res.StatusCode)
+	}
+	p := h.problemOf(res, body)
+	if p.Slug() != problem.SlugConflict {
+		t.Errorf("slug = %q, want %q", p.Slug(), problem.SlugConflict)
+	}
+	if !strings.Contains(p.Fix, "Stop a Process") {
+		t.Errorf("fix = %q, want it to say what to do about the cap", p.Fix)
+	}
+
+	// Re-running a Process the member already holds is a replacement, not one
+	// more, so the cap never stops a restart.
+	if _, res, body := h.register(last); res.StatusCode != http.StatusOK {
+		t.Fatalf("replacing at the cap = %d, body %s", res.StatusCode, body)
 	}
 }
 
@@ -294,7 +325,7 @@ func TestUnregisterAnotherOwnersProcessIsRefused(t *testing.T) {
 	if err := h.store.RegisterProcess(context.Background(), store.Process{
 		ID: id, Owner: "someone-else", Package: "/home/someone-else/echo",
 		Expose: ExposeNone, RegisteredAt: time.Now(),
-	}, hash); err != nil {
+	}, hash, 0); err != nil {
 		t.Fatalf("RegisterProcess: %v", err)
 	}
 	res, body := h.do(http.MethodDelete, processesPath+"/"+id, "", nil)
@@ -356,6 +387,10 @@ func TestTCPRefusesWithoutAToken(t *testing.T) {
 		p := h.problemOf(res, body)
 		if p.Slug() != problem.SlugNotPermitted {
 			t.Errorf("slug = %q, want %q", p.Slug(), problem.SlugNotPermitted)
+		}
+		if got := res.Header.Get("WWW-Authenticate"); got != BearerChallenge {
+			t.Errorf("WWW-Authenticate = %q, want %q; RFC 9110 requires a challenge with a 401",
+				got, BearerChallenge)
 		}
 	}
 	if spans := h.spans(); len(spans) != 0 {
@@ -559,7 +594,7 @@ type fanoutRequest struct {
 	body map[string]any
 }
 
-func newSubscriber(t *testing.T, slow bool) *subscriberStub {
+func newSubscriberStub(t *testing.T, slow bool) *subscriberStub {
 	t.Helper()
 	sub := &subscriberStub{
 		requests: make(chan fanoutRequest, 64),
@@ -627,7 +662,7 @@ func (h *harness) addSubscriber(owner string, admin bool, endpoint string) strin
 		Endpoint:      endpoint,
 		Subscriptions: []string{store.SubscriptionTelemetry},
 		RegisteredAt:  time.Now(),
-	}, hash); err != nil {
+	}, hash, 0); err != nil {
 		h.t.Fatalf("RegisterProcess: %v", err)
 	}
 	if err := h.server.LoadSubscribers(context.Background()); err != nil {
@@ -641,9 +676,9 @@ func (h *harness) addSubscriber(owner string, admin bool, endpoint string) strin
 // their own, and the records arrive as OTLP JSON on the standard path.
 func TestFanOutFollowsTheReadingRule(t *testing.T) {
 	h := serve(t, false)
-	adminSub := newSubscriber(t, false)
-	memberSub := newSubscriber(t, false)
-	otherSub := newSubscriber(t, false)
+	adminSub := newSubscriberStub(t, false)
+	memberSub := newSubscriberStub(t, false)
+	otherSub := newSubscriberStub(t, false)
 
 	h.addSubscriber("an-admin", true, adminSub.server.URL)
 	h.addSubscriber(h.user, false, memberSub.server.URL)
@@ -675,32 +710,123 @@ func TestFanOutFollowsTheReadingRule(t *testing.T) {
 	otherSub.silent(t, 300*time.Millisecond)
 }
 
-// TestFanOutSkipsTheProducingSubscriber keeps an observability kit from being
-// fed its own exports, which would never stop.
-func TestFanOutSkipsTheProducingSubscriber(t *testing.T) {
+// TestFanOutStopsAtRecordsFromSubscribers is the loop guard. A record a
+// subscriber wrote is stored and queryable, and pushed to nobody: not back to
+// its own producer, and not to a second kit, whose own records would otherwise
+// wake the first one again for as long as both run.
+func TestFanOutStopsAtRecordsFromSubscribers(t *testing.T) {
 	h := serve(t, true)
 	base := h.serveTCP()
-	itself := newSubscriber(t, false)
-	other := newSubscriber(t, false)
+	itself := newSubscriberStub(t, false)
+	other := newSubscriberStub(t, false)
 
 	req := registration(itself.server.URL)
 	token, res, body := h.register(req)
 	if res.StatusCode != http.StatusOK {
 		t.Fatalf("register status = %d, body %s", res.StatusCode, body)
 	}
-	h.addSubscriber(h.user, false, other.server.URL)
+	h.addSubscriber(h.user, true, other.server.URL)
 
 	res, body = h.exportTCP(base, pathTraces, token,
-		processExport("echo", nil, false, time.Now().Add(-time.Minute)))
+		processExport("judgement", nil, true, time.Now().Add(-time.Minute)))
 	if res.StatusCode != http.StatusOK {
 		t.Fatalf("export status = %d, body %s", res.StatusCode, body)
 	}
 
-	got := other.await(t)
-	if attributeMap(onlySpan(t, got.body))[otlp.AttrProducer] != req.ID {
-		t.Errorf("the other subscriber received %v", got.body)
-	}
 	itself.silent(t, 300*time.Millisecond)
+	other.silent(t, 300*time.Millisecond)
+
+	// The store still has it: the push is what stops, not the record.
+	spans := h.spans()
+	if len(spans) != 1 || spans[0].Producer != req.ID {
+		t.Fatalf("the store holds %+v, want the kit's record", spans)
+	}
+
+	// A record from a member's session still fans out, so the guard is about
+	// who produced the record and not about the subscribers being asleep.
+	res, body = h.do(http.MethodPost, pathTraces, otlp.ContentTypeProtobuf,
+		exportRequest("fs_list", h.user, time.Now().Add(-time.Minute)))
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("session export = %d, body %s", res.StatusCode, body)
+	}
+	if got := other.await(t); got.path != pathTraces {
+		t.Errorf("the second subscriber received %s", got.path)
+	}
+}
+
+// TestFanOutDoesNotFollowRedirects is the network boundary: a member's Process
+// answers 307 for another host, and the daemon delivers there. It must not.
+// kitbashd runs as root, so a subscriber deciding where records go next would
+// hand one member's Telemetry to whatever address another member names.
+func TestFanOutDoesNotFollowRedirects(t *testing.T) {
+	h := serve(t, false)
+	elsewhere := newSubscriberStub(t, false)
+
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, elsewhere.server.URL+r.URL.Path, http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(redirector.Close)
+
+	h.addSubscriber(h.user, false, redirector.URL)
+	res, body := h.do(http.MethodPost, pathTraces, otlp.ContentTypeProtobuf,
+		exportRequest("fs_list", h.user, time.Now().Add(-time.Minute)))
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("export status = %d, body %s", res.StatusCode, body)
+	}
+	elsewhere.silent(t, time.Second)
+}
+
+// TestFanOutRefusesToLeaveLoopback is the same boundary one layer down: the
+// endpoint check at registration is not the only thing standing between a
+// store row and the network.
+func TestFanOutRefusesToLeaveLoopback(t *testing.T) {
+	for _, address := range []string{"10.10.10.116:4318", "example.org:80"} {
+		if _, err := dialLoopback(context.Background(), "tcp", address); err == nil {
+			t.Errorf("the fan out dialled %s", address)
+		}
+	}
+	// The one address it does dial is refused only because nothing listens.
+	if _, err := dialLoopback(context.Background(), "udp", "127.0.0.1:9"); err == nil {
+		t.Error("the fan out dialled a datagram socket")
+	}
+}
+
+// TestQueueIsBoundedInBytes is the second bound on a subscriber that never
+// answers: a thousand requests of four megabytes each would be gigabytes of
+// the daemon's memory held for one Process that stopped reading.
+func TestQueueIsBoundedInBytes(t *testing.T) {
+	sub := &subscriber{
+		id:    "a-process",
+		queue: make(chan delivery, QueueDepth),
+		stop:  make(chan struct{}),
+		done:  make(chan struct{}),
+	}
+	body := bytes.Repeat([]byte{'x'}, 1<<20)
+	// Nothing drains this queue: the subscriber never answers.
+	for range 200 {
+		sub.enqueue(delivery{path: pathTraces, body: body})
+	}
+	if held := sub.held.Load(); held > QueueBytes {
+		t.Errorf("the queue holds %d bytes, over the budget of %d", held, QueueBytes)
+	}
+	if held := sub.held.Load(); held < QueueBytes-int64(len(body)) {
+		t.Errorf("the queue holds %d bytes, want it filled to about %d", held, QueueBytes)
+	}
+	if dropped := sub.dropped.Load(); dropped == 0 {
+		t.Error("nothing was dropped, so the budget did not bind")
+	}
+	if len(sub.queue) != int(sub.held.Load()/int64(len(body))) {
+		t.Errorf("queue holds %d requests and %d bytes, which do not agree",
+			len(sub.queue), sub.held.Load())
+	}
+
+	// What the worker takes off the queue is given back to the budget.
+	before := sub.held.Load()
+	d := <-sub.queue
+	sub.release(d)
+	if got := sub.held.Load(); got != before-int64(len(body)) {
+		t.Errorf("held = %d after one delivery left the queue, want %d", got, before-int64(len(body)))
+	}
 }
 
 // TestFanOutNeverDelaysTheProducer is the promise the queue exists for: a
@@ -708,7 +834,7 @@ func TestFanOutSkipsTheProducingSubscriber(t *testing.T) {
 // are stored.
 func TestFanOutNeverDelaysTheProducer(t *testing.T) {
 	h := serve(t, false)
-	slow := newSubscriber(t, true)
+	slow := newSubscriberStub(t, true)
 	h.addSubscriber(h.user, false, slow.server.URL)
 
 	start := time.Now()
@@ -761,7 +887,7 @@ func TestQueueDropsTheOldest(t *testing.T) {
 func TestHealthReportsListenersAndSubscribers(t *testing.T) {
 	h := serve(t, false)
 	base := h.serveTCP()
-	sub := newSubscriber(t, false)
+	sub := newSubscriberStub(t, false)
 	h.addSubscriber(h.user, false, sub.server.URL)
 
 	res, body := h.do(http.MethodGet, healthPath, "", nil)

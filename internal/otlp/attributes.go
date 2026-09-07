@@ -62,8 +62,14 @@ func attributes(resource map[string]any, record []*commonpb.KeyValue) store.Attr
 			delete(merged, key)
 		}
 	}
-	if b, ok := merged[AttrEval].(bool); ok {
-		attrs.Eval = &b
+	// kitbash.eval decides how a record is stamped and whether a query for
+	// judgments returns it, so a value of the wrong type is dropped rather
+	// than left among the other attributes: a string "true" sitting under the
+	// eval name is a value a reader would take for the flag it is not.
+	if raw, sent := merged[AttrEval]; sent {
+		if b, ok := raw.(bool); ok {
+			attrs.Eval = &b
+		}
 		delete(merged, AttrEval)
 	}
 	if len(merged) > 0 {

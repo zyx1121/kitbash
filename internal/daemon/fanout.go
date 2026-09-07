@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -19,6 +20,12 @@ import (
 // behind wants the newest records, and the store still holds them all, see
 // spec/kitbashd-api.yaml.
 const QueueDepth = 1024
+
+// QueueBytes is how much a subscriber's queue may hold. A request may carry up
+// to otlp.MaxBodyBytes, so a depth of 1024 alone would let one subscriber that
+// stopped answering pin gigabytes of the daemon's memory. Whichever bound is
+// reached first drops the oldest request.
+const QueueBytes = 64 << 20
 
 // DeliveryTimeout bounds one POST to a subscriber. There is no retry: the push
 // is a wake up and the store is the source of truth.
@@ -46,6 +53,9 @@ type subscriber struct {
 	endpoint string
 	queue    chan delivery
 	dropped  atomic.Int64
+	// held is how many bytes the queue is carrying. It is the second bound on
+	// the queue and it is kept by whoever puts a request in or takes one out.
+	held atomic.Int64
 	// failing is read and written only by the worker.
 	failing bool
 	// stop is closed when this subscriber is unregistered, and done when its
@@ -63,22 +73,44 @@ func (s *subscriber) eligible(user string) bool {
 	return s.admin || s.owner == user
 }
 
-// enqueue never blocks. A full queue loses its oldest request to make room,
-// because the producer's 200 must not wait for a subscriber that is behind.
+// enqueue never blocks. A queue that is full, by count or by bytes, loses its
+// oldest requests to make room, because the producer's 200 must not wait for a
+// subscriber that is behind.
+//
+// A request larger than the whole budget would empty the queue and still not
+// fit, so it is dropped rather than allowed to evict everything for nothing.
 func (s *subscriber) enqueue(d delivery) {
+	size := int64(len(d.body))
 	for {
-		select {
-		case s.queue <- d:
-			return
-		default:
+		if s.held.Load()+size <= QueueBytes {
+			select {
+			case s.queue <- d:
+				s.held.Add(size)
+				return
+			default:
+			}
 		}
 		select {
-		case <-s.queue:
+		case old := <-s.queue:
+			s.held.Add(-int64(len(old.body)))
 			s.dropped.Add(1)
 		default:
-			// Another goroutine drained it first; try to enqueue again.
+			// Nothing left to evict. If the budget has room now, the worker
+			// emptied the queue between the two checks and this request goes
+			// in on the next turn; if it still does not fit, it never will.
+			if s.held.Load()+size <= QueueBytes {
+				continue
+			}
+			s.dropped.Add(1)
+			return
 		}
 	}
+}
+
+// release gives the bytes of one request back to the budget. The worker calls
+// it for every request it takes off the queue.
+func (s *subscriber) release(d delivery) {
+	s.held.Add(-int64(len(d.body)))
 }
 
 // fanout holds the subscribers and delivers stored records to them.
@@ -89,12 +121,67 @@ type fanout struct {
 	closed bool
 }
 
-// newFanout builds the fan out with the delivery timeout of the spec.
+// newFanout builds the fan out with the delivery timeout of the spec and a
+// client that cannot be talked off the host.
+//
+// kitbashd runs as root and delivers other members' Telemetry, so a subscriber
+// is a place records go, never a place that decides where they go next. Two
+// rules enforce that. A redirect is not followed, so a member's Process cannot
+// answer 307 and have the daemon replay the records somewhere else. And every
+// connection is refused unless it lands on a loopback address, which re-checks
+// at connect time what registration checked at write time: a store row that
+// was tampered with, or an endpoint that resolves off the host, never reaches
+// the network.
 func newFanout() *fanout {
 	return &fanout{
-		client: &http.Client{Timeout: DeliveryTimeout},
-		subs:   map[string]*subscriber{},
+		client: &http.Client{
+			Timeout: DeliveryTimeout,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+			Transport: &http.Transport{
+				DialContext:           dialLoopback,
+				MaxIdleConnsPerHost:   2,
+				IdleConnTimeout:       IdleSubscriberTimeout,
+				TLSHandshakeTimeout:   DeliveryTimeout,
+				ResponseHeaderTimeout: DeliveryTimeout,
+			},
+		},
+		subs: map[string]*subscriber{},
 	}
+}
+
+// IdleSubscriberTimeout is how long a connection to a subscriber is kept for
+// the next delivery.
+const IdleSubscriberTimeout = 30 * time.Second
+
+// dialLoopback connects only to the loopback address, and only over TCP. A
+// host name is resolved first and refused unless every address it answers with
+// is loopback, so a name that resolves off the host is refused rather than
+// dialled once and noticed later.
+func dialLoopback(ctx context.Context, network, address string) (net.Conn, error) {
+	if network != "tcp" && network != "tcp4" && network != "tcp6" {
+		return nil, fmt.Errorf("daemon: the fan out does not deliver over %s", network)
+	}
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, fmt.Errorf("daemon: %q is not an address the fan out delivers to", address)
+	}
+	resolved, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	if err != nil {
+		return nil, fmt.Errorf("daemon: %q is not an address the fan out delivers to", address)
+	}
+	for _, addr := range resolved {
+		if !addr.Unmap().IsLoopback() {
+			return nil, fmt.Errorf("daemon: the fan out delivers to the loopback address only, and %q is %s",
+				host, addr.Unmap())
+		}
+	}
+	if len(resolved) == 0 {
+		return nil, fmt.Errorf("daemon: %q resolves to no address", host)
+	}
+	dialer := net.Dialer{Timeout: DeliveryTimeout}
+	return dialer.DialContext(ctx, network, net.JoinHostPort(resolved[0].String(), port))
 }
 
 // count is how many subscribers the fan out is delivering to, which health
@@ -105,9 +192,63 @@ func (f *fanout) count() int {
 	return len(f.subs)
 }
 
+// track adds or replaces the subscriber of one Process, and is what a
+// registration calls: one row changed, so one entry changes. A Process that
+// declares no subscription, or no endpoint, is removed instead.
+func (f *fanout) track(p store.Process) {
+	if !p.Subscribes() || p.Endpoint == "" {
+		f.untrack(p.ID)
+		return
+	}
+	f.mu.Lock()
+	if f.closed {
+		f.mu.Unlock()
+		return
+	}
+	old, existed := f.subs[p.ID]
+	if existed && old.endpoint == p.Endpoint && old.owner == p.Owner && old.admin == p.Admin {
+		f.mu.Unlock()
+		return
+	}
+	sub := newSubscriber(p)
+	f.subs[p.ID] = sub
+	f.mu.Unlock()
+
+	if existed {
+		close(old.stop)
+	}
+	go f.work(sub)
+}
+
+// untrack removes one subscriber, which is what unregistering a Process does.
+func (f *fanout) untrack(id string) {
+	f.mu.Lock()
+	sub, existed := f.subs[id]
+	if existed {
+		delete(f.subs, id)
+	}
+	f.mu.Unlock()
+	if existed {
+		close(sub.stop)
+	}
+}
+
+// newSubscriber is one Process's queue and the worker that drains it.
+func newSubscriber(p store.Process) *subscriber {
+	return &subscriber{
+		id:       p.ID,
+		owner:    p.Owner,
+		admin:    p.Admin,
+		endpoint: p.Endpoint,
+		queue:    make(chan delivery, QueueDepth),
+		stop:     make(chan struct{}),
+		done:     make(chan struct{}),
+	}
+}
+
 // reload makes the subscriber set match the registered Processes. It runs on
-// start and whenever the processes table changes, so a Process that stops
-// receiving is one that was unregistered.
+// start, where the whole table is what the daemon has to go on; a single
+// registration calls track instead.
 //
 // A subscriber whose endpoint changed is replaced rather than updated: the
 // queue belongs to an endpoint, and records queued for the old one are not
@@ -138,15 +279,7 @@ func (f *fanout) reload(processes []store.Process) {
 	}
 	var started []*subscriber
 	for id, p := range wanted {
-		sub := &subscriber{
-			id:       id,
-			owner:    p.Owner,
-			admin:    p.Admin,
-			endpoint: p.Endpoint,
-			queue:    make(chan delivery, QueueDepth),
-			stop:     make(chan struct{}),
-			done:     make(chan struct{}),
-		}
+		sub := newSubscriber(p)
 		f.subs[id] = sub
 		started = append(started, sub)
 	}
@@ -188,19 +321,27 @@ func (f *fanout) close() {
 // is bounded by the body the producer already sent, and enqueueing drops
 // rather than waits.
 //
-// A subscriber never receives a record it produced itself. Without that an
-// evaluation kit would judge its own judgments and a subscriber that exports
-// its own spans would feed itself forever.
+// A record produced by a subscriber is not fanned out at all. The obvious rule,
+// not delivering a record back to the subscriber that produced it, only stops a
+// loop one hop long: with two kits subscribed, each one's records wake the
+// other, whose records wake the first, and the pair amplifies for as long as
+// they run. Stopping at the first hop is the only rule that terminates without
+// kitbashd knowing what a kit does with what it receives.
+//
+// What a kit writes is therefore in the store and answered by tel_query, but it
+// is not pushed. That is the documented contract: the fan out is best effort
+// and the store is the source of truth, see PLAN.md section 5.5.
 func (f *fanout) dispatch(e store.Export, producer string) {
 	if f == nil || e.Empty() {
 		return
 	}
 	f.mu.Lock()
+	if _, producedByASubscriber := f.subs[producer]; producedByASubscriber {
+		f.mu.Unlock()
+		return
+	}
 	subs := make([]*subscriber, 0, len(f.subs))
 	for _, sub := range f.subs {
-		if sub.id == producer {
-			continue
-		}
 		subs = append(subs, sub)
 	}
 	f.mu.Unlock()
@@ -315,6 +456,7 @@ func (f *fanout) work(sub *subscriber) {
 		case <-sub.stop:
 			return
 		case d = <-sub.queue:
+			sub.release(d)
 		}
 		err := f.post(ctx, sub, d)
 		switch {
@@ -348,6 +490,8 @@ func (f *fanout) post(ctx context.Context, sub *subscriber, d delivery) error {
 	// The body is drained so the connection can be reused for the next
 	// request rather than torn down after every one.
 	io.Copy(io.Discard, io.LimitReader(res.Body, DiscardLimit))
+	// A redirect is a refusal here, not a hop: the client is told to hand it
+	// back rather than follow it, and 3xx falls into this same branch.
 	if res.StatusCode < 200 || res.StatusCode > 299 {
 		return fmt.Errorf("the Process answered %d", res.StatusCode)
 	}

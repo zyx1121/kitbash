@@ -18,6 +18,11 @@ import (
 // ever written to a client that is not an OTLP response or an API body.
 func writeProblem(w http.ResponseWriter, p *problem.Problem) {
 	w.Header().Set("Content-Type", ProblemContentType)
+	// RFC 9110 requires a challenge with a 401, and the only 401 this API
+	// answers is a Process without a usable token on the receiver.
+	if p.Status == http.StatusUnauthorized {
+		w.Header().Set("WWW-Authenticate", BearerChallenge)
+	}
 	w.WriteHeader(p.Status)
 	fmt.Fprintln(w, p.JSON())
 }

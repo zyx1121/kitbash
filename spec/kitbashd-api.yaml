@@ -65,10 +65,23 @@ fan_out:
     endpoint, run by an admin (receives everything) or by the record's
     kitbash.user (receives that member's records).
   delivery: >
-    Asynchronous, one bounded queue of 1024 requests per subscriber, oldest
-    dropped when full, 5 s request timeout, no retry. Transitions between
-    delivering and failing are logged once each with the dropped count. The
-    store is the source of truth; the push is a wake up.
+    Asynchronous, one queue per subscriber bounded twice, at 1024 requests and
+    at 64 MiB, oldest dropped when either bound is reached, 5 s request
+    timeout, no retry. Transitions between delivering and failing are logged
+    once each with the dropped count. The store is the source of truth; the
+    push is a wake up.
+  transport: >
+    kitbashd never follows a redirect from a subscriber and never connects
+    anywhere but the loopback address, which is checked again when the
+    connection is made and not only when the endpoint is registered. kitbashd
+    runs as root and carries other members' records, so a subscriber is a place
+    records go and never a place that decides where they go next.
+  loops: >
+    A record whose producer is itself a registered subscriber is not fanned out
+    at all, to anyone. Refusing only to send a record back to its own producer
+    would still let two subscribed kits wake each other for as long as both
+    run. What a kit writes is stored and answered by tel_query; it is not
+    pushed.
 
 otlp:
   paths:
@@ -120,19 +133,43 @@ api:
       registration time. Registering an id that already exists for the same
       owner replaces the record and returns a new token (the old one is
       revoked); the same id owned by another member is 409 conflict.
+    limit: >
+      A member holds at most 64 registered Processes; the 65th is 409 conflict.
+      A replacement is not a new Process and is never refused by the limit.
+      Every registration is a live token and, for a subscriber, a queue, so
+      this count is what bounds what one member costs the daemon.
+    validation: >
+      id is a canonical version 7 UUID of 36 characters, package an absolute
+      path, expose one of mcp, http or none, subscriptions a subset of
+      [telemetry], and endpoint http://127.0.0.1:PORT and nothing else: the fan
+      out POSTs to whatever it names, so it may never point at the network.
     errors: [bad-request, conflict, internal]
   processes_unregister:
     method: DELETE
     path: /kitbash/v1/processes/{id}
     response: 204 on success, 404 not-found when unknown, 403 not-permitted when owned by another member
+    authorization: >
+      The owner and nobody else, admins included. Unregistering revokes a token
+      the container is still using, and in version 1 no member needs to do that
+      to another member's Process. An admin who must clear a stale registration
+      stops the Process. Widening this is a decision, not an oversight.
   processes_list:
     method: GET
     path: /kitbash/v1/processes
-    response: The caller's registered Processes without tokens; admins see all.
+    response: >
+      { processes: [ { id, owner, admin, package, name, expose, endpoint,
+      subscriptions, registeredAt } ] }. The caller's registered Processes,
+      every key present even when its value is empty, and no token anywhere.
+      An admin sees every member's.
   health:
     method: GET
     path: /kitbash/v1/health
-    response: { version: "v0.3.0", store: "/var/lib/kitbash/kitbashd.db", uptimeSeconds: 12 }
+    response: >
+      { version: "v0.4.0", store: "/var/lib/kitbash/kitbashd.db",
+      uptimeSeconds: 12, listeners: { socket: "/run/kitbash/kitbashd.sock",
+      tcp: "0.0.0.0:4318" }, subscribers: 1 }. A listener that is not bound is
+      absent; subscribers is how many registered Processes the fan out is
+      delivering to.
 
 retention:
   defaults: { traces: 30d, logs: 14d, metrics: 30d }

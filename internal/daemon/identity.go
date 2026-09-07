@@ -13,6 +13,10 @@ import (
 // bearerPrefix is how a Process presents its token on the TCP receiver.
 const bearerPrefix = "bearer "
 
+// BearerChallenge is the WWW-Authenticate a 401 carries, as RFC 9110 requires
+// of every 401.
+const BearerChallenge = `Bearer realm="kitbash Process receiver"`
+
 // identity is what a record is stamped with: who it is about, and who wrote
 // it. A session over the unix socket is the member on both counts; a Process
 // over the TCP receiver is its owner and its own id, see PLAN.md section 2.4.

@@ -36,6 +36,13 @@ const (
 	MaxSubscriptions = 8
 )
 
+// MaxProcessesPerMember is how many Processes one member may hold registered.
+// Every one of them is a live token and, if it subscribes, a queue of up to
+// QueueBytes, so the count is what bounds what one member costs the daemon. A
+// member running more than a few dozen Processes on one machine has a
+// different problem than this limit.
+const MaxProcessesPerMember = 64
+
 // processID is the UUIDv7 shape spec/kitbashd-api.yaml declares, the same one
 // internal/uuid writes.
 var processID = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
@@ -113,17 +120,23 @@ func (s *Server) registerProcess(w http.ResponseWriter, r *http.Request, caller 
 		Subscriptions: req.Subscriptions,
 		RegisteredAt:  s.now().UTC(),
 	}
-	if err := s.store.RegisterProcess(r.Context(), p, hash); err != nil {
+	if err := s.store.RegisterProcess(r.Context(), p, hash, MaxProcessesPerMember); err != nil {
 		if errors.Is(err, store.ErrProcessOwned) {
 			writeProblem(w, problem.ConflictFix(r.URL.Path,
 				fmt.Sprintf("the Process %s belongs to another member", req.ID),
 				"Register the Process under a new id."))
 			return
 		}
+		if errors.Is(err, store.ErrTooManyProcesses) {
+			writeProblem(w, problem.ConflictFix(r.URL.Path,
+				fmt.Sprintf("%s already has %d Processes registered", caller.User, MaxProcessesPerMember),
+				"Stop a Process you are no longer using, which unregisters it, then run this one."))
+			return
+		}
 		writeProblem(w, problem.Internal(r.URL.Path, err.Error(), ""))
 		return
 	}
-	s.reloadSubscribers(r.Context())
+	s.fanout.track(p)
 	writeJSON(w, r.URL.Path, processResponse{ID: p.ID, Token: token})
 }
 
@@ -189,17 +202,8 @@ func (s *Server) unregisterProcess(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, problem.Internal(r.URL.Path, err.Error(), ""))
 		return
 	}
-	s.reloadSubscribers(r.Context())
+	s.fanout.untrack(id)
 	w.WriteHeader(http.StatusNoContent)
-}
-
-// reloadSubscribers makes the fan out match the processes table. It runs after
-// every change to that table and once on start; a failure leaves the previous
-// set delivering, which is better than none.
-func (s *Server) reloadSubscribers(ctx context.Context) {
-	if err := s.LoadSubscribers(ctx); err != nil {
-		logger.Printf("could not reload the fan out subscribers: %v", err)
-	}
 }
 
 // LoadSubscribers reads the registered Processes and points the fan out at the

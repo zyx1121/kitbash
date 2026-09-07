@@ -28,6 +28,12 @@ const TokenBytes = 32
 // not a replacement.
 var ErrProcessOwned = errors.New("store: the Process id belongs to another member")
 
+// ErrTooManyProcesses reports a member at their registration limit. The limit
+// is the caller's, see daemon.MaxProcessesPerMember; the store enforces it
+// inside the transaction, so two sessions registering at once cannot both pass
+// a check and both write.
+var ErrTooManyProcesses = errors.New("store: the member has too many Processes registered")
+
 // Process is one registered Process: who runs it, what it runs, and what it
 // asked to receive. The token is not part of it; only the hash of the token
 // lives in the store, see spec/kitbashd-api.yaml.
@@ -79,7 +85,11 @@ func HashToken(token string) string {
 // same owner already holds replaces the record and revokes the old token,
 // which is what makes a re-run of the same Process safe to repeat. The same id
 // held by another member is ErrProcessOwned.
-func (s *Store) RegisterProcess(ctx context.Context, p Process, tokenHash string) error {
+//
+// maxPerOwner bounds how many Processes one member may hold; zero means no
+// bound, which is what a caller not exercising the limit passes. A replacement
+// is not a new Process and is never refused by it.
+func (s *Store) RegisterProcess(ctx context.Context, p Process, tokenHash string, maxPerOwner int) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("store: begin: %w", err)
@@ -87,13 +97,27 @@ func (s *Store) RegisterProcess(ctx context.Context, p Process, tokenHash string
 	defer tx.Rollback()
 
 	var owner string
+	replacing := true
 	err = tx.QueryRowContext(ctx, "SELECT owner FROM processes WHERE id = ?", p.ID).Scan(&owner)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
+		replacing = false
 	case err != nil:
 		return fmt.Errorf("store: read the Process %s: %w", p.ID, err)
 	case owner != p.Owner:
 		return ErrProcessOwned
+	}
+	// The count is inside the transaction, so two sessions registering at the
+	// same moment cannot both read a count under the limit and both write.
+	if !replacing && maxPerOwner > 0 {
+		var held int
+		if err := tx.QueryRowContext(ctx,
+			"SELECT count(*) FROM processes WHERE owner = ?", p.Owner).Scan(&held); err != nil {
+			return fmt.Errorf("store: count the Processes of %s: %w", p.Owner, err)
+		}
+		if held >= maxPerOwner {
+			return ErrTooManyProcesses
+		}
 	}
 
 	subscriptions, err := json.Marshal(subscriptionList(p.Subscriptions))
