@@ -123,6 +123,8 @@ $defs:
       path: { type: string }
       tool: { type: string }
       eval: { type: boolean }
+      producer: { type: string, description: "Member name or Process id that wrote the record" }
+      subject: { type: object, description: "For evaluation records: traceId and spanId of the judged span", properties: { traceId: { type: string }, spanId: { type: string } } }
   spanRecord:
     type: object
     required: [traceId, spanId, name, start, end, status, attributes]
@@ -294,7 +296,10 @@ families:
           the build context is the caller's to fix; a runtime that will not run
           at all is internal. An uncommitted change under the path is conflict:
           kitbash builds from a commit. Version 1 supports one container unit
-          with a build context per Package.
+          per Package. A unit with build is built from its context; a unit
+          with image is pulled by digest and relabelled through a one line
+          Containerfile so the result carries the same labels and its own
+          image ID.
         input: { type: object, additionalProperties: false, required: [path], properties: { path: { type: string } } }
         output:
           type: object
@@ -373,7 +378,13 @@ families:
           its container name: a name already held by a Process of another
           Package is a conflict, and so is a tool name another running Process
           already answers, which leaves the Process running with its tools off
-          the surface. Version 1 runs the first container unit.
+          the surface. Version 1 runs the first container unit. Before the
+          container starts the Process is registered with kitbashd, which
+          mints its Telemetry token; the container receives
+          KITBASH_TELEMETRY_ENDPOINT, KITBASH_TELEMETRY_TOKEN, KITBASH_PROCESS,
+          KITBASH_PACKAGE and KITBASH_USER, see spec/kitbashd-api.yaml. A
+          Process whose manifest declares subscriptions: [telemetry] with
+          expose: http and a port is registered as a fan out subscriber.
         input:
           type: object
           additionalProperties: false
@@ -455,6 +466,7 @@ families:
             path: { type: string, description: "Files path, as kitbash.path; prefix match" }
             tool: { type: string, description: "Surface tool name, as kitbash.tool" }
             eval: { type: boolean, description: "Only evaluation results written back by kits" }
+            producer: { type: string, description: "Member name or Process id that wrote the record" }
             since: { type: string, format: date-time }
             until: { type: string, format: date-time }
             limit: { type: integer, minimum: 1, default: 100, maximum: 1000 }

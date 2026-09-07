@@ -18,6 +18,58 @@ socket_owner: root:kitbash-users
 socket_mode: "0660"
 store: /var/lib/kitbash/kitbashd.db
 
+tcp:
+  description: >
+    The Process receiver. kitbashd also listens for OTLP/HTTP on KITBASH_OTLP_LISTEN
+    (default 0.0.0.0:4318) because rootless networking delivers
+    host.containers.internal to the host's primary address, not to loopback.
+    Only the OTLP paths are served there; the /kitbash/v1 API is socket only.
+  authorization: >
+    Every request carries Authorization: Bearer <token>. The token was minted
+    by POST /kitbash/v1/processes and names one Process; kitbashd stamps
+    kitbash.user, kitbash.package and kitbash.process from it and sets
+    kitbash.producer to the Process id. A missing, unknown or revoked token
+    is 401 not-permitted. Records from a Process may carry any other
+    attribute; the eval rules below are the one exception where claims on
+    the stamped attributes are honoured.
+  environment_given_to_every_process:
+    KITBASH_TELEMETRY_ENDPOINT: http://host.containers.internal:4318
+    KITBASH_TELEMETRY_TOKEN: the Process token
+    KITBASH_PROCESS: the Process id
+    KITBASH_PACKAGE: the Package path
+    KITBASH_USER: the member who ran it
+
+producer_attribute:
+  kitbash.producer: >
+    Stamped by kitbashd on every record. The member name for a record that
+    arrived over the unix socket, the Process id for one that arrived over
+    TCP with a token. Never taken from the body.
+
+eval:
+  description: >
+    A record with attribute kitbash.eval = true is a judgment about a subject
+    named by kitbash.subject.trace_id and kitbash.subject.span_id. When the
+    producing Process was run by an admin, the record's kitbash.user,
+    kitbash.package, kitbash.process and kitbash.path are kept as sent so the
+    judgment is found by the same query as its subject. When the producer is
+    a member's Process, or a member's session, those four are stamped as for
+    any other record. kitbash.producer still names the kit.
+
+fan_out:
+  description: >
+    After a request is stored, kitbashd re-encodes each record as OTLP/HTTP
+    JSON (hex identifiers, string nanosecond timestamps) with the stamped
+    attributes and POSTs it to every eligible subscriber's endpoint on the
+    matching standard path (/v1/traces, /v1/logs, /v1/metrics). Eligible: a
+    registered Process with subscriptions containing telemetry and an
+    endpoint, run by an admin (receives everything) or by the record's
+    kitbash.user (receives that member's records).
+  delivery: >
+    Asynchronous, one bounded queue of 1024 requests per subscriber, oldest
+    dropped when full, 5 s request timeout, no retry. Transitions between
+    delivering and failing are logged once each with the dropped count. The
+    store is the source of truth; the push is a wake up.
+
 otlp:
   paths:
     traces: POST /v1/traces
@@ -57,6 +109,26 @@ api:
     response: The full retention after the change.
     authorization: admin only, 403 not-permitted otherwise.
     errors: [bad-request, not-permitted, internal]
+  processes_register:
+    method: POST
+    path: /kitbash/v1/processes
+    request: { id: "UUIDv7", package: "/home/loki/echo", name: "echo", expose: "mcp|http|none", endpoint: "http://127.0.0.1:40275 when expose is http", subscriptions: ["telemetry"] }
+    response: { id: "UUIDv7", token: "opaque, at least 32 bytes of entropy, returned once" }
+    authorization: >
+      The caller is the member the Process belongs to; kitbashd records the
+      peer user as the Process owner and whether they are an admin at
+      registration time. Registering an id that already exists for the same
+      owner replaces the record and returns a new token (the old one is
+      revoked); the same id owned by another member is 409 conflict.
+    errors: [bad-request, conflict, internal]
+  processes_unregister:
+    method: DELETE
+    path: /kitbash/v1/processes/{id}
+    response: 204 on success, 404 not-found when unknown, 403 not-permitted when owned by another member
+  processes_list:
+    method: GET
+    path: /kitbash/v1/processes
+    response: The caller's registered Processes without tokens; admins see all.
   health:
     method: GET
     path: /kitbash/v1/health
@@ -68,6 +140,15 @@ retention:
   storage: settings table in the same SQLite file; a value survives restarts
 
 client_behaviour:
+  processes: >
+    kitbash-mcp registers a Process at proc_run before the container starts,
+    injects the environment above, and unregisters it at proc_stop and when
+    a replace removes the old container. bridge.Sync at session start
+    re-registers every running Process of the caller that kitbashd does not
+    know (compare with processes_list), so a restarted kitbashd learns the
+    running set from the next session; re-registration mints a new token, so
+    the container keeps the old one and its exports fail until the Process
+    is run again. That gap is accepted in version 1 and logged.
   description: >
     kitbash-mcp exports asynchronously and never blocks a tool call on the
     exporter. If the socket is absent or refuses, spans are dropped and one
