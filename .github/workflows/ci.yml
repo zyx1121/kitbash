@@ -18,7 +18,7 @@ jobs:
           check-latest: true
 
       - name: Lint, test and build
-        run: make lint test build-linux
+        run: make lint test test-race build-linux
 
       - uses: actions/upload-artifact@v4
         with:

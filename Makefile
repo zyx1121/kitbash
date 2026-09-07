@@ -2,7 +2,7 @@ BINARIES := kitbash-mcp kitbashd
 VERSION ?= $(shell git describe --tags --always 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
-.PHONY: all build test lint build-linux clean
+.PHONY: all build test test-race lint build-linux clean
 
 all: lint test build
 
@@ -15,6 +15,10 @@ build:
 ## test: every package
 test:
 	go test ./...
+
+## test-race: the concurrent packages under the race detector (needs cgo)
+test-race:
+	CGO_ENABLED=1 go test -race -count=1 ./internal/daemon/... ./internal/store/... ./internal/otlp/... ./internal/telemetry/... ./internal/bridge/... ./internal/proc/...
 
 ## lint: formatting and correctness
 lint:
