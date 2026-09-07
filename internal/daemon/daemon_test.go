@@ -66,6 +66,7 @@ func serveWith(t *testing.T, opts Options) *harness {
 		opts.Admin = func(*user.User) (bool, error) { return false, nil }
 	}
 	srv := New(st, opts)
+	t.Cleanup(srv.Close)
 
 	socket := filepath.Join(dir, "kitbashd.sock")
 	ln, err := net.Listen("unix", socket)

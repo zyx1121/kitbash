@@ -101,6 +101,18 @@ func NotPermitted(instance, detail, fix string) *Problem {
 	return newProblem(SlugNotPermitted, "Not permitted", http.StatusForbidden, instance, detail, fix)
 }
 
+// NotAuthenticated reports a request that carried no identity kitbashd could
+// use: the Process receiver's bearer token is missing, unknown or revoked. The
+// slug stays not-permitted, so a client matches one class of refusal however
+// it was refused, and the status is 401 because a different token would change
+// the answer.
+func NotAuthenticated(instance, detail, fix string) *Problem {
+	if fix == "" {
+		fix = "Send the token kitbashd minted for this Process as an Authorization bearer header."
+	}
+	return newProblem(SlugNotPermitted, "Not permitted", http.StatusUnauthorized, instance, detail, fix)
+}
+
 // BadRequest reports malformed input the tool's schema does not catch, such as
 // content that is not base64.
 func BadRequest(instance, detail, fix string) *Problem {

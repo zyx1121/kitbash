@@ -18,6 +18,11 @@ import (
 // ever written to a client that is not an OTLP response or an API body.
 func writeProblem(w http.ResponseWriter, p *problem.Problem) {
 	w.Header().Set("Content-Type", ProblemContentType)
+	// RFC 9110 requires a challenge with a 401, and the only 401 this API
+	// answers is a Process without a usable token on the receiver.
+	if p.Status == http.StatusUnauthorized {
+		w.Header().Set("WWW-Authenticate", BearerChallenge)
+	}
 	w.WriteHeader(p.Status)
 	fmt.Fprintln(w, p.JSON())
 }
@@ -34,99 +39,104 @@ func writeJSON(w http.ResponseWriter, instance string, body any) {
 	w.Write(b)
 }
 
-// exportTraces, exportLogs and exportMetrics are the three OTLP paths. They
-// differ only in what they decode, so they share everything else.
-func (s *Server) exportTraces(w http.ResponseWriter, r *http.Request) {
-	s.export(w, r, func(f otlp.Format, body []byte, caller Caller) (store.Export, []byte, error) {
-		spans, err := otlp.DecodeTraces(f, body)
-		if err != nil {
-			return store.Export{}, nil, err
-		}
-		for i := range spans {
-			spans[i].User = caller.User
-		}
-		res, err := otlp.TracesResponse(f)
-		return store.Export{Spans: spans}, res, err
-	})
+// decodeTraces, decodeLogs and decodeMetrics are the three OTLP paths. They
+// differ only in what they decode, so they share everything else, stamping
+// included.
+func decodeTraces(f otlp.Format, body []byte, id identity) (store.Export, []byte, error) {
+	spans, err := otlp.DecodeTraces(f, body)
+	if err != nil {
+		return store.Export{}, nil, err
+	}
+	for i := range spans {
+		id.apply(&spans[i].Attributes)
+	}
+	res, err := otlp.TracesResponse(f)
+	return store.Export{Spans: spans}, res, err
 }
 
-func (s *Server) exportLogs(w http.ResponseWriter, r *http.Request) {
-	s.export(w, r, func(f otlp.Format, body []byte, caller Caller) (store.Export, []byte, error) {
-		logs, err := otlp.DecodeLogs(f, body)
-		if err != nil {
-			return store.Export{}, nil, err
-		}
-		for i := range logs {
-			logs[i].User = caller.User
-		}
-		res, err := otlp.LogsResponse(f)
-		return store.Export{Logs: logs}, res, err
-	})
+func decodeLogs(f otlp.Format, body []byte, id identity) (store.Export, []byte, error) {
+	logs, err := otlp.DecodeLogs(f, body)
+	if err != nil {
+		return store.Export{}, nil, err
+	}
+	for i := range logs {
+		id.apply(&logs[i].Attributes)
+	}
+	res, err := otlp.LogsResponse(f)
+	return store.Export{Logs: logs}, res, err
 }
 
-func (s *Server) exportMetrics(w http.ResponseWriter, r *http.Request) {
-	s.export(w, r, func(f otlp.Format, body []byte, caller Caller) (store.Export, []byte, error) {
-		metrics, err := otlp.DecodeMetrics(f, body)
-		if err != nil {
-			return store.Export{}, nil, err
-		}
-		for i := range metrics {
-			metrics[i].User = caller.User
-		}
-		res, err := otlp.MetricsResponse(f)
-		return store.Export{Metrics: metrics}, res, err
-	})
+func decodeMetrics(f otlp.Format, body []byte, id identity) (store.Export, []byte, error) {
+	metrics, err := otlp.DecodeMetrics(f, body)
+	if err != nil {
+		return store.Export{}, nil, err
+	}
+	for i := range metrics {
+		id.apply(&metrics[i].Attributes)
+	}
+	res, err := otlp.MetricsResponse(f)
+	return store.Export{Metrics: metrics}, res, err
 }
 
 // decoder turns one request body into records to store and the response body
 // that acknowledges them.
-type decoder func(f otlp.Format, body []byte, caller Caller) (store.Export, []byte, error)
+type decoder func(f otlp.Format, body []byte, id identity) (store.Export, []byte, error)
 
-// export is the shared OTLP path: identity, size limit, decode, stamp, store.
-// kitbash.user is taken from the peer on every record, replacing whatever the
-// producer sent, see PLAN.md section 2.4.
-func (s *Server) export(w http.ResponseWriter, r *http.Request, decode decoder) {
-	caller, prob := s.caller(r)
-	if prob != nil {
-		writeProblem(w, prob)
-		return
-	}
-	format, err := otlp.ParseFormat(r.Header.Get("Content-Type"))
-	if err != nil {
-		writeProblem(w, problem.BadRequest(r.URL.Path, err.Error(),
-			"Send the export as application/x-protobuf or application/json."))
-		return
-	}
-	if r.ContentLength > otlp.MaxBodyBytes {
-		writeProblem(w, tooLarge(r.URL.Path))
-		return
-	}
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, otlp.MaxBodyBytes))
-	if err != nil {
-		var limit *http.MaxBytesError
-		if errors.As(err, &limit) {
+// export is the shared OTLP path: identity, size limit, decode, stamp, store,
+// fan out. kitbash.user is taken from the connection on every record, replacing
+// whatever the producer sent, see PLAN.md section 2.4.
+//
+// The same handler serves the socket and the Process receiver; only how the
+// identity is read differs, so a Process and a member session cannot drift
+// apart in what they are allowed to say about themselves.
+func (s *Server) export(ident identifier, decode decoder) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, prob := ident(r)
+		if prob != nil {
+			writeProblem(w, prob)
+			return
+		}
+		format, err := otlp.ParseFormat(r.Header.Get("Content-Type"))
+		if err != nil {
+			writeProblem(w, problem.BadRequest(r.URL.Path, err.Error(),
+				"Send the export as application/x-protobuf or application/json."))
+			return
+		}
+		if r.ContentLength > otlp.MaxBodyBytes {
 			writeProblem(w, tooLarge(r.URL.Path))
 			return
 		}
-		writeProblem(w, problem.BadRequest(r.URL.Path, fmt.Sprintf("could not read the request body: %v", err),
-			"Send the export again."))
-		return
-	}
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, otlp.MaxBodyBytes))
+		if err != nil {
+			var limit *http.MaxBytesError
+			if errors.As(err, &limit) {
+				writeProblem(w, tooLarge(r.URL.Path))
+				return
+			}
+			writeProblem(w, problem.BadRequest(r.URL.Path, fmt.Sprintf("could not read the request body: %v", err),
+				"Send the export again."))
+			return
+		}
 
-	export, response, err := decode(format, body, caller)
-	if err != nil {
-		writeProblem(w, problem.BadRequest(r.URL.Path, err.Error(),
-			"Send an OTLP export request the OpenTelemetry protocol defines."))
-		return
-	}
-	if err := s.store.Insert(r.Context(), export); err != nil {
-		writeProblem(w, problem.Internal(r.URL.Path, err.Error(), ""))
-		return
-	}
+		export, response, err := decode(format, body, id)
+		if err != nil {
+			writeProblem(w, problem.BadRequest(r.URL.Path, err.Error(),
+				"Send an OTLP export request the OpenTelemetry protocol defines."))
+			return
+		}
+		if err := s.store.Insert(r.Context(), export); err != nil {
+			writeProblem(w, problem.Internal(r.URL.Path, err.Error(), ""))
+			return
+		}
+		// The store is the source of truth and the records are in it. What
+		// the subscribers do with them cannot hold up this response, so the
+		// fan out only queues here, see spec/kitbashd-api.yaml.
+		s.fanout.dispatch(export, id.Producer)
 
-	w.Header().Set("Content-Type", format.ContentType())
-	w.WriteHeader(http.StatusOK)
-	w.Write(response)
+		w.Header().Set("Content-Type", format.ContentType())
+		w.WriteHeader(http.StatusOK)
+		w.Write(response)
+	}
 }
 
 func tooLarge(instance string) *problem.Problem {
@@ -137,16 +147,17 @@ func tooLarge(instance string) *problem.Problem {
 
 // queryRequest is the tel_query input of spec/mcp-surface.yaml.
 type queryRequest struct {
-	Signal  string `json:"signal"`
-	User    string `json:"user,omitempty"`
-	Package string `json:"package,omitempty"`
-	Process string `json:"process,omitempty"`
-	Path    string `json:"path,omitempty"`
-	Tool    string `json:"tool,omitempty"`
-	Eval    *bool  `json:"eval,omitempty"`
-	Since   string `json:"since,omitempty"`
-	Until   string `json:"until,omitempty"`
-	Limit   int    `json:"limit,omitempty"`
+	Signal   string `json:"signal"`
+	User     string `json:"user,omitempty"`
+	Package  string `json:"package,omitempty"`
+	Process  string `json:"process,omitempty"`
+	Path     string `json:"path,omitempty"`
+	Tool     string `json:"tool,omitempty"`
+	Eval     *bool  `json:"eval,omitempty"`
+	Producer string `json:"producer,omitempty"`
+	Since    string `json:"since,omitempty"`
+	Until    string `json:"until,omitempty"`
+	Limit    int    `json:"limit,omitempty"`
 }
 
 // queryResponse is the tel_query output.
@@ -190,15 +201,16 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request) {
 
 	now := s.now()
 	filter := store.Filter{
-		User:    req.User,
-		Package: req.Package,
-		Process: req.Process,
-		Path:    req.Path,
-		Tool:    req.Tool,
-		Eval:    req.Eval,
-		Since:   now.Add(-QueryWindow),
-		Until:   now,
-		Limit:   req.Limit,
+		User:     req.User,
+		Package:  req.Package,
+		Process:  req.Process,
+		Path:     req.Path,
+		Tool:     req.Tool,
+		Eval:     req.Eval,
+		Producer: req.Producer,
+		Since:    now.Add(-QueryWindow),
+		Until:    now,
+		Limit:    req.Limit,
 	}
 	if req.Since != "" {
 		since, err := time.Parse(time.RFC3339, req.Since)
@@ -283,11 +295,22 @@ func (s *Server) retention(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// healthResponse is what /kitbash/v1/health answers.
+// healthResponse is what /kitbash/v1/health answers. The listeners say which
+// of the two receivers is bound, and subscribers how many Processes the fan
+// out is delivering to.
 type healthResponse struct {
-	Version       string `json:"version"`
-	Store         string `json:"store"`
-	UptimeSeconds int64  `json:"uptimeSeconds"`
+	Version       string    `json:"version"`
+	Store         string    `json:"store"`
+	UptimeSeconds int64     `json:"uptimeSeconds"`
+	Listeners     listeners `json:"listeners"`
+	Subscribers   int       `json:"subscribers"`
+}
+
+// listeners are the addresses kitbashd is serving on, empty for one that is
+// not bound.
+type listeners struct {
+	Socket string `json:"socket,omitempty"`
+	TCP    string `json:"tcp,omitempty"`
 }
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
@@ -299,6 +322,8 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		Version:       s.version,
 		Store:         s.store.Path(),
 		UptimeSeconds: int64(s.now().Sub(s.started) / time.Second),
+		Listeners:     s.listeners(),
+		Subscribers:   s.fanout.count(),
 	})
 }
 

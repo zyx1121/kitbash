@@ -9,6 +9,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	colmetrics "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
+	coltrace "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
 	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
@@ -192,5 +193,50 @@ func TestDecodeErrorsNameNoGoTypes(t *testing.T) {
 		if strings.Contains(err.Error(), leak) {
 			t.Errorf("error %q leaks the Go type name %q", err, leak)
 		}
+	}
+}
+
+// TestDecodeDropsAWrongTypedEval is what a producer sending kitbash.eval as a
+// string does not get: the attribute decides how a record is stamped and
+// whether a judgment query returns it, so a value that is not a boolean is
+// dropped rather than left among the other attributes where a reader would
+// take it for the flag.
+func TestDecodeDropsAWrongTypedEval(t *testing.T) {
+	req := &coltrace.ExportTraceServiceRequest{
+		ResourceSpans: []*tracepb.ResourceSpans{{
+			ScopeSpans: []*tracepb.ScopeSpans{{
+				Spans: []*tracepb.Span{{
+					TraceId: make([]byte, 16),
+					SpanId:  make([]byte, 8),
+					Name:    "judgement",
+					Attributes: []*commonpb.KeyValue{
+						{Key: AttrEval, Value: &commonpb.AnyValue{
+							Value: &commonpb.AnyValue_StringValue{StringValue: "true"}}},
+						{Key: "kitbash.eval.score", Value: &commonpb.AnyValue{
+							Value: &commonpb.AnyValue_StringValue{StringValue: "0.9"}}},
+					},
+				}},
+			}},
+		}},
+	}
+	body, err := proto.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	spans, err := DecodeTraces(Protobuf, body)
+	if err != nil {
+		t.Fatalf("DecodeTraces: %v", err)
+	}
+	if len(spans) != 1 {
+		t.Fatalf("spans = %d, want 1", len(spans))
+	}
+	if spans[0].Eval != nil {
+		t.Errorf("eval = %v, want absent for a value that is not a boolean", *spans[0].Eval)
+	}
+	if _, kept := spans[0].Other[AttrEval]; kept {
+		t.Errorf("other carries %s = %v", AttrEval, spans[0].Other[AttrEval])
+	}
+	if spans[0].Other["kitbash.eval.score"] != "0.9" {
+		t.Errorf("other = %v, want every other attribute kept", spans[0].Other)
 	}
 }

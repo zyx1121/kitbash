@@ -1,7 +1,9 @@
 #!/sbin/openrc-run
 # kitbashd: the OTLP receiver and Telemetry store, see PLAN.md section 4.1.
-# It listens on one unix socket and reads the caller from its peer credentials,
-# so nothing here opens a port and nothing here handles authentication.
+# It listens on one unix socket, where the caller is read from the peer
+# credentials, and on TCP 4318, the Process receiver, where the caller is the
+# bearer token kitbashd minted at registration. The host firewall scopes who
+# may reach that port; nothing here installs one.
 
 name="kitbashd"
 description="kitbash daemon: OTLP receiver and Telemetry store"
@@ -19,8 +21,12 @@ respawn_max=0
 rc_ulimit="-n 1024"
 
 depend() {
-	# A unix socket needs a filesystem, not a network.
+	# The socket needs a filesystem. The Process receiver binds every address,
+	# which works before the network is configured, so net is a preference and
+	# not a requirement: a host whose network is down still stores the
+	# Telemetry of the sessions on it.
 	need localmount
+	use net
 }
 
 start_pre() {

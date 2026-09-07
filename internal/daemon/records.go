@@ -11,39 +11,58 @@ import (
 // like they carry different precision.
 const timeLayout = "2006-01-02T15:04:05.000000000Z07:00"
 
+// telAttributes is the attributes object of the tel_query output: the stored
+// attributes, plus the subject of an evaluation record, which the store keeps
+// among the rest by its wire name.
+type telAttributes struct {
+	store.Attributes
+	Subject *subject `json:"subject,omitempty"`
+}
+
+// subject names the span a judgment is about, see PLAN.md section 2.4.
+type subject struct {
+	TraceID string `json:"traceId,omitempty"`
+	SpanID  string `json:"spanId,omitempty"`
+}
+
+// attributesOf renders one record's attributes for the query surface.
+func attributesOf(a store.Attributes) telAttributes {
+	return telAttributes{Attributes: a, Subject: subjectOf(a.Other)}
+}
+
 // spanRecord, logRecord and metricRecord are the shapes of the tel_query
 // output, defined in the $defs of spec/mcp-surface.yaml.
 type spanRecord struct {
-	TraceID       string           `json:"traceId"`
-	SpanID        string           `json:"spanId"`
-	ParentSpanID  string           `json:"parentSpanId,omitempty"`
-	Name          string           `json:"name"`
-	Start         string           `json:"start"`
-	End           string           `json:"end"`
-	DurationMs    float64          `json:"durationMs"`
-	Status        string           `json:"status"`
-	StatusMessage string           `json:"statusMessage,omitempty"`
-	Attributes    store.Attributes `json:"attributes"`
-	Other         map[string]any   `json:"other,omitempty"`
+	TraceID       string         `json:"traceId"`
+	SpanID        string         `json:"spanId"`
+	ParentSpanID  string         `json:"parentSpanId,omitempty"`
+	Name          string         `json:"name"`
+	Start         string         `json:"start"`
+	End           string         `json:"end"`
+	DurationMs    float64        `json:"durationMs"`
+	Status        string         `json:"status"`
+	StatusMessage string         `json:"statusMessage,omitempty"`
+	Attributes    telAttributes  `json:"attributes"`
+	Other         map[string]any `json:"other,omitempty"`
 }
 
 type logRecord struct {
-	Time       string           `json:"time"`
-	Severity   string           `json:"severity"`
-	Body       string           `json:"body"`
-	TraceID    string           `json:"traceId,omitempty"`
-	SpanID     string           `json:"spanId,omitempty"`
-	Attributes store.Attributes `json:"attributes"`
-	Other      map[string]any   `json:"other,omitempty"`
+	Time       string         `json:"time"`
+	Severity   string         `json:"severity"`
+	Body       string         `json:"body"`
+	TraceID    string         `json:"traceId,omitempty"`
+	SpanID     string         `json:"spanId,omitempty"`
+	Attributes telAttributes  `json:"attributes"`
+	Other      map[string]any `json:"other,omitempty"`
 }
 
 type metricRecord struct {
-	Time       string           `json:"time"`
-	Name       string           `json:"name"`
-	Value      float64          `json:"value"`
-	Unit       string           `json:"unit,omitempty"`
-	Attributes store.Attributes `json:"attributes"`
-	Other      map[string]any   `json:"other,omitempty"`
+	Time       string         `json:"time"`
+	Name       string         `json:"name"`
+	Value      float64        `json:"value"`
+	Unit       string         `json:"unit,omitempty"`
+	Attributes telAttributes  `json:"attributes"`
+	Other      map[string]any `json:"other,omitempty"`
 }
 
 // records renders one page of the store as the records the surface publishes.
@@ -61,7 +80,7 @@ func records(page store.Page) []any {
 			DurationMs:    float64(sp.EndNS-sp.StartNS) / float64(time.Millisecond),
 			Status:        sp.Status,
 			StatusMessage: sp.StatusMessage,
-			Attributes:    sp.Attributes,
+			Attributes:    attributesOf(sp.Attributes),
 			Other:         sp.Other,
 		})
 	}
@@ -72,7 +91,7 @@ func records(page store.Page) []any {
 			Body:       l.Body,
 			TraceID:    l.TraceID,
 			SpanID:     l.SpanID,
-			Attributes: l.Attributes,
+			Attributes: attributesOf(l.Attributes),
 			Other:      l.Other,
 		})
 	}
@@ -82,7 +101,7 @@ func records(page store.Page) []any {
 			Name:       m.Name,
 			Value:      m.Value,
 			Unit:       m.Unit,
-			Attributes: m.Attributes,
+			Attributes: attributesOf(m.Attributes),
 			Other:      m.Other,
 		})
 	}
