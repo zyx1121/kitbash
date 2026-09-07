@@ -1,8 +1,12 @@
-# import-mcp: a stdio MCP server. kitbash runs it as PID 1 with stdin held open
+# import-oci: a stdio MCP server. kitbash runs it as PID 1 with stdin held open
 # and execs one more instance of this entrypoint per MCP session.
 FROM node:22-alpine
 
 WORKDIR /app
+
+# skopeo reads an image manifest straight out of a registry, so the kit never
+# pulls a layer and never needs a container runtime of its own.
+RUN apk add --no-cache skopeo
 
 # The direct versions are pinned in package.json. Transitive versions are not,
 # so two builds of this image can differ; what a Process is pinned to is the

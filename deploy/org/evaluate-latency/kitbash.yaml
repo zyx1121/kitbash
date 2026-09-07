@@ -1,0 +1,20 @@
+name: evaluate-latency
+description: >-
+  Judges every tool call span slower than a threshold and writes the judgment
+  back as an evaluation log record. Run it to have slow calls flagged in
+  Telemetry next to the calls they are about, found by the same query.
+tags: [kit, evaluate, observe]
+
+provides:
+  kit: [observe, evaluate]
+  subscriptions: [telemetry]
+
+deploy:
+  units:
+    - type: container
+      build: .
+      expose: http
+      port: 8080
+      env:
+        # Milliseconds. A surface span slower than this is judged slow.
+        KITBASH_EVAL_THRESHOLD_MS: "1000"

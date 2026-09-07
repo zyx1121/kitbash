@@ -1,0 +1,17 @@
+name: observe-count
+description: >-
+  Counts every span, log record and metric point kitbashd fans out, per member
+  and in total, and reports the totals back as metrics. Run it to see whether
+  Telemetry is flowing and how much of it each member produces.
+tags: [kit, observe]
+
+provides:
+  kit: [observe]
+  subscriptions: [telemetry]
+
+deploy:
+  units:
+    - type: container
+      build: .
+      expose: http
+      port: 8080
