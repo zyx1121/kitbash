@@ -1,0 +1,54 @@
+name: import-oci
+description: >-
+  Wraps an existing OCI image as a Package. Use it through pkg_import with source
+  oci://<registry>/<repository>@sha256:<digest>: it inspects the image in its
+  registry and returns a manifest that runs that exact digest.
+tags: [kit, import, oci]
+
+provides:
+  kit: [import]
+  tools:
+    - name: import
+      description: >-
+        Wrap the OCI image named by source as a Package folder. Returns the files
+        pkg_import writes: a kitbash.yaml pinned to the digest that was asked
+        for, and a README describing the image the registry reported.
+      input:
+        type: object
+        additionalProperties: false
+        required: [source]
+        properties:
+          source:
+            type: string
+            pattern: "^oci://[a-z0-9]([a-z0-9._-]*[a-z0-9])?(:[0-9]+)?(/[a-z0-9]([a-z0-9._-]*[a-z0-9])?)+@sha256:[a-f0-9]{64}$"
+            description: >-
+              The image to wrap, as oci://<registry>/<repository>@sha256:<digest>.
+              The registry host is required and the image is pinned by digest,
+              which must be the manifest digest skopeo inspect reports. A tag
+              such as :latest names a moving target and is refused.
+      output:
+        type: object
+        required: [files]
+        properties:
+          files:
+            type: array
+            minItems: 1
+            items:
+              type: object
+              required: [path]
+              properties:
+                path:
+                  type: string
+                  description: Relative to the target folder, no leading slash, no dot component.
+                content:
+                  type: string
+                  description: UTF-8 text.
+                contentBase64:
+                  type: string
+                  contentEncoding: base64
+
+deploy:
+  units:
+    - type: container
+      build: .
+      expose: mcp

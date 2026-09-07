@@ -1,0 +1,12 @@
+{
+  "name": "import-oci",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "kitbash import kit that wraps an existing OCI image as a Package.",
+  "main": "index.js",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "yaml": "2.9.0"
+  }
+}
