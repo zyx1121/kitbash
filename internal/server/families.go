@@ -21,7 +21,9 @@ func RegisterPackages(s *mcp.Server, packages *pkg.Service) {
 			"kitbash.commit and kitbash.user, which is the whole build record. Only the tail of the build log " +
 			"is returned; the full log never leaves the host. A build that runs and fails returns that same " +
 			"tail as a bad-request. kitbash builds from a commit, so an uncommitted change under the path is " +
-			"a conflict. Version 1 supports one container unit with a build context per Package.",
+			"a conflict. Version 1 supports one container unit per Package. A unit with build is built from " +
+			"its context; a unit with image is pulled by digest and relabelled through a one line " +
+			"Containerfile so the result carries the same labels and its own image ID.",
 		InputSchema:  pkgBuildInputSchema,
 		OutputSchema: pkgBuildOutputSchema,
 	}, buildHandler(packages))
@@ -64,7 +66,11 @@ func RegisterProcesses(s *mcp.Server, processes *proc.Service, b *bridge.Bridge)
 			"kitbash.user, kitbash.package, kitbash.name and kitbash.digest. With expose: mcp the manifest's " +
 			"tools join the caller's surface. A Process is identified by its Package path, so a name held " +
 			"by a Process of another Package is a conflict, and so is a tool name another running Process " +
-			"already answers. Version 1 runs the first container unit.",
+			"already answers. Version 1 runs the first container unit. Before the container starts the " +
+			"Process is registered with kitbashd, which mints its Telemetry token; the container receives " +
+			"KITBASH_TELEMETRY_ENDPOINT, KITBASH_TELEMETRY_TOKEN, KITBASH_PROCESS, KITBASH_PACKAGE and " +
+			"KITBASH_USER. A Process whose manifest declares subscriptions: [telemetry] with expose: http " +
+			"and a port is registered as a fan out subscriber.",
 		InputSchema:  procRunInputSchema,
 		OutputSchema: procRunOutputSchema,
 	}, runHandler(processes, b))
