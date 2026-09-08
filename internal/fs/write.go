@@ -82,9 +82,10 @@ func (s *Service) Write(ctx context.Context, req WriteRequest) (*WriteResult, *p
 		return nil, problem.InvalidPath(clean,
 			"a file must live inside a top level folder, which is the git repository it is committed to")
 	}
-	// Lstat, not Stat: the target is judged as it is on disk, never through a
-	// link. writeNoFollow refuses the link itself further down.
-	if info, err := os.Lstat(clean); err == nil && info.IsDir() {
+	// The target is judged as it is on disk, never through a link: the stat
+	// resolves below the root and refuses a link at any component, and the
+	// write further down refuses it again at the moment it opens the file.
+	if info, err := s.stat(clean); err == nil && info.IsDir() {
 		return nil, problem.InvalidPath(clean, "the path is a folder, not a file")
 	}
 
@@ -152,7 +153,7 @@ func (s *Service) Write(ctx context.Context, req WriteRequest) (*WriteResult, *p
 	if err := s.makeDir(folder); err != nil {
 		return nil, writeProblem(clean, err)
 	}
-	if err := writeNoFollow(clean, data); err != nil {
+	if err := s.writeFile(clean, data); err != nil {
 		return nil, writeProblem(clean, err)
 	}
 	if err := s.share(clean); err != nil {
@@ -215,7 +216,7 @@ func (s *Service) writeVisible(folder, name string) *problem.Problem {
 	if s.isRoot(folder) || name == manifest.FileName {
 		return nil
 	}
-	if _, ok := manifest.Visible(folder); !ok {
+	if _, ok := s.visible(folder); !ok {
 		return notVisible(folder, "Write kitbash.yaml with name and description first")
 	}
 	return nil
@@ -225,15 +226,17 @@ func (s *Service) writeVisible(folder, name string) *problem.Problem {
 // file: a FIFO, a socket, a device.
 var errNotRegular = errors.New("the path is not a regular file")
 
-// writeNoFollow replaces a file without ever following a symlink at the final
-// component, which a caller could have planted between the check and the write.
+// writeFile replaces a file without ever following a symlink, at the final
+// component or at any component above it, which a caller could have planted
+// between the check and the write. The whole path is resolved by the kernel in
+// the one syscall that opens the file, so there is no window to plant it in.
 //
 // O_NONBLOCK is not optional: open(2) on a FIFO for writing blocks until a
 // reader appears, so a FIFO planted by the caller would hang the session. With
 // it the open fails or returns at once, and the type of the descriptor is
 // checked before anything is written.
-func writeNoFollow(path string, data []byte) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0o644)
+func (s *Service) writeFile(path string, data []byte) error {
+	f, err := s.open(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
 	}
@@ -262,6 +265,9 @@ func writeProblem(path string, err error) *problem.Problem {
 	if errors.Is(err, syscall.ELOOP) {
 		return symlinkRefused(path, path)
 	}
+	if errors.Is(err, syscall.EXDEV) {
+		return problem.InvalidPath(path, "the path leaves the root it started in")
+	}
 	// ENXIO is a FIFO opened for writing with no reader on the other end.
 	if errors.Is(err, errNotRegular) || errors.Is(err, syscall.ENXIO) {
 		return problem.InvalidPathFix(path, "the path is not a regular file",
@@ -276,6 +282,12 @@ func writeProblem(path string, err error) *problem.Problem {
 // that is not a plain refusal by the operating system goes to problem.Internal,
 // which writes the cause to the server log and returns a generic detail.
 func gitProblem(path string, err error) *problem.Problem {
+	// A refusal by the resolution rather than by git: the repository is a
+	// symlink, or it left its root, so git was never run. That is the same
+	// answer every other tool gives for the same path.
+	if errors.Is(err, syscall.ELOOP) || errors.Is(err, syscall.EXDEV) || errors.Is(err, syscall.ENOTDIR) {
+		return openProblem(path, err)
+	}
 	if isPermissionDenied(err) {
 		return sharedReadOnly(path)
 	}
@@ -320,7 +332,7 @@ func (s *Service) ensureRepo(ctx context.Context, repo string) *problem.Problem 
 	if err := s.makeDir(repo); err != nil {
 		return statProblem(repo, err)
 	}
-	if isRepo(repo) {
+	if s.isRepo(repo) {
 		return nil
 	}
 	args := []string{"init", "--quiet", "--initial-branch=main"}

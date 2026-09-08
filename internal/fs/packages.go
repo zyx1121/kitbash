@@ -2,7 +2,6 @@ package fs
 
 import (
 	"context"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -34,9 +33,9 @@ func (s *Service) Manifest(_ context.Context, path string) (*manifest.Manifest, 
 	if s.isRoot(clean) {
 		return nil, "", problem.InvalidPath(clean, "the path is a root, not a folder with a manifest")
 	}
-	info, err := os.Stat(clean)
+	info, err := s.stat(clean)
 	if err != nil {
-		return nil, "", statProblem(clean, err)
+		return nil, "", openProblem(clean, err)
 	}
 	if !info.IsDir() {
 		return nil, "", problem.InvalidPath(clean, "the path is a file, not a folder")
@@ -62,14 +61,21 @@ func (s *Service) Packages(_ context.Context) ([]PackageEntry, *problem.Problem)
 }
 
 // walk descends one folder. It never follows a symlink and never enters a
-// folder whose name begins with a dot.
+// folder whose name begins with a dot. The folder is listed through a
+// descriptor opened below its root, so the entries belong to the folder the
+// walk meant to read.
 func (s *Service) walk(dir string, depth int, found *[]PackageEntry) {
 	if depth > MaxWalkDepth {
 		return
 	}
-	entries, err := os.ReadDir(dir)
+	f, err := s.read(dir)
 	if err != nil {
 		// A folder the kernel will not open contributes nothing.
+		return
+	}
+	entries, err := f.ReadDir(-1)
+	f.Close()
+	if err != nil {
 		return
 	}
 	for _, e := range entries {
@@ -77,11 +83,11 @@ func (s *Service) walk(dir string, depth int, found *[]PackageEntry) {
 			continue
 		}
 		child := filepath.Join(dir, e.Name())
-		info, err := os.Lstat(child)
-		if err != nil || info.Mode()&os.ModeSymlink != 0 {
+		info, err := s.stat(child)
+		if err != nil || !info.IsDir() {
 			continue
 		}
-		m, ok := manifest.Visible(child)
+		m, ok := s.visible(child)
 		if !ok {
 			continue
 		}
@@ -113,7 +119,7 @@ func (s *Service) Head(ctx context.Context, path string) (*Head, *problem.Proble
 		return nil, problem.InvalidPath(clean,
 			"the path is not inside a top level folder, which is the git repository it belongs to")
 	}
-	if !isRepo(repo) {
+	if !s.isRepo(repo) {
 		return nil, problem.NotFoundFix(clean, "this folder is not in a git repository yet",
 			"Write a file with fs_write first, which creates the repository and the first commit.")
 	}

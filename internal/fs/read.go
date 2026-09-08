@@ -43,13 +43,14 @@ func (s *Service) Read(ctx context.Context, path string, opts ReadOptions) (*Rea
 	if prob != nil {
 		return nil, prob
 	}
-	// O_NOFOLLOW closes the window between the walk resolve just made and this
-	// open: a file swapped for a symlink is refused, never followed. The whole
-	// call is then served from this one descriptor, so the bytes returned are
-	// the bytes of the file that was checked. The open is non blocking and the
-	// type of the descriptor is judged before a single byte is read, so a FIFO
-	// planted by the caller is refused instead of hanging the session.
-	f, err := openNoFollow(clean)
+	// The open closes the window between the walk resolve just made and this
+	// call: a component swapped for a symlink is refused by the kernel, never
+	// followed. The whole call is then served from this one descriptor, so the
+	// bytes returned are the bytes of the file that was checked. The open is
+	// non blocking and the type of the descriptor is judged before a single
+	// byte is read, so a FIFO planted by the caller is refused instead of
+	// hanging the session.
+	f, err := s.read(clean)
 	if err != nil {
 		return nil, openProblem(clean, err)
 	}
@@ -124,7 +125,7 @@ func (s *Service) Read(ctx context.Context, path string, opts ReadOptions) (*Rea
 }
 
 // readText reads a text file whole, or the window the caller asked for, from
-// the descriptor Read already opened with O_NOFOLLOW.
+// the descriptor Read already opened below its root.
 func readText(path string, f *os.File, size int64, opts ReadOptions) (string, bool, *problem.Problem) {
 	if !opts.Window {
 		if size > MaxBytes {
@@ -157,7 +158,7 @@ func readText(path string, f *os.File, size int64, opts ReadOptions) (string, bo
 }
 
 // extractPDF pulls the plain text out of a PDF, best effort. It reads the
-// descriptor Read opened with O_NOFOLLOW rather than opening the path again.
+// descriptor Read opened below its root rather than opening the path again.
 func extractPDF(f *os.File, size int64) (text string, err error) {
 	defer func() {
 		// The extractor panics on some malformed documents.
@@ -183,7 +184,7 @@ func extractPDF(f *os.File, size int64) (text string, err error) {
 // fileSha is the commit that last touched a file.
 func (s *Service) fileSha(ctx context.Context, clean string) (string, error) {
 	repo, ok := s.topFolder(clean)
-	if !ok || !isRepo(repo) {
+	if !ok || !s.isRepo(repo) {
 		return "", nil
 	}
 	rel, err := filepath.Rel(repo, clean)

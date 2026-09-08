@@ -8,7 +8,6 @@ import (
 	"sort"
 	"time"
 
-	"github.com/zyx1121/kitbash/internal/manifest"
 	"github.com/zyx1121/kitbash/internal/problem"
 )
 
@@ -52,11 +51,15 @@ func (s *Service) List(ctx context.Context, path string) (*ListResult, *problem.
 	if prob != nil {
 		return nil, prob
 	}
-	// The folder is opened with O_NOFOLLOW and listed through that descriptor,
-	// so a folder swapped for a symlink after resolve is refused, not followed.
-	// The open is non blocking and nothing is read until the descriptor is
-	// known to be a directory, so a FIFO here is refused, not waited on.
-	dir, err := openNoFollow(clean)
+	// The folder is opened below its root and listed through that descriptor,
+	// so a folder swapped for a symlink after resolve is refused, not followed,
+	// and the names come from the folder that was checked. The names are all
+	// that comes from the descriptor: everything said about an entry below is
+	// a fresh resolution below the root, because the listing and the
+	// description are two moments and the folder can change between them. The
+	// open is non blocking and nothing is read until the descriptor is known to
+	// be a directory, so a FIFO here is refused, not waited on.
+	dir, err := s.read(clean)
 	if err != nil {
 		return nil, openProblem(clean, err)
 	}
@@ -87,12 +90,12 @@ func (s *Service) List(ctx context.Context, path string) (*ListResult, *problem.
 		}
 		child := filepath.Join(clean, e.Name())
 		if e.IsDir() {
-			if entry, ok := folderEntry(child); ok {
+			if entry, ok := s.folderEntry(child); ok {
 				result.Folders = append(result.Folders, entry)
 			}
 			continue
 		}
-		if entry, ok := fileEntry(child, e); ok {
+		if entry, ok := s.fileEntry(child); ok {
 			result.Files = append(result.Files, entry)
 		}
 	}
@@ -105,16 +108,22 @@ func (s *Service) List(ctx context.Context, path string) (*ListResult, *problem.
 func (s *Service) listRoots() (*ListResult, *problem.Problem) {
 	result := &ListResult{Path: RootsPath, Folders: []FolderEntry{}, Files: []FileEntry{}}
 	for _, root := range s.roots {
-		entries, err := os.ReadDir(root)
+		f, err := s.read(root)
 		if err != nil {
-			// A root that is absent or unreadable simply contributes nothing.
+			// A root that is absent, unreadable, or not a folder at all simply
+			// contributes nothing.
+			continue
+		}
+		entries, err := f.ReadDir(-1)
+		f.Close()
+		if err != nil {
 			continue
 		}
 		for _, e := range entries {
 			if !e.IsDir() || hidden(e.Name()) {
 				continue
 			}
-			if entry, ok := folderEntry(filepath.Join(root, e.Name())); ok {
+			if entry, ok := s.folderEntry(filepath.Join(root, e.Name())); ok {
 				result.Folders = append(result.Folders, entry)
 			}
 		}
@@ -124,8 +133,8 @@ func (s *Service) listRoots() (*ListResult, *problem.Problem) {
 }
 
 // folderEntry describes a folder if it is visible.
-func folderEntry(dir string) (FolderEntry, bool) {
-	m, ok := manifest.Visible(dir)
+func (s *Service) folderEntry(dir string) (FolderEntry, bool) {
+	m, ok := s.visible(dir)
 	if !ok {
 		return FolderEntry{}, false
 	}
@@ -139,25 +148,32 @@ func folderEntry(dir string) (FolderEntry, bool) {
 }
 
 // fileEntry describes one file.
-func fileEntry(path string, e os.DirEntry) (FileEntry, bool) {
-	info, err := e.Info()
+//
+// The size and the time come from a stat that resolves below the root, not
+// from the directory entry: os.DirEntry.Info lstats the path again, so a
+// folder swapped for a symlink between the listing and the description would
+// put the size and the modification time of a file outside the root on the
+// surface. It is metadata rather than content, and it still is not the
+// caller's to read.
+func (s *Service) fileEntry(path string) (FileEntry, bool) {
+	info, err := s.stat(path)
 	if err != nil || !info.Mode().IsRegular() {
 		return FileEntry{}, false
 	}
 	return FileEntry{
 		Path:      path,
-		Name:      e.Name(),
+		Name:      filepath.Base(path),
 		Size:      info.Size(),
-		MediaType: MediaType(path, sniff(path)),
+		MediaType: MediaType(path, s.sniff(path)),
 		Modified:  info.ModTime().UTC().Format(time.RFC3339),
 	}, true
 }
 
 // sniff reads the head of a file so the media type can be detected by content
-// when the extension says nothing. A symlink is never sniffed: O_NOFOLLOW
-// fails the open, and the media type falls back to the extension.
-func sniff(path string) []byte {
-	f, err := openNoFollow(path)
+// when the extension says nothing. A symlink is never sniffed: the open fails,
+// and the media type falls back to the extension.
+func (s *Service) sniff(path string) []byte {
+	f, err := s.read(path)
 	if err != nil {
 		return nil
 	}

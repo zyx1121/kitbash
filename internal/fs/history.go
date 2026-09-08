@@ -2,7 +2,6 @@ package fs
 
 import (
 	"context"
-	"os"
 	"path/filepath"
 
 	"github.com/zyx1121/kitbash/internal/problem"
@@ -26,14 +25,12 @@ func (s *Service) History(ctx context.Context, path string, limit int) (*History
 	if limit <= 0 {
 		limit = DefaultHistoryLimit
 	}
-	// Lstat, not Stat: a symlink swapped in after resolve is refused here
-	// rather than resolved to whatever it points at.
-	info, err := os.Lstat(clean)
+	// The stat resolves below the root the way every open does, so a symlink
+	// swapped in after resolve, at the path or anywhere above it, is refused
+	// here rather than resolved to whatever it points at.
+	info, err := s.stat(clean)
 	if err != nil {
-		return nil, statProblem(clean, err)
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return nil, symlinkRefused(clean, clean)
+		return nil, openProblem(clean, err)
 	}
 	if !info.IsDir() && !info.Mode().IsRegular() {
 		// A FIFO or a device is not something the surface has a history for.
@@ -49,7 +46,7 @@ func (s *Service) History(ctx context.Context, path string, limit int) (*History
 
 	result := &HistoryResult{Path: clean, Commits: []Commit{}}
 	repo, ok := s.topFolder(clean)
-	if !ok || !isRepo(repo) {
+	if !ok || !s.isRepo(repo) {
 		return result, nil
 	}
 	rel, err := filepath.Rel(repo, clean)
