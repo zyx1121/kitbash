@@ -2,7 +2,7 @@
 
 > An operating system for AI agents. Files, Packages, Processes, Telemetry. Nothing built for a human at a terminal.
 
-This is the single living document for the product. It replaces a design doc, an architecture doc and a roadmap. When a decision changes, this file changes. Status: draft v0.4, 2026-09-07.
+This is the single living document for the product. It replaces a design doc, an architecture doc and a roadmap. When a decision changes, this file changes. Status: draft v0.5, 2026-09-08.
 
 ## 1. Positioning
 
@@ -48,10 +48,12 @@ There are exactly four objects. New capability is added as a kit that operates o
 
 Files is the filesystem, and every top level folder is a git repository. Two roots exist:
 
-- `/org`: owned by root, readable by every user, writable by admins. Shared handbooks, plans, meeting notes, org wide packages.
+- `/org`: owned by root, group `kitbash-admin`, readable by every user, writable by admins. Shared handbooks, plans, meeting notes, org wide packages. Folders are setgid so what an admin adds stays admin writable, and every repository is `core.sharedRepository=group`.
 - `/home/<user>`: owned by the user. Private files, private packages.
 
 Sharing between users uses Linux groups on folders. There is no permission system beyond what the kernel already enforces.
+
+**Writes to `/org` by a member are approvals.** When a member's `fs_write` or `pkg_import` names a path under `/org`, the surface does not fail: it queues the call in kitbashd and answers with a `queued` problem (status 202) carrying the approval id. An admin lists the queue, and `approvals_approve` runs the queued call in the admin's session as the admin's Linux user, with the commit authored by the requester and a trailer naming the admin who approved. The result is stored on the approval so the requester reads it back with `approvals_list`. `approvals_reject` stores the reason instead. Only these two tools queue in version 1; everything else outside the caller's space is simply not permitted.
 
 **Progressive disclosure is the reading model.** A folder is visible to an agent only if it carries a `kitbash.yaml` with a `name` and a `description`. The agent sees folder descriptions first, decides whether to enter, and only then sees file names and contents. A folder without a manifest does not exist as far as the MCP surface is concerned. This rule is what keeps Files from becoming a dump.
 
@@ -71,7 +73,7 @@ Packages can also be imported rather than built: an existing OCI image, an exist
 
 ### 2.3 Processes
 
-A Process is a Package running as a rootless container under the user who started it. kitbashd supervises Processes directly: restart policy, boot restore, health, resource limits. There is no dependency on systemd user sessions.
+A Process is a Package running as a rootless container under the user who started it. kitbashd supervises Processes directly: restart policy, boot restore, health, resource limits. There is no dependency on systemd user sessions. Boot restore works from the registrations kitbashd holds: at start it creates each owner's runtime directory and starts each registered container as its owner, so every Process that was running before a reboot is running after it, with the token it already had.
 
 A Process declares how it is exposed:
 
@@ -205,7 +207,7 @@ Build and run dispatch to an installed kit is the one part of the contract versi
 
 ### 4.1 Base
 
-Alpine Linux plus one daemon, `kitbashd`, written in Go and shipped as a static binary in an apk. The apk ships two binaries: `kitbashd`, the resident daemon OpenRC starts at boot, and `kitbash-mcp`, the per session process sshd starts for each member. From M3 kitbashd is the OTLP receiver and the Telemetry store. The container runtime still supervises Processes on kitbashd's behalf; boot restore and the approval queue move into kitbashd in M5. Alpine is chosen for its appliance lineage, its 8 MB root filesystem and its package manager. Go is chosen because a static binary has no musl versus glibc problem and no runtime to install.
+Alpine Linux plus one daemon, `kitbashd`, written in Go and shipped as a static binary in an apk. The apk ships two binaries: `kitbashd`, the resident daemon OpenRC starts at boot, and `kitbash-mcp`, the per session process sshd starts for each member. From M3 kitbashd is the OTLP receiver and the Telemetry store. The container runtime still supervises Processes on kitbashd's behalf between boots; from M5 kitbashd restores every registered Process at boot, holds the approval queue and creates members. Alpine is chosen for its appliance lineage, its 8 MB root filesystem and its package manager. Go is chosen because a static binary has no musl versus glibc problem and no runtime to install.
 
 Proxmox VE is the precedent for the packaging model: a standard base distribution plus one package that turns it into the appliance. An installable ISO or a LinuxKit image can come later without changing kitbashd.
 
@@ -252,6 +254,8 @@ ssh alice@kitbash.example.org
 sshd applies `ForceCommand kitbash-mcp` to every regular user. The connection is an MCP stdio session. Authentication, encryption and multi user isolation are sshd's job. kitbashd contains no authentication code for members in version 1. OIDC or an HTTP MCP endpoint can be added later without touching the object model. Processes are the one identity kitbashd checks itself: a bearer token per Process on the Telemetry receiver, minted at `proc_run`, because a container's network address says nothing about who runs it.
 
 Admins are members of the `kitbash-admin` group. They create users, manage `/org`, and approve queued operations, all through the same MCP surface.
+
+Creating a member is root's work, so the `users` family is served by kitbashd: kitbash-mcp forwards the call over the socket, kitbashd checks the peer is an admin and runs the system's own tools (`useradd`, `usermod`, the subordinate id files, `authorized_keys`, the runtime directory). Removing a member stops and unregisters their Processes, ends their sessions, archives their home under `/org/.archive/<name>` where the surface cannot see it, and deletes the account. The first admin has no admin to create them: `kitbash-adduser` on the console does the same work and stays as the bootstrap and break glass path.
 
 kitbash-mcp talks to kitbashd over a unix socket, `/run/kitbash/kitbashd.sock`, owned by root with group `kitbash-users` and mode 0660. Processes talk to kitbashd over TCP on the host's address, port 4318, because rootless networking delivers `host.containers.internal` to that address and not to loopback; the host firewall scopes who else can reach it, and the token decides whose records they are. kitbashd learns who is calling from the socket's peer credentials, the same kernel fact sshd relied on, and reads group membership from the system. There is no token and no second identity. The socket carries OTLP/HTTP on the standard paths and a small JSON API for queries and settings; the machine readable definition is [`spec/kitbashd-api.yaml`](spec/kitbashd-api.yaml).
 
@@ -322,6 +326,8 @@ The MCP tool surface is decided in `spec/mcp-surface.yaml`: six families, `fs` i
 - Metrics: the store and the receiver accept them from M3; the first producers are the M4 kits.
 - Build and run kits: the contract is declared, dispatch is not implemented, and the manifest has no field to name a builder or runner. Add the field when a second builder or runner exists.
 - Fan out is best effort. A subscriber that must not miss a record should read the store through `tel_query` and treat the push as a wake up.
+- Approvals cover `fs_write` and `pkg_import` into `/org`. Whether `proc_run` of an `/org` Package by a member should run as a shared Process rather than a private one is open; today it runs privately under the member.
+- Sharing a built image between members is still open. An `/org` Package built by one member is built again by the next, from the same commit to the same image ID.
 
 ## 6. Vocabulary
 
