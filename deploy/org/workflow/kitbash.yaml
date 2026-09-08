@@ -1,0 +1,81 @@
+name: workflow
+description: >-
+  Runs a graph stored in Files whose steps call tools of the owner's running
+  Processes. Write the graph as YAML or JSON, read WORKFLOW.md for the format,
+  then call run with its path.
+tags: [kit, workflow]
+
+provides:
+  prompt: WORKFLOW.md
+  tools:
+    - name: run
+      description: >-
+        Run the graph at path. Every step calls one surface tool, or another
+        graph, with an input templated from the graph input and from earlier
+        steps. Returns the graph output and one entry per step.
+      input:
+        type: object
+        additionalProperties: false
+        required: [path]
+        properties:
+          path:
+            type: string
+            pattern: "^/"
+            description: >-
+              Absolute Files path of the graph file, read through the MCP
+              endpoint this Process reaches. YAML or JSON.
+          input:
+            type: object
+            description: >-
+              The graph's input. Step inputs reference it as ${input.<field>}.
+      output:
+        type: object
+        additionalProperties: false
+        required: [path, outputs, steps]
+        properties:
+          path:
+            type: string
+            description: The graph that ran.
+          outputs:
+            type: object
+            description: >-
+              The graph's output block, resolved. When the graph declares none,
+              every step's output keyed by step id.
+          steps:
+            type: array
+            description: One entry per step of this graph, in the order they ran.
+            items:
+              type: object
+              additionalProperties: false
+              required: [id, durationMs, status]
+              properties:
+                id: { type: string }
+                tool:
+                  type: string
+                  description: The surface tool this step called, if it called one.
+                workflow:
+                  type: string
+                  description: The graph this step ran, if it ran one.
+                durationMs: { type: number }
+                status:
+                  type: string
+                  enum: [ok]
+                  description: >-
+                    Always ok. A step that fails stops the run, and run answers
+                    a problem instead of this output.
+                clipped:
+                  type: boolean
+                  description: >-
+                    Present and true when this step returned more than 4 MiB,
+                    so what later steps and the output see is clipped.
+
+deploy:
+  units:
+    - type: container
+      build: .
+      expose: mcp
+      # What the engine holds at once: one 256 KiB graph, at most 16 MiB of step
+      # outputs across the run, and the result of the step that is running,
+      # which arrives whole and is clipped to 4 MiB as it is kept. This limit is
+      # the backstop for that last one, which a tool decides the size of.
+      limits: { memory: 512Mi }
