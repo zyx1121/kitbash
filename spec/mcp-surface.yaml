@@ -4,7 +4,7 @@
 # <family>_<verb> because MCP tool names allow [A-Za-z0-9_-] only; the dot form
 # used in PLAN.md is the same tool spoken aloud.
 #
-# fs is implemented in M1, pkg and proc in M2, tel in M3. The other families are declared
+# fs is implemented in M1, pkg and proc in M2, tel in M3, users and approvals in M5. All six families are declared
 # here so the surface is designed as one piece and later milestones fill in the
 # implementation without renaming anything.
 #
@@ -52,6 +52,7 @@ $error:
     - https://kitbash.zyx.tw/errors/unsupported-media-type  # fs_read cannot render this media type
     - https://kitbash.zyx.tw/errors/too-large
     - https://kitbash.zyx.tw/errors/conflict           # write raced another commit
+    - https://kitbash.zyx.tw/errors/queued             # status 202: the call waits in the approval queue; instance is the approval id
     - https://kitbash.zyx.tw/errors/internal
 
 $package_tools:
@@ -242,6 +243,9 @@ families:
           against spec/manifest.schema.json before commit. Binary content is
           base64. Pass expectedSha to refuse the write if the file changed since
           it was read.
+          A member writing under /org does not fail: the call is queued for
+          an admin and the result is a queued problem (202) whose instance is
+          the approval id; approvals_list shows the outcome once an admin decides.
         input:
           type: object
           additionalProperties: false
@@ -261,7 +265,7 @@ families:
           properties:
             path: { type: string }
             commit: { $ref: "#/$defs/commit" }
-        errors: [bad-request, not-permitted, invalid-path, invalid-manifest, too-large, conflict, internal]
+        errors: [bad-request, not-permitted, invalid-path, invalid-manifest, too-large, conflict, queued, internal]
 
       fs_history:
         description: List commits that touched a path, newest first.
@@ -325,7 +329,7 @@ families:
             path: { type: string, description: "New folder to create" }
             source: { type: string, description: "npm:<pkg>@<ver> today; oci://<ref>@sha256:... and pypi:<pkg>==<ver> once their kits exist" }
         output: { type: object, required: [path, commit], properties: { path: { type: string }, commit: { $ref: "#/$defs/commit" } } }
-        errors: [bad-request, not-found, not-permitted, invalid-path, invalid-manifest, conflict, too-large, internal]
+        errors: [bad-request, not-found, not-permitted, invalid-path, invalid-manifest, conflict, too-large, queued, internal]
       pkg_list:
         description: >
           Packages visible to the caller with their latest built digest, if
@@ -506,33 +510,42 @@ families:
 
   # ---------------------------------------------------------------- users (M5)
   users:
-    description: Organization members. Linux users with SSH keys. Admin only except users_me.
+    description: Organization members. Linux users with SSH keys. Admin only except users_me. Served by kitbashd over its socket, see spec/kitbashd-api.yaml.
     implemented_in: M5
     tools:
       users_me:
-        description: Who am I and what groups am I in.
-        input: { type: object, properties: {} }
+        description: Who am I and what groups am I in. Answered by kitbashd from the socket's peer credentials.
+        input: { type: object, additionalProperties: false, properties: {} }
         output: { type: object, required: [user, uid, admin], properties: { user: { type: string }, uid: { type: integer }, admin: { type: boolean }, groups: { type: array, items: { type: string } } } }
       users_create:
-        description: Create a member with an SSH public key, home repository and subuid range.
-        input: { type: object, required: [name, sshKey], properties: { name: { type: string, pattern: "^[a-z][a-z0-9-]{1,31}$" }, sshKey: { type: string }, admin: { type: boolean, default: false } } }
-        output: { type: object, required: [user, uid], properties: { user: { type: string }, uid: { type: integer } } }
-        errors: [not-permitted, conflict]
+        description: >
+          Create a member with an SSH public key, a private home and a
+          subordinate id range, through kitbashd. Admin only. The member can
+          connect immediately; their home is a root for Files and starts
+          empty.
+        input: { type: object, additionalProperties: false, required: [name, sshKey], properties: { name: { type: string, pattern: "^[a-z][a-z0-9-]{1,31}$" }, sshKey: { type: string, maxLength: 4096, description: "One OpenSSH public key line" }, admin: { type: boolean, default: false } } }
+        output: { type: object, required: [user, uid, admin], properties: { user: { type: string }, uid: { type: integer }, admin: { type: boolean } } }
+        errors: [bad-request, not-permitted, conflict, internal]
       users_list:
-        description: All members.
-        input: { type: object, properties: {} }
-        output: { type: object, required: [users], properties: { users: { type: array, items: { type: object } } } }
-        errors: [not-permitted]
+        description: All members with uid, admin flag, key count and running Process count. Admin only.
+        input: { type: object, additionalProperties: false, properties: {} }
+        output: { type: object, required: [users], properties: { users: { type: array, items: { type: object, required: [user, uid, admin], properties: { user: { type: string }, uid: { type: integer }, admin: { type: boolean }, keys: { type: integer }, processes: { type: integer } } } } } }
+        errors: [not-permitted, internal]
       users_add_key:
-        description: Add an SSH public key to a member.
-        input: { type: object, required: [name, sshKey], properties: { name: { type: string }, sshKey: { type: string } } }
+        description: Add an SSH public key to a member. Admin only. A key already present is not added twice.
+        input: { type: object, additionalProperties: false, required: [name, sshKey], properties: { name: { type: string, pattern: "^[a-z][a-z0-9-]{1,31}$" }, sshKey: { type: string, maxLength: 4096 } } }
         output: { type: object, required: [user, keys], properties: { user: { type: string }, keys: { type: integer } } }
-        errors: [not-permitted, not-found]
+        errors: [bad-request, not-permitted, not-found, internal]
       users_remove:
-        description: Remove a member. Their Processes stop, their home is archived under /org/.archive/<name>.
-        input: { type: object, required: [name], properties: { name: { type: string } } }
-        output: { type: object, required: [user], properties: { user: { type: string } } }
-        errors: [not-permitted, not-found]
+        description: >
+          Remove a member. Admin only. Their Processes stop and are
+          unregistered, their sessions end, their home is archived under
+          /org/.archive/<name> where the surface cannot see it, and the
+          account is deleted. An admin cannot remove themselves or the last
+          admin.
+        input: { type: object, additionalProperties: false, required: [name], properties: { name: { type: string, pattern: "^[a-z][a-z0-9-]{1,31}$" } } }
+        output: { type: object, required: [user, archived], properties: { user: { type: string }, archived: { type: string } } }
+        errors: [not-permitted, not-found, conflict, internal]
 
   # ---------------------------------------------------------------- approvals (M5)
   approvals:
@@ -543,16 +556,22 @@ families:
     implemented_in: M5
     tools:
       approvals_list:
-        description: Pending approvals. Regular users see their own, admins see all.
-        input: { type: object, properties: { state: { type: string, enum: [pending, approved, rejected], default: pending } } }
-        output: { type: object, required: [approvals], properties: { approvals: { type: array, items: { type: object, required: [id, requester, tool, input, state, requestedAt], properties: { id: { type: string }, requester: { type: string }, tool: { type: string }, input: { type: object }, state: { type: string }, requestedAt: { type: string, format: date-time } } } } } }
+        description: Approvals by state. Members see their own, admins see all. An executed approval carries the tool's result, a normal output or a problem.
+        input: { type: object, additionalProperties: false, properties: { state: { type: string, enum: [pending, approved, rejected], default: pending } } }
+        output: { type: object, required: [approvals], properties: { approvals: { type: array, items: { type: object, required: [id, requester, tool, input, state, requestedAt], properties: { id: { type: string }, requester: { type: string }, tool: { type: string, enum: [fs_write, pkg_import] }, input: { type: object }, state: { type: string, enum: [pending, approved, rejected] }, requestedAt: { type: string, format: date-time }, decidedAt: { type: string, format: date-time }, decidedBy: { type: string }, note: { type: string }, reason: { type: string }, result: { type: object } } } } } }
+        errors: [not-permitted, internal]
       approvals_approve:
-        description: Approve and execute a queued operation. The result is delivered as if the requester had called the tool.
-        input: { type: object, required: [id], properties: { id: { type: string }, note: { type: string } } }
-        output: { type: object, required: [id, state, result], properties: { id: { type: string }, state: { type: string }, result: { type: object } } }
-        errors: [not-permitted, not-found, conflict]
+        description: >
+          Approve and execute a queued operation. Admin only. The tool runs in
+          the admin's session as the admin's Linux user; a commit is authored
+          by the requester with an Approved-by trailer naming the admin. The
+          result, a normal output or a problem, is returned here and stored on
+          the approval for the requester.
+        input: { type: object, additionalProperties: false, required: [id], properties: { id: { type: string }, note: { type: string, maxLength: 500 } } }
+        output: { type: object, required: [id, state, result], properties: { id: { type: string }, state: { type: string, enum: [approved] }, result: { type: object } } }
+        errors: [not-permitted, not-found, conflict, internal]
       approvals_reject:
-        description: Reject a queued operation with a reason the requester will see.
-        input: { type: object, required: [id, reason], properties: { id: { type: string }, reason: { type: string } } }
-        output: { type: object, required: [id, state], properties: { id: { type: string }, state: { type: string } } }
-        errors: [not-permitted, not-found, conflict]
+        description: Reject a queued operation with a reason the requester will see. Admin only.
+        input: { type: object, additionalProperties: false, required: [id, reason], properties: { id: { type: string }, reason: { type: string, minLength: 3, maxLength: 500 } } }
+        output: { type: object, required: [id, state], properties: { id: { type: string }, state: { type: string, enum: [rejected] } } }
+        errors: [not-permitted, not-found, conflict, internal]

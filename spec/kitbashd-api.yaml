@@ -125,7 +125,7 @@ api:
   processes_register:
     method: POST
     path: /kitbash/v1/processes
-    request: { id: "UUIDv7", package: "/home/loki/echo", name: "echo", expose: "mcp|http|none", endpoint: "http://127.0.0.1:40275 when expose is http", subscriptions: ["telemetry"] }
+    request: { id: "UUIDv7", package: "/home/loki/echo", name: "echo", container: "kitbash-echo-echo", digest: "sha256:...", expose: "mcp|http|none", endpoint: "http://127.0.0.1:40275 when expose is http", subscriptions: ["telemetry"] }
     response: { id: "UUIDv7", token: "opaque, at least 32 bytes of entropy, returned once" }
     authorization: >
       The caller is the member the Process belongs to; kitbashd records the
@@ -161,6 +161,64 @@ api:
       subscriptions, registeredAt } ] }. The caller's registered Processes,
       every key present even when its value is empty, and no token anywhere.
       An admin sees every member's.
+  users_create:
+    method: POST
+    path: /kitbash/v1/users
+    request: { name: "^[a-z][a-z0-9-]{1,31}$", sshKey: "one OpenSSH public key line", admin: false }
+    response: { user: "name", uid: 1005 }
+    authorization: admin only. Runs useradd -m -s /bin/sh -G kitbash-users, usermod -p '*', adds the member to kitbash-admin when admin is true, allocates a 65536 wide subuid and subgid range, writes authorized_keys 0600 in a 0700 .ssh, sets the home to 0700, creates /run/user/<uid> 0700 owned by the member.
+    errors: [bad-request, not-permitted, conflict, internal]
+  users_list:
+    method: GET
+    path: /kitbash/v1/users
+    response: { users: [{ user, uid, admin, keys, home, processes }] }
+    authorization: admin only.
+  users_me:
+    method: GET
+    path: /kitbash/v1/users/me
+    response: { user, uid, admin, groups }
+    authorization: any member; answers about the peer.
+  users_add_key:
+    method: POST
+    path: /kitbash/v1/users/{name}/keys
+    request: { sshKey: "one OpenSSH public key line" }
+    response: { user, keys }
+    authorization: admin only. The key line is validated as type, base64 body and optional comment, one line, at most 4096 bytes; duplicates are not added twice.
+  users_remove:
+    method: DELETE
+    path: /kitbash/v1/users/{name}
+    response: { user, archived: "/org/.archive/<name>" }
+    authorization: admin only; an admin cannot remove themselves or the last admin. Stops and removes the member's kitbash containers as the member, deletes their registrations and approvals, kills their processes, moves the home to /org/.archive/<name> owned by root 0700, deletes the account and its subordinate ranges.
+    errors: [not-permitted, not-found, conflict, internal]
+  approvals_create:
+    method: POST
+    path: /kitbash/v1/approvals
+    request: { tool: "fs_write|pkg_import", input: { the tool's input verbatim } }
+    response: { id: "UUIDv7", state: "pending", requestedAt }
+    authorization: any member; the requester is the peer. Input is capped at 1 MiB plus the tool's own limits; at most 64 pending approvals per member (409 beyond).
+  approvals_list:
+    method: GET
+    path: /kitbash/v1/approvals?state=pending|approved|rejected
+    response: { approvals: [{ id, requester, tool, input, state, requestedAt, decidedAt, decidedBy, note, reason, result }] }
+    authorization: members see their own, admins all. result is the stored tool result (a normal output or a problem) once executed.
+  approvals_claim:
+    method: POST
+    path: /kitbash/v1/approvals/{id}/claim
+    request: { note }
+    response: { id, requester, tool, input, state: "approved" }
+    authorization: admin only; pending to approved, 409 when not pending. The admin's session then executes the tool and stores the outcome with approvals_result.
+  approvals_result:
+    method: PUT
+    path: /kitbash/v1/approvals/{id}/result
+    request: { result: { the tool's output or a problem } }
+    response: 204
+    authorization: the admin who claimed it, once.
+  approvals_reject:
+    method: POST
+    path: /kitbash/v1/approvals/{id}/reject
+    request: { reason }
+    response: { id, state: "rejected" }
+    authorization: admin only; pending to rejected, 409 otherwise.
   health:
     method: GET
     path: /kitbash/v1/health
@@ -170,6 +228,20 @@ api:
       tcp: "0.0.0.0:4318" }, subscribers: 1 }. A listener that is not bound is
       absent; subscribers is how many registered Processes the fan out is
       delivering to.
+
+restore:
+  description: >
+    At start, after the store is open and before the listeners accept,
+    kitbashd restores Processes: for every registered Process whose owner
+    still exists it creates /run/user/<uid> (0700, owned by the member) and
+    runs podman start <container> as that member (setuid to the member's uid
+    and gid with HOME, USER, LOGNAME, PATH and XDG_RUNTIME_DIR set), 60 s per
+    container, in parallel per owner and serially within one owner. A
+    container that no longer exists is unregistered and logged. Restore runs
+    once per daemon start and is also what makes "all Processes come back
+    after a reboot" true; the OpenRC script orders kitbashd after localmount
+    and the local runlevel scripts.
+  registration_fields: the registration carries the container name and the digest from M5 on, so restore needs no manifest.
 
 retention:
   defaults: { traces: 30d, logs: 14d, metrics: 30d }
