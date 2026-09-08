@@ -303,11 +303,27 @@ CREATE TABLE IF NOT EXISTS processes (
   admin         INTEGER NOT NULL DEFAULT 0,
   package       TEXT    NOT NULL DEFAULT '',
   name          TEXT    NOT NULL DEFAULT '',
+  container     TEXT    NOT NULL DEFAULT '',
+  digest        TEXT    NOT NULL DEFAULT '',
   expose        TEXT    NOT NULL DEFAULT '',
   endpoint      TEXT    NOT NULL DEFAULT '',
   subscriptions TEXT    NOT NULL DEFAULT '',
   token_hash    TEXT    NOT NULL,
   registered_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS approvals (
+  id           TEXT    PRIMARY KEY,
+  requester    TEXT    NOT NULL,
+  tool         TEXT    NOT NULL,
+  input        TEXT    NOT NULL DEFAULT '',
+  state        TEXT    NOT NULL DEFAULT 'pending',
+  requested_at INTEGER NOT NULL,
+  decided_at   INTEGER NOT NULL DEFAULT 0,
+  decided_by   TEXT    NOT NULL DEFAULT '',
+  note         TEXT    NOT NULL DEFAULT '',
+  reason       TEXT    NOT NULL DEFAULT '',
+  result       TEXT    NOT NULL DEFAULT ''
 );
 `
 
@@ -331,6 +347,9 @@ CREATE INDEX IF NOT EXISTS metrics_producer ON metrics(producer, time_ns);
 
 CREATE INDEX IF NOT EXISTS processes_owner ON processes(owner);
 CREATE UNIQUE INDEX IF NOT EXISTS processes_token ON processes(token_hash);
+
+CREATE INDEX IF NOT EXISTS approvals_requester ON approvals(requester, state);
+CREATE INDEX IF NOT EXISTS approvals_state     ON approvals(state);
 `
 
 // Insert writes one export request in a single transaction, so a request that
