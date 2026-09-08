@@ -98,7 +98,7 @@ fi
 prune=""
 [ -d /org/.archive ] && prune="-path /org/.archive -prune -o"
 # shellcheck disable=SC2086
-find /org $prune -exec chown root:kitbash-admin {} + 2>/dev/null || true
+find /org $prune -exec chown -h root:kitbash-admin {} + 2>/dev/null || true
 # shellcheck disable=SC2086
 find /org $prune -type d -exec chmod 2775 {} +
 # g+w,o+r rather than a fixed mode: a file in /org may be a script, and 664
