@@ -24,7 +24,11 @@ import (
 // exporters do, written out here because theirs arrives with the gRPC stack
 // attached, see PLAN.md section 2.7 and internal/otlpproto/README.md. Nothing
 // is dropped on the way: a record that would have gone out under the SDK's
-// exporter goes out with the same fields under this one.
+// exporter goes out with at least the same fields under this one.
+//
+// There is one deliberate addition. A link carries the trace state of the span
+// it points at, which the protocol has a field for and the SDK's exporter
+// leaves empty. Sending it costs nothing and loses nothing.
 
 // resourceSpans groups a batch of finished spans by resource and then by
 // instrumentation scope, which is the shape an OTLP export request has.

@@ -126,9 +126,11 @@ type poster struct {
 	stopped bool
 }
 
-// post sends one request message. A shutdown exporter reports success without
-// sending, which is what the SDK's own exporters do: the batch is gone either
-// way and the session is over.
+// post sends one request message. A shutdown exporter drops the batch and
+// reports success. The SDK's own exporters answer with an error instead, which
+// the guard above would turn into the line a dropping session is told about,
+// over a batch that arrived after the last flush: the session is over by then
+// and nothing an agent could read is still listening.
 func (p *poster) post(ctx context.Context, message proto.Message) error {
 	p.mu.RLock()
 	defer p.mu.RUnlock()

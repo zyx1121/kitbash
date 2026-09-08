@@ -28,6 +28,10 @@ collector/trace/v1/trace_service.pb.go
 collector/logs/v1/logs_service.pb.go
 collector/metrics/v1/metrics_service.pb.go"
 
+# A file the list no longer names is a file upstream dropped or renamed, and
+# leaving it behind would keep compiling long after it stopped being generated.
+find "$here" -name '*.pb.go' -delete
+
 for file in $files; do
 	mkdir -p "$here/$(dirname "$file")"
 	{

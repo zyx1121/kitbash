@@ -17,13 +17,21 @@ here is written by hand.
 The upstream packages ship the generated messages next to a gRPC service stub
 and a grpc-gateway handler. Importing `collector/trace/v1` for the one request
 message linked `google.golang.org/grpc`, `google.golang.org/genproto/*` and
-`github.com/grpc-ecosystem/grpc-gateway/v2` into both binaries: 70 packages
-neither of them can reach, since kitbashd and kitbash-mcp speak OTLP over HTTP
-on a unix socket and never make an RPC.
+`github.com/grpc-ecosystem/grpc-gateway/v2` into both binaries: 71 packages in
+kitbash-mcp and 70 in kitbashd, none of which either can reach, since they
+speak OTLP over HTTP on a unix socket and never make an RPC. Counting the eight
+message packages that are used, `go list -deps` matched 77 and 78.
 
 Taking the messages alone is the option PLAN.md section 2.7 records. The
 protocol is still the OpenTelemetry one, byte for byte, because these are the
 upstream generated types.
+
+This copy and `go.opentelemetry.io/proto/otlp` cannot both be linked into one
+binary. Each registers the same protobuf file paths, such as
+`opentelemetry/proto/trace/v1/trace.proto`, in the global registry, and the
+second registration panics during package initialisation. A dependency that
+pulls the upstream module back in therefore fails loudly at start up rather
+than quietly sending a second set of the same messages.
 
 ## Files taken
 
