@@ -1,6 +1,6 @@
 # Maintainer: Loki <yongxiang.zhan@outlook.com>
 pkgname=kitbashd
-pkgver=0.6.1
+pkgver=0.6.2
 pkgrel=0
 pkgdesc="kitbash: an operating system layer for AI agents. MCP over SSH, Files, Packages, Processes, Telemetry."
 url="https://github.com/zyx1121/kitbash"
