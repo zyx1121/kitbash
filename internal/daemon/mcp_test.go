@@ -566,6 +566,22 @@ func TestMCPSessionOfAnotherProcessIsNotReachable(t *testing.T) {
 	}
 }
 
+// TestMCPStoppingTheReceiverEndsItsSessions is the shutdown path: a session
+// holds an event stream open, which is a request in flight, so a receiver that
+// waited for it would take the whole shutdown timeout to stop. The session is
+// left open on purpose here: the harness fails the test if ServeTCP does not
+// return promptly once its context is cancelled.
+func TestMCPStoppingTheReceiverEndsItsSessions(t *testing.T) {
+	m := serveMCPDaemon(t, 0)
+	session := m.connect(t, nil)
+	if got := toolNames(t, session); len(got) != 2 {
+		t.Fatalf("tools = %v, want the child's two", got)
+	}
+	if n := m.live(t); n != 1 {
+		t.Fatalf("health reports %d MCP sessions, want 1", n)
+	}
+}
+
 func TestMCPIsNotServedOverTheSocket(t *testing.T) {
 	m := serveMCPDaemon(t, 0)
 	res, body := m.do(http.MethodPost, MCPPath, "application/json", []byte("{}"))

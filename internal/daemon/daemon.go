@@ -367,6 +367,14 @@ func (s *Server) serve(ctx context.Context, ln net.Listener, kind string, handle
 		}
 		return fmt.Errorf("daemon: serve: %w", err)
 	case <-ctx.Done():
+		if kind == listenerTCP {
+			// The MCP sessions of this listener hold an event stream open
+			// each, which is a request in flight that Shutdown would wait
+			// out. Ending them first closes those streams and takes every
+			// kitbash-mcp with them, which is what stopping the receiver
+			// means: a session nobody serves any more is over.
+			s.closeMCPSessions()
+		}
 		shutdown, cancel := context.WithTimeout(context.WithoutCancel(ctx), ShutdownTimeout)
 		defer cancel()
 		if err := srv.Shutdown(shutdown); err != nil {
