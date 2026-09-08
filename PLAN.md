@@ -2,7 +2,7 @@
 
 > An operating system for AI agents. Files, Packages, Processes, Telemetry. Nothing built for a human at a terminal.
 
-This is the single living document for the product. It replaces a design doc, an architecture doc and a roadmap. When a decision changes, this file changes. Status: draft v0.6, 2026-09-08.
+This is the single living document for the product. It replaces a design doc, an architecture doc and a roadmap. When a decision changes, this file changes. Status: draft v0.7, 2026-09-08.
 
 ## 1. Positioning
 
@@ -99,7 +99,7 @@ From M4 every Process is a producer too. kitbashd also listens for OTLP/HTTP on 
 
 Every record also carries `kitbash.producer`, stamped by kitbashd: the member for a session record, the Process id for a Process record. `kitbash.user` is the member the record is about. The two differ only for evaluation records, see below.
 
-**Fan out.** A Process whose manifest declares `provides.subscriptions: [telemetry]`, `expose: http` and a `port` receives every record kitbashd stores, as OTLP/HTTP JSON POSTed to the standard paths on its endpoint, after the record is stored and stamped. Delivery is best effort and asynchronous with a bounded queue per subscriber; a subscriber that is down loses records and the gap is logged, the store is the source of truth. A subscriber run by an admin receives the whole machine. A subscriber run by a member receives that member's records only, the same rule as `tel_query`.
+**Fan out.** A Process whose manifest declares `provides.subscriptions: [telemetry]`, `expose: http` and a `port` receives every record kitbashd stores, as OTLP/HTTP JSON POSTed to the standard paths on its endpoint, after the record is stored and stamped. Delivery is best effort and asynchronous with a bounded queue per subscriber; a subscriber that is down loses records and the gap is logged, the store is the source of truth. Every delivery carries a bearer secret minted for that Process at registration and given to its container, so a subscriber knows the records came from kitbashd and not from a neighbour on the host. A subscriber run by an admin receives the whole machine. A subscriber run by a member receives that member's records only, the same rule as `tel_query`.
 
 **Evaluation.** An evaluation kit is a subscriber that writes judgments back through the Process receiver with `kitbash.eval: true`. A judgment is about a subject, named by `kitbash.subject.trace_id` and `kitbash.subject.span_id`, and it carries the subject's `kitbash.user`, `kitbash.package`, `kitbash.process` and `kitbash.path` so that the query that asks what a Package did also returns how it was judged. kitbashd accepts those claims on an evaluation record only when the producing Process was run by an admin; a member's evaluation kit has them forced to the member's own. `kitbash.producer` always names the kit's Process, so a judgment is never mistaken for the act it judges.
 
@@ -160,7 +160,7 @@ kitbash adopts existing specifications wherever one exists. Nothing in this list
 | Specification | Where it binds | Note |
 |---------------|----------------|------|
 | OCI image, runtime and distribution specs | Packages, Processes | A Package version is an OCI digest |
-| OpenTelemetry semantic conventions and W3C Trace Context | Telemetry | Attribute names follow the conventions; `traceparent` crosses process boundaries |
+| OpenTelemetry semantic conventions and W3C Trace Context | Telemetry | Attribute names follow the conventions; `traceparent` crosses process boundaries. kitbashd and kitbash-mcp speak OTLP/HTTP with the protocol's message definitions compiled in and nothing of the gRPC stack, because neither ever makes an RPC |
 | Model Context Protocol, 2025-06 revision | The MCP surface | Files map onto MCP primitives: binary content as resources, `prompt` entries as prompts, everything else as tools |
 | JSON Schema 2020-12 | Tool input and output in the manifest | Composition binds on schemas, so the draft is pinned |
 | RFC 9457 Problem Details | Every error | Structured errors are `type`, `title`, `detail`, `instance`, plus a `fix` extension |

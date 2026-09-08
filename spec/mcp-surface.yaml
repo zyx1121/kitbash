@@ -18,7 +18,10 @@
 #   connecting Linux user.
 # - A folder is visible only if it carries kitbash.yaml with name and
 #   description, and so does every folder between it and its root. kitbash
-#   follows no symlinks and refuses every path component that begins with a dot.
+#   follows no symlinks and refuses every path component that begins with a dot;
+#   every open below a root resolves with openat2 RESOLVE_NO_SYMLINKS and
+#   RESOLVE_BENEATH, so a link swapped in at any component during a call is
+#   refused by the kernel, not by a check that could race.
 # - Timestamps are RFC 3339. Identifiers are UUIDv7 unless they are git SHAs or
 #   OCI digests.
 # - Errors are returned as an MCP tool result with isError: true whose single
@@ -67,7 +70,12 @@ $package_tools:
     The set is read from the caller's running Processes when a session starts
     and kept current within the session; other sessions see changes when they
     reconnect.
-  errors: [bad-request, not-found, internal]
+  errors: [bad-request, not-found, internal, and any problem the Package itself returns]
+  package_errors: >
+    When a Package tool answers isError with a single text block that parses
+    as problem details of a kitbash type, the surface returns that problem
+    unchanged, so a kit's own not-found or too-large reaches the agent as is.
+    Any other error text is wrapped as bad-request with the text as detail.
   import_hook:
     description: >
       The contract an import kit implements. The kit's manifest declares

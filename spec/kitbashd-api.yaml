@@ -40,6 +40,7 @@ tcp:
     KITBASH_PACKAGE: the Package path
     KITBASH_USER: the member who ran it
     KITBASH_MCP_ENDPOINT: http://host.containers.internal:4318/mcp, see mcp_for_processes
+    KITBASH_FANOUT_SECRET: the bearer every fan out request to this Process carries, see fan_out.authentication
 
 mcp_for_processes:
   description: >
@@ -115,6 +116,14 @@ fan_out:
     registered Process with subscriptions containing telemetry and an
     endpoint, run by an admin (receives everything) or by the record's
     kitbash.user (receives that member's records).
+  authentication: >
+    Every fan out request carries Authorization: Bearer <fan out secret>. The
+    secret is minted with the Process token at registration and returned once
+    as fanoutSecret; kitbash-mcp hands it to the container as
+    KITBASH_FANOUT_SECRET. A subscriber accepts a fan out POST only when the
+    header matches, so nothing else on the host can feed it records. kitbashd
+    stores the secret in the processes table (the store is root only) because
+    it must send it, unlike the token of which only the hash is kept.
   delivery: >
     Asynchronous, one queue per subscriber bounded twice, at 1024 requests and
     at 64 MiB, oldest dropped when either bound is reached, 5 s request
@@ -177,7 +186,7 @@ api:
     method: POST
     path: /kitbash/v1/processes
     request: { id: "UUIDv7", package: "/home/loki/echo", name: "echo", container: "kitbash-echo-echo", digest: "sha256:...", expose: "mcp|http|none", endpoint: "http://127.0.0.1:40275 when expose is http", subscriptions: ["telemetry"] }
-    response: { id: "UUIDv7", token: "opaque, at least 32 bytes of entropy, returned once" }
+    response: { id: "UUIDv7", token: "opaque, at least 32 bytes of entropy, returned once", fanoutSecret: "opaque, 32 bytes, returned once; the bearer the fan out presents to this Process" }
     authorization: >
       The caller is the member the Process belongs to; kitbashd records the
       peer user as the Process owner and whether they are an admin at
