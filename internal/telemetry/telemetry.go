@@ -77,6 +77,15 @@ const (
 	AttrError  = "kitbash.error"
 )
 
+// AttrApproval and AttrRequester name the queued call an approvals_approve
+// span executed and the member it was executed for. The admin's session
+// records the span, so without them a query for what a member asked for would
+// end at the queued problem.
+const (
+	AttrApproval  = "kitbash.approval"
+	AttrRequester = "kitbash.requester"
+)
+
 // Options configure a Provider.
 type Options struct {
 	// Version is the kitbash-mcp version, exported as service.version.
@@ -405,6 +414,12 @@ func SetProcess(ctx context.Context, id string) { set(ctx, AttrProcess, id) }
 
 // SetPath records the Files path on the call in flight.
 func SetPath(ctx context.Context, path string) { set(ctx, AttrPath, path) }
+
+// SetApproval records the approval this call executed.
+func SetApproval(ctx context.Context, id string) { set(ctx, AttrApproval, id) }
+
+// SetRequester records the member an approved call was executed for.
+func SetRequester(ctx context.Context, user string) { set(ctx, AttrRequester, user) }
 
 // set puts one of the four attributes on the span in hand and on the span of
 // the whole call. They describe the call, not one step of it: a query for

@@ -119,11 +119,14 @@ deploy:
       build: .
       expose: mcp
 `
-	out, prob := service.WriteFiles(ctx, folder, []fs.File{
-		{Path: "kitbash.yaml", Content: &yaml},
-		{Path: "README.md", Content: &body},
-		{Path: "src/Containerfile", Content: &body},
-	}, "Import npm:time-mcp")
+	out, prob := service.WriteFiles(ctx, fs.WriteFilesRequest{
+		Path: folder,
+		Files: []fs.File{
+			{Path: "kitbash.yaml", Content: &yaml},
+			{Path: "README.md", Content: &body},
+			{Path: "src/Containerfile", Content: &body},
+		},
+		Message: "Import npm:time-mcp"})
 	if prob != nil {
 		t.Fatalf("WriteFiles: %s", prob.Detail)
 	}
@@ -156,8 +159,10 @@ func TestWriteFilesRefusesDotComponentsAndEscapes(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, prob := service.WriteFiles(ctx, filepath.Join(root, "new-package"),
-				[]fs.File{{Path: tc.path, Content: &body}}, "Import something")
+			_, prob := service.WriteFiles(ctx, fs.WriteFilesRequest{
+				Path:    filepath.Join(root, "new-package"),
+				Files:   []fs.File{{Path: tc.path, Content: &body}},
+				Message: "Import something"})
 			if prob == nil {
 				t.Fatalf("the path %q was accepted", tc.path)
 			}
@@ -174,8 +179,10 @@ func TestWriteFilesWithoutAManifestIsAllowed(t *testing.T) {
 	service, root := tree(t)
 	body := "notes\n"
 
-	_, prob := service.WriteFiles(context.Background(), filepath.Join(root, "scratch"),
-		[]fs.File{{Path: "README.md", Content: &body}}, "Add scratch notes")
+	_, prob := service.WriteFiles(context.Background(), fs.WriteFilesRequest{
+		Path:    filepath.Join(root, "scratch"),
+		Files:   []fs.File{{Path: "README.md", Content: &body}},
+		Message: "Add scratch notes"})
 	if prob != nil {
 		t.Fatalf("WriteFiles: %s", prob.Detail)
 	}
@@ -185,8 +192,10 @@ func TestWriteFilesValidatesTheManifest(t *testing.T) {
 	service, root := tree(t)
 	broken := "name: Not Kebab Case\n"
 
-	_, prob := service.WriteFiles(context.Background(), filepath.Join(root, "broken"),
-		[]fs.File{{Path: "kitbash.yaml", Content: &broken}}, "Import something broken")
+	_, prob := service.WriteFiles(context.Background(), fs.WriteFilesRequest{
+		Path:    filepath.Join(root, "broken"),
+		Files:   []fs.File{{Path: "kitbash.yaml", Content: &broken}},
+		Message: "Import something broken"})
 	if prob == nil {
 		t.Fatal("an invalid manifest was committed")
 	}
@@ -205,8 +214,10 @@ func TestHeadReportsADirtyTree(t *testing.T) {
 	yaml := `name: time
 description: A wrapped MCP server that answers what the time is right now.
 `
-	if _, prob := service.WriteFiles(ctx, folder, []fs.File{{Path: "kitbash.yaml", Content: &yaml}},
-		"Add the time Package"); prob != nil {
+	if _, prob := service.WriteFiles(ctx, fs.WriteFilesRequest{
+		Path:    folder,
+		Files:   []fs.File{{Path: "kitbash.yaml", Content: &yaml}},
+		Message: "Add the time Package"}); prob != nil {
 		t.Fatalf("WriteFiles: %s", prob.Detail)
 	}
 

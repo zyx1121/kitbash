@@ -41,11 +41,8 @@ type importOutput struct {
 // against each running kit's import input schema, and exactly one kit has to
 // accept it. Two kits accepting the same source is a conflict the caller
 // resolves by stopping one, see PLAN.md section 3.
-func (s *Service) Import(ctx context.Context, path, source string) (*ImportResult, *problem.Problem) {
-	if s.kits == nil {
-		return nil, problem.NotFoundFix(path, "no import kit is running",
-			"Run an import kit that understands this source, for example /org/import-mcp.")
-	}
+func (s *Service) Import(ctx context.Context, req ImportRequest) (*ImportResult, *problem.Problem) {
+	path, source := req.Path, req.Source
 	exists, prob := s.files.Exists(ctx, path)
 	if prob != nil {
 		return nil, prob
@@ -53,6 +50,21 @@ func (s *Service) Import(ctx context.Context, path, source string) (*ImportResul
 	if exists {
 		return nil, problem.ConflictFix(path, "this path already exists",
 			"Import into a new folder, or write into this one with fs_write.")
+	}
+	// A member importing into /org queues the call rather than running a kit
+	// of their own: the admin who approves it runs the kit in their session,
+	// see PLAN.md section 2.1. The path is validated above, so a queued import
+	// is one that could have run.
+	input, prob := req.input()
+	if prob != nil {
+		return nil, prob
+	}
+	if prob := s.files.Queue(ctx, path, telemetry.ToolPkgImport, input); prob != nil {
+		return nil, prob
+	}
+	if s.kits == nil {
+		return nil, problem.NotFoundFix(path, "no import kit is running",
+			"Run an import kit that understands this source, for example /org/import-mcp.")
 	}
 
 	kits, prob := s.kits.Kits(ctx)
@@ -73,7 +85,13 @@ func (s *Service) Import(ctx context.Context, path, source string) (*ImportResul
 	if prob != nil {
 		return nil, prob
 	}
-	written, prob := s.files.WriteFiles(ctx, path, files, "Import "+source)
+	written, prob := s.files.WriteFiles(ctx, fs.WriteFilesRequest{
+		Path:       path,
+		Files:      files,
+		Message:    "Import " + source,
+		Author:     req.Author,
+		ApprovedBy: req.ApprovedBy,
+	})
 	if prob != nil {
 		return nil, prob
 	}

@@ -84,6 +84,14 @@ func TestRunRegistersTheProcessBeforeItStarts(t *testing.T) {
 	if len(got.Subscriptions) != 0 {
 		t.Errorf("subscriptions are %v, want none", got.Subscriptions)
 	}
+	// Boot restore starts the container the registration names from the image
+	// it names, so both are registered with the Process.
+	if got.Container != proc.ContainerName("ffmpeg", "ffmpeg") {
+		t.Errorf("container is %q, want the one the Process runs as", got.Container)
+	}
+	if got.Digest != process.Digest || got.Digest == "" {
+		t.Errorf("digest is %q, want the image the Process runs, %q", got.Digest, process.Digest)
+	}
 
 	env := f.runner.Runs[0].Env
 	if env[telemetry.EnvToken] != f.daemon.Token(process.ID) || env[telemetry.EnvToken] == "" {

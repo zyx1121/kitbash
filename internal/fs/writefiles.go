@@ -32,6 +32,19 @@ type File struct {
 	ContentBase64 *string
 }
 
+// WriteFilesRequest is one multi file write: the folder, its files and the
+// message they are committed with.
+//
+// Author and ApprovedBy are what they are on WriteRequest: empty on a call an
+// agent made, set when an admin's session executes an approved pkg_import.
+type WriteFilesRequest struct {
+	Path       string
+	Files      []File
+	Message    string
+	Author     string
+	ApprovedBy string
+}
+
 // WriteFilesResult is the folder that was written and the one commit it landed
 // as.
 type WriteFilesResult struct {
@@ -47,9 +60,14 @@ type WriteFilesResult struct {
 // resolves inside a root, every ancestor is visible, no path component begins
 // with a dot, no component is a symlink, each file is at most MaxBytes, and a
 // kitbash.yaml among them is validated before anything is committed.
-func (s *Service) WriteFiles(ctx context.Context, folder string, files []File, message string) (*WriteFilesResult, *problem.Problem) {
+func (s *Service) WriteFiles(ctx context.Context, req WriteFilesRequest) (*WriteFilesResult, *problem.Problem) {
+	folder, files, message := req.Path, req.Files, req.Message
 	clean, prob := s.resolve(folder)
 	if prob != nil {
+		return nil, prob
+	}
+	by := authorship{Author: req.Author, ApprovedBy: req.ApprovedBy}
+	if prob := by.check(clean); prob != nil {
 		return nil, prob
 	}
 	if s.isRoot(clean) {
@@ -136,10 +154,13 @@ func (s *Service) WriteFiles(ctx context.Context, folder string, files []File, m
 	}
 	rels := make([]string, 0, len(planned))
 	for _, p := range planned {
-		if err := os.MkdirAll(filepath.Dir(p.full), 0o755); err != nil {
+		if err := s.makeDir(filepath.Dir(p.full)); err != nil {
 			return nil, writeProblem(p.full, err)
 		}
 		if err := writeNoFollow(p.full, p.data); err != nil {
+			return nil, writeProblem(p.full, err)
+		}
+		if err := s.share(p.full); err != nil {
 			return nil, writeProblem(p.full, err)
 		}
 		rels = append(rels, p.rel)
@@ -159,7 +180,7 @@ func (s *Service) WriteFiles(ctx context.Context, folder string, files []File, m
 			return &WriteFilesResult{Path: clean, Commit: *before}, nil
 		}
 	}
-	commit, err := s.commitPaths(ctx, repo, message, rels)
+	commit, err := s.commitPaths(ctx, repo, message, rels, by)
 	if err != nil {
 		return nil, gitProblem(clean, err)
 	}

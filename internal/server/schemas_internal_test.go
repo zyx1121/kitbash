@@ -38,16 +38,59 @@ func TestTelSchemasMatchTheSurfaceSpecification(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			want := normalise(t, tc.want)
-			var got any
-			if err := json.Unmarshal([]byte(tc.got), &got); err != nil {
-				t.Fatalf("the transcribed schema is not JSON: %v", err)
-			}
-			if !reflect.DeepEqual(got, want) {
-				t.Errorf("the transcribed schema is\n%s\nand the specification says\n%s",
-					pretty(t, got), pretty(t, want))
-			}
+			matches(t, tc.got, tc.want)
 		})
+	}
+}
+
+// The users and approvals families are served by kitbashd, so these schemas
+// are the only description of them kitbash-mcp holds and nothing else would
+// notice if they drifted. Every tool is diffed on both sides, input and
+// output, against spec/mcp-surface.yaml.
+func TestUsersAndApprovalsSchemasMatchTheSurfaceSpecification(t *testing.T) {
+	surface := readSurface(t)
+	cases := []struct {
+		family string
+		tool   string
+		side   string
+		got    string
+	}{
+		{"users", "users_me", "input", string(usersMeInputSchema)},
+		{"users", "users_me", "output", string(usersMeOutputSchema)},
+		{"users", "users_create", "input", string(usersCreateInputSchema)},
+		{"users", "users_create", "output", string(usersCreateOutputSchema)},
+		{"users", "users_list", "input", string(usersListInputSchema)},
+		{"users", "users_list", "output", string(usersListOutputSchema)},
+		{"users", "users_add_key", "input", string(usersAddKeyInputSchema)},
+		{"users", "users_add_key", "output", string(usersAddKeyOutputSchema)},
+		{"users", "users_remove", "input", string(usersRemoveInputSchema)},
+		{"users", "users_remove", "output", string(usersRemoveOutputSchema)},
+		{"approvals", "approvals_list", "input", string(approvalsListInputSchema)},
+		{"approvals", "approvals_list", "output", string(approvalsListOutputSchema)},
+		{"approvals", "approvals_approve", "input", string(approvalsApproveInputSchema)},
+		{"approvals", "approvals_approve", "output", string(approvalsApproveOutputSchema)},
+		{"approvals", "approvals_reject", "input", string(approvalsRejectInputSchema)},
+		{"approvals", "approvals_reject", "output", string(approvalsRejectOutputSchema)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.tool+" "+tc.side, func(t *testing.T) {
+			matches(t, tc.got, dig(t, surface, "families", tc.family, "tools", tc.tool, tc.side))
+		})
+	}
+}
+
+// matches holds one transcribed schema to the node of the specification it was
+// transcribed from.
+func matches(t *testing.T, transcribed string, want any) {
+	t.Helper()
+	specified := normalise(t, want)
+	var got any
+	if err := json.Unmarshal([]byte(transcribed), &got); err != nil {
+		t.Fatalf("the transcribed schema is not JSON: %v", err)
+	}
+	if !reflect.DeepEqual(got, specified) {
+		t.Errorf("the transcribed schema is\n%s\nand the specification says\n%s",
+			pretty(t, got), pretty(t, specified))
 	}
 }
 

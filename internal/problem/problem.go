@@ -24,6 +24,7 @@ const (
 	SlugUnsupported     = "unsupported-media-type"
 	SlugTooLarge        = "too-large"
 	SlugConflict        = "conflict"
+	SlugQueued          = "queued"
 	SlugInternal        = "internal"
 )
 
@@ -175,6 +176,15 @@ func ConflictFix(instance, detail, fix string) *Problem {
 	p := Conflict(instance, detail)
 	p.Fix = fix
 	return p
+}
+
+// Queued reports a call that was not run but put in the approval queue, which
+// is what a member's write under /org is, see PLAN.md section 2.1. It is the
+// one problem that is not a failure: the status is 202, the instance is the
+// approval id, and the outcome lands on the approval once an admin decides.
+func Queued(id, detail string) *Problem {
+	return newProblem(SlugQueued, "Queued", http.StatusAccepted, id, detail,
+		fmt.Sprintf("Ask an admin to run approvals_approve %s, or call approvals_list to follow it.", id))
 }
 
 // logger writes the causes of internal errors where the operator can read them.

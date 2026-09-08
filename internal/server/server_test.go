@@ -826,7 +826,7 @@ description: A folder members may read but never write, like /org itself.
 	if p.Status != 403 {
 		t.Errorf("status is %d, want 403", p.Status)
 	}
-	if !strings.Contains(p.Fix, "M5") {
+	if !strings.Contains(p.Fix, "queued") {
 		t.Errorf("fix is %q, want the approvals advice", p.Fix)
 	}
 }

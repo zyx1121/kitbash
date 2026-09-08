@@ -22,7 +22,8 @@ func TestWriteFilesRefusesTooManyFiles(t *testing.T) {
 		files = append(files, fs.File{Path: fmt.Sprintf("file%03d.md", i), Content: &body})
 	}
 
-	_, prob := service.WriteFiles(context.Background(), filepath.Join(root, "many"), files, "Import many files")
+	_, prob := service.WriteFiles(context.Background(), fs.WriteFilesRequest{
+		Path: filepath.Join(root, "many"), Files: files, Message: "Import many files"})
 	if prob == nil {
 		t.Fatal("a write of more files than the limit was accepted")
 	}
@@ -45,7 +46,8 @@ func TestWriteFilesRefusesTooManyBytes(t *testing.T) {
 		files = append(files, fs.File{Path: fmt.Sprintf("file%02d.bin", i), Content: &body})
 	}
 
-	_, prob := service.WriteFiles(context.Background(), filepath.Join(root, "big"), files, "Import a big Package")
+	_, prob := service.WriteFiles(context.Background(), fs.WriteFilesRequest{
+		Path: filepath.Join(root, "big"), Files: files, Message: "Import a big Package"})
 	if prob == nil {
 		t.Fatal("a write over the folder byte limit was accepted")
 	}
@@ -71,8 +73,10 @@ func TestWriteFilesRefusesASymlinkedComponent(t *testing.T) {
 	}
 	body := "x\n"
 
-	_, prob := service.WriteFiles(context.Background(), folder,
-		[]fs.File{{Path: "out/escaped.md", Content: &body}}, "Write through a link")
+	_, prob := service.WriteFiles(context.Background(), fs.WriteFilesRequest{
+		Path:    folder,
+		Files:   []fs.File{{Path: "out/escaped.md", Content: &body}},
+		Message: "Write through a link"})
 	if prob == nil {
 		t.Fatal("a write through a symlink was accepted")
 	}
@@ -89,8 +93,10 @@ func TestWriteFilesRefusesTheFolderItself(t *testing.T) {
 	service, root := tree(t)
 	body := "x\n"
 
-	_, prob := service.WriteFiles(context.Background(), filepath.Join(root, "dot"),
-		[]fs.File{{Path: ".", Content: &body}}, "Write the folder itself")
+	_, prob := service.WriteFiles(context.Background(), fs.WriteFilesRequest{
+		Path:    filepath.Join(root, "dot"),
+		Files:   []fs.File{{Path: ".", Content: &body}},
+		Message: "Write the folder itself"})
 	if prob == nil {
 		t.Fatal("a file path of . was accepted")
 	}

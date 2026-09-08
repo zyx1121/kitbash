@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"regexp"
 
 	"github.com/zyx1121/kitbash/internal/problem"
 )
@@ -49,13 +50,44 @@ func EndpointForProcesses() string {
 // Registration is one Process as kitbashd records it. It is the request body
 // of processes_register in spec/kitbashd-api.yaml; the owner is not in it,
 // because kitbashd reads that from the socket's peer credentials.
+// Container and Digest are what boot restore needs: the container to start
+// and the image it was started from, so kitbashd restores a Process without
+// reading its manifest, see registration_fields in spec/kitbashd-api.yaml.
+// Both are omitted when the caller does not know them.
 type Registration struct {
 	ID            string   `json:"id"`
 	Package       string   `json:"package"`
 	Name          string   `json:"name"`
+	Container     string   `json:"container,omitempty"`
+	Digest        string   `json:"digest,omitempty"`
 	Expose        string   `json:"expose"`
 	Endpoint      string   `json:"endpoint,omitempty"`
 	Subscriptions []string `json:"subscriptions,omitempty"`
+}
+
+// The shapes the two restore fields must have. kitbashd starts what the
+// container field names, as the owner, at boot: a name that is not a kitbash
+// container name, or a digest that is not an OCI image id, is a registration
+// this process got wrong and must not send.
+var (
+	containerName = regexp.MustCompile(`^kitbash-[a-z0-9-]+$`)
+	imageDigest   = regexp.MustCompile(`^sha256:[a-f0-9]{64}$`)
+)
+
+// check holds the registration to those shapes. The other fields are checked
+// by kitbashd, which is the one that has to trust them; these two are checked
+// here as well because a wrong value is not a caller's mistake but this
+// program's, and it would be found at the next boot rather than now.
+func (r Registration) check() *problem.Problem {
+	if r.Container != "" && !containerName.MatchString(r.Container) {
+		return problem.BadRequest(r.ID,
+			fmt.Sprintf("%q is not a kitbash container name", r.Container), "")
+	}
+	if r.Digest != "" && !imageDigest.MatchString(r.Digest) {
+		return problem.BadRequest(r.ID,
+			fmt.Sprintf("%q is not an OCI image digest", r.Digest), "")
+	}
+	return nil
 }
 
 // Registered is one Process kitbashd knows about, as processes_list returns
@@ -117,6 +149,9 @@ type processList struct {
 func (c *Client) RegisterProcess(ctx context.Context, reg Registration) (string, *problem.Problem) {
 	if c == nil {
 		return "", problem.Internal(reg.ID, "telemetry is not configured for this session", NotRunningFix)
+	}
+	if prob := reg.check(); prob != nil {
+		return "", prob
 	}
 	body, err := json.Marshal(reg)
 	if err != nil {

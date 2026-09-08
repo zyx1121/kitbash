@@ -9,6 +9,7 @@ package pkg
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -72,6 +73,31 @@ type InspectResult struct {
 	Path     string         `json:"path"`
 	Manifest map[string]any `json:"manifest"`
 	Builds   []Build        `json:"builds"`
+}
+
+// ImportRequest is the input of pkg_import. Author and ApprovedBy are what
+// they are on fs.WriteRequest: empty on a call an agent made, set when an
+// admin's session executes an approved import, so the one commit it writes is
+// authored by the member who asked for it.
+type ImportRequest struct {
+	Path       string
+	Source     string
+	Author     string
+	ApprovedBy string
+}
+
+// input is this request as the pkg_import input of spec/mcp-surface.yaml,
+// which is what an approval stores. The tool's input has no property this
+// struct does not hold and refuses every other one.
+func (req ImportRequest) input() (json.RawMessage, *problem.Problem) {
+	body, err := json.Marshal(struct {
+		Path   string `json:"path"`
+		Source string `json:"source"`
+	}{Path: req.Path, Source: req.Source})
+	if err != nil {
+		return nil, problem.Internal(req.Path, err.Error(), "")
+	}
+	return body, nil
 }
 
 // ImportResult is the output of pkg_import.

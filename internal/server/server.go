@@ -59,7 +59,12 @@ func New(version string, deps Deps) *mcp.Server {
 		RegisterProcesses(s, deps.Processes, deps.Bridge)
 	}
 	if deps.Telemetry != nil {
-		RegisterTelemetry(s, deps.Telemetry.Client())
+		client := deps.Telemetry.Client()
+		RegisterTelemetry(s, client)
+		// The users and approvals families live in kitbashd, so they are on
+		// the surface only when this session has a socket to reach it on.
+		RegisterUsers(s, client)
+		RegisterApprovals(s, client, deps.Files, deps.Packages)
 	}
 	return s
 }
@@ -89,7 +94,10 @@ func Register(s *mcp.Server, files *fs.Service) {
 		Description: "Create or replace one file and commit it to the enclosing top level repository, " +
 			"attributed to the caller. Writing kitbash.yaml into a new folder is how a folder becomes " +
 			"visible; the manifest is validated against spec/manifest.schema.json before commit. Binary " +
-			"content is base64. Pass expectedSha to refuse the write if the file changed since it was read.",
+			"content is base64. Pass expectedSha to refuse the write if the file changed since it was read. " +
+			"A member writing under /org does not fail: the call is queued for an admin and the result is a " +
+			"queued problem (202) whose instance is the approval id; approvals_list shows the outcome once " +
+			"an admin decides.",
 		InputSchema:  writeInputSchema,
 		OutputSchema: writeOutputSchema,
 	}, writeHandler(files))
