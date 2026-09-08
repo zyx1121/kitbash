@@ -37,6 +37,52 @@ func tree(t *testing.T) (root, outside string) {
 	return root, outside
 }
 
+// The whole answer for one relative path, in one table: what is accepted, and
+// which refusal each way out gets. The errors are what the fs family maps onto
+// the surface's classes, so they are part of the contract rather than an
+// implementation detail.
+func TestOpenAnswersEveryShapeOfRelativePath(t *testing.T) {
+	root, outside := tree(t)
+	if err := os.Symlink(filepath.Join(outside, "docs", "note.md"), filepath.Join(root, "link")); err != nil {
+		t.Skipf("this filesystem does not do symlinks: %v", err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "dirlink")); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	for _, c := range []struct {
+		rel  string
+		want error // nil means it has to succeed
+	}{
+		{rel: ""},
+		{rel: "."},
+		{rel: "docs"},
+		{rel: "./docs/./note.md"},
+		{rel: "docs//note.md"},
+		{rel: "docs/"},
+		{rel: "/etc/passwd", want: syscall.EXDEV},
+		{rel: filepath.Join(outside, "docs"), want: syscall.EXDEV},
+		{rel: "..", want: syscall.EXDEV},
+		{rel: "docs/../../etc", want: syscall.EXDEV},
+		{rel: "link", want: syscall.ELOOP},
+		{rel: "dirlink/docs/note.md", want: syscall.ELOOP},
+		{rel: "docs/note.md/", want: syscall.ENOTDIR},
+		{rel: "docs/note.md/x", want: syscall.ENOTDIR},
+		{rel: "absent", want: syscall.ENOENT},
+		{rel: "docs/\x00x", want: syscall.EINVAL},
+	} {
+		f, err := safeopen.Open(root, c.rel, os.O_RDONLY, 0)
+		if f != nil {
+			f.Close()
+		}
+		switch {
+		case c.want == nil && err != nil:
+			t.Errorf("Open(%q) failed with %v, want it to succeed", c.rel, err)
+		case c.want != nil && !errors.Is(err, c.want):
+			t.Errorf("Open(%q) failed with %v, want %v", c.rel, err, c.want)
+		}
+	}
+}
+
 func TestOpenReadsAFileBelowTheRoot(t *testing.T) {
 	root, _ := tree(t)
 	f, err := safeopen.Open(root, "docs/note.md", os.O_RDONLY, 0)

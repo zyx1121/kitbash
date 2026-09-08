@@ -19,9 +19,16 @@
 # - A folder is visible only if it carries kitbash.yaml with name and
 #   description, and so does every folder between it and its root. kitbash
 #   follows no symlinks and refuses every path component that begins with a dot;
-#   every open below a root resolves with openat2 RESOLVE_NO_SYMLINKS and
-#   RESOLVE_BENEATH, so a link swapped in at any component during a call is
-#   refused by the kernel, not by a check that could race.
+#   every open kitbash itself makes below a root resolves with openat2
+#   RESOLVE_NO_SYMLINKS and RESOLVE_BENEATH, so a link swapped in at any
+#   component during a call is refused by the kernel, not by a check that could
+#   race. git is the exception and is scoped rather than hidden: it is handed
+#   the repository as a descriptor on the folder that was resolved, but it asks
+#   the kernel for that directory as a path and works by the path afterwards, so
+#   a folder renamed underneath a running git can still redirect git's own
+#   resolution. git runs as the caller, so what that reaches is what the caller
+#   could reach with their own git; it is not a way to read or write anything
+#   the caller could not.
 # - Timestamps are RFC 3339. Identifiers are UUIDv7 unless they are git SHAs or
 #   OCI digests.
 # - Errors are returned as an MCP tool result with isError: true whose single

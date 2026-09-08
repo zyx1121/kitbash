@@ -12,7 +12,14 @@
 //
 // The root itself is the trust boundary and is opened by path: it is a folder
 // the host configured, not a path a caller sent. It must not be a symlink,
-// which is checked before it is opened.
+// which is checked before it is opened. RESOLVE_BENEATH starts at the root, so
+// it says nothing about the path to the root: a caller path handed in as a
+// root carries only the guarantee of whoever resolved it.
+//
+// os.Root is not this. It confines a path to a root, but it follows a symlink
+// whose target stays inside that root, and kitbash follows none: a link is
+// refused wherever it points, because the target of a link is not the file the
+// caller named.
 package safeopen
 
 import (
@@ -147,7 +154,7 @@ func MkdirAll(root, rel string, perm os.FileMode) ([]string, error) {
 // itself being a link.
 func descend(dir int, segment string) (int, error) {
 	if available() {
-		fd, err := openat2(dir, segment, unix.O_RDONLY|unix.O_DIRECTORY, 0)
+		fd, err := openat2(dir, segment, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 		if err == nil {
 			return fd, nil
 		}

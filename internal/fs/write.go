@@ -265,6 +265,9 @@ func writeProblem(path string, err error) *problem.Problem {
 	if errors.Is(err, syscall.ELOOP) {
 		return symlinkRefused(path, path)
 	}
+	if errors.Is(err, syscall.EXDEV) {
+		return problem.InvalidPath(path, "the path leaves the root it started in")
+	}
 	// ENXIO is a FIFO opened for writing with no reader on the other end.
 	if errors.Is(err, errNotRegular) || errors.Is(err, syscall.ENXIO) {
 		return problem.InvalidPathFix(path, "the path is not a regular file",
@@ -279,6 +282,12 @@ func writeProblem(path string, err error) *problem.Problem {
 // that is not a plain refusal by the operating system goes to problem.Internal,
 // which writes the cause to the server log and returns a generic detail.
 func gitProblem(path string, err error) *problem.Problem {
+	// A refusal by the resolution rather than by git: the repository is a
+	// symlink, or it left its root, so git was never run. That is the same
+	// answer every other tool gives for the same path.
+	if errors.Is(err, syscall.ELOOP) || errors.Is(err, syscall.EXDEV) || errors.Is(err, syscall.ENOTDIR) {
+		return openProblem(path, err)
+	}
 	if isPermissionDenied(err) {
 		return sharedReadOnly(path)
 	}

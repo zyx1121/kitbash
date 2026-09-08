@@ -53,9 +53,12 @@ func (s *Service) List(ctx context.Context, path string) (*ListResult, *problem.
 	}
 	// The folder is opened below its root and listed through that descriptor,
 	// so a folder swapped for a symlink after resolve is refused, not followed,
-	// and the entries are the entries of the folder that was checked. The open
-	// is non blocking and nothing is read until the descriptor is known to be a
-	// directory, so a FIFO here is refused, not waited on.
+	// and the names come from the folder that was checked. The names are all
+	// that comes from the descriptor: everything said about an entry below is
+	// a fresh resolution below the root, because the listing and the
+	// description are two moments and the folder can change between them. The
+	// open is non blocking and nothing is read until the descriptor is known to
+	// be a directory, so a FIFO here is refused, not waited on.
 	dir, err := s.read(clean)
 	if err != nil {
 		return nil, openProblem(clean, err)
@@ -92,7 +95,7 @@ func (s *Service) List(ctx context.Context, path string) (*ListResult, *problem.
 			}
 			continue
 		}
-		if entry, ok := s.fileEntry(child, e); ok {
+		if entry, ok := s.fileEntry(child); ok {
 			result.Files = append(result.Files, entry)
 		}
 	}
@@ -145,14 +148,21 @@ func (s *Service) folderEntry(dir string) (FolderEntry, bool) {
 }
 
 // fileEntry describes one file.
-func (s *Service) fileEntry(path string, e os.DirEntry) (FileEntry, bool) {
-	info, err := e.Info()
+//
+// The size and the time come from a stat that resolves below the root, not
+// from the directory entry: os.DirEntry.Info lstats the path again, so a
+// folder swapped for a symlink between the listing and the description would
+// put the size and the modification time of a file outside the root on the
+// surface. It is metadata rather than content, and it still is not the
+// caller's to read.
+func (s *Service) fileEntry(path string) (FileEntry, bool) {
+	info, err := s.stat(path)
 	if err != nil || !info.Mode().IsRegular() {
 		return FileEntry{}, false
 	}
 	return FileEntry{
 		Path:      path,
-		Name:      e.Name(),
+		Name:      filepath.Base(path),
 		Size:      info.Size(),
 		MediaType: MediaType(path, s.sniff(path)),
 		Modified:  info.ModTime().UTC().Format(time.RFC3339),

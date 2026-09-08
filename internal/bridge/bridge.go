@@ -169,7 +169,7 @@ func (b *Bridge) Add(ctx context.Context, p *proc.Process) *problem.Problem {
 		return problem.InvalidManifest(folder, fmt.Sprintf(
 			"the Package name %q is a built in tool family, so its tools cannot join the surface", m.Name))
 	}
-	tools, err := m.ResolveSchemas(folder)
+	tools, err := b.schemas(m, folder)
 	if err != nil {
 		return problem.InvalidManifest(folder, err.Error())
 	}
@@ -306,6 +306,21 @@ func (b *Bridge) Tools(id string) []string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return append([]string(nil), b.published[id]...)
+}
+
+// schemas reads the manifest's tool schemas from the Package folder. The
+// folder is named below the root it belongs to rather than treated as a root
+// of its own, so every component from the root down is resolved in one
+// openat2: a folder above the Package swapped for a symlink mid session cannot
+// feed a schema from somewhere else into the surface.
+func (b *Bridge) schemas(m *manifest.Manifest, folder string) ([]manifest.Tool, error) {
+	root, rel, ok := b.files.RootOf(folder)
+	if !ok {
+		// fs resolved this folder a moment ago, so this is a folder that left
+		// the roots underneath us. Refuse rather than reach for it.
+		return nil, fmt.Errorf("%s is outside the roots", folder)
+	}
+	return m.ResolveSchemasBelow(root, rel)
 }
 
 // addTool registers one proxied tool. The manifest's input schema becomes the
@@ -477,7 +492,7 @@ func (b *Bridge) Kits(ctx context.Context) ([]Kit, *problem.Problem) {
 		if !m.HasKit(ImportHook) {
 			continue
 		}
-		tools, err := m.ResolveSchemas(folder)
+		tools, err := b.schemas(m, folder)
 		if err != nil {
 			b.logger.Printf("bridge: skipping kit at %s: %v", p.Package, err)
 			continue

@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/zyx1121/kitbash/internal/fs"
@@ -283,11 +284,11 @@ func (s *Service) Inspect(ctx context.Context, path string) (*InspectResult, *pr
 func (s *Service) source(folder string, unit manifest.Unit) (contextDir, containerfile string, cleanup func(), prob *problem.Problem) {
 	switch {
 	case unit.Build != "":
-		contextDir, prob := buildContext(folder, unit.Build)
+		contextDir, prob := s.buildContext(folder, unit.Build)
 		if prob != nil {
 			return "", "", nil, prob
 		}
-		containerfile, prob := findContainerfile(folder, unit.Build, contextDir)
+		containerfile, prob := s.findContainerfile(folder, unit.Build, contextDir)
 		if prob != nil {
 			return "", "", nil, prob
 		}
@@ -318,15 +319,20 @@ func (s *Service) source(folder string, unit manifest.Unit) (contextDir, contain
 // Package cannot reach outside its own tree at build time, which is rule 4 of
 // PLAN.md section 2.5, and a symlink is a way out of the tree that looks like
 // a way in: safepath applies the lexical rules and names what is wrong,
-// safeopen asks the kernel, which refuses a link at any component of the
-// context as part of the syscall that reads it.
-func buildContext(folder, build string) (string, *problem.Problem) {
+// safeopen asks the kernel, which refuses a link at any component as part of
+// the syscall that reads it.
+//
+// The stat is made below the root the Package belongs to, not below the
+// Package folder, because a root is the only thing RESOLVE_BENEATH can be
+// anchored to: anchoring it to the Package folder would leave the path to that
+// folder unguarded.
+func (s *Service) buildContext(folder, build string) (string, *problem.Problem) {
 	dir, err := safepath.Inside(folder, build)
 	if err != nil {
 		return "", problem.InvalidManifest(folder,
 			fmt.Sprintf("the build context %q is outside the Package folder: %s", build, err))
 	}
-	info, err := safeopen.Stat(folder, build)
+	info, err := s.statBelowRoot(folder, build)
 	if err != nil || !info.IsDir() {
 		return "", problem.NotFoundFix(dir,
 			fmt.Sprintf("the build context %q is not a folder", build),
@@ -337,16 +343,14 @@ func buildContext(folder, build string) (string, *problem.Problem) {
 
 // findContainerfile picks the file the build reads. Containerfile wins, which
 // is the OCI spelling; Dockerfile is accepted because that is what an agent
-// writes by habit. The file is looked up below the Package folder, not below
-// the build context, so every component from the Package down is resolved by
-// the one rule.
-func findContainerfile(folder, build, contextDir string) (string, *problem.Problem) {
+// writes by habit.
+func (s *Service) findContainerfile(folder, build, contextDir string) (string, *problem.Problem) {
 	for _, name := range containerfiles {
 		candidate, err := safepath.Inside(contextDir, name)
 		if err != nil {
 			continue
 		}
-		info, err := safeopen.Stat(folder, filepath.Join(build, name))
+		info, err := s.statBelowRoot(folder, filepath.Join(build, name))
 		if err != nil || !info.Mode().IsRegular() {
 			continue
 		}
@@ -355,6 +359,17 @@ func findContainerfile(folder, build, contextDir string) (string, *problem.Probl
 	return "", problem.NotFoundFix(contextDir,
 		"the build context has no Containerfile and no Dockerfile",
 		"Write a Containerfile into the build context with fs_write, then build again.")
+}
+
+// statBelowRoot describes a path inside a Package folder, resolved from the
+// root that folder belongs to. It is the one way this package touches the
+// filesystem, so nothing here anchors a resolution to a path a caller chose.
+func (s *Service) statBelowRoot(folder, rel string) (os.FileInfo, error) {
+	root, folderRel, ok := s.files.RootOf(folder)
+	if !ok {
+		return nil, &os.PathError{Op: "stat", Path: folder, Err: syscall.EXDEV}
+	}
+	return safeopen.Stat(root, filepath.Join(folderRel, rel))
 }
 
 // buildFailure is what the caller reads when a build fails: the same tail the

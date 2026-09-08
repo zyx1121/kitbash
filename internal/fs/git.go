@@ -8,7 +8,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/zyx1121/kitbash/internal/problem"
 )
@@ -100,6 +102,43 @@ func (s *Service) isRepo(dir string) bool {
 	return err == nil && (info.IsDir() || info.Mode().IsRegular())
 }
 
+// repoDir is the working directory one git invocation is given, and the
+// function that releases it.
+//
+// It is /proc/self/fd/<n> for a descriptor opened below the root, so the child
+// starts in the directory kitbash resolved rather than in whatever the name
+// points at when git runs. The descriptor is close on exec, so it is gone by
+// the time git runs; the chdir happens first, in the child, before the exec.
+//
+// This narrows the window, it does not close it. git asks the kernel for its
+// working directory as a path and works by that path from then on, so a folder
+// renamed underneath a running git can still send git's own resolution
+// somewhere else. What that is worth is bounded by the fact that git runs as
+// the caller: it can reach what the caller could reach anyway, see the header
+// of spec/mcp-surface.yaml. kitbash's own reads and writes do not share that
+// window, because they never hand a path back to be resolved a second time.
+//
+// A repository that cannot be opened below its root is an error, never a
+// fallback to the name: the open fails exactly when the folder has become a
+// symlink, and that is the moment handing git the name would point it straight
+// at the link's target.
+//
+// Without a /proc to name the descriptor through, the plain path is used. The
+// readlink is the probe: it answers only where /proc is mounted, and it costs
+// one syscall against a git process.
+func (s *Service) repoDir(repo string) (string, func(), error) {
+	f, err := s.open(repo, os.O_RDONLY|syscall.O_DIRECTORY, 0)
+	if err != nil {
+		return "", func() {}, err
+	}
+	name := "/proc/self/fd/" + strconv.Itoa(int(f.Fd()))
+	if _, err := os.Readlink(name); err != nil {
+		f.Close()
+		return repo, func() {}, nil
+	}
+	return name, func() { f.Close() }, nil
+}
+
 // git runs one git command inside repo and returns its standard output.
 //
 // Its error carries git's standard error for the server log only. Never put
@@ -115,7 +154,19 @@ func (s *Service) git(ctx context.Context, repo string, args ...string) (string,
 		"-c", "advice.detachedHead=false",
 	}, args...)
 	cmd := exec.CommandContext(ctx, "git", full...)
-	cmd.Dir = repo
+	// git resolves paths itself, so the one thing kitbash controls is which
+	// directory it starts in. Naming that directory by path would hand git a
+	// name to resolve, and a top level folder swapped for a symlink mid call
+	// would send git init outside the root. The descriptor names the folder
+	// this call already resolved below its root, and the child changes into it
+	// before exec, so git works on the directory that was checked whatever
+	// happens to the name afterwards.
+	dir, release, err := s.repoDir(repo)
+	if err != nil {
+		return "", err
+	}
+	defer release()
+	cmd.Dir = dir
 	cmd.Env = append(os.Environ(),
 		"GIT_AUTHOR_NAME="+s.user,
 		"GIT_AUTHOR_EMAIL="+s.user+"@kitbash",

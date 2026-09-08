@@ -15,6 +15,19 @@ import (
 // the moment of the syscall, which is the part a check cannot promise on its
 // own, see safeopen.
 
+// RootOf splits a resolved path into the root it belongs to and its path below
+// that root. It is what a caller outside this package needs to open something
+// below a Package folder with the same guarantee the fs family gets: the root
+// has to be a root the host configured, because RESOLVE_BENEATH says nothing
+// about the path to the root it starts at.
+func (s *Service) RootOf(clean string) (root, rel string, ok bool) {
+	root, rel, err := s.relative(clean)
+	if err != nil {
+		return "", "", false
+	}
+	return root, rel, true
+}
+
 // relative splits a resolved path into the root it belongs to and its path
 // below that root. A path that belongs to no root never reaches the
 // filesystem: resolve refuses it first, and this is the belt under that.

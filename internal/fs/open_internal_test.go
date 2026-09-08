@@ -151,6 +151,54 @@ func TestWriteFileRefusesALinkSwappedInAtAnIntermediateComponent(t *testing.T) {
 	}
 }
 
+// git resolves its own paths, so the working directory it is handed is a
+// descriptor rather than a name. This asserts the descriptor is really what it
+// gets on a host with /proc, and that the descriptor names the folder that was
+// resolved.
+func TestRepoDirNamesADescriptor(t *testing.T) {
+	service, folder, _ := planted(t)
+	dir, release, err := service.repoDir(folder)
+	if err != nil {
+		t.Fatalf("repoDir: %v", err)
+	}
+	defer release()
+	if !strings.HasPrefix(dir, "/proc/self/fd/") {
+		t.Fatalf("the working directory is %q, want a descriptor", dir)
+	}
+	target, err := os.Readlink(dir)
+	if err != nil {
+		t.Fatalf("readlink: %v", err)
+	}
+	if target != folder {
+		t.Errorf("the descriptor holds %q, want %q", target, folder)
+	}
+}
+
+// A repository that has become a symlink gets no working directory at all.
+// Falling back to the name here is what let git init create a .git outside the
+// root, because the name is what the link redirects.
+func TestRepoDirRefusesASymlinkedRepo(t *testing.T) {
+	service, folder, _ := planted(t)
+	outside := t.TempDir()
+	if err := os.RemoveAll(folder); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if err := os.Symlink(outside, folder); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	dir, release, err := service.repoDir(folder)
+	release()
+	if err == nil {
+		t.Fatalf("a symlinked repository was given %q as a working directory", dir)
+	}
+	if !errors.Is(err, syscall.ELOOP) {
+		t.Errorf("repoDir failed with %v, want ELOOP", err)
+	}
+	if got := gitProblem(folder, err).Slug(); got != problem.SlugInvalidPath {
+		t.Errorf("the failure is %s, want %s", got, problem.SlugInvalidPath)
+	}
+}
+
 // A missing file is still a plain not found, so the openat2 mapping does not
 // turn every failed open into an invalid path.
 func TestOpenProblemKeepsOtherFailuresIntact(t *testing.T) {

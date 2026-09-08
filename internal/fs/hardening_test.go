@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/zyx1121/kitbash/internal/fs"
+	"github.com/zyx1121/kitbash/internal/manifest"
 	"github.com/zyx1121/kitbash/internal/problem"
 )
 
@@ -230,29 +231,28 @@ func TestFifoIsRefusedWithoutBlocking(t *testing.T) {
 	}
 }
 
-// The window issue #22 named: a folder is a folder while the path is resolved
-// and a symlink by the time the file is opened. The swap is driven in a
-// goroutine while reads run, so the race is real rather than staged. Every
-// answer is acceptable except one: the content behind the link.
-func TestAFolderSwappedForALinkWhileReadsRunNeverLeaks(t *testing.T) {
-	service, root, folder := hardened(t)
-	ctx := context.Background()
-
-	// The same shape outside the root, holding the secret under the name the
-	// caller reads. Following the link at any moment returns it.
-	outside := t.TempDir()
-	planted := filepath.Join(outside, "docs")
+// plantOutside builds the folder a swapped link points at: the same shape as
+// the one on the surface, holding the secret under the same names, so
+// following the link at any moment is visible in the answer.
+func plantOutside(t *testing.T) string {
+	t.Helper()
+	planted := filepath.Join(t.TempDir(), "docs")
 	if err := os.MkdirAll(planted, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
 	writeFile(t, filepath.Join(planted, "kitbash.yaml"),
 		"name: docs\ndescription: A folder outside every root.\n")
 	writeFile(t, filepath.Join(planted, "note.md"), secret+"\n")
+	writeFile(t, filepath.Join(planted, "outside.md"), secret+"\n")
+	return planted
+}
 
-	note := filepath.Join(folder, "note.md")
-	real := filepath.Join(root, "docs.real")
-
-	stop := make(chan struct{})
+// swapFolder flips folder between the real directory and a symlink to planted
+// until stop is closed. It is the window issue #22 named, driven rather than
+// staged: the tools below run against a path whose middle changes underneath
+// them.
+func swapFolder(t *testing.T, folder, real, planted string, stop <-chan struct{}) <-chan struct{} {
+	t.Helper()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -262,9 +262,6 @@ func TestAFolderSwappedForALinkWhileReadsRunNeverLeaks(t *testing.T) {
 				return
 			default:
 			}
-			// docs becomes a link to the folder outside the root, then a
-			// folder again. A read landing in either state, or between them,
-			// must not see the secret.
 			if err := os.Rename(folder, real); err != nil {
 				continue
 			}
@@ -276,12 +273,35 @@ func TestAFolderSwappedForALinkWhileReadsRunNeverLeaks(t *testing.T) {
 			os.Rename(real, folder)
 		}
 	}()
+	return done
+}
 
-	for i := 0; i < 2000; i++ {
+// A folder swapped for a link while reads run: every answer is acceptable
+// except one, the content behind the link. The counts are asserted as well,
+// because a race test where every call fails proves nothing.
+func TestAFolderSwappedForALinkWhileReadsRunNeverLeaks(t *testing.T) {
+	service, root, folder := hardened(t)
+	ctx := context.Background()
+	planted := plantOutside(t)
+	note := filepath.Join(folder, "note.md")
+
+	// Standing still, the read works. The counts under the swap are a race and
+	// cannot be asserted; that the call answers at all is asserted here, so a
+	// run where everything is refused cannot pass for a run that proved
+	// something.
+	if _, prob := service.Read(ctx, note, fs.ReadOptions{}); prob != nil {
+		t.Fatalf("fs_read before the swap: %s", prob.Detail)
+	}
+
+	stop := make(chan struct{})
+	done := swapFolder(t, folder, filepath.Join(root, "docs.real"), planted, stop)
+	refused := 0
+	for i := 0; i < 4000; i++ {
 		res, prob := service.Read(ctx, note, fs.ReadOptions{})
 		if prob != nil {
 			// Not found, not visible and invalid path are all honest answers
 			// while the folder is being swapped underneath the call.
+			refused++
 			continue
 		}
 		if strings.Contains(res.Text, secret) {
@@ -292,6 +312,172 @@ func TestAFolderSwappedForALinkWhileReadsRunNeverLeaks(t *testing.T) {
 	}
 	close(stop)
 	<-done
+	if refused == 0 {
+		t.Error("the read race never reached the window: nothing was ever refused")
+	}
+}
+
+// The same swap under fs_list. A listing describes what it found, and the
+// description is where the leak was: the directory entry's own Info lstats the
+// path a second time, so the size and the modification time of a file outside
+// the root reached the surface while the content never did.
+func TestAFolderSwappedForALinkWhileListsRunNeverLeaks(t *testing.T) {
+	service, root, folder := hardened(t)
+	ctx := context.Background()
+	planted := plantOutside(t)
+	inside, err := os.Stat(filepath.Join(folder, "note.md"))
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+
+	if _, prob := service.List(ctx, folder); prob != nil {
+		t.Fatalf("fs_list before the swap: %s", prob.Detail)
+	}
+
+	stop := make(chan struct{})
+	done := swapFolder(t, folder, filepath.Join(root, "docs.real"), planted, stop)
+	refused := 0
+	fail := func(format string, args ...any) {
+		close(stop)
+		<-done
+		t.Fatalf(format, args...)
+	}
+	for i := 0; i < 4000; i++ {
+		res, prob := service.List(ctx, folder)
+		if prob != nil {
+			refused++
+			continue
+		}
+		for _, f := range res.Files {
+			if f.Name == "outside.md" {
+				fail("fs_list listed a file from outside the root: %+v", f)
+			}
+			if f.Name == "note.md" && f.Size != inside.Size() {
+				fail("fs_list described a file outside the root: %+v, the file inside is %d bytes",
+					f, inside.Size())
+			}
+		}
+		if res.Manifest != nil {
+			if d, _ := res.Manifest["description"].(string); strings.Contains(d, "outside every root") {
+				fail("fs_list returned the manifest from outside the root: %v", res.Manifest)
+			}
+		}
+	}
+	close(stop)
+	<-done
+	if refused == 0 {
+		t.Error("the list race never reached the window: nothing was ever refused")
+	}
+}
+
+// A whole fs_write while a folder inside the repository is swapped for a link
+// out of the root: no byte may land outside, whichever moment the write
+// arrives in.
+func TestAFolderSwappedForALinkWhileWritesRunLandsNothingOutside(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "proj")
+	sub := filepath.Join(repo, "sub")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	writeFile(t, filepath.Join(repo, "kitbash.yaml"), "name: proj\ndescription: A folder on the surface.\n")
+	writeFile(t, filepath.Join(sub, "kitbash.yaml"), "name: sub\ndescription: A folder inside it.\n")
+	writeFile(t, filepath.Join(sub, "note.md"), "a note\n")
+	service, err := fs.New("tester", []string{root})
+	if err != nil {
+		t.Fatalf("fs.New: %v", err)
+	}
+	ctx := context.Background()
+
+	planted := filepath.Join(t.TempDir(), "sub")
+	if err := os.MkdirAll(planted, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	writeFile(t, filepath.Join(planted, "kitbash.yaml"), "name: sub\ndescription: A folder outside every root.\n")
+
+	first := "a first write\n"
+	if _, prob := service.Write(ctx, fs.WriteRequest{
+		Path: filepath.Join(sub, "note.md"), Content: &first, Message: "write"}); prob != nil {
+		t.Fatalf("fs_write before the swap: %s", prob.Detail)
+	}
+
+	stop := make(chan struct{})
+	done := swapFolder(t, sub, filepath.Join(repo, "sub.real"), planted, stop)
+	refused := 0
+	for i := 0; i < 400; i++ {
+		content := "planted\n"
+		_, prob := service.Write(ctx, fs.WriteRequest{
+			Path: filepath.Join(sub, "note.md"), Content: &content, Message: "write"})
+		if prob != nil {
+			refused++
+		}
+	}
+	close(stop)
+	<-done
+	assertOnlyTheManifest(t, planted)
+	if refused == 0 {
+		t.Error("the write race never reached the window: nothing was ever refused")
+	}
+}
+
+// The same swap where the folder being replaced is the git repository itself.
+// This is the boundary of what the surface promises, so it is asserted rather
+// than assumed: kitbash's own write never lands outside the root, and git,
+// which asks the kernel for its working directory as a path and works by that
+// path afterwards, may still put a repository of its own out there. That is
+// the qualification in the header of spec/mcp-surface.yaml, and it is bounded
+// by git running as the caller.
+func TestARepositorySwappedForALinkWhileWritesRunLandsNoContentOutside(t *testing.T) {
+	service, root, folder := hardened(t)
+	ctx := context.Background()
+	planted := filepath.Join(t.TempDir(), "docs")
+	if err := os.MkdirAll(planted, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	writeFile(t, filepath.Join(planted, "kitbash.yaml"), "name: docs\ndescription: A folder outside every root.\n")
+
+	stop := make(chan struct{})
+	done := swapFolder(t, folder, filepath.Join(root, "docs.real"), planted, stop)
+	for i := 0; i < 400; i++ {
+		content := "planted\n"
+		service.Write(ctx, fs.WriteRequest{
+			Path: filepath.Join(folder, "note.md"), Content: &content, Message: "write"})
+	}
+	close(stop)
+	<-done
+
+	entries, err := os.ReadDir(planted)
+	if err != nil {
+		t.Fatalf("read the planted folder: %v", err)
+	}
+	for _, e := range entries {
+		switch e.Name() {
+		case manifest.FileName:
+		case ".git":
+			// git's own path resolution, which the header of the spec says
+			// kitbash does not stand behind. It must be git and nothing else.
+			t.Logf("git initialised a repository outside the root, as documented: %s",
+				filepath.Join(planted, e.Name()))
+		default:
+			t.Errorf("a write left %q outside the root", filepath.Join(planted, e.Name()))
+		}
+	}
+}
+
+// assertOnlyTheManifest reports anything that appeared in the planted folder,
+// which is anything a write let out of the root: a file, or a .git a
+// repository was initialised into.
+func assertOnlyTheManifest(t *testing.T, planted string) {
+	t.Helper()
+	entries, err := os.ReadDir(planted)
+	if err != nil {
+		t.Fatalf("read the planted folder: %v", err)
+	}
+	for _, e := range entries {
+		if e.Name() != manifest.FileName {
+			t.Errorf("a write left %q outside the root", filepath.Join(planted, e.Name()))
+		}
+	}
 }
 
 // A folder whose kitbash.yaml is a symlink is not visible. Following it would

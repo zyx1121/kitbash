@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
@@ -22,15 +23,26 @@ const MaxSchemaBytes = 64 << 10
 // {"$ref": "schemas/x.json"} replaced by the contents of that file. The file
 // must live inside dir, which is the Package folder: a Package cannot reach
 // outside its own tree, the same rule build contexts follow.
+//
+// dir is its own root here, so a symlink above it is followed: that part of
+// the path is whatever the caller resolved. ResolveSchemasBelow is the form
+// that closes it, and it is what the bridge uses.
 func (m *Manifest) ResolveSchemas(dir string) ([]Tool, error) {
+	return m.ResolveSchemasBelow(dir, ".")
+}
+
+// ResolveSchemasBelow is ResolveSchemas for a Package folder named below a
+// root: every component from the root down, the reference included, is
+// resolved in one openat2, so no part of the path may be a symlink.
+func (m *Manifest) ResolveSchemasBelow(root, dir string) ([]Tool, error) {
 	tools := m.Tools()
 	out := make([]Tool, 0, len(tools))
 	for _, tool := range tools {
-		input, err := resolveSchema(dir, tool.Name, "input", tool.Input)
+		input, err := resolveSchema(root, dir, tool.Name, "input", tool.Input)
 		if err != nil {
 			return nil, err
 		}
-		output, err := resolveSchema(dir, tool.Name, "output", tool.Output)
+		output, err := resolveSchema(root, dir, tool.Name, "output", tool.Output)
 		if err != nil {
 			return nil, err
 		}
@@ -43,13 +55,13 @@ func (m *Manifest) ResolveSchemas(dir string) ([]Tool, error) {
 
 // resolveSchema inlines one schema reference, or returns the inline schema
 // unchanged.
-func resolveSchema(dir, tool, field string, schema map[string]any) (map[string]any, error) {
+func resolveSchema(root, dir, tool, field string, schema map[string]any) (map[string]any, error) {
 	ref, ok := schema["$ref"].(string)
 	if !ok {
 		return schema, nil
 	}
 	where := fmt.Sprintf("tool %s %s schema", tool, field)
-	f, err := openSchema(dir, ref)
+	f, err := openSchema(root, dir, ref)
 	if err != nil {
 		return nil, &ErrInvalid{Messages: []string{where + ": " + err.Error()}}
 	}
@@ -79,14 +91,14 @@ func resolveSchema(dir, tool, field string, schema map[string]any) (map[string]a
 // itself so no component of the reference may be a symlink at the moment of
 // the open. The file has to be a regular file opened without blocking: a named
 // pipe called schemas/x.json would otherwise hold a session open forever.
-func openSchema(dir, ref string) (*os.File, error) {
+func openSchema(root, dir, ref string) (*os.File, error) {
 	if ref == "." {
 		return nil, fmt.Errorf("%q is not a schema file", ref)
 	}
 	if _, err := safepath.Inside(dir, ref); err != nil {
 		return nil, err
 	}
-	f, err := safeopen.Open(dir, ref, os.O_RDONLY, 0)
+	f, err := safeopen.Open(root, filepath.Join(dir, ref), os.O_RDONLY, 0)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, fmt.Errorf("%q does not exist", ref)
