@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"math"
 
-	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
+	commonpb "github.com/zyx1121/kitbash/internal/otlpproto/common/v1"
 
 	"github.com/zyx1121/kitbash/internal/store"
 )

@@ -7,14 +7,14 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 
-	collogs "go.opentelemetry.io/proto/otlp/collector/logs/v1"
-	colmetrics "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
-	coltrace "go.opentelemetry.io/proto/otlp/collector/trace/v1"
-	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
-	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
-	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
-	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
-	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
+	collogs "github.com/zyx1121/kitbash/internal/otlpproto/collector/logs/v1"
+	colmetrics "github.com/zyx1121/kitbash/internal/otlpproto/collector/metrics/v1"
+	coltrace "github.com/zyx1121/kitbash/internal/otlpproto/collector/trace/v1"
+	commonpb "github.com/zyx1121/kitbash/internal/otlpproto/common/v1"
+	logspb "github.com/zyx1121/kitbash/internal/otlpproto/logs/v1"
+	metricspb "github.com/zyx1121/kitbash/internal/otlpproto/metrics/v1"
+	resourcepb "github.com/zyx1121/kitbash/internal/otlpproto/resource/v1"
+	tracepb "github.com/zyx1121/kitbash/internal/otlpproto/trace/v1"
 
 	"github.com/zyx1121/kitbash/internal/store"
 )

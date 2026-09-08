@@ -22,10 +22,10 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
-	collogspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
-	coltracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
-	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
-	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
+	collogspb "github.com/zyx1121/kitbash/internal/otlpproto/collector/logs/v1"
+	coltracepb "github.com/zyx1121/kitbash/internal/otlpproto/collector/trace/v1"
+	commonpb "github.com/zyx1121/kitbash/internal/otlpproto/common/v1"
+	tracepb "github.com/zyx1121/kitbash/internal/otlpproto/trace/v1"
 )
 
 // maxBodyBytes is the request limit of spec/kitbashd-api.yaml.
@@ -98,10 +98,15 @@ type Daemon struct {
 	spans        []Span
 	logs         []LogRecord
 	contentTypes []string
-	calls        []Call
-	query        Response
-	retention    Response
-	pause        time.Duration
+
+	// The export requests as they decoded off the wire, for a test that
+	// asserts on a field the flattened Span and LogRecord do not carry.
+	traceRequests []*coltracepb.ExportTraceServiceRequest
+	logRequests   []*collogspb.ExportLogsServiceRequest
+	calls         []Call
+	query         Response
+	retention     Response
+	pause         time.Duration
 
 	// The Process registry: what was registered, in arrival order, what was
 	// unregistered, and the answer that replaces the registry's own.
@@ -265,6 +270,24 @@ func (d *Daemon) Logs() []LogRecord {
 	return append([]LogRecord(nil), d.logs...)
 }
 
+// TraceRequests are the trace export requests received so far, exactly as
+// they decoded off the wire. Spans is the flattened view a test usually wants;
+// this is for the fields it does not carry, such as a span's kind, its events
+// and its links.
+func (d *Daemon) TraceRequests() []*coltracepb.ExportTraceServiceRequest {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]*coltracepb.ExportTraceServiceRequest(nil), d.traceRequests...)
+}
+
+// LogRequests are the log export requests received so far, decoded the same
+// way.
+func (d *Daemon) LogRequests() []*collogspb.ExportLogsServiceRequest {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]*collogspb.ExportLogsServiceRequest(nil), d.logRequests...)
+}
+
 // ContentTypes are the content types the OTLP requests carried.
 func (d *Daemon) ContentTypes() []string {
 	d.mu.Lock()
@@ -285,6 +308,7 @@ func (d *Daemon) traces(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	d.mu.Lock()
+	d.traceRequests = append(d.traceRequests, &req)
 	for _, resource := range req.GetResourceSpans() {
 		res := attributes(resource.GetResource().GetAttributes())
 		for _, scope := range resource.GetScopeSpans() {
@@ -312,6 +336,7 @@ func (d *Daemon) logRecords(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	d.mu.Lock()
+	d.logRequests = append(d.logRequests, &req)
 	for _, resource := range req.GetResourceLogs() {
 		for _, scope := range resource.GetScopeLogs() {
 			for _, record := range scope.GetLogRecords() {

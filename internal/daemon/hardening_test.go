@@ -17,8 +17,8 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
-	colmetrics "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
-	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
+	colmetrics "github.com/zyx1121/kitbash/internal/otlpproto/collector/metrics/v1"
+	metricspb "github.com/zyx1121/kitbash/internal/otlpproto/metrics/v1"
 
 	"github.com/zyx1121/kitbash/internal/otlp"
 	"github.com/zyx1121/kitbash/internal/problem"

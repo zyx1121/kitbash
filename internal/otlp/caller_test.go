@@ -5,9 +5,9 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
-	coltrace "go.opentelemetry.io/proto/otlp/collector/trace/v1"
-	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
-	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
+	coltrace "github.com/zyx1121/kitbash/internal/otlpproto/collector/trace/v1"
+	commonpb "github.com/zyx1121/kitbash/internal/otlpproto/common/v1"
+	tracepb "github.com/zyx1121/kitbash/internal/otlpproto/trace/v1"
 )
 
 // TestDecodeLiftsTheCaller is the attribute a session kitbashd opened for a
