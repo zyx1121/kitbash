@@ -91,11 +91,12 @@ func isPermissionDenied(err error) bool {
 		strings.Contains(msg, "operation not permitted")
 }
 
-// isRepo reports whether dir is the top of a git repository. Lstat, not Stat:
-// a .git that is a symlink is not a repository as far as kitbash is concerned,
+// isRepo reports whether dir is the top of a git repository. The stat resolves
+// below the root and follows nothing: a .git that is a symlink, or that is
+// reached through one, is not a repository as far as kitbash is concerned,
 // because kitbash follows no symlinks.
-func isRepo(dir string) bool {
-	info, err := os.Lstat(filepath.Join(dir, ".git"))
+func (s *Service) isRepo(dir string) bool {
+	info, err := s.stat(filepath.Join(dir, ".git"))
 	return err == nil && (info.IsDir() || info.Mode().IsRegular())
 }
 
@@ -137,7 +138,7 @@ func (s *Service) git(ctx context.Context, repo string, args ...string) (string,
 
 // history reads the commits that touched rel inside repo, newest first.
 func (s *Service) history(ctx context.Context, repo, rel string, limit int) ([]Commit, error) {
-	if !isRepo(repo) {
+	if !s.isRepo(repo) {
 		return nil, nil
 	}
 	args := []string{"log", "--format=" + commitFormat, fmt.Sprintf("-n%d", limit)}

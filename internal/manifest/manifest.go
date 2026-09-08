@@ -13,13 +13,13 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"syscall"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
 	"golang.org/x/text/language"
 	"golang.org/x/text/message"
 	"gopkg.in/yaml.v3"
 
+	"github.com/zyx1121/kitbash/internal/safeopen"
 	"github.com/zyx1121/kitbash/spec"
 )
 
@@ -172,15 +172,22 @@ func validationMessages(err error) []string {
 var ErrNotRegular = errors.New("kitbash.yaml is not a regular file")
 
 // Load reads and validates the manifest of one folder, refusing to read more
-// than MaxBytes of it.
+// than MaxBytes of it. The folder is its own root, which is all a caller
+// outside the fs family can say about it.
+func Load(dir string) (*Manifest, error) { return LoadBelow(dir, ".") }
+
+// LoadBelow reads the manifest of the folder rel below root. Everything from
+// root down is resolved by safeopen, so no component of rel, and not the
+// manifest itself, may be a symlink.
 //
-// O_NOFOLLOW keeps a symlinked manifest from lending its name and description
-// to a folder that carries none, which would put that folder on the surface
-// with the contents of a folder the caller never named. O_NONBLOCK keeps a
-// FIFO from hanging the open.
-func Load(dir string) (*Manifest, error) {
-	path := filepath.Join(dir, FileName)
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+// Refusing a symlinked manifest is not a detail: it keeps a manifest from
+// lending its name and description to a folder that carries none, which would
+// put that folder on the surface describing contents the caller never named.
+// Refusing a FIFO keeps a manifest from hanging the open, which every
+// visibility check would then wait on.
+func LoadBelow(root, rel string) (*Manifest, error) {
+	path := filepath.Join(root, rel, FileName)
+	f, err := safeopen.Open(root, filepath.Join(rel, FileName), os.O_RDONLY, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -202,8 +209,12 @@ func Load(dir string) (*Manifest, error) {
 // Visible reports whether a folder is visible: it carries a kitbash.yaml that
 // parses, validates, and has both name and description. The manifest is
 // returned when it is visible.
-func Visible(dir string) (*Manifest, bool) {
-	m, err := Load(dir)
+func Visible(dir string) (*Manifest, bool) { return VisibleBelow(dir, ".") }
+
+// VisibleBelow is Visible for a folder named below a root, which is how the fs
+// family asks: the root is the folder the caller may not resolve out of.
+func VisibleBelow(root, rel string) (*Manifest, bool) {
+	m, err := LoadBelow(root, rel)
 	if err != nil {
 		return nil, false
 	}

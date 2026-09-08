@@ -230,6 +230,70 @@ func TestFifoIsRefusedWithoutBlocking(t *testing.T) {
 	}
 }
 
+// The window issue #22 named: a folder is a folder while the path is resolved
+// and a symlink by the time the file is opened. The swap is driven in a
+// goroutine while reads run, so the race is real rather than staged. Every
+// answer is acceptable except one: the content behind the link.
+func TestAFolderSwappedForALinkWhileReadsRunNeverLeaks(t *testing.T) {
+	service, root, folder := hardened(t)
+	ctx := context.Background()
+
+	// The same shape outside the root, holding the secret under the name the
+	// caller reads. Following the link at any moment returns it.
+	outside := t.TempDir()
+	planted := filepath.Join(outside, "docs")
+	if err := os.MkdirAll(planted, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	writeFile(t, filepath.Join(planted, "kitbash.yaml"),
+		"name: docs\ndescription: A folder outside every root.\n")
+	writeFile(t, filepath.Join(planted, "note.md"), secret+"\n")
+
+	note := filepath.Join(folder, "note.md")
+	real := filepath.Join(root, "docs.real")
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			// docs becomes a link to the folder outside the root, then a
+			// folder again. A read landing in either state, or between them,
+			// must not see the secret.
+			if err := os.Rename(folder, real); err != nil {
+				continue
+			}
+			if err := os.Symlink(planted, folder); err != nil {
+				os.Rename(real, folder)
+				continue
+			}
+			os.Remove(folder)
+			os.Rename(real, folder)
+		}
+	}()
+
+	for i := 0; i < 2000; i++ {
+		res, prob := service.Read(ctx, note, fs.ReadOptions{})
+		if prob != nil {
+			// Not found, not visible and invalid path are all honest answers
+			// while the folder is being swapped underneath the call.
+			continue
+		}
+		if strings.Contains(res.Text, secret) {
+			close(stop)
+			<-done
+			t.Fatalf("fs_read followed the swapped folder and returned %q", res.Text)
+		}
+	}
+	close(stop)
+	<-done
+}
+
 // A folder whose kitbash.yaml is a symlink is not visible. Following it would
 // lend the name and the description of a manifest the caller never named to a
 // folder that carries none, and put that folder's files on the surface.

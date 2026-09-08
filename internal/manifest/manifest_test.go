@@ -110,6 +110,34 @@ func TestLoadRefusesASymlinkedManifest(t *testing.T) {
 	}
 }
 
+// The same refusal one level up: the folder itself is reached through a link.
+// LoadBelow is how the fs family asks, with the root the caller may not
+// resolve out of, so a folder swapped for a link mid call cannot lend a
+// manifest to the surface either.
+func TestLoadBelowRefusesASymlinkedFolder(t *testing.T) {
+	elsewhere := t.TempDir()
+	if err := os.WriteFile(filepath.Join(elsewhere, manifest.FileName),
+		[]byte("name: borrowed\ndescription: A manifest that lives somewhere else.\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	root := t.TempDir()
+	if err := os.Symlink(elsewhere, filepath.Join(root, "docs")); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	if _, err := manifest.LoadBelow(root, "docs"); !errors.Is(err, syscall.ELOOP) {
+		t.Errorf("LoadBelow followed the link, or failed with %v, want ELOOP", err)
+	}
+	if m, ok := manifest.VisibleBelow(root, "docs"); ok {
+		t.Errorf("a folder that is a symlink is visible as %q", m.Name)
+	}
+	// The lexical belt still holds: a path that climbs out of the root is
+	// refused before anything is opened.
+	if _, ok := manifest.VisibleBelow(root, "../elsewhere"); ok {
+		t.Error("a folder outside the root is visible")
+	}
+}
+
 // A manifest that is a FIFO must not hang the visibility check either.
 func TestLoadRefusesAManifestThatIsNotARegularFile(t *testing.T) {
 	dir := t.TempDir()

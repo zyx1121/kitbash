@@ -306,6 +306,144 @@ func TestRemoteErrorBecomesABadRequest(t *testing.T) {
 	}
 }
 
+// errorText is the raw text of an error result, before anything parses it.
+func errorText(t *testing.T, res *mcp.CallToolResult) string {
+	t.Helper()
+	if !res.IsError {
+		t.Fatal("expected an error result")
+	}
+	if len(res.Content) != 1 {
+		t.Fatalf("expected one content block, got %d", len(res.Content))
+	}
+	text, ok := res.Content[0].(*mcp.TextContent)
+	if !ok {
+		t.Fatalf("the error content is %T, want text", res.Content[0])
+	}
+	return text.Text
+}
+
+// A kit that already speaks problem details keeps its own answer: the agent
+// reads the kit's not-found as a not-found, with the kit's own fix, rather
+// than a bad-request carrying JSON as a string, see issue #58.
+func TestAPackageProblemPassesThroughUnchanged(t *testing.T) {
+	own := problem.NotFoundFix("/org/media/absent.mov",
+		"the source file is not in the workflow's inbox",
+		"Import the file with the kit's own import tool first.")
+	sent := own.JSON()
+	h := newHarness(t, func(_ context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return &mcp.CallToolResult{
+			IsError: true,
+			Content: []mcp.Content{&mcp.TextContent{Text: sent}},
+		}, nil
+	})
+	h.run(t)
+	s := h.connect(t)
+
+	res, err := s.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "ffmpeg_transcode",
+		Arguments: map[string]any{"path": "/org/media/absent.mov"},
+	})
+	if err != nil {
+		t.Fatalf("calling the tool: %v", err)
+	}
+	if got := errorText(t, res); got != sent {
+		t.Errorf("the problem came back as\n%s\nwant it unchanged:\n%s", got, sent)
+	}
+	p := problemOf(t, res)
+	if p.Slug() != problem.SlugNotFound {
+		t.Errorf("problem is %s, want the kit's own not-found", p.Slug())
+	}
+	if p.Instance != "/org/media/absent.mov" {
+		t.Errorf("instance is %q, want the kit's own", p.Instance)
+	}
+}
+
+// A problem is passed through, not trusted: it is text a Package wrote, so the
+// detail is clipped, the title is clipped and a fix too long to be advice is
+// dropped. Otherwise a hostile Package answers every call with a megabyte.
+func TestAPassedProblemIsClipped(t *testing.T) {
+	own := &problem.Problem{
+		Type:     problem.Base + problem.SlugTooLarge,
+		Title:    strings.Repeat("t", bridge.MaxPassedTitle+50),
+		Status:   413,
+		Detail:   strings.Repeat("d", bridge.MaxPassedDetail*2),
+		Instance: "/org/media/clip.mov",
+		Fix:      strings.Repeat("f", bridge.MaxPassedFix+1),
+	}
+	h := newHarness(t, func(_ context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return &mcp.CallToolResult{
+			IsError: true,
+			Content: []mcp.Content{&mcp.TextContent{Text: own.JSON()}},
+		}, nil
+	})
+	h.run(t)
+	s := h.connect(t)
+
+	res, err := s.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "ffmpeg_transcode",
+		Arguments: map[string]any{"path": "/org/media/clip.mov"},
+	})
+	if err != nil {
+		t.Fatalf("calling the tool: %v", err)
+	}
+	p := problemOf(t, res)
+	if p.Slug() != problem.SlugTooLarge {
+		t.Errorf("problem is %s, want the kit's own too-large", p.Slug())
+	}
+	if len(p.Detail) != bridge.MaxPassedDetail {
+		t.Errorf("the detail is %d bytes, want it clipped to %d", len(p.Detail), bridge.MaxPassedDetail)
+	}
+	if len([]rune(p.Title)) != bridge.MaxPassedTitle {
+		t.Errorf("the title is %d characters, want it clipped to %d", len([]rune(p.Title)), bridge.MaxPassedTitle)
+	}
+	if p.Fix != "" {
+		t.Errorf("the fix is %d bytes, want a fix too long to be advice dropped", len(p.Fix))
+	}
+}
+
+// The bar for passing through is narrow: JSON that is not a problem of a
+// kitbash class keeps the wrapper, so a Package cannot answer with any
+// document it likes and have it become the surface's error.
+func TestOnlyAKitbashProblemPassesThrough(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		text string
+	}{
+		{"another error vocabulary", `{"type":"https://example.com/errors/nope","title":"Nope","status":400,"detail":"no"}`},
+		{"a document with more in it", `{"type":"` + problem.Base + `not-found","title":"Not found","status":404,"detail":"no","extra":1}`},
+		{"no detail", `{"type":"` + problem.Base + `not-found","title":"Not found","status":404}`},
+		{"a status that is not one", `{"type":"` + problem.Base + `not-found","title":"Not found","status":7,"detail":"no"}`},
+		{"plain JSON", `{"error":"no such file"}`},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			text := c.text
+			h := newHarness(t, func(_ context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+				return &mcp.CallToolResult{
+					IsError: true,
+					Content: []mcp.Content{&mcp.TextContent{Text: text}},
+				}, nil
+			})
+			h.run(t)
+			s := h.connect(t)
+
+			res, err := s.CallTool(context.Background(), &mcp.CallToolParams{
+				Name:      "ffmpeg_transcode",
+				Arguments: map[string]any{"path": "/org/media/clip.mov"},
+			})
+			if err != nil {
+				t.Fatalf("calling the tool: %v", err)
+			}
+			p := problemOf(t, res)
+			if p.Slug() != problem.SlugBadRequest {
+				t.Errorf("problem is %s, want the wrapper", p.Slug())
+			}
+			if !strings.Contains(p.Detail, strings.TrimPrefix(text, "{")[:8]) {
+				t.Errorf("detail is %q, want the Package's own text", p.Detail)
+			}
+		})
+	}
+}
+
 // Not every tool answers with a structure. A text only result has nothing to
 // validate against the manifest, so it goes through as it came.
 func TestTextOnlyResultPassesThrough(t *testing.T) {

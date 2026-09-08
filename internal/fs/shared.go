@@ -3,6 +3,8 @@ package fs
 import (
 	"os"
 	"path/filepath"
+
+	"github.com/zyx1121/kitbash/internal/safeopen"
 )
 
 // The modes of what an admin writes under the shared root. /org is 2775 and
@@ -31,27 +33,37 @@ func (s *Service) sharedPath(clean string) bool {
 // makeDir creates a folder and every missing folder above it. Under the shared
 // root each folder it creates is made setgid and group writable; elsewhere the
 // default mode is the caller's own.
+//
+// The folders are made one component at a time from a descriptor on the root,
+// which is what keeps a folder from being created outside the root through a
+// symlink swapped in while the call runs, see safeopen.
 func (s *Service) makeDir(dir string) error {
-	if !s.sharedPath(dir) {
-		return os.MkdirAll(dir, homeDirMode)
-	}
-	// Only the folders this call creates are given the shared mode. A folder
-	// that was already there belongs to whoever made it, and changing its mode
-	// is not this write's business.
-	var created []string
-	for current := dir; s.sharedPath(current) && current != s.shared; current = filepath.Dir(current) {
-		if _, err := os.Lstat(current); err == nil {
-			break
-		}
-		created = append(created, current)
-	}
-	if err := os.MkdirAll(dir, sharedDirMode); err != nil {
+	root, rel, err := s.relative(dir)
+	if err != nil {
 		return err
 	}
+	mode := homeDirMode
+	if s.sharedPath(dir) {
+		mode = sharedDirMode
+	}
+	created, err := safeopen.MkdirAll(root, rel, mode)
+	if err != nil {
+		return err
+	}
+	if !s.sharedPath(dir) {
+		return nil
+	}
+	// Only the folders this call created are given the shared mode. A folder
+	// that was already there belongs to whoever made it, and changing its mode
+	// is not this write's business.
 	for _, folder := range created {
+		full := filepath.Join(root, folder)
+		if !s.sharedPath(full) || full == s.shared {
+			continue
+		}
 		// mkdir(2) applies the umask and drops the setgid bit, so the mode is
 		// set again here.
-		if err := os.Chmod(folder, sharedDirMode); err != nil {
+		if err := s.chmod(full, sharedDirMode); err != nil {
 			return err
 		}
 	}
@@ -68,12 +80,12 @@ func (s *Service) share(path string) error {
 	if !s.sharedPath(path) {
 		return nil
 	}
-	info, err := os.Lstat(path)
+	info, err := s.stat(path)
 	if err != nil {
 		return err
 	}
 	if info.Mode().Perm()&0o060 == 0o060 {
 		return nil
 	}
-	return os.Chmod(path, sharedFileMode)
+	return s.chmod(path, sharedFileMode)
 }

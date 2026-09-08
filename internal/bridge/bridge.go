@@ -370,6 +370,15 @@ func (b *Bridge) call(ctx context.Context, p *proc.Process, tool manifest.Tool, 
 		return nil, problem.Internal(surface, err.Error(), "")
 	}
 	if res.IsError {
+		// A Package that already answers in problem details is answering in
+		// the surface's own language, so its problem is returned as it stands:
+		// a kit's not-found reaches the agent as a not-found instead of a
+		// bad-request with JSON buried in the detail, see issue #58. Every
+		// other error text is a Package reporting in its own words, and that
+		// is what the wrapper is for.
+		if passed := packageProblem(res); passed != nil {
+			return nil, passed
+		}
 		return nil, problem.BadRequest(surface, remoteText(res),
 			"The Package refused the call; read the detail.")
 	}

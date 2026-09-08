@@ -157,7 +157,7 @@ func (s *Service) WriteFiles(ctx context.Context, req WriteFilesRequest) (*Write
 		if err := s.makeDir(filepath.Dir(p.full)); err != nil {
 			return nil, writeProblem(p.full, err)
 		}
-		if err := writeNoFollow(p.full, p.data); err != nil {
+		if err := s.writeFile(p.full, p.data); err != nil {
 			return nil, writeProblem(p.full, err)
 		}
 		if err := s.share(p.full); err != nil {
@@ -194,11 +194,11 @@ func (s *Service) Exists(_ context.Context, path string) (bool, *problem.Problem
 	if prob != nil {
 		return false, prob
 	}
-	if _, err := os.Lstat(clean); err != nil {
+	if _, err := s.stat(clean); err != nil {
 		if os.IsNotExist(err) {
 			return false, nil
 		}
-		return false, statProblem(clean, err)
+		return false, openProblem(clean, err)
 	}
 	return true, nil
 }

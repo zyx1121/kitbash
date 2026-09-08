@@ -7,10 +7,10 @@ import (
 	"io"
 	"os"
 	"strings"
-	"syscall"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
 
+	"github.com/zyx1121/kitbash/internal/safeopen"
 	"github.com/zyx1121/kitbash/internal/safepath"
 )
 
@@ -74,18 +74,19 @@ func resolveSchema(dir, tool, field string, schema map[string]any) (map[string]a
 }
 
 // openSchema opens one schema file inside the Package folder. The reference
-// obeys the same path rules as every other path the surface takes, and the
-// file has to be a regular file opened without blocking: a named pipe called
-// schemas/x.json would otherwise hold a session open forever.
+// obeys the same path rules as every other path the surface takes: safepath
+// applies the lexical ones and names what is wrong, safeopen resolves the file
+// itself so no component of the reference may be a symlink at the moment of
+// the open. The file has to be a regular file opened without blocking: a named
+// pipe called schemas/x.json would otherwise hold a session open forever.
 func openSchema(dir, ref string) (*os.File, error) {
 	if ref == "." {
 		return nil, fmt.Errorf("%q is not a schema file", ref)
 	}
-	path, err := safepath.Inside(dir, ref)
-	if err != nil {
+	if _, err := safepath.Inside(dir, ref); err != nil {
 		return nil, err
 	}
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
+	f, err := safeopen.Open(dir, ref, os.O_RDONLY, 0)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, fmt.Errorf("%q does not exist", ref)

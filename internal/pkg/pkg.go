@@ -21,6 +21,7 @@ import (
 	"github.com/zyx1121/kitbash/internal/manifest"
 	"github.com/zyx1121/kitbash/internal/podman"
 	"github.com/zyx1121/kitbash/internal/problem"
+	"github.com/zyx1121/kitbash/internal/safeopen"
 	"github.com/zyx1121/kitbash/internal/safepath"
 	"github.com/zyx1121/kitbash/internal/telemetry"
 )
@@ -286,7 +287,7 @@ func (s *Service) source(folder string, unit manifest.Unit) (contextDir, contain
 		if prob != nil {
 			return "", "", nil, prob
 		}
-		containerfile, prob := findContainerfile(contextDir)
+		containerfile, prob := findContainerfile(folder, unit.Build, contextDir)
 		if prob != nil {
 			return "", "", nil, prob
 		}
@@ -316,14 +317,16 @@ func (s *Service) source(folder string, unit manifest.Unit) (contextDir, contain
 // buildContext resolves deploy.units[0].build against the Package folder. A
 // Package cannot reach outside its own tree at build time, which is rule 4 of
 // PLAN.md section 2.5, and a symlink is a way out of the tree that looks like
-// a way in, so safepath walks it rather than comparing strings.
+// a way in: safepath applies the lexical rules and names what is wrong,
+// safeopen asks the kernel, which refuses a link at any component of the
+// context as part of the syscall that reads it.
 func buildContext(folder, build string) (string, *problem.Problem) {
 	dir, err := safepath.Inside(folder, build)
 	if err != nil {
 		return "", problem.InvalidManifest(folder,
 			fmt.Sprintf("the build context %q is outside the Package folder: %s", build, err))
 	}
-	info, err := os.Lstat(dir)
+	info, err := safeopen.Stat(folder, build)
 	if err != nil || !info.IsDir() {
 		return "", problem.NotFoundFix(dir,
 			fmt.Sprintf("the build context %q is not a folder", build),
@@ -334,14 +337,16 @@ func buildContext(folder, build string) (string, *problem.Problem) {
 
 // findContainerfile picks the file the build reads. Containerfile wins, which
 // is the OCI spelling; Dockerfile is accepted because that is what an agent
-// writes by habit.
-func findContainerfile(contextDir string) (string, *problem.Problem) {
+// writes by habit. The file is looked up below the Package folder, not below
+// the build context, so every component from the Package down is resolved by
+// the one rule.
+func findContainerfile(folder, build, contextDir string) (string, *problem.Problem) {
 	for _, name := range containerfiles {
 		candidate, err := safepath.Inside(contextDir, name)
 		if err != nil {
 			continue
 		}
-		info, err := os.Lstat(candidate)
+		info, err := safeopen.Stat(folder, filepath.Join(build, name))
 		if err != nil || !info.Mode().IsRegular() {
 			continue
 		}

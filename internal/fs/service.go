@@ -125,12 +125,13 @@ func (s *Service) Roots() []string { return append([]string(nil), s.roots...) }
 // escapes, because the target of a link is not the file the caller named and
 // checking a target after the fact races the filesystem.
 //
-// The walk below checks every component of the path at the time of the call.
-// Opens then add O_NOFOLLOW, which covers the final component only: a file
-// swapped for a link between this walk and the open is refused. An
-// intermediate directory swapped for a link after the walk is not covered by
-// O_NOFOLLOW, so the guarantee is the state the walk saw, plus a final
-// component that is never followed.
+// The walk below is the first belt: it names the component that is a link, and
+// it applies the rules a kernel knows nothing about, such as a name beginning
+// with a dot. It is not the guarantee. The guarantee is the second belt, the
+// open itself: every open below a root goes through safeopen, which resolves
+// the whole path in one openat2 with RESOLVE_NO_SYMLINKS and RESOLVE_BENEATH,
+// so a directory swapped for a link between this walk and the open is refused
+// by the kernel rather than followed.
 func (s *Service) resolve(p string) (string, *problem.Problem) {
 	if p == "" {
 		return "", problem.InvalidPath(p, "the path is empty")
@@ -248,28 +249,18 @@ func statProblem(path string, err error) *problem.Problem {
 	}
 }
 
-// openNoFollow opens a caller supplied path without following a symlink at the
-// final component. resolve already refused every link its walk could see, but a
-// file swapped for a link after that walk would still be followed by a plain
-// open, so every open of a caller path goes through here.
-//
-// O_NONBLOCK is not optional: open(2) on a FIFO with no writer blocks forever,
-// and a caller can put a FIFO anywhere they can write. With it the open returns
-// at once and the caller can reject the file by its type. Regular files and
-// directories are unaffected by the flag.
-func openNoFollow(path string) (*os.File, error) {
-	return os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
-}
-
-// openProblem maps a failed open of a caller path. O_NOFOLLOW reports ELOOP
-// when the final component turned out to be a symlink, which is the same
-// refusal resolve gives, not an internal failure. ENOTDIR is a path naming a
-// file where a folder must be, which is the caller's mistake as well.
+// openProblem maps a failed open or stat of a caller path. openat2 reports
+// ELOOP for a symlink at any component, which is the same refusal resolve
+// gives, not an internal failure, and EXDEV for a resolution that left the
+// root, which is the caller's mistake as well. ENOTDIR is a path naming a file
+// where a folder must be.
 func openProblem(path string, err error) *problem.Problem {
-	if errors.Is(err, syscall.ELOOP) {
+	switch {
+	case errors.Is(err, syscall.ELOOP):
 		return symlinkRefused(path, path)
-	}
-	if errors.Is(err, syscall.ENOTDIR) {
+	case errors.Is(err, syscall.EXDEV):
+		return problem.InvalidPath(path, "the path leaves the root it started in")
+	case errors.Is(err, syscall.ENOTDIR):
 		return problem.InvalidPath(path, "a component of the path is a file, not a folder")
 	}
 	return statProblem(path, err)
@@ -291,7 +282,7 @@ func (s *Service) folderManifest(dir string) (*manifest.Manifest, *problem.Probl
 	if s.isRoot(dir) {
 		return nil, nil
 	}
-	m, ok := manifest.Visible(dir)
+	m, ok := s.visible(dir)
 	if !ok {
 		return nil, notVisible(dir, "")
 	}
@@ -308,7 +299,7 @@ func (s *Service) ancestorsVisible(dir string) *problem.Problem {
 		return problem.InvalidPath(dir, "the path is outside its root")
 	}
 	for current := filepath.Dir(dir); within(current, root) && current != root; current = filepath.Dir(current) {
-		if _, ok := manifest.Visible(current); !ok {
+		if _, ok := s.visible(current); !ok {
 			return notVisible(current, "")
 		}
 	}
