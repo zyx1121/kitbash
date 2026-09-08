@@ -65,6 +65,8 @@ type Registration struct {
 	ID            string   `json:"id"`
 	Package       string   `json:"package"`
 	Name          string   `json:"name"`
+	Container     string   `json:"container,omitempty"`
+	Digest        string   `json:"digest,omitempty"`
 	Expose        string   `json:"expose,omitempty"`
 	Endpoint      string   `json:"endpoint,omitempty"`
 	Subscriptions []string `json:"subscriptions,omitempty"`
@@ -109,6 +111,19 @@ type Daemon struct {
 	unregistered  []string
 	processes     Response
 	tokens        int
+
+	// The users family: who the caller is, since one fake serves one session,
+	// and the member list users_list answers with.
+	identity Identity
+	members  []Member
+	users    Response
+
+	// The approval queue and its state machine, mirroring the approvals
+	// family of spec/kitbashd-api.yaml.
+	approvals       map[string]Approval
+	approvalOrder   []string
+	approvalIDs     int
+	approvalsAnswer Response
 }
 
 // Start listens on a unix socket in a temporary directory of its own. The
@@ -144,6 +159,10 @@ func StartAt(socket string) (*Daemon, error) {
 			Body: `{"traces":"30d","logs":"14d","metrics":"30d"}`},
 		registrations: map[string]Registration{},
 		minted:        map[string]string{},
+		approvals:     map[string]Approval{},
+		// The caller is a member until a test says otherwise, which is the
+		// side every rule in PLAN.md section 2.1 is written from.
+		identity: Identity{User: "tester", UID: 1001, Groups: []string{"kitbash-users"}},
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/traces", d.traces)
@@ -153,6 +172,16 @@ func StartAt(socket string) (*Daemon, error) {
 	mux.HandleFunc("POST /kitbash/v1/processes", d.register)
 	mux.HandleFunc("GET /kitbash/v1/processes", d.listProcesses)
 	mux.HandleFunc("DELETE /kitbash/v1/processes/{id}", d.unregister)
+	mux.HandleFunc("GET /kitbash/v1/users/me", d.me)
+	mux.HandleFunc("POST /kitbash/v1/users", d.createUser)
+	mux.HandleFunc("GET /kitbash/v1/users", d.listUsers)
+	mux.HandleFunc("POST /kitbash/v1/users/{name}/keys", d.addKey)
+	mux.HandleFunc("DELETE /kitbash/v1/users/{name}", d.removeUser)
+	mux.HandleFunc("POST /kitbash/v1/approvals", d.createApproval)
+	mux.HandleFunc("GET /kitbash/v1/approvals", d.listApprovals)
+	mux.HandleFunc("POST /kitbash/v1/approvals/{id}/claim", d.claimApproval)
+	mux.HandleFunc("PUT /kitbash/v1/approvals/{id}/result", d.storeResult)
+	mux.HandleFunc("POST /kitbash/v1/approvals/{id}/reject", d.rejectApproval)
 	d.server = &http.Server{Handler: mux}
 	go func() {
 		if err := d.server.Serve(listener); err != nil &&

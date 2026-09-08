@@ -247,9 +247,14 @@ func (s *Service) run(ctx context.Context, span *telemetry.Span, path, digest, n
 	// in the environment the container is created with, see PLAN.md 2.4.
 	id := opts.Labels[podman.LabelID]
 	env, registered := s.telemetryEnv(ctx, unit.Env, telemetry.Registration{
-		ID:            id,
-		Package:       folder,
-		Name:          name,
+		ID:      id,
+		Package: folder,
+		Name:    name,
+		// The container name and the image are what boot restore starts from,
+		// so they are registered with the Process rather than read back from a
+		// manifest at boot, see registration_fields in spec/kitbashd-api.yaml.
+		Container:     container,
+		Digest:        image.ID,
 		Expose:        unit.Expose,
 		Endpoint:      endpoint,
 		Subscriptions: m.Subscriptions(),
@@ -368,11 +373,13 @@ func (s *Service) Reconcile(ctx context.Context, running []Process) (registered,
 			continue
 		}
 		reg := telemetry.Registration{
-			ID:       p.ID,
-			Package:  p.Package,
-			Name:     p.Name,
-			Expose:   p.Expose,
-			Endpoint: p.Endpoint,
+			ID:        p.ID,
+			Package:   p.Package,
+			Name:      p.Name,
+			Container: p.Container,
+			Digest:    p.Digest,
+			Expose:    p.Expose,
+			Endpoint:  p.Endpoint,
 		}
 		if m, folder, prob := s.files.Manifest(ctx, p.Package); prob == nil {
 			reg.Package = folder

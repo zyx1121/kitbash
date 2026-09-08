@@ -62,6 +62,10 @@ func run() error {
 		}
 	}()
 
+	// The same client is the approval queue: a member's write under /org is
+	// queued with kitbashd instead of being attempted, see PLAN.md 2.1.
+	files.SetApprovals(telem.Client())
+
 	runner := podman.NewCLI()
 	// The Process registry is the same client tel_query forwards through: a
 	// Process is registered with kitbashd before its container starts, which

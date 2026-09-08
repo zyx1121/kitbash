@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/zyx1121/kitbash/internal/problem"
 )
@@ -33,6 +34,12 @@ const maxResponseBytes = 4 << 20
 type Client struct {
 	socket string
 	http   *http.Client
+
+	// The one identity question the session asks, users_me, and whether it
+	// has been asked. Admin holds them, see users.go.
+	mu       sync.Mutex
+	asked    bool
+	identity Identity
 }
 
 // NewClient builds the client for one socket.

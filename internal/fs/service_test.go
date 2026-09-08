@@ -29,6 +29,38 @@ func TestRootsEnvIsIgnoredInAnSSHSession(t *testing.T) {
 	}
 }
 
+// On a kitbash host /org is the shared root without anyone saying so, and the
+// override that names another one is refused to a member the same way the
+// roots override is.
+func TestTheSharedRootIsOrgAndTheOverrideIsIgnoredInAnSSHSession(t *testing.T) {
+	elsewhere := t.TempDir()
+	t.Setenv(fs.SSHEnv, "10.0.0.2 51000 10.0.0.1 22")
+	t.Setenv(fs.SharedEnv, elsewhere)
+
+	service, err := fs.NewFromEnv()
+	if err != nil {
+		t.Fatalf("NewFromEnv: %v", err)
+	}
+	if service.Shared() != fs.OrgRoot {
+		t.Errorf("the shared root is %q, want %s", service.Shared(), fs.OrgRoot)
+	}
+}
+
+func TestSharedEnvAppliesOutsideAnSSHSession(t *testing.T) {
+	elsewhere := t.TempDir()
+	t.Setenv(fs.SSHEnv, "")
+	t.Setenv(fs.RootsEnv, elsewhere)
+	t.Setenv(fs.SharedEnv, elsewhere)
+
+	service, err := fs.NewFromEnv()
+	if err != nil {
+		t.Fatalf("NewFromEnv: %v", err)
+	}
+	if service.Shared() != filepath.Clean(elsewhere) {
+		t.Errorf("the shared root is %q, want %s", service.Shared(), elsewhere)
+	}
+}
+
 func TestRootsEnvAppliesOutsideAnSSHSession(t *testing.T) {
 	elsewhere := t.TempDir()
 	t.Setenv(fs.SSHEnv, "")

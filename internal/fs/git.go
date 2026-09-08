@@ -7,7 +7,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
+
+	"github.com/zyx1121/kitbash/internal/problem"
 )
 
 // commitFormat feeds git log. ASCII unit and record separators delimit the
@@ -24,6 +27,56 @@ type Commit struct {
 	Author  string `json:"author"`
 	Time    string `json:"time"`
 	Message string `json:"message"`
+}
+
+// memberName is the shape of a member's Linux name, the same pattern the users
+// family publishes. An author reaches git as one argument of a commit, so the
+// name is held to it rather than trusted.
+var memberName = regexp.MustCompile(`^[a-z][a-z0-9-]{1,31}$`)
+
+// authorship is who a commit belongs to when the caller is not the author. An
+// approved call is committed by the admin whose session ran it and authored by
+// the member who asked for it, with a trailer naming the admin, see PLAN.md
+// section 2.1. The zero value is the ordinary case: the caller is the author.
+type authorship struct {
+	Author     string
+	ApprovedBy string
+}
+
+// check refuses an authorship kitbash would not put in a commit.
+func (a authorship) check(instance string) *problem.Problem {
+	if a.Author == "" && a.ApprovedBy == "" {
+		return nil
+	}
+	if !memberName.MatchString(a.Author) {
+		return problem.BadRequest(instance,
+			fmt.Sprintf("%q is not a member name, so the commit has no author", a.Author),
+			"Author a commit as the member who asked for the write.")
+	}
+	if a.ApprovedBy != "" && !memberName.MatchString(a.ApprovedBy) {
+		return problem.BadRequest(instance,
+			fmt.Sprintf("%q is not a member name, so the commit has no approver", a.ApprovedBy),
+			"Name the admin who approved the write.")
+	}
+	return nil
+}
+
+// message appends the Approved-by trailer, which is how a commit says who let
+// it into the shared root.
+func (a authorship) message(message string) string {
+	if a.ApprovedBy == "" {
+		return message
+	}
+	return message + "\n\nApproved-by: " + a.ApprovedBy
+}
+
+// args are what git commit is given to attribute the commit to the author.
+// The committer is left to the environment, which is the session's own user.
+func (a authorship) args() []string {
+	if a.Author == "" {
+		return nil
+	}
+	return []string{"--author", fmt.Sprintf("%s <%s@kitbash>", a.Author, a.Author)}
 }
 
 // isPermissionDenied reports whether a git failure was the operating system

@@ -49,10 +49,16 @@ func EndpointForProcesses() string {
 // Registration is one Process as kitbashd records it. It is the request body
 // of processes_register in spec/kitbashd-api.yaml; the owner is not in it,
 // because kitbashd reads that from the socket's peer credentials.
+// Container and Digest are what boot restore needs: the container to start
+// and the image it was started from, so kitbashd restores a Process without
+// reading its manifest, see registration_fields in spec/kitbashd-api.yaml.
+// Both are omitted when the caller does not know them.
 type Registration struct {
 	ID            string   `json:"id"`
 	Package       string   `json:"package"`
 	Name          string   `json:"name"`
+	Container     string   `json:"container,omitempty"`
+	Digest        string   `json:"digest,omitempty"`
 	Expose        string   `json:"expose"`
 	Endpoint      string   `json:"endpoint,omitempty"`
 	Subscriptions []string `json:"subscriptions,omitempty"`

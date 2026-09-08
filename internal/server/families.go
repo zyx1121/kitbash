@@ -7,6 +7,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/zyx1121/kitbash/internal/bridge"
+	"github.com/zyx1121/kitbash/internal/fs"
 	"github.com/zyx1121/kitbash/internal/pkg"
 	"github.com/zyx1121/kitbash/internal/proc"
 	"github.com/zyx1121/kitbash/internal/telemetry"
@@ -32,7 +33,9 @@ func RegisterPackages(s *mcp.Server, packages *pkg.Service) {
 		Name: "pkg_import",
 		Description: "Wrap something external as a Package folder at path using a running import kit. Writes " +
 			"the folder as one commit, does not build. The target folder must not exist yet. Returns " +
-			"not-found when no running kit accepts the source and conflict when more than one does.",
+			"not-found when no running kit accepts the source and conflict when more than one does. A " +
+			"member importing under /org does not fail: the call is queued for an admin the way fs_write " +
+			"is, and the queued problem carries the approval id.",
 		InputSchema:  pkgImportInputSchema,
 		OutputSchema: pkgImportOutputSchema,
 	}, importHandler(packages))
@@ -124,6 +127,84 @@ func RegisterTelemetry(s *mcp.Server, client *telemetry.Client) {
 	}, retentionHandler(client))
 }
 
+// RegisterUsers adds the users family to an existing MCP server. Creating a
+// member is root's work, so every tool here is forwarded to kitbashd over its
+// socket and the daemon decides from the peer credentials whether the caller
+// may do it, see PLAN.md section 4.5.
+func RegisterUsers(s *mcp.Server, client *telemetry.Client) {
+	mcp.AddTool(s, &mcp.Tool{
+		Name: "users_me",
+		Description: "Who am I and what groups am I in. Answered by kitbashd from the socket's peer " +
+			"credentials.",
+		InputSchema:  usersMeInputSchema,
+		OutputSchema: usersMeOutputSchema,
+	}, meHandler(client))
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name: "users_create",
+		Description: "Create a member with an SSH public key, a private home and a subordinate id range, " +
+			"through kitbashd. Admin only. The member can connect immediately; their home is a root for " +
+			"Files and starts empty.",
+		InputSchema:  usersCreateInputSchema,
+		OutputSchema: usersCreateOutputSchema,
+	}, createUserHandler(client))
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:         "users_list",
+		Description:  "All members with uid, admin flag, key count and running Process count. Admin only.",
+		InputSchema:  usersListInputSchema,
+		OutputSchema: usersListOutputSchema,
+	}, listUsersHandler(client))
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name: "users_add_key",
+		Description: "Add an SSH public key to a member. Admin only. A key already present is not added " +
+			"twice.",
+		InputSchema:  usersAddKeyInputSchema,
+		OutputSchema: usersAddKeyOutputSchema,
+	}, addKeyHandler(client))
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name: "users_remove",
+		Description: "Remove a member. Admin only. Their Processes stop and are unregistered, their " +
+			"sessions end, their home is archived under /org/.archive/<name> where the surface cannot see " +
+			"it, and the account is deleted. An admin cannot remove themselves or the last admin.",
+		InputSchema:  usersRemoveInputSchema,
+		OutputSchema: usersRemoveOutputSchema,
+	}, removeUserHandler(client))
+}
+
+// RegisterApprovals adds the approvals family to an existing MCP server.
+// Listing and rejecting are forwarded to kitbashd; approving claims the
+// approval there and then runs the tool in this session, which is what makes
+// the write land as the admin's Linux user, see approve.go.
+func RegisterApprovals(s *mcp.Server, client *telemetry.Client, files *fs.Service, packages *pkg.Service) {
+	mcp.AddTool(s, &mcp.Tool{
+		Name: "approvals_list",
+		Description: "Approvals by state. Members see their own, admins see all. An executed approval " +
+			"carries the tool's result, a normal output or a problem.",
+		InputSchema:  approvalsListInputSchema,
+		OutputSchema: approvalsListOutputSchema,
+	}, listApprovalsHandler(client))
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name: "approvals_approve",
+		Description: "Approve and execute a queued operation. Admin only. The tool runs in the admin's " +
+			"session as the admin's Linux user; a commit is authored by the requester with an Approved-by " +
+			"trailer naming the admin. The result, a normal output or a problem, is returned here and " +
+			"stored on the approval for the requester.",
+		InputSchema:  approvalsApproveInputSchema,
+		OutputSchema: approvalsApproveOutputSchema,
+	}, approveHandler(client, files, packages))
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:         "approvals_reject",
+		Description:  "Reject a queued operation with a reason the requester will see. Admin only.",
+		InputSchema:  approvalsRejectInputSchema,
+		OutputSchema: approvalsRejectOutputSchema,
+	}, rejectHandler(client))
+}
+
 type pathInput struct {
 	Path string `json:"path"`
 }
@@ -154,6 +235,29 @@ type retentionInput struct {
 	Set json.RawMessage `json:"set,omitempty"`
 }
 
+type keyInput struct {
+	Name   string `json:"name"`
+	SSHKey string `json:"sshKey"`
+}
+
+type nameInput struct {
+	Name string `json:"name"`
+}
+
+type stateInput struct {
+	State string `json:"state,omitempty"`
+}
+
+type approveInput struct {
+	ID   string `json:"id"`
+	Note string `json:"note,omitempty"`
+}
+
+type rejectInput struct {
+	ID     string `json:"id"`
+	Reason string `json:"reason"`
+}
+
 func buildHandler(packages *pkg.Service) mcp.ToolHandlerFor[pathInput, any] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, in pathInput) (*mcp.CallToolResult, any, error) {
 		out, prob := packages.Build(ctx, in.Path)
@@ -166,11 +270,85 @@ func buildHandler(packages *pkg.Service) mcp.ToolHandlerFor[pathInput, any] {
 
 func importHandler(packages *pkg.Service) mcp.ToolHandlerFor[importInput, any] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, in importInput) (*mcp.CallToolResult, any, error) {
-		out, prob := packages.Import(ctx, in.Path, in.Source)
+		out, prob := packages.Import(ctx, pkg.ImportRequest{Path: in.Path, Source: in.Source})
 		if prob != nil {
 			return errorResult(prob), nil, nil
 		}
 		return structuredResult(out)
+	}
+}
+
+// The users family is forwarded to kitbashd as it arrived and answered with
+// the daemon's body as it arrived: the tool's schemas and the daemon's are the
+// same ones, so reshaping either side could only lose something. A problem
+// kitbashd returns reaches the agent unchanged, slug and fix and all.
+func meHandler(client *telemetry.Client) mcp.ToolHandlerFor[emptyInput, any] {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, any, error) {
+		out, prob := client.Me(ctx)
+		if prob != nil {
+			return errorResult(prob), nil, nil
+		}
+		return rawResult(out)
+	}
+}
+
+func createUserHandler(client *telemetry.Client) mcp.ToolHandlerFor[json.RawMessage, any] {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, in json.RawMessage) (*mcp.CallToolResult, any, error) {
+		out, prob := client.CreateUser(ctx, in)
+		if prob != nil {
+			return errorResult(prob), nil, nil
+		}
+		return rawResult(out)
+	}
+}
+
+func listUsersHandler(client *telemetry.Client) mcp.ToolHandlerFor[emptyInput, any] {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, any, error) {
+		out, prob := client.ListUsers(ctx)
+		if prob != nil {
+			return errorResult(prob), nil, nil
+		}
+		return rawResult(out)
+	}
+}
+
+func addKeyHandler(client *telemetry.Client) mcp.ToolHandlerFor[keyInput, any] {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, in keyInput) (*mcp.CallToolResult, any, error) {
+		out, prob := client.AddKey(ctx, in.Name, in.SSHKey)
+		if prob != nil {
+			return errorResult(prob), nil, nil
+		}
+		return rawResult(out)
+	}
+}
+
+func removeUserHandler(client *telemetry.Client) mcp.ToolHandlerFor[nameInput, any] {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, in nameInput) (*mcp.CallToolResult, any, error) {
+		out, prob := client.RemoveUser(ctx, in.Name)
+		if prob != nil {
+			return errorResult(prob), nil, nil
+		}
+		return rawResult(out)
+	}
+}
+
+func listApprovalsHandler(client *telemetry.Client) mcp.ToolHandlerFor[stateInput, any] {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, in stateInput) (*mcp.CallToolResult, any, error) {
+		out, prob := client.ListApprovals(ctx, in.State)
+		if prob != nil {
+			return errorResult(prob), nil, nil
+		}
+		return rawResult(out)
+	}
+}
+
+func rejectHandler(client *telemetry.Client) mcp.ToolHandlerFor[rejectInput, any] {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, in rejectInput) (*mcp.CallToolResult, any, error) {
+		out, prob := client.RejectApproval(ctx, in.ID, in.Reason)
+		if prob != nil {
+			return errorResult(prob), nil, nil
+		}
+		return rawResult(out)
 	}
 }
 

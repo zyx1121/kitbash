@@ -76,7 +76,7 @@ func TestImportWritesTheKitsFilesAsOneCommit(t *testing.T) {
 	packages, root := newImporter(t, kits)
 	target := filepath.Join(root, "time")
 
-	out, prob := packages.Import(context.Background(), target, "npm:time-mcp@1.0.0")
+	out, prob := packages.Import(context.Background(), pkg.ImportRequest{Path: target, Source: "npm:time-mcp@1.0.0"})
 	if prob != nil {
 		t.Fatalf("Import: %s", prob.Detail)
 	}
@@ -100,7 +100,7 @@ func TestImportWithNoAcceptingKit(t *testing.T) {
 	kits := &stubKits{kits: []bridge.Kit{kit("/org/import-mcp", "^npm:")}}
 	packages, root := newImporter(t, kits)
 
-	_, prob := packages.Import(context.Background(), filepath.Join(root, "alpine"), "oci://alpine@sha256:0")
+	_, prob := packages.Import(context.Background(), pkg.ImportRequest{Path: filepath.Join(root, "alpine"), Source: "oci://alpine@sha256:0"})
 	if prob == nil {
 		t.Fatal("a source no kit accepts was imported")
 	}
@@ -119,7 +119,7 @@ func TestImportWithTwoAcceptingKits(t *testing.T) {
 	}}
 	packages, root := newImporter(t, kits)
 
-	_, prob := packages.Import(context.Background(), filepath.Join(root, "time"), "npm:time-mcp@1.0.0")
+	_, prob := packages.Import(context.Background(), pkg.ImportRequest{Path: filepath.Join(root, "time"), Source: "npm:time-mcp@1.0.0"})
 	if prob == nil {
 		t.Fatal("two kits accepting the same source was not a conflict")
 	}
@@ -139,7 +139,7 @@ func TestImportRefusesAnExistingFolder(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, prob := packages.Import(context.Background(), target, "npm:time-mcp@1.0.0")
+	_, prob := packages.Import(context.Background(), pkg.ImportRequest{Path: target, Source: "npm:time-mcp@1.0.0"})
 	if prob == nil {
 		t.Fatal("an existing folder was imported into")
 	}
@@ -156,7 +156,7 @@ func TestImportRequiresAManifestAmongTheFiles(t *testing.T) {
 	packages, root := newImporter(t, kits)
 	target := filepath.Join(root, "time")
 
-	_, prob := packages.Import(context.Background(), target, "npm:time-mcp@1.0.0")
+	_, prob := packages.Import(context.Background(), pkg.ImportRequest{Path: target, Source: "npm:time-mcp@1.0.0"})
 	if prob == nil {
 		t.Fatal("a folder without a manifest was imported")
 	}
@@ -183,7 +183,7 @@ func TestImportRefusesAKitThatEscapesTheFolder(t *testing.T) {
 			kits := &stubKits{kits: []bridge.Kit{kit("/org/import-mcp", "^npm:")}, result: string(body)}
 			packages, root := newImporter(t, kits)
 
-			_, prob := packages.Import(context.Background(), filepath.Join(root, "time"), "npm:time-mcp@1.0.0")
+			_, prob := packages.Import(context.Background(), pkg.ImportRequest{Path: filepath.Join(root, "time"), Source: "npm:time-mcp@1.0.0"})
 			if prob == nil {
 				t.Fatalf("the kit path %q was accepted", tc.path)
 			}

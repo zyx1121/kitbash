@@ -32,11 +32,22 @@ const SSHEnv = "SSH_CONNECTION"
 // OrgRoot is the shared root every member can read.
 const OrgRoot = "/org"
 
+// SharedEnv overrides which root a member's write is queued under. Like
+// RootsEnv it exists for tests and for running the server outside a kitbash
+// host, so it is honoured only when the process is not serving an SSH session.
+const SharedEnv = "KITBASH_SHARED"
+
 // Service answers the fs family for one caller. Access control is the
 // kernel's: the process already runs as that caller.
 type Service struct {
 	user  string
 	roots []string
+
+	// shared is the root a member's write is queued under, /org on a kitbash
+	// host, and approvals is the queue itself. Both are optional: without
+	// them every write is attempted and the kernel has the last word.
+	shared    string
+	approvals Approvals
 }
 
 // New builds a Service for a named user over the given roots.
@@ -55,9 +66,22 @@ func New(username string, roots []string) (*Service, error) {
 		if !filepath.IsAbs(r) {
 			return nil, fmt.Errorf("fs: root %q is not absolute", r)
 		}
-		s.roots = append(s.roots, filepath.Clean(r))
+		root := filepath.Clean(r)
+		if root == OrgRoot {
+			s.shared = root
+		}
+		s.roots = append(s.roots, root)
 	}
 	return s, nil
+}
+
+// cleanRoot normalises a root path. An empty one leaves the service without a
+// shared root, which is a host where nothing is queued.
+func cleanRoot(root string) string {
+	if root == "" {
+		return ""
+	}
+	return filepath.Clean(root)
 }
 
 // NewFromEnv builds the Service the server runs with: /org and the current
@@ -68,14 +92,22 @@ func NewFromEnv() (*Service, error) {
 		return nil, fmt.Errorf("fs: reading the current user: %w", err)
 	}
 	name := u.Username
-	if env := os.Getenv(RootsEnv); env != "" && os.Getenv(SSHEnv) == "" {
-		return New(name, strings.Split(env, ":"))
-	}
 	home := u.HomeDir
 	if home == "" {
 		home = filepath.Join("/home", name)
 	}
-	return New(name, []string{OrgRoot, home})
+	roots := []string{OrgRoot, home}
+	if env := os.Getenv(RootsEnv); env != "" && os.Getenv(SSHEnv) == "" {
+		roots = strings.Split(env, ":")
+	}
+	s, err := New(name, roots)
+	if err != nil {
+		return nil, err
+	}
+	if env := os.Getenv(SharedEnv); env != "" && os.Getenv(SSHEnv) == "" {
+		s.SetShared(env)
+	}
+	return s, nil
 }
 
 // User is the Linux user every commit is attributed to.

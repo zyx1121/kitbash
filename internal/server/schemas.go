@@ -443,3 +443,184 @@ var (
   }
 }`)
 )
+
+// The schemas below are the users and approvals families of
+// spec/mcp-surface.yaml, transcribed the same way. Both families are served by
+// kitbashd over its socket, so these are the only place kitbash-mcp says what
+// their shape is, and the diff test holds them to the specification.
+
+const memberDef = `{
+  "type": "object",
+  "required": ["user", "uid", "admin"],
+  "properties": {
+    "user": { "type": "string" },
+    "uid": { "type": "integer" },
+    "admin": { "type": "boolean" },
+    "keys": { "type": "integer" },
+    "processes": { "type": "integer" }
+  }
+}`
+
+const approvalDef = `{
+  "type": "object",
+  "required": ["id", "requester", "tool", "input", "state", "requestedAt"],
+  "properties": {
+    "id": { "type": "string" },
+    "requester": { "type": "string" },
+    "tool": { "type": "string", "enum": ["fs_write", "pkg_import"] },
+    "input": { "type": "object" },
+    "state": { "type": "string", "enum": ["pending", "approved", "rejected"] },
+    "requestedAt": { "type": "string", "format": "date-time" },
+    "decidedAt": { "type": "string", "format": "date-time" },
+    "decidedBy": { "type": "string" },
+    "note": { "type": "string" },
+    "reason": { "type": "string" },
+    "result": { "type": "object" }
+  }
+}`
+
+var (
+	usersMeInputSchema = json.RawMessage(`{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {}
+}`)
+
+	usersMeOutputSchema = json.RawMessage(`{
+  "type": "object",
+  "required": ["user", "uid", "admin"],
+  "properties": {
+    "user": { "type": "string" },
+    "uid": { "type": "integer" },
+    "admin": { "type": "boolean" },
+    "groups": { "type": "array", "items": { "type": "string" } }
+  }
+}`)
+
+	usersCreateInputSchema = json.RawMessage(`{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name", "sshKey"],
+  "properties": {
+    "name": { "type": "string", "pattern": "^[a-z][a-z0-9-]{1,31}$" },
+    "sshKey": { "type": "string", "maxLength": 4096, "description": "One OpenSSH public key line" },
+    "admin": { "type": "boolean", "default": false }
+  }
+}`)
+
+	usersCreateOutputSchema = json.RawMessage(`{
+  "type": "object",
+  "required": ["user", "uid", "admin"],
+  "properties": {
+    "user": { "type": "string" },
+    "uid": { "type": "integer" },
+    "admin": { "type": "boolean" }
+  }
+}`)
+
+	usersListInputSchema = json.RawMessage(`{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {}
+}`)
+
+	usersListOutputSchema = json.RawMessage(`{
+  "type": "object",
+  "required": ["users"],
+  "properties": {
+    "users": { "type": "array", "items": ` + memberDef + ` }
+  }
+}`)
+
+	usersAddKeyInputSchema = json.RawMessage(`{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name", "sshKey"],
+  "properties": {
+    "name": { "type": "string", "pattern": "^[a-z][a-z0-9-]{1,31}$" },
+    "sshKey": { "type": "string", "maxLength": 4096 }
+  }
+}`)
+
+	usersAddKeyOutputSchema = json.RawMessage(`{
+  "type": "object",
+  "required": ["user", "keys"],
+  "properties": {
+    "user": { "type": "string" },
+    "keys": { "type": "integer" }
+  }
+}`)
+
+	usersRemoveInputSchema = json.RawMessage(`{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name"],
+  "properties": {
+    "name": { "type": "string", "pattern": "^[a-z][a-z0-9-]{1,31}$" }
+  }
+}`)
+
+	usersRemoveOutputSchema = json.RawMessage(`{
+  "type": "object",
+  "required": ["user", "archived"],
+  "properties": {
+    "user": { "type": "string" },
+    "archived": { "type": "string" }
+  }
+}`)
+
+	approvalsListInputSchema = json.RawMessage(`{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "state": { "type": "string", "enum": ["pending", "approved", "rejected"], "default": "pending" }
+  }
+}`)
+
+	approvalsListOutputSchema = json.RawMessage(`{
+  "type": "object",
+  "required": ["approvals"],
+  "properties": {
+    "approvals": { "type": "array", "items": ` + approvalDef + ` }
+  }
+}`)
+
+	approvalsApproveInputSchema = json.RawMessage(`{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id"],
+  "properties": {
+    "id": { "type": "string" },
+    "note": { "type": "string", "maxLength": 500 }
+  }
+}`)
+
+	approvalsApproveOutputSchema = json.RawMessage(`{
+  "type": "object",
+  "required": ["id", "state", "result"],
+  "properties": {
+    "id": { "type": "string" },
+    "state": { "type": "string", "enum": ["approved"] },
+    "result": { "type": "object" }
+  }
+}`)
+
+	approvalsRejectInputSchema = json.RawMessage(`{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "reason"],
+  "properties": {
+    "id": { "type": "string" },
+    "reason": { "type": "string", "minLength": 3, "maxLength": 500 }
+  }
+}`)
+
+	approvalsRejectOutputSchema = json.RawMessage(`{
+  "type": "object",
+  "required": ["id", "state"],
+  "properties": {
+    "id": { "type": "string" },
+    "state": { "type": "string", "enum": ["rejected"] }
+  }
+}`)
+)

@@ -79,7 +79,8 @@ func newFixture(t *testing.T) *fixture {
 func (f *fixture) commit(t *testing.T, name string, files ...fs.File) string {
 	t.Helper()
 	folder := filepath.Join(f.root, name)
-	if _, prob := f.files.WriteFiles(context.Background(), folder, files, "Add "+name); prob != nil {
+	if _, prob := f.files.WriteFiles(context.Background(), fs.WriteFilesRequest{
+		Path: folder, Files: files, Message: "Add " + name}); prob != nil {
 		t.Fatalf("writing %s: %s", name, prob.Detail)
 	}
 	return folder
