@@ -123,7 +123,12 @@ fan_out:
     KITBASH_FANOUT_SECRET. A subscriber accepts a fan out POST only when the
     header matches, so nothing else on the host can feed it records. kitbashd
     stores the secret in the processes table (the store is root only) because
-    it must send it, unlike the token of which only the hash is kept.
+    it must send it, unlike the token of which only the hash is kept. A
+    registration written before this existed carries no secret: it is delivered
+    to without the header, which kitbashd says once per subscriber, until the
+    Process is registered again. A subscriber started without
+    KITBASH_FANOUT_SECRET accepts what arrives for the same reason and says so
+    once at start.
   delivery: >
     Asynchronous, one queue per subscriber bounded twice, at 1024 requests and
     at 64 MiB, oldest dropped when either bound is reached, 5 s request
@@ -316,9 +321,10 @@ client_behaviour:
     a replace removes the old container. bridge.Sync at session start
     re-registers every running Process of the caller that kitbashd does not
     know (compare with processes_list), so a restarted kitbashd learns the
-    running set from the next session; re-registration mints a new token, so
-    the container keeps the old one and its exports fail until the Process
-    is run again. That gap is accepted in version 1 and logged.
+    running set from the next session; re-registration mints a new token and a
+    new fan out secret, so the container keeps the old pair, its exports fail
+    and it refuses the fan out until the Process is run again. That gap is
+    accepted in version 1 and logged.
   description: >
     kitbash-mcp exports asynchronously and never blocks a tool call on the
     exporter. If the socket is absent or refuses, spans are dropped and one

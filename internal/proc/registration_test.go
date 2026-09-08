@@ -49,6 +49,7 @@ deploy:
         KITBASH_PROCESS: someone-elses-process
         KITBASH_PACKAGE: /org/somewhere-else
         KITBASH_USER: root
+        KITBASH_FANOUT_SECRET: forged
 `
 
 // A Process is registered before its container exists, and the token that
@@ -115,6 +116,12 @@ func TestRunRegistersTheProcessBeforeItStarts(t *testing.T) {
 		t.Errorf("the MCP endpoint is %q, want %q",
 			env[telemetry.EnvMCPEndpoint], telemetry.ProcessEndpoint+telemetry.MCPPath)
 	}
+	// The fan out secret is minted with the token and reaches the container
+	// the same way, so a subscriber knows a delivery came from kitbashd, see
+	// fan_out.authentication in spec/kitbashd-api.yaml.
+	if env[telemetry.EnvFanoutSecret] != f.daemon.FanoutSecret(process.ID) || env[telemetry.EnvFanoutSecret] == "" {
+		t.Errorf("the fan out secret is %q, want the one the registration minted", env[telemetry.EnvFanoutSecret])
+	}
 	// The manifest's own environment is still there.
 	if env["LOG_LEVEL"] != "debug" {
 		t.Errorf("env is %v, want the manifest's LOG_LEVEL as well", env)
@@ -164,9 +171,11 @@ func TestRunRegistersTheEndpointOfAnHTTPProcess(t *testing.T) {
 	}
 }
 
-// The six variables are the Process's identity and the two endpoints it
-// reaches kitbashd on. A manifest that declares them is overruled rather than
-// trusted.
+// The seven variables are the Process's identity, the two endpoints it reaches
+// kitbashd on, and the secret that tells it a fan out request came from
+// kitbashd. A manifest that declares them is overruled rather than trusted: a
+// Package that could name its own fan out secret could take records from
+// anything on the host.
 func TestManifestEnvironmentCannotOverrideTheTelemetryEnvironment(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
@@ -185,7 +194,8 @@ func TestManifestEnvironmentCannotOverrideTheTelemetryEnvironment(t *testing.T) 
 		telemetry.EnvPackage:  folder,
 		telemetry.EnvUser:     "tester",
 
-		telemetry.EnvMCPEndpoint: telemetry.ProcessEndpoint + telemetry.MCPPath,
+		telemetry.EnvMCPEndpoint:  telemetry.ProcessEndpoint + telemetry.MCPPath,
+		telemetry.EnvFanoutSecret: f.daemon.FanoutSecret(process.ID),
 	}
 	for k, v := range want {
 		if env[k] != v {
@@ -332,6 +342,7 @@ func TestRunWithoutKitbashdStartsTheProcessUntraced(t *testing.T) {
 	for _, key := range []string{
 		telemetry.EnvEndpoint, telemetry.EnvToken,
 		telemetry.EnvProcess, telemetry.EnvPackage, telemetry.EnvUser,
+		telemetry.EnvFanoutSecret,
 	} {
 		if _, set := env[key]; set {
 			t.Errorf("%s is in the environment, but no registration minted it", key)
@@ -350,6 +361,8 @@ func TestRunWithoutKitbashdStartsTheProcessUntraced(t *testing.T) {
 func TestReconcileRegistersWhatKitbashdDoesNotKnow(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
+	var lines bytes.Buffer
+	f.processes.SetLogger(log.New(&lines, "", 0))
 	folder := f.pack(t, "observer", observerManifest)
 	f.build(folder, "observer")
 
@@ -387,6 +400,13 @@ func TestReconcileRegistersWhatKitbashdDoesNotKnow(t *testing.T) {
 	}
 	if len(got.Subscriptions) != 1 || got.Subscriptions[0] != "telemetry" {
 		t.Errorf("subscriptions are %v, want [telemetry] from the manifest", got.Subscriptions)
+	}
+	// The re-registration minted a secret the running container does not
+	// have, so its fan out is refused until it is run again. That gap is the
+	// token's gap and is said rather than hidden.
+	want := "Process " + process.ID + " was registered again; the running container holds the previous fan out secret"
+	if !strings.Contains(lines.String(), want) {
+		t.Errorf("the log is %q, want it to contain %q", lines.String(), want)
 	}
 	// A registration kitbashd holds for a container that is gone is left
 	// alone: proc_stop is what removes one, and a failed delivery is all it

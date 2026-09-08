@@ -2,7 +2,9 @@ name: observe-count
 description: >-
   Counts every span, log record and metric point kitbashd fans out, per member
   and in total, and reports the totals back as metrics. Run it to see whether
-  Telemetry is flowing and how much of it each member produces.
+  Telemetry is flowing and how much of it each member produces. It counts the
+  kitbashd fan out only: a request that does not carry this Process's fan out
+  secret is refused.
 tags: [kit, observe]
 
 provides:

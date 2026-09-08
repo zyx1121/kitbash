@@ -23,6 +23,12 @@ const SubscriptionTelemetry = "telemetry"
 // base64url, returned once and never stored.
 const TokenBytes = 32
 
+// FanoutSecretBytes is how much entropy the bearer of a fan out request
+// carries, see fan_out.authentication in spec/kitbashd-api.yaml. It is as wide
+// as a Process token, and unlike the token it is kept in the clear: kitbashd
+// is the sender, so a hash would leave it with nothing to send.
+const FanoutSecretBytes = 32
+
 // ErrProcessOwned reports a registration for an id another member already
 // owns. Two members' Processes never share an id, so this is a conflict and
 // not a replacement.
@@ -57,6 +63,13 @@ type Process struct {
 	Endpoint      string    `json:"endpoint"`
 	Subscriptions []string  `json:"subscriptions"`
 	RegisteredAt  time.Time `json:"registeredAt"`
+	// FanoutSecret is the bearer kitbashd puts on every fan out request to
+	// this Process. It is minted with the token at registration and handed to
+	// the container once. The tag keeps it out of processes_list, which is the
+	// one place this struct is serialised for a caller: a listing carries no
+	// secret any more than it carries a token. A registration written before
+	// the fan out was authenticated carries none.
+	FanoutSecret string `json:"-"`
 }
 
 // Subscribes reports whether this Process asked for the Telemetry fan out.
@@ -79,6 +92,18 @@ func NewToken() (token, hash string, err error) {
 	}
 	token = base64.RawURLEncoding.EncodeToString(b[:])
 	return token, HashToken(token), nil
+}
+
+// NewFanoutSecret mints the bearer of one Process's fan out. Unlike a token it
+// is stored as it is sent: the subscriber compares what kitbashd gave it at
+// start with what arrives, and only kitbashd can produce it, so nothing else
+// on the host can feed a subscriber records.
+func NewFanoutSecret() (string, error) {
+	var b [FanoutSecretBytes]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("store: mint a fan out secret: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(b[:]), nil
 }
 
 // HashToken is how a token becomes the value the store holds and looks up by.
@@ -130,18 +155,20 @@ func (s *Store) RegisterProcess(ctx context.Context, p Process, tokenHash string
 	if err != nil {
 		return fmt.Errorf("store: encode subscriptions: %w", err)
 	}
+	// The fan out secret is replaced with the token, because the two are minted
+	// together: a container holding the old token holds the old secret.
 	if _, err := tx.ExecContext(ctx, `INSERT INTO processes
 		(id, owner, admin, package, name, container, digest, expose, endpoint,
-		 subscriptions, token_hash, registered_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+		 subscriptions, token_hash, fanout_secret, registered_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 			owner = excluded.owner, admin = excluded.admin, package = excluded.package,
 			name = excluded.name, container = excluded.container, digest = excluded.digest,
 			expose = excluded.expose, endpoint = excluded.endpoint,
 			subscriptions = excluded.subscriptions, token_hash = excluded.token_hash,
-			registered_at = excluded.registered_at`,
+			fanout_secret = excluded.fanout_secret, registered_at = excluded.registered_at`,
 		p.ID, p.Owner, p.Admin, p.Package, p.Name, p.Container, p.Digest, p.Expose, p.Endpoint,
-		string(subscriptions), tokenHash, p.RegisteredAt.UnixNano()); err != nil {
+		string(subscriptions), tokenHash, p.FanoutSecret, p.RegisteredAt.UnixNano()); err != nil {
 		return fmt.Errorf("store: register the Process %s: %w", p.ID, err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -274,7 +301,7 @@ func (s *Store) Processes(ctx context.Context, owner string) ([]Process, error) 
 
 // processColumns is the one select every read of this table shares.
 const processColumns = `SELECT id, owner, admin, package, name, container, digest,
-	expose, endpoint, subscriptions, registered_at`
+	expose, endpoint, subscriptions, fanout_secret, registered_at`
 
 // scanner is what both a single row and a row of a result set satisfy.
 type scanner interface {
@@ -286,7 +313,7 @@ func scanProcess(row scanner) (Process, error) {
 	var subscriptions string
 	var registered int64
 	if err := row.Scan(&p.ID, &p.Owner, &p.Admin, &p.Package, &p.Name, &p.Container, &p.Digest,
-		&p.Expose, &p.Endpoint, &subscriptions, &registered); err != nil {
+		&p.Expose, &p.Endpoint, &subscriptions, &p.FanoutSecret, &registered); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Process{}, err
 		}
@@ -325,9 +352,12 @@ func migrate(db *sql.DB) error {
 			return err
 		}
 	}
-	// The container name and the image digest arrive with M5. A registration
-	// written before then simply carries neither, and restore skips it.
-	for _, column := range []string{"container", "digest"} {
+	// The container name and the image digest arrive with M5, the fan out
+	// secret with the authenticated fan out. A registration written before any
+	// of them carries none: restore skips a Process without a container, and
+	// the fan out delivers to a Process without a secret with no bearer on the
+	// request until it is registered again.
+	for _, column := range []string{"container", "digest", "fanout_secret"} {
 		if err := addTextColumn(db, "processes", column); err != nil {
 			return err
 		}

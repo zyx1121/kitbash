@@ -159,7 +159,7 @@ func TestRegistrationRefusesAMalformedContainerOrDigest(t *testing.T) {
 		Digest:    "sha256:" + strings.Repeat("a", 64),
 		Expose:    "mcp",
 	}
-	if _, prob := client.RegisterProcess(context.Background(), good); prob != nil {
+	if _, _, prob := client.RegisterProcess(context.Background(), good); prob != nil {
 		t.Fatalf("a well formed registration was refused: %s", prob.Detail)
 	}
 
@@ -179,7 +179,7 @@ func TestRegistrationRefusesAMalformedContainerOrDigest(t *testing.T) {
 			before := len(daemon.Calls())
 			reg := good
 			reg.Container, reg.Digest = tc.container, tc.digest
-			_, prob := client.RegisterProcess(context.Background(), reg)
+			_, _, prob := client.RegisterProcess(context.Background(), reg)
 			if prob == nil {
 				t.Fatal("the registration was sent")
 			}

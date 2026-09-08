@@ -13,6 +13,9 @@ const kit = path.join(import.meta.dirname, "..", "index.js");
 const KIT_URL = "http://127.0.0.1:8080";
 const TOKEN = "tok-evaluate";
 const PROC = "proc-evaluate-1";
+// What kitbashd would have minted for this Process, and what the fan out puts
+// on every delivery.
+const SECRET = "fanout-secret-evaluate";
 
 const received = [];
 const receiver = Bun.serve({
@@ -28,7 +31,14 @@ const endpoint = `http://127.0.0.1:${receiver.port}`;
 
 const child = spawn("bun", ["run", kit], {
   stdio: ["ignore", "pipe", "pipe"],
-  env: { ...process.env, KITBASH_TELEMETRY_ENDPOINT: endpoint, KITBASH_TELEMETRY_TOKEN: TOKEN, KITBASH_PROCESS: PROC, KITBASH_EVAL_THRESHOLD_MS: "1000" },
+  env: {
+    ...process.env,
+    KITBASH_TELEMETRY_ENDPOINT: endpoint,
+    KITBASH_TELEMETRY_TOKEN: TOKEN,
+    KITBASH_PROCESS: PROC,
+    KITBASH_FANOUT_SECRET: SECRET,
+    KITBASH_EVAL_THRESHOLD_MS: "1000",
+  },
 });
 let stdout = "";
 let stderr = "";
@@ -39,19 +49,27 @@ const results = [];
 const check = (name, ok, extra = "") => results.push(`${ok ? "PASS" : "FAIL"} ${name}${extra ? ` ${extra}` : ""}`);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-for (let i = 0; i < 100; i += 1) {
-  try {
-    await fetch(`${KIT_URL}/healthz`);
-    break;
-  } catch {
+// Waits for the kit this driver started rather than for whatever else may
+// still hold the port: healthz names the kit, and the second kit below is told
+// apart by the fan out it was started with.
+async function waitForKit(authenticated) {
+  for (let i = 0; i < 100; i += 1) {
+    try {
+      const health = await (await fetch(`${KIT_URL}/healthz`)).json();
+      if (health.kit === "evaluate-latency" && health.authenticated === authenticated) return true;
+    } catch {}
     await sleep(50);
   }
+  return false;
 }
+check("the kit came up with an authenticated fan out", await waitForKit(true));
 
-const post = (route, body) =>
+// Every POST carries the secret, the way the fan out does. The requests that
+// do not are the ones checked below.
+const post = (route, body, headers = { authorization: `Bearer ${SECRET}` }) =>
   fetch(`${KIT_URL}${route}`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...headers },
     body: typeof body === "string" ? body : JSON.stringify(body),
   });
 const healthz = async () => (await fetch(`${KIT_URL}/healthz`)).json();
@@ -105,6 +123,32 @@ check("POST /v1/metrics is accepted and judges nothing", (await post("/v1/metric
 // one character at a time.
 const notAList = await post("/v1/traces", { resourceSpans: "aaaaaaaaaaaaaaaaaaaa" });
 check("a malformed repeated field judges nothing", notAList.status === 200 && (await healthz()).spans === 6, `${notAList.status}`);
+
+// Anything on the host can reach this port; only kitbashd has the secret. This
+// kit is run by an admin, so a slow span from a stranger would be a judgment
+// about whatever subject the stranger named. It is refused before the body is
+// read and judged nowhere, which the single written request below says.
+const strangerSpan = (ids) => span("pkg_build", 9000, [attr("kitbash.user", "mallory"), attr("kitbash.tool", "pkg_build"), attr("kitbash.package", "/org/ffmpeg")], ids);
+const strangerBody = { resourceSpans: [{ scopeSpans: [{ spans: [strangerSpan({ traceId: "99999999999999999999999999999999", spanId: "9999999999999999" })] }] }] };
+const noHeader = await post("/v1/traces", strangerBody, {});
+check("a fan out request without the secret is 401", noHeader.status === 401, `status=${noHeader.status}`);
+const refusal = await noHeader.json();
+check(
+  "the 401 is an RFC 9457 problem with a challenge",
+  refusal.type.endsWith("/not-permitted") && refusal.status === 401 && /^Bearer /.test(noHeader.headers.get("www-authenticate") ?? ""),
+  `${JSON.stringify(refusal).slice(0, 120)} ${noHeader.headers.get("www-authenticate")}`,
+);
+const wrongSecret = await post("/v1/traces", strangerBody, { authorization: `Bearer ${SECRET}x` });
+check("a fan out request with the wrong secret is 401", wrongSecret.status === 401, `status=${wrongSecret.status}`);
+const wrongScheme = await post("/v1/logs", { resourceLogs: [] }, { authorization: SECRET });
+check("the secret without the Bearer scheme is 401", wrongScheme.status === 401, `status=${wrongScheme.status}`);
+check("/healthz stays open", (await fetch(`${KIT_URL}/healthz`)).status === 200);
+const refused = await healthz();
+check(
+  "a refused request is judged nowhere",
+  refused.spans === 6 && refused.judged === 1 && refused.received === 4 && refused.refused === 3 && refused.authenticated === true,
+  JSON.stringify({ spans: refused.spans, judged: refused.judged, received: refused.received, refused: refused.refused }),
+);
 
 check("judgments are held for the batch window", received.length === 0, `${received.length} requests after the posts`);
 for (let i = 0; i < 40 && received.length === 0; i += 1) await sleep(100);
@@ -212,17 +256,31 @@ await sleep(200);
 const fallback = spawn("bun", ["run", kit], { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, KITBASH_EVAL_THRESHOLD_MS: "soon" } });
 let fallbackErr = "";
 fallback.stderr.on("data", (chunk) => (fallbackErr += chunk));
+check("the second kit came up with an unauthenticated fan out", await waitForKit(false));
+check("an unparsable threshold falls back to 1000", (await healthz()).thresholdMs === 1000);
+check("the fallback is logged on stderr", /KITBASH_EVAL_THRESHOLD_MS is "soon"/.test(fallbackErr), fallbackErr.split("\n")[0]);
+// That kit was started without a fan out secret, which is a kitbashd from
+// before the fan out was authenticated: it accepts what arrives and says so
+// once. The Process is the same one an upgrade leaves running.
+const legacyPost = await post("/v1/traces", { resourceSpans: [{ scopeSpans: [{ spans: [span("fs_list", 100, [attr("kitbash.user", "alice"), attr("kitbash.tool", "fs_list")])] }] }] }, {});
+const legacyHealth = await healthz();
+check("without a secret a request carrying none is accepted", legacyPost.status === 200 && legacyHealth.spans === 1, `status=${legacyPost.status} spans=${legacyHealth.spans}`);
+check("healthz says the fan out is unauthenticated", legacyHealth.authenticated === false && legacyHealth.refused === 0);
+check(
+  "the unauthenticated fan out is logged once at start",
+  fallbackErr.split("\n").filter((line) => line.includes("KITBASH_FANOUT_SECRET is not set")).length === 1,
+  fallbackErr.split("\n").filter((line) => line.includes("KITBASH_FANOUT_SECRET")).length.toString(),
+);
+fallback.kill("SIGKILL");
+// The other driver binds this same port, so this one leaves it free.
 for (let i = 0; i < 100; i += 1) {
   try {
     await fetch(`${KIT_URL}/healthz`);
-    break;
-  } catch {
     await sleep(50);
+  } catch {
+    break;
   }
 }
-check("an unparsable threshold falls back to 1000", (await healthz()).thresholdMs === 1000);
-check("the fallback is logged on stderr", /KITBASH_EVAL_THRESHOLD_MS is "soon"/.test(fallbackErr), fallbackErr.split("\n")[0]);
-fallback.kill("SIGKILL");
 
 console.log(results.join("\n"));
 const failed = results.some((line) => line.startsWith("FAIL"));

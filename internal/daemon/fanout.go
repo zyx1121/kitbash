@@ -56,8 +56,17 @@ type subscriber struct {
 	// held is how many bytes the queue is carrying. It is the second bound on
 	// the queue and it is kept by whoever puts a request in or takes one out.
 	held atomic.Int64
-	// failing is read and written only by the worker.
+	// secret is the bearer every delivery to this subscriber carries. It is a
+	// pointer because a re-registration mints a new one while the worker is
+	// running: the endpoint has not moved, so the queue is kept and only the
+	// secret is replaced.
+	secret atomic.Pointer[string]
+	// failing and unauthenticated are read and written only by the worker.
 	failing bool
+	// unauthenticated says the missing secret of a legacy registration has
+	// been reported once, so a subscriber registered by an older kitbash-mcp
+	// costs one line and not one per delivery.
+	unauthenticated bool
 	// stop is closed when this subscriber is unregistered, and done when its
 	// worker has left. The queue itself is never closed: a producer that took
 	// a snapshot of the subscribers may still be enqueueing, and a send on a
@@ -71,6 +80,23 @@ type subscriber struct {
 // same rule tel_query follows, see PLAN.md section 2.4.
 func (s *subscriber) eligible(user string) bool {
 	return s.admin || s.owner == user
+}
+
+// bearer is the secret this subscriber's deliveries carry. It is empty for a
+// registration written before the fan out was authenticated, which is
+// delivered to without a bearer until the Process is registered again.
+func (s *subscriber) bearer() string {
+	if secret := s.secret.Load(); secret != nil {
+		return *secret
+	}
+	return ""
+}
+
+// setBearer replaces the secret without disturbing the queue, which is what a
+// re-registration at the same endpoint wants: the records already queued are
+// for this same Process and go out under the secret it holds now.
+func (s *subscriber) setBearer(secret string) {
+	s.secret.Store(&secret)
 }
 
 // enqueue never blocks. A queue that is full, by count or by bytes, loses its
@@ -207,6 +233,9 @@ func (f *fanout) track(p store.Process) {
 	}
 	old, existed := f.subs[p.ID]
 	if existed && old.endpoint == p.Endpoint && old.owner == p.Owner && old.admin == p.Admin {
+		// Only the secret changed, which a re-registration always changes.
+		// The queue belongs to the endpoint and the endpoint is the same one.
+		old.setBearer(p.FanoutSecret)
 		f.mu.Unlock()
 		return
 	}
@@ -235,7 +264,7 @@ func (f *fanout) untrack(id string) {
 
 // newSubscriber is one Process's queue and the worker that drains it.
 func newSubscriber(p store.Process) *subscriber {
-	return &subscriber{
+	sub := &subscriber{
 		id:       p.ID,
 		owner:    p.Owner,
 		admin:    p.Admin,
@@ -244,6 +273,8 @@ func newSubscriber(p store.Process) *subscriber {
 		stop:     make(chan struct{}),
 		done:     make(chan struct{}),
 	}
+	sub.setBearer(p.FanoutSecret)
+	return sub
 }
 
 // reload makes the subscriber set match the registered Processes. It runs on
@@ -271,6 +302,7 @@ func (f *fanout) reload(processes []store.Process) {
 	for id, sub := range f.subs {
 		p, keep := wanted[id]
 		if keep && p.Endpoint == sub.endpoint && p.Owner == sub.owner && p.Admin == sub.admin {
+			sub.setBearer(p.FanoutSecret)
 			delete(wanted, id)
 			continue
 		}
@@ -474,6 +506,13 @@ func (f *fanout) work(sub *subscriber) {
 
 // post delivers one request. Anything but a 2xx is a failure, and there is no
 // retry: the subscriber reads what it missed from the store.
+//
+// Every request carries the subscriber's secret, which is how a kit tells
+// kitbashd from anything else on the host that can reach its loopback port,
+// see fan_out.authentication in spec/kitbashd-api.yaml. A registration written
+// before that secret existed is delivered to without one, so an upgrade does
+// not silently stop a running kit; it is said once and ends when the Process
+// is run again.
 func (f *fanout) post(ctx context.Context, sub *subscriber, d delivery) error {
 	ctx, cancel := context.WithTimeout(ctx, DeliveryTimeout)
 	defer cancel()
@@ -482,6 +521,13 @@ func (f *fanout) post(ctx context.Context, sub *subscriber, d delivery) error {
 		return err
 	}
 	req.Header.Set("Content-Type", otlp.ContentTypeJSON)
+	if secret := sub.bearer(); secret != "" {
+		req.Header.Set("Authorization", "Bearer "+secret)
+	} else if !sub.unauthenticated {
+		sub.unauthenticated = true
+		logger.Printf("fan out to the Process %s at %s carries no secret: it was registered before the fan out was authenticated, so its deliveries are unauthenticated until it is run again",
+			sub.id, sub.endpoint)
+	}
 	res, err := f.client.Do(req)
 	if err != nil {
 		return err

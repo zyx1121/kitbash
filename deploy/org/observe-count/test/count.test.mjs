@@ -14,6 +14,9 @@ const kit = path.join(import.meta.dirname, "..", "index.js");
 const KIT_URL = "http://127.0.0.1:8080";
 const TOKEN = "tok-observe";
 const PROC = "proc-observe-1";
+// What kitbashd would have minted for this Process, and what the fan out puts
+// on every delivery.
+const SECRET = "fanout-secret-observe";
 
 const received = [];
 const serve = (port) =>
@@ -44,6 +47,7 @@ const child = spawn("bun", ["run", kit], {
     KITBASH_PROCESS: PROC,
     KITBASH_USER: "alice",
     KITBASH_PACKAGE: "/org/observe-count",
+    KITBASH_FANOUT_SECRET: SECRET,
     KITBASH_OBSERVE_INTERVAL_MS: "300",
   },
 });
@@ -56,19 +60,26 @@ const results = [];
 const check = (name, ok, extra = "") => results.push(`${ok ? "PASS" : "FAIL"} ${name}${extra ? ` ${extra}` : ""}`);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-for (let i = 0; i < 100; i += 1) {
-  try {
-    await fetch(`${KIT_URL}/healthz`);
-    break;
-  } catch {
+// Waits for the kit this driver started rather than for whatever else may
+// still hold the port: healthz names the kit, and the legacy phase at the end
+// is told apart by the fan out it was started with.
+async function waitForKit(authenticated) {
+  for (let i = 0; i < 100; i += 1) {
+    try {
+      const health = await (await fetch(`${KIT_URL}/healthz`)).json();
+      if (health.kit === "observe-count" && health.authenticated === authenticated) return true;
+    } catch {}
     await sleep(50);
   }
+  return false;
 }
 
-const post = (route, body) =>
+// Every POST carries the secret, the way the fan out does. The requests that
+// do not are the ones checked below.
+const post = (route, body, headers = { authorization: `Bearer ${SECRET}` }) =>
   fetch(`${KIT_URL}${route}`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...headers },
     body: typeof body === "string" ? body : JSON.stringify(body),
   });
 const healthz = async () => (await fetch(`${KIT_URL}/healthz`)).json();
@@ -81,6 +92,8 @@ const span = (user, tool) => ({
   endTimeUnixNano: "1000000100000000000",
   attributes: [attr("kitbash.user", user), attr("kitbash.tool", tool), attr("kitbash.producer", user)],
 });
+
+check("the kit came up with an authenticated fan out", await waitForKit(true));
 
 // Two members, three signals, delivered the way the fan out delivers them.
 const traces = await post("/v1/traces", {
@@ -134,7 +147,30 @@ const loop = await post("/v1/metrics", {
 });
 check("a record produced by this Process is accepted", loop.status === 200);
 
+// Anything on the host can reach this port; only kitbashd has the secret. The
+// records in these three requests are counted nowhere, which the totals below
+// say: they are the same totals as before them.
+const spansOfAStranger = {
+  resourceSpans: [{ scopeSpans: [{ spans: [span("mallory", "fs_list"), span("mallory", "fs_list"), span("mallory", "fs_list")] }] }],
+};
+const noHeader = await post("/v1/traces", spansOfAStranger, {});
+check("a fan out request without the secret is 401", noHeader.status === 401, `status=${noHeader.status}`);
+const refusal = await noHeader.json();
+check(
+  "the 401 is an RFC 9457 problem with a challenge",
+  refusal.type.endsWith("/not-permitted") && refusal.status === 401 && /^Bearer /.test(noHeader.headers.get("www-authenticate") ?? ""),
+  `${JSON.stringify(refusal).slice(0, 120)} ${noHeader.headers.get("www-authenticate")}`,
+);
+const wrongSecret = await post("/v1/logs", { resourceLogs: [{ scopeLogs: [{ logRecords: [{ timeUnixNano: "1", attributes: [attr("kitbash.user", "mallory")] }] }] }] }, { authorization: `Bearer ${SECRET}x` });
+check("a fan out request with the wrong secret is 401", wrongSecret.status === 401, `status=${wrongSecret.status}`);
+const wrongScheme = await post("/v1/metrics", { resourceMetrics: [] }, { authorization: SECRET });
+check("the secret without the Bearer scheme is 401", wrongScheme.status === 401, `status=${wrongScheme.status}`);
+check("/healthz stays open", (await fetch(`${KIT_URL}/healthz`)).status === 200);
+
 let health = await healthz();
+check("nothing a refused request carried was counted", health.totals.spans === 2 && health.totals.logs === 1 && health.totals.metrics === 2, JSON.stringify(health.totals));
+check("healthz says the fan out is authenticated and counts the refusals", health.authenticated === true && health.refused === 3, `authenticated=${health.authenticated} refused=${health.refused}`);
+check("a refused request is not received", health.received === 4, `received=${health.received}`);
 check("healthz counts 2 spans, 1 log and 2 metric points", health.totals.spans === 2 && health.totals.logs === 1 && health.totals.metrics === 2, JSON.stringify(health.totals));
 check("healthz counts per member", health.users.alice.spans === 1 && health.users.bob.spans === 1, JSON.stringify(health.users));
 check("the loop guard ignored exactly one point", health.ignored === 1, `ignored=${health.ignored}`);
@@ -217,6 +253,36 @@ check("the shutdown is logged", /SIGTERM, stopping/.test(stderr));
 
 child.kill("SIGKILL");
 receiver.stop(true);
+
+// A kit started by a kitbashd from before the fan out was authenticated counts
+// what arrives, the way it always did, and says so once.
+await sleep(200);
+const legacy = spawn("bun", ["run", kit], {
+  stdio: ["ignore", "pipe", "pipe"],
+  env: { ...process.env, KITBASH_PROCESS: PROC, KITBASH_FANOUT_SECRET: "", KITBASH_OBSERVE_INTERVAL_MS: "300" },
+});
+let legacyErr = "";
+legacy.stderr.on("data", (chunk) => (legacyErr += chunk));
+check("the kit came up with an unauthenticated fan out", await waitForKit(false));
+const legacyPost = await post("/v1/traces", { resourceSpans: [{ scopeSpans: [{ spans: [span("alice", "fs_list")] }] }] }, {});
+const legacyHealth = await healthz();
+check("without a secret a request carrying none is accepted", legacyPost.status === 200 && legacyHealth.totals.spans === 1, `status=${legacyPost.status} spans=${legacyHealth.totals.spans}`);
+check("healthz says the fan out is unauthenticated", legacyHealth.authenticated === false && legacyHealth.refused === 0);
+check(
+  "the unauthenticated fan out is logged once at start",
+  legacyErr.split("\n").filter((line) => line.includes("KITBASH_FANOUT_SECRET is not set")).length === 1,
+  legacyErr.split("\n").filter((line) => line.includes("KITBASH_FANOUT_SECRET")).length.toString(),
+);
+legacy.kill("SIGKILL");
+// The other driver binds this same port, so this one leaves it free.
+for (let i = 0; i < 100; i += 1) {
+  try {
+    await fetch(`${KIT_URL}/healthz`);
+    await sleep(50);
+  } catch {
+    break;
+  }
+}
 
 console.log(results.join("\n"));
 const failed = results.some((line) => line.startsWith("FAIL"));

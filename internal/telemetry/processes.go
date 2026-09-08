@@ -28,6 +28,12 @@ const (
 	EnvPackage     = "KITBASH_PACKAGE"
 	EnvUser        = "KITBASH_USER"
 	EnvMCPEndpoint = "KITBASH_MCP_ENDPOINT"
+	// EnvFanoutSecret is the bearer every fan out request to this Process
+	// carries. A subscriber compares it with the header and takes records from
+	// nothing else, see fan_out.authentication in spec/kitbashd-api.yaml. It
+	// is set only for a daemon that mints one; an older one answers a
+	// registration without it and the Process runs as it did before.
+	EnvFanoutSecret = "KITBASH_FANOUT_SECRET"
 )
 
 // ProcessEndpoint is the address a rootless container reaches kitbashd's OTLP
@@ -143,10 +149,14 @@ func (r *Registered) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// registerResponse is what processes_register answers.
+// registerResponse is what processes_register answers. The fan out secret is
+// returned beside the token and, like it, only here: processes_list carries
+// neither. A daemon of an earlier release answers without one, and a Process
+// started from that answer runs with an unauthenticated fan out.
 type registerResponse struct {
-	ID    string `json:"id"`
-	Token string `json:"token"`
+	ID           string `json:"id"`
+	Token        string `json:"token"`
+	FanoutSecret string `json:"fanoutSecret"`
 }
 
 // processList is the object form of a Process list. The array form is accepted
@@ -155,41 +165,47 @@ type processList struct {
 	Processes []Registered `json:"processes"`
 }
 
-// RegisterProcess registers one Process and returns its Telemetry token. The
-// token is returned once and is the only proof the Process has that it may
-// export, so the caller injects it into the container and keeps no copy.
+// RegisterProcess registers one Process and returns its Telemetry token and
+// its fan out secret. Both are returned once: the token is the only proof the
+// Process has that it may export, the secret the only proof it has that a
+// delivery came from kitbashd. The caller injects them into the container and
+// keeps no copy.
+//
+// An empty secret is not a failure. A daemon of an earlier release answers a
+// registration without one, and a Process is not worth refusing to start over
+// a fan out that is authenticated the way it was last week.
 //
 // A host without kitbashd is not a reason to refuse to start a container: the
 // container runtime does not depend on the daemon. The caller logs the problem
 // and starts the Process untraced.
-func (c *Client) RegisterProcess(ctx context.Context, reg Registration) (string, *problem.Problem) {
+func (c *Client) RegisterProcess(ctx context.Context, reg Registration) (token, fanoutSecret string, prob *problem.Problem) {
 	if c == nil {
-		return "", problem.Internal(reg.ID, "telemetry is not configured for this session", NotRunningFix)
+		return "", "", problem.Internal(reg.ID, "telemetry is not configured for this session", NotRunningFix)
 	}
 	if prob := reg.check(); prob != nil {
-		return "", prob
+		return "", "", prob
 	}
 	body, err := json.Marshal(reg)
 	if err != nil {
-		return "", problem.Internal(reg.ID, err.Error(), "")
+		return "", "", problem.Internal(reg.ID, err.Error(), "")
 	}
 	status, payload, prob := c.send(ctx, http.MethodPost, ProcessesPath, body, reg.ID)
 	if prob != nil {
-		return "", prob
+		return "", "", prob
 	}
 	if status >= 300 {
-		return "", c.failure(reg.ID, statusText(status), payload)
+		return "", "", c.failure(reg.ID, statusText(status), payload)
 	}
 	var answer registerResponse
 	if err := json.Unmarshal(payload, &answer); err != nil {
-		return "", problem.Internal(reg.ID,
+		return "", "", problem.Internal(reg.ID,
 			fmt.Sprintf("%s answered with a body that is not a registration: %v", ProcessesPath, err), "")
 	}
 	if answer.Token == "" {
-		return "", problem.Internal(reg.ID,
+		return "", "", problem.Internal(reg.ID,
 			fmt.Sprintf("%s answered without a token", ProcessesPath), "")
 	}
-	return answer.Token, nil
+	return answer.Token, answer.FanoutSecret, nil
 }
 
 // UnregisterProcess revokes a Process's token. A Process kitbashd does not

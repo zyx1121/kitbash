@@ -253,3 +253,143 @@ func TestMigrationAddsTheProducerColumn(t *testing.T) {
 		t.Fatalf("logs = %d, want the record written after the migration", len(page.Logs))
 	}
 }
+
+// TestFanOutSecretsAreMintedAndReplaced is what the authenticated fan out
+// rests on: every registration mints a secret, registering the same id again
+// replaces it, and the store keeps it as it is sent because kitbashd is the
+// sender, see fan_out.authentication in spec/kitbashd-api.yaml.
+func TestFanOutSecretsAreMintedAndReplaced(t *testing.T) {
+	st := openProcessStore(t)
+	ctx := context.Background()
+
+	first, err := store.NewFanoutSecret()
+	if err != nil {
+		t.Fatalf("NewFanoutSecret: %v", err)
+	}
+	if len(first) < 40 || strings.ContainsAny(first, "+/=") {
+		t.Errorf("secret = %q, want at least 32 bytes of entropy in base64url", first)
+	}
+	second, err := store.NewFanoutSecret()
+	if err != nil {
+		t.Fatalf("NewFanoutSecret: %v", err)
+	}
+	if first == second {
+		t.Fatal("two secrets are the same value")
+	}
+
+	_, hash, err := store.NewToken()
+	if err != nil {
+		t.Fatalf("NewToken: %v", err)
+	}
+	p := process(idOne, "alice", false)
+	p.FanoutSecret = first
+	if err := st.RegisterProcess(ctx, p, hash, 0); err != nil {
+		t.Fatalf("RegisterProcess: %v", err)
+	}
+	got, found, err := st.Process(ctx, idOne)
+	if err != nil || !found {
+		t.Fatalf("Process: %t, %v", found, err)
+	}
+	if got.FanoutSecret != first {
+		t.Errorf("secret = %q, want the one registered", got.FanoutSecret)
+	}
+
+	// A re-registration mints a new token, so it replaces the secret too: a
+	// container holding the old token holds the old secret.
+	p.FanoutSecret = second
+	if err := st.RegisterProcess(ctx, p, hash, 0); err != nil {
+		t.Fatalf("RegisterProcess again: %v", err)
+	}
+	got, _, err = st.Process(ctx, idOne)
+	if err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if got.FanoutSecret != second {
+		t.Errorf("secret = %q, want the one the second registration minted", got.FanoutSecret)
+	}
+
+	// The fan out loads the whole table and the secret is what it sends, so it
+	// has to be on a listed Process and not only on a single read.
+	list, err := st.Processes(ctx, "")
+	if err != nil {
+		t.Fatalf("Processes: %v", err)
+	}
+	if len(list) != 1 || list[0].FanoutSecret != second {
+		t.Fatalf("the listed Process carries %q, want the secret the fan out sends", list[0].FanoutSecret)
+	}
+}
+
+// TestMigrationAddsTheFanOutSecretColumn is the upgrade path from a store
+// written before the fan out was authenticated: the column is added and the
+// registrations already in it keep working, without a secret until each
+// Process is registered again.
+func TestMigrationAddsTheFanOutSecretColumn(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "kitbashd.db")
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	ctx := context.Background()
+	_, hash, err := store.NewToken()
+	if err != nil {
+		t.Fatalf("NewToken: %v", err)
+	}
+	legacy := process(idOne, "alice", false)
+	legacy.FanoutSecret = "written-before-the-column-was-dropped"
+	if err := st.RegisterProcess(ctx, legacy, hash, 0); err != nil {
+		t.Fatalf("RegisterProcess: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Put the file back the way a version without the column left it: the row
+	// stays, the secret goes with the column.
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatalf("open the store file directly: %v", err)
+	}
+	if _, err := db.Exec("ALTER TABLE processes DROP COLUMN fanout_secret"); err != nil {
+		t.Fatalf("drop the column: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	st, err = store.Open(path)
+	if err != nil {
+		t.Fatalf("reopen a store written without the column: %v", err)
+	}
+	defer st.Close()
+
+	// The registration from before the upgrade is still there and carries no
+	// secret, which is the row the fan out delivers to without a bearer.
+	got, found, err := st.Process(ctx, idOne)
+	if err != nil || !found {
+		t.Fatalf("Process after the migration: %t, %v", found, err)
+	}
+	if got.FanoutSecret != "" {
+		t.Errorf("secret = %q, want none for a row written before the column", got.FanoutSecret)
+	}
+	if got.Owner != "alice" {
+		t.Errorf("owner = %q, want the registration kept across the migration", got.Owner)
+	}
+
+	// Registering again is what gives it one.
+	fresh, err := store.NewFanoutSecret()
+	if err != nil {
+		t.Fatalf("NewFanoutSecret: %v", err)
+	}
+	p := process(idOne, "alice", false)
+	p.FanoutSecret = fresh
+	if err := st.RegisterProcess(ctx, p, hash, 0); err != nil {
+		t.Fatalf("RegisterProcess after the migration: %v", err)
+	}
+	got, _, err = st.Process(ctx, idOne)
+	if err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if got.FanoutSecret != fresh {
+		t.Errorf("secret = %q, want the one minted after the migration", got.FanoutSecret)
+	}
+}

@@ -10,6 +10,12 @@
 // out POSTs, and answers GET /healthz with the same counters so a Process can
 // be inspected without a query.
 //
+// The three paths take records from kitbashd only: every fan out request
+// carries Authorization: Bearer KITBASH_FANOUT_SECRET, and anything else on
+// the host that can reach this port is answered 401 and counted nowhere. A kit
+// started without that secret, by a kitbashd from before the fan out was
+// authenticated, accepts what arrives and says so once at start.
+//
 // The kit adds no attributes of its own to what it exports. kitbashd stamps
 // kitbash.user, kitbash.package and kitbash.process from the Process token, and
 // kitbash.producer names this kit's Process, so a count is never mistaken for
@@ -17,11 +23,13 @@
 //
 // Environment, all supplied by kitbashd: KITBASH_TELEMETRY_ENDPOINT and
 // KITBASH_TELEMETRY_TOKEN say where and how to write back, KITBASH_PROCESS
-// names this Process. KITBASH_OBSERVE_INTERVAL_MS overrides the ten seconds.
+// names this Process, KITBASH_FANOUT_SECRET is the bearer every fan out request
+// carries. KITBASH_OBSERVE_INTERVAL_MS overrides the ten seconds.
 //
 // Nothing is written to stdout. This Package speaks HTTP, not stdio, and its
 // log is stderr.
 
+import { createHash, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 
 const PORT = 8080;
@@ -67,12 +75,19 @@ const intervalMs = readInterval();
 // this Process is one of our own exports coming back around, and counting it
 // would make the counters count themselves.
 const selfProcess = (process.env.KITBASH_PROCESS ?? "").trim();
+// The bearer kitbashd minted for this Process. Only kitbashd has it, so a
+// request carrying it came from the fan out and not from a neighbour on the
+// host that found this loopback port. An empty one means this kit was started
+// by a kitbashd from before the fan out was authenticated: it accepts what
+// arrives, the way it always did, and says so once at start.
+const fanoutSecret = (process.env.KITBASH_FANOUT_SECRET ?? "").trim();
+const expectedAuthorization = fanoutSecret === "" ? "" : `Bearer ${fanoutSecret}`;
 
 // ---------------------------------------------------------------- counters
 
 const totals = { spans: 0, logs: 0, metrics: 0 };
 const byUser = new Map();
-const state = { received: 0, ignored: 0, exported: 0, exportFailures: 0, skipped: 0, overflowUsers: 0, failing: false, lastError: null };
+const state = { received: 0, refused: 0, ignored: 0, exported: 0, exportFailures: 0, skipped: 0, overflowUsers: 0, failing: false, lastError: null };
 
 // Truncated the way kitbash-mcp truncates an attribute, and stripped of control
 // characters so a member name cannot carry an escape sequence into a log line
@@ -315,6 +330,40 @@ function problem(response, status, slug, title, detail, fix) {
   response.end(body);
 }
 
+// The two headers are compared as fixed width digests, so the comparison takes
+// the same time whatever arrives: neither the length of the secret nor how much
+// of it a caller guessed right is readable from how long the answer took.
+function sameSecret(given) {
+  const digest = (value) => createHash("sha256").update(value, "utf8").digest();
+  return timingSafeEqual(digest(given), digest(expectedAuthorization));
+}
+
+// Whether one request may feed this kit. A kit that was given no secret takes
+// what it is given, which is what an upgrade of kitbashd under a running
+// Process looks like.
+function authorized(request) {
+  if (expectedAuthorization === "") return true;
+  return sameSecret(request.headers.authorization ?? "");
+}
+
+// RFC 9110 wants a challenge with every 401, and the only 401 this kit answers
+// is a fan out request that did not come from kitbashd.
+function unauthorized(response) {
+  response.setHeader("www-authenticate", `Bearer realm="${SELF}"`);
+  // The body of the refused request is never read, so this connection has an
+  // unread request on it and cannot carry another. Saying so is what keeps a
+  // client from reusing it and reading a reset instead of an answer.
+  response.setHeader("connection", "close");
+  problem(
+    response,
+    401,
+    "not-permitted",
+    "Not permitted",
+    "This kit takes records from the kitbashd fan out only, and this request did not carry its secret.",
+    "Nothing to fix from the outside: kitbashd sends the secret it minted for this Process.",
+  );
+}
+
 function json(response, status, value) {
   const body = JSON.stringify(value);
   response.writeHead(status, { "content-type": "application/json", "content-length": Buffer.byteLength(body) });
@@ -386,7 +435,11 @@ const server = createServer(async (request, response) => {
       userCount: byUser.size,
       usersTruncated: byUser.size > HEALTHZ_USERS,
       overflowUsers: state.overflowUsers,
+      // Whether the fan out is authenticated, and how many requests were
+      // refused because they carried no secret of kitbashd's or the wrong one.
+      authenticated: expectedAuthorization !== "",
       received: state.received,
+      refused: state.refused,
       ignored: state.ignored,
       exported: state.exported,
       exportFailures: state.exportFailures,
@@ -404,6 +457,13 @@ const server = createServer(async (request, response) => {
   }
   if (request.method !== "POST") {
     problem(response, 405, "bad-request", "Method not allowed", `${route} accepts POST.`, "POST an OTLP/HTTP JSON export.");
+    return;
+  }
+  // Before the body is read, so an unauthenticated caller cannot make this kit
+  // buffer 4 MiB, and nothing it sent is counted.
+  if (!authorized(request)) {
+    state.refused += 1;
+    unauthorized(response);
     return;
   }
 
@@ -460,4 +520,7 @@ process.on("SIGINT", () => shutdown("SIGINT"));
 
 server.listen(PORT, HOST, () => {
   console.error(`[observe-count] listening on ${HOST}:${PORT}, reporting every ${intervalMs} ms`);
+  if (expectedAuthorization === "") {
+    console.error("[observe-count] KITBASH_FANOUT_SECRET is not set: the fan out is unauthenticated and this kit counts records from anything on the host that can reach its port; run the Process again on a kitbashd that mints one");
+  }
 });

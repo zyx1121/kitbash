@@ -8,7 +8,9 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -591,6 +593,10 @@ type subscriberStub struct {
 // fanoutRequest is one delivery a subscriber received.
 type fanoutRequest struct {
 	path string
+	// auth is the Authorization header of the delivery, which is how a
+	// subscriber tells kitbashd from anything else on the host, see
+	// fan_out.authentication in spec/kitbashd-api.yaml.
+	auth string
 	body map[string]any
 }
 
@@ -606,7 +612,7 @@ func newSubscriberStub(t *testing.T, slow bool) *subscriberStub {
 		var decoded map[string]any
 		json.Unmarshal(body, &decoded)
 		select {
-		case sub.requests <- fanoutRequest{path: r.URL.Path, body: decoded}:
+		case sub.requests <- fanoutRequest{path: r.URL.Path, auth: r.Header.Get("Authorization"), body: decoded}:
 		default:
 		}
 		if sub.slow {
@@ -645,8 +651,21 @@ func (s *subscriberStub) silent(t *testing.T, window time.Duration) {
 }
 
 // addSubscriber registers a subscriber owned by whoever the test names, which
-// is how one daemon gets records of two members' Processes.
-func (h *harness) addSubscriber(owner string, admin bool, endpoint string) string {
+// is how one daemon gets records of two members' Processes. It answers the
+// Process id and the fan out secret its deliveries carry.
+func (h *harness) addSubscriber(owner string, admin bool, endpoint string) (string, string) {
+	h.t.Helper()
+	secret, err := store.NewFanoutSecret()
+	if err != nil {
+		h.t.Fatalf("NewFanoutSecret: %v", err)
+	}
+	return h.addSubscriberWithSecret(owner, admin, endpoint, secret), secret
+}
+
+// addSubscriberWithSecret is the same with the secret given, so a test can
+// register the row a store written before the fan out was authenticated holds:
+// one with no secret at all.
+func (h *harness) addSubscriberWithSecret(owner string, admin bool, endpoint, secret string) string {
 	h.t.Helper()
 	id := uuid.V7()
 	_, hash, err := store.NewToken()
@@ -661,6 +680,7 @@ func (h *harness) addSubscriber(owner string, admin bool, endpoint string) strin
 		Expose:        ExposeHTTP,
 		Endpoint:      endpoint,
 		Subscriptions: []string{store.SubscriptionTelemetry},
+		FanoutSecret:  secret,
 		RegisteredAt:  time.Now(),
 	}, hash, 0); err != nil {
 		h.t.Fatalf("RegisterProcess: %v", err)
@@ -680,9 +700,10 @@ func TestFanOutFollowsTheReadingRule(t *testing.T) {
 	memberSub := newSubscriberStub(t, false)
 	otherSub := newSubscriberStub(t, false)
 
-	h.addSubscriber("an-admin", true, adminSub.server.URL)
-	h.addSubscriber(h.user, false, memberSub.server.URL)
+	_, adminSecret := h.addSubscriber("an-admin", true, adminSub.server.URL)
+	_, memberSecret := h.addSubscriber(h.user, false, memberSub.server.URL)
 	h.addSubscriber("someone-else", false, otherSub.server.URL)
+	secrets := map[string]string{"admin": adminSecret, "owner": memberSecret}
 
 	res, body := h.do(http.MethodPost, pathTraces, otlp.ContentTypeProtobuf,
 		exportRequest("fs_list", h.user, time.Now().Add(-time.Minute)))
@@ -694,6 +715,11 @@ func TestFanOutFollowsTheReadingRule(t *testing.T) {
 		got := sub.await(t)
 		if got.path != pathTraces {
 			t.Errorf("%s subscriber received %s, want %s", name, got.path, pathTraces)
+		}
+		// Each subscriber's own secret, so one kit's deliveries are not
+		// something another kit could have replayed.
+		if want := "Bearer " + secrets[name]; got.auth != want {
+			t.Errorf("%s subscriber received %q, want %q", name, got.auth, want)
 		}
 		span := onlySpan(t, got.body)
 		if span["traceId"] != strings.Repeat("ab", 16) {
@@ -946,4 +972,162 @@ func attributeMap(span map[string]any) map[string]string {
 		}
 	}
 	return out
+}
+
+// daemonLog captures what the package logger writes for one test. The fan out
+// logs from its own goroutine, so the buffer is guarded.
+type daemonLog struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (l *daemonLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(p)
+}
+
+func (l *daemonLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.String()
+}
+
+// captureDaemonLog points the daemon log at a buffer for the length of one
+// test, which is how a test reads a line the operator would read.
+func captureDaemonLog(t *testing.T) *daemonLog {
+	t.Helper()
+	captured := &daemonLog{}
+	logger.SetOutput(captured)
+	t.Cleanup(func() { logger.SetOutput(os.Stderr) })
+	return captured
+}
+
+// TestRegistrationAnswersAFanOutSecretTheListHides is the mint of
+// fan_out.authentication: a registration returns the secret its container is
+// started with, a re-registration replaces it, and no listing carries it.
+func TestRegistrationAnswersAFanOutSecretTheListHides(t *testing.T) {
+	h := serve(t, false)
+	req := registration("")
+
+	res, body := h.postJSON(http.MethodPost, processesPath, req)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("register status = %d, body %s", res.StatusCode, body)
+	}
+	var first processResponse
+	if err := json.Unmarshal(body, &first); err != nil {
+		t.Fatalf("body %q: %v", body, err)
+	}
+	if len(first.FanoutSecret) < 40 {
+		t.Fatalf("fanoutSecret = %q, want at least 32 bytes of entropy", first.FanoutSecret)
+	}
+	if first.FanoutSecret == first.Token {
+		t.Error("the secret is the token; they are two credentials, not one")
+	}
+
+	// Unlike the token the store holds it, because kitbashd is the one that
+	// sends it on every delivery.
+	p, found, err := h.store.Process(context.Background(), req.ID)
+	if err != nil || !found {
+		t.Fatalf("Process: %v, found %v", err, found)
+	}
+	if p.FanoutSecret != first.FanoutSecret {
+		t.Errorf("the store holds %q, want the secret the registration answered", p.FanoutSecret)
+	}
+
+	res, body = h.postJSON(http.MethodPost, processesPath, req)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("register again status = %d, body %s", res.StatusCode, body)
+	}
+	var second processResponse
+	if err := json.Unmarshal(body, &second); err != nil {
+		t.Fatalf("body %q: %v", body, err)
+	}
+	if second.FanoutSecret == first.FanoutSecret {
+		t.Error("registering again returned the same secret; it is minted with the token")
+	}
+
+	res, body = h.do(http.MethodGet, processesPath, "", nil)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("list status = %d, body %s", res.StatusCode, body)
+	}
+	if strings.Contains(string(body), second.FanoutSecret) || strings.Contains(string(body), first.FanoutSecret) {
+		t.Errorf("the list carries a fan out secret: %s", body)
+	}
+	if strings.Contains(string(body), "fanoutSecret") {
+		t.Errorf("the list carries a fanoutSecret key: %s", body)
+	}
+}
+
+// TestFanOutMovesToTheSecretOfTheNewestRegistration is what a re-run of the
+// same Process does to a subscriber that is already being delivered to: the
+// endpoint has not moved, so the queue is kept and the deliveries carry the
+// secret the newest registration minted.
+func TestFanOutMovesToTheSecretOfTheNewestRegistration(t *testing.T) {
+	h := serve(t, false)
+	sub := newSubscriberStub(t, false)
+	req := registration(sub.server.URL)
+
+	_, res, body := h.register(req)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("register status = %d, body %s", res.StatusCode, body)
+	}
+	var first processResponse
+	if err := json.Unmarshal(body, &first); err != nil {
+		t.Fatalf("body %q: %v", body, err)
+	}
+
+	export := exportRequest("fs_list", h.user, time.Now().Add(-time.Minute))
+	if res, body := h.do(http.MethodPost, pathTraces, otlp.ContentTypeProtobuf, export); res.StatusCode != http.StatusOK {
+		t.Fatalf("export status = %d, body %s", res.StatusCode, body)
+	}
+	if got := sub.await(t); got.auth != "Bearer "+first.FanoutSecret {
+		t.Errorf("delivery carried %q, want the secret of the registration", got.auth)
+	}
+
+	_, res, body = h.register(req)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("register again status = %d, body %s", res.StatusCode, body)
+	}
+	var second processResponse
+	if err := json.Unmarshal(body, &second); err != nil {
+		t.Fatalf("body %q: %v", body, err)
+	}
+	if res, body := h.do(http.MethodPost, pathTraces, otlp.ContentTypeProtobuf, export); res.StatusCode != http.StatusOK {
+		t.Fatalf("export status = %d, body %s", res.StatusCode, body)
+	}
+	if got := sub.await(t); got.auth != "Bearer "+second.FanoutSecret {
+		t.Errorf("delivery carried %q, want the secret of the newest registration", got.auth)
+	}
+}
+
+// TestALegacySubscriberIsDeliveredToWithoutASecret is the upgrade path: a
+// registration written before the fan out was authenticated keeps receiving,
+// without a bearer, and the operator is told once rather than once per
+// delivery.
+func TestALegacySubscriberIsDeliveredToWithoutASecret(t *testing.T) {
+	captured := captureDaemonLog(t)
+	h := serve(t, false)
+	sub := newSubscriberStub(t, false)
+	id := h.addSubscriberWithSecret(h.user, false, sub.server.URL, "")
+
+	export := exportRequest("fs_list", h.user, time.Now().Add(-time.Minute))
+	for i := 0; i < 3; i++ {
+		if res, body := h.do(http.MethodPost, pathTraces, otlp.ContentTypeProtobuf, export); res.StatusCode != http.StatusOK {
+			t.Fatalf("export status = %d, body %s", res.StatusCode, body)
+		}
+		if got := sub.await(t); got.auth != "" {
+			t.Fatalf("delivery %d carried %q, want no bearer for a registration that has no secret", i, got.auth)
+		}
+	}
+
+	var said int
+	for _, line := range strings.Split(captured.String(), "\n") {
+		if strings.Contains(line, "carries no secret") && strings.Contains(line, id) {
+			said++
+		}
+	}
+	if said != 1 {
+		t.Errorf("the missing secret was logged %d times, want once: %s", said, captured.String())
+	}
 }

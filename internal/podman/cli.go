@@ -247,7 +247,8 @@ func (c *CLI) Run(ctx context.Context, opts RunOptions) (string, error) {
 // An env file is a list of KEY=value lines, so a value with a line break has
 // no spelling in one. Those keys stay on the command line, where they are
 // visible: they can only come from a manifest, never from kitbash itself, and
-// the five variables kitbash sets carry no line breaks.
+// the variables kitbash sets itself, the token and the fan out secret among
+// them, carry no line breaks.
 func writeEnvFile(env map[string]string) (path string, inline []string, cleanup func(), err error) {
 	if len(env) == 0 {
 		return "", nil, nil, nil
