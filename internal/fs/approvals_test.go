@@ -265,6 +265,113 @@ func TestWriteRefusesAnAuthorThatIsNotAMemberName(t *testing.T) {
 	}
 }
 
+// /org is 2775 and owned by kitbash-admin, so what an admin writes there has
+// to stay writable by the group: with the default umask the next admin could
+// not replace a file the first one wrote.
+func TestWritesUnderTheSharedRootStayGroupWritable(t *testing.T) {
+	service, root, _ := shared(t, true)
+	folder := filepath.Join(root, "policies")
+	manifest := "name: policies\ndescription: What this organization requires of everyone who works here.\n"
+
+	if _, prob := service.Write(context.Background(), fs.WriteRequest{
+		Path:    filepath.Join(folder, "kitbash.yaml"),
+		Content: &manifest,
+		Message: "Add the policies folder",
+	}); prob != nil {
+		t.Fatalf("Write: %s", prob.Detail)
+	}
+
+	if got := mode(t, filepath.Join(folder, "kitbash.yaml")); got.Perm() != 0o664 {
+		t.Errorf("the file is %v, want 0664 so another admin can replace it", got.Perm())
+	}
+	// The folder the write created keeps the group and the setgid bit, so what
+	// lands inside it stays admin writable too.
+	if got := mode(t, folder); got.Perm() != 0o775 || got&os.ModeSetgid == 0 {
+		t.Errorf("%s is %v, want 2775", folder, got)
+	}
+	// git writes its objects read only unless the repository says it is
+	// shared, so the second admin to commit would be refused by the kernel.
+	if got := gitConfig(t, folder, "core.sharedRepository"); got != "group" {
+		t.Errorf("core.sharedRepository is %q, want group", got)
+	}
+}
+
+// A multi file write is the same rule: an imported Package under the shared
+// root is as replaceable as a written one.
+func TestWriteFilesUnderTheSharedRootStayGroupWritable(t *testing.T) {
+	service, root, _ := shared(t, true)
+	manifest := "name: time\ndescription: A wrapped MCP server that answers what the time is right now.\n"
+	body := "FROM alpine\n"
+	folder := filepath.Join(root, "time")
+
+	if _, prob := service.WriteFiles(context.Background(), fs.WriteFilesRequest{
+		Path: folder,
+		Files: []fs.File{
+			{Path: "kitbash.yaml", Content: &manifest},
+			{Path: "src/Containerfile", Content: &body},
+		},
+		Message: "Import npm:time-mcp",
+	}); prob != nil {
+		t.Fatalf("WriteFiles: %s", prob.Detail)
+	}
+
+	for _, name := range []string{"kitbash.yaml", filepath.Join("src", "Containerfile")} {
+		if got := mode(t, filepath.Join(folder, name)); got.Perm() != 0o664 {
+			t.Errorf("%s is %v, want 0664", name, got.Perm())
+		}
+	}
+	if got := mode(t, filepath.Join(folder, "src")); got.Perm() != 0o775 || got&os.ModeSetgid == 0 {
+		t.Errorf("the src folder is %v, want 2775", got)
+	}
+}
+
+// A member's home is theirs alone, so nothing about it is widened.
+func TestWritesOutsideTheSharedRootKeepTheDefaultModes(t *testing.T) {
+	service, root := tree(t)
+	folder := filepath.Join(root, "notes")
+	manifest := "name: notes\ndescription: Notes a member keeps to themselves in their own home.\n"
+
+	if _, prob := service.Write(context.Background(), fs.WriteRequest{
+		Path:    filepath.Join(folder, "kitbash.yaml"),
+		Content: &manifest,
+		Message: "Add a private folder",
+	}); prob != nil {
+		t.Fatalf("Write: %s", prob.Detail)
+	}
+	if got := mode(t, filepath.Join(folder, "kitbash.yaml")); got.Perm() != 0o644 {
+		t.Errorf("the file is %v, want the default 0644", got.Perm())
+	}
+	if got := mode(t, folder); got.Perm() != 0o755 || got&os.ModeSetgid != 0 {
+		t.Errorf("the folder is %v, want the default 0755", got)
+	}
+	if got := gitConfig(t, folder, "core.sharedRepository"); got != "" {
+		t.Errorf("core.sharedRepository is %q, want it unset in a member's home", got)
+	}
+}
+
+// mode is the mode of one path.
+func mode(t *testing.T, path string) os.FileMode {
+	t.Helper()
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	return info.Mode()
+}
+
+// gitConfig reads one setting of a repository, empty when it is not set.
+func gitConfig(t *testing.T, repo, key string) string {
+	t.Helper()
+	cmd := exec.Command("git", "-c", "safe.directory="+repo, "config", "--get", key)
+	cmd.Dir = repo
+	out, err := cmd.Output()
+	if err != nil {
+		// git exits 1 for a setting that is not there, which is an answer.
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
 // gitShow reads one field of the newest commit of a repository, which is how
 // the committer is checked: the surface returns the author and says nothing
 // about who ran the commit.

@@ -154,10 +154,13 @@ func (s *Service) WriteFiles(ctx context.Context, req WriteFilesRequest) (*Write
 	}
 	rels := make([]string, 0, len(planned))
 	for _, p := range planned {
-		if err := os.MkdirAll(filepath.Dir(p.full), 0o755); err != nil {
+		if err := s.makeDir(filepath.Dir(p.full)); err != nil {
 			return nil, writeProblem(p.full, err)
 		}
 		if err := writeNoFollow(p.full, p.data); err != nil {
+			return nil, writeProblem(p.full, err)
+		}
+		if err := s.share(p.full); err != nil {
 			return nil, writeProblem(p.full, err)
 		}
 		rels = append(rels, p.rel)

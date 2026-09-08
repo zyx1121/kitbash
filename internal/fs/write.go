@@ -149,10 +149,13 @@ func (s *Service) Write(ctx context.Context, req WriteRequest) (*WriteResult, *p
 		}
 	}
 
-	if err := os.MkdirAll(folder, 0o755); err != nil {
+	if err := s.makeDir(folder); err != nil {
 		return nil, writeProblem(clean, err)
 	}
 	if err := writeNoFollow(clean, data); err != nil {
+		return nil, writeProblem(clean, err)
+	}
+	if err := s.share(clean); err != nil {
 		return nil, writeProblem(clean, err)
 	}
 	rels := []string{rel}
@@ -308,15 +311,31 @@ func payload(instance string, req WriteRequest) ([]byte, *problem.Problem) {
 
 // ensureRepo makes the top level folder a git repository, creating it when it
 // does not exist yet.
+//
+// A repository under the shared root is initialised with --shared=group, which
+// is core.sharedRepository=group of PLAN.md section 2.1: without it git writes
+// its objects read only and owned by whoever committed first, and the second
+// admin to write the folder is refused by the kernel.
 func (s *Service) ensureRepo(ctx context.Context, repo string) *problem.Problem {
-	if err := os.MkdirAll(repo, 0o755); err != nil {
+	if err := s.makeDir(repo); err != nil {
 		return statProblem(repo, err)
 	}
 	if isRepo(repo) {
 		return nil
 	}
-	if _, err := s.git(ctx, repo, "init", "--quiet", "--initial-branch=main"); err != nil {
+	args := []string{"init", "--quiet", "--initial-branch=main"}
+	if s.sharedPath(repo) {
+		args = append(args, "--shared=group")
+	}
+	if _, err := s.git(ctx, repo, args...); err != nil {
 		return gitProblem(repo, err)
+	}
+	if s.sharedPath(repo) {
+		// --shared=group records itself as 1. The setting is the same one, and
+		// a human reading .git/config reads the spelling PLAN.md uses.
+		if _, err := s.git(ctx, repo, "config", "core.sharedRepository", "group"); err != nil {
+			return gitProblem(repo, err)
+		}
 	}
 	return nil
 }
