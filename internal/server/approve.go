@@ -73,12 +73,21 @@ func execute(ctx context.Context, files *fs.Service, packages *pkg.Service, appr
 
 // run dispatches one approved call. The admin is the session's own Linux user,
 // which is who the commit is committed by.
+//
+// The path is confined to the shared root before anything runs. Only writes to
+// the shared root are queued, so an approval naming anything else is not a
+// call this session executes: the tool would otherwise happily write the
+// admin's own home on a requester's behalf, because the admin's roots include
+// it and the kernel would allow it.
 func run(ctx context.Context, files *fs.Service, packages *pkg.Service, approval *telemetry.Approval) (any, *problem.Problem) {
 	admin := files.User()
 	switch approval.Tool {
 	case telemetry.ToolFSWrite:
 		var in writeInput
 		if prob := decodeInput(approval, &in); prob != nil {
+			return nil, prob
+		}
+		if prob := confined(files, approval, in.Path); prob != nil {
 			return nil, prob
 		}
 		telemetry.SetPath(ctx, in.Path)
@@ -100,6 +109,9 @@ func run(ctx context.Context, files *fs.Service, packages *pkg.Service, approval
 		if prob := decodeInput(approval, &in); prob != nil {
 			return nil, prob
 		}
+		if prob := confined(files, approval, in.Path); prob != nil {
+			return nil, prob
+		}
 		telemetry.SetPackage(ctx, in.Path)
 		return packages.Import(ctx, pkg.ImportRequest{
 			Path:       in.Path,
@@ -112,6 +124,26 @@ func run(ctx context.Context, files *fs.Service, packages *pkg.Service, approval
 			fmt.Sprintf("%q is not a tool this session can execute", approval.Tool),
 			"Only fs_write and pkg_import are queued, so only those can be approved.")
 	}
+}
+
+// confined refuses an approved call whose path is not under the shared root.
+// The problem is stored on the approval like any other outcome, so the admin
+// reads why nothing happened and rejects it.
+func confined(files *fs.Service, approval *telemetry.Approval, path string) *problem.Problem {
+	if files.UnderShared(path) {
+		return nil
+	}
+	return problem.BadRequest(approval.ID, "the queued path is outside the shared root",
+		fmt.Sprintf("Reject this approval with approvals_reject; %s only queues writes under %s.",
+			approval.Tool, sharedOrNone(files)))
+}
+
+// sharedOrNone names the shared root, or says there is none.
+func sharedOrNone(files *fs.Service) string {
+	if shared := files.Shared(); shared != "" {
+		return shared
+	}
+	return "the shared root, which this session does not have"
 }
 
 // decodeInput reads the input the approval stored. It is the requester's, so a

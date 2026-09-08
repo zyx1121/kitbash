@@ -19,13 +19,21 @@ import (
 // records what was queued. The temporary root of the fixture stands in for
 // /org, which is the only thing about /org this package knows.
 type queue struct {
-	admin  bool
+	admin bool
+	// silent is a daemon that did not answer who the caller is, which is what
+	// a host whose kitbashd is down looks like from here.
+	silent bool
 	queued []telemetry.Approval
 	refuse *problem.Problem
 	ids    int
 }
 
-func (q *queue) Admin(context.Context) bool { return q.admin }
+func (q *queue) Admin(context.Context) (bool, bool) {
+	if q.silent {
+		return false, false
+	}
+	return q.admin, true
+}
 
 func (q *queue) CreateApproval(_ context.Context, tool string, input json.RawMessage) (*telemetry.Approval, *problem.Problem) {
 	if q.refuse != nil {
@@ -186,6 +194,35 @@ func TestAdminWriteUnderTheSharedRootIsNotQueued(t *testing.T) {
 	}
 	if out.Commit.Author != "tester" {
 		t.Errorf("the commit author is %q, want the admin who wrote it", out.Commit.Author)
+	}
+	if _, err := os.Stat(target); err != nil {
+		t.Errorf("the file was not written: %v", err)
+	}
+}
+
+// A daemon that does not answer queues nothing. The write is attempted and the
+// kernel decides, which is what a host without kitbashd does: an admin's write
+// lands through the group bits and a member's is refused. The fixture root is
+// writable, so this is the admin half of that.
+func TestAWriteIsNotQueuedWhenTheDaemonDoesNotAnswer(t *testing.T) {
+	service, root, q := shared(t, false)
+	q.silent = true
+	target := filepath.Join(root, "handbook", "onboarding.md")
+	body := "# Onboarding\n"
+
+	out, prob := service.Write(context.Background(), fs.WriteRequest{
+		Path:    target,
+		Content: &body,
+		Message: "Add the onboarding page",
+	})
+	if prob != nil {
+		t.Fatalf("Write: %s", prob.Detail)
+	}
+	if len(q.queued) != 0 {
+		t.Errorf("%d calls were queued, want none: there was nothing to queue with", len(q.queued))
+	}
+	if out.Commit.Sha == "" {
+		t.Error("the write produced no commit")
 	}
 	if _, err := os.Stat(target); err != nil {
 		t.Errorf("the file was not written: %v", err)

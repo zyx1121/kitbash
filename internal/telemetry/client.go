@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/zyx1121/kitbash/internal/problem"
 )
@@ -36,7 +37,7 @@ type Client struct {
 	http   *http.Client
 
 	// The one identity question the session asks, users_me, and whether it
-	// has been asked. Admin holds them, see users.go.
+	// has been answered. Admin holds them, see users.go.
 	mu       sync.Mutex
 	asked    bool
 	identity Identity
@@ -134,7 +135,25 @@ func (c *Client) failure(instance, status string, payload []byte) *problem.Probl
 		detail = status
 	}
 	return problem.Internal(instance,
-		fmt.Sprintf("kitbashd answered %s: %s", status, detail), "")
+		fmt.Sprintf("kitbashd answered %s: %s", status, clip(detail, maxDetailBytes)), "")
+}
+
+// maxDetailBytes is how much of a body that is not problem details is worth
+// repeating. The answer is a refusal nobody structured, and the whole of it
+// could be a megabyte of HTML on its way into the server log.
+const maxDetailBytes = 1 << 10
+
+// clip shortens a string to a byte budget, saying that it did.
+func clip(s string, limit int) string {
+	if len(s) <= limit {
+		return s
+	}
+	// The budget is bytes, so the cut is moved back off a partial rune.
+	cut := limit
+	for cut > 0 && !utf8.ValidString(s[:cut]) {
+		cut--
+	}
+	return s[:cut] + fmt.Sprintf("... (%d bytes truncated)", len(s)-cut)
 }
 
 // statusText spells a status the way an HTTP response line does, which is what

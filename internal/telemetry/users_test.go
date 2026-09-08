@@ -132,26 +132,59 @@ func TestAdminAsksTheDaemonOncePerSession(t *testing.T) {
 	ctx := context.Background()
 
 	for range 3 {
-		if !client.Admin(ctx) {
+		admin, known := client.Admin(ctx)
+		if !admin || !known {
 			t.Fatal("the caller is an admin and was not reported as one")
 		}
 	}
+	if calls := meCalls(daemon); calls != 1 {
+		t.Errorf("users_me was called %d times, want once", calls)
+	}
+}
+
+// A daemon that cannot be reached makes the caller neither an admin nor a
+// member: there is nothing to queue with, so the caller falls through to the
+// kernel instead of being guessed about.
+func TestAdminIsUnknownWithoutADaemon(t *testing.T) {
+	client := telemetry.NewClient(t.TempDir() + "/absent.sock")
+
+	admin, known := client.Admin(context.Background())
+	if admin || known {
+		t.Errorf("Admin answered (%v, %v), want it unknown", admin, known)
+	}
+}
+
+// A failure is not an answer, so it is not kept: a daemon that was starting
+// when the first call landed is asked again by the second.
+func TestAFailedIdentityIsAskedAgain(t *testing.T) {
+	daemon := newDaemon(t)
+	daemon.AnswerUsers(teltest.Problem(http.StatusInternalServerError, "internal",
+		"Internal error", "the store is not open yet", ""))
+	client := telemetry.NewClient(daemon.Socket)
+	ctx := context.Background()
+
+	if _, known := client.Admin(ctx); known {
+		t.Fatal("a refused users_me was taken for an answer")
+	}
+	daemon.AnswerUsers(teltest.Response{})
+	daemon.SetAdmin(true)
+
+	admin, known := client.Admin(ctx)
+	if !admin || !known {
+		t.Errorf("Admin answered (%v, %v), want the admin the daemon now names", admin, known)
+	}
+	if calls := meCalls(daemon); calls != 2 {
+		t.Errorf("users_me was called %d times, want the failure and the answer", calls)
+	}
+}
+
+// meCalls counts how often the identity was asked for.
+func meCalls(daemon *teltest.Daemon) int {
 	calls := 0
 	for _, call := range daemon.Calls() {
 		if call.Path == telemetry.UsersMePath {
 			calls++
 		}
 	}
-	if calls != 1 {
-		t.Errorf("users_me was called %d times, want once", calls)
-	}
-}
-
-// A daemon that is not there makes the caller a member, which is the answer
-// that queues a write rather than the one that attempts it.
-func TestAdminIsFalseWithoutADaemon(t *testing.T) {
-	client := telemetry.NewClient(t.TempDir() + "/absent.sock")
-	if client.Admin(context.Background()) {
-		t.Error("a caller with no daemon was treated as an admin")
-	}
+	return calls
 }

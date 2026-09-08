@@ -124,6 +124,7 @@ type Daemon struct {
 	approvalOrder   []string
 	approvalIDs     int
 	approvalsAnswer Response
+	resultAnswer    Response
 }
 
 // Start listens on a unix socket in a temporary directory of its own. The

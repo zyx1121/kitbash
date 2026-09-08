@@ -18,10 +18,16 @@ import (
 // says whether the caller is an admin and keeps what was queued.
 type queue struct {
 	admin  bool
+	silent bool
 	queued []telemetry.Approval
 }
 
-func (q *queue) Admin(context.Context) bool { return q.admin }
+func (q *queue) Admin(context.Context) (bool, bool) {
+	if q.silent {
+		return false, false
+	}
+	return q.admin, true
+}
 
 func (q *queue) CreateApproval(_ context.Context, tool string, input json.RawMessage) (*telemetry.Approval, *problem.Problem) {
 	approval := telemetry.Approval{

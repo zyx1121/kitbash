@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/zyx1121/kitbash/internal/problem"
@@ -141,6 +142,76 @@ func TestTheQueueRefusesBeyondThePendingCap(t *testing.T) {
 	}
 	if prob.Slug() != problem.SlugConflict {
 		t.Errorf("problem is %s, want conflict", prob.Slug())
+	}
+}
+
+// kitbashd starts what the container field names at boot, so a registration
+// this process got wrong is not sent: the mistake would be found at the next
+// boot instead of now.
+func TestRegistrationRefusesAMalformedContainerOrDigest(t *testing.T) {
+	daemon := newDaemon(t)
+	client := telemetry.NewClient(daemon.Socket)
+	good := telemetry.Registration{
+		ID:        "0192f000-0000-7000-8000-000000000000",
+		Package:   "/org/ffmpeg",
+		Name:      "ffmpeg",
+		Container: "kitbash-ffmpeg-ffmpeg",
+		Digest:    "sha256:" + strings.Repeat("a", 64),
+		Expose:    "mcp",
+	}
+	if _, prob := client.RegisterProcess(context.Background(), good); prob != nil {
+		t.Fatalf("a well formed registration was refused: %s", prob.Detail)
+	}
+
+	cases := []struct {
+		name      string
+		container string
+		digest    string
+	}{
+		{name: "container without the prefix", container: "ffmpeg", digest: good.Digest},
+		{name: "container with a slash", container: "kitbash-ffmpeg/ffmpeg", digest: good.Digest},
+		{name: "digest without the algorithm", container: good.Container, digest: strings.Repeat("a", 64)},
+		{name: "digest of the wrong length", container: good.Container, digest: "sha256:abc"},
+		{name: "digest in upper case", container: good.Container, digest: "sha256:" + strings.Repeat("A", 64)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			before := len(daemon.Calls())
+			reg := good
+			reg.Container, reg.Digest = tc.container, tc.digest
+			_, prob := client.RegisterProcess(context.Background(), reg)
+			if prob == nil {
+				t.Fatal("the registration was sent")
+			}
+			if prob.Slug() != problem.SlugBadRequest {
+				t.Errorf("problem is %s, want bad-request", prob.Slug())
+			}
+			if len(daemon.Calls()) != before {
+				t.Error("the registration reached the daemon anyway")
+			}
+		})
+	}
+}
+
+// A refusal that is not problem details still goes to the server log, so what
+// is copied out of it is bounded: the body could be a megabyte of HTML.
+func TestAnUnreadableRefusalIsTruncated(t *testing.T) {
+	daemon := newDaemon(t)
+	daemon.AnswerUsers(teltest.Response{Status: http.StatusBadGateway, ContentType: "text/html",
+		Body: strings.Repeat("x", 4096)})
+	client := telemetry.NewClient(daemon.Socket)
+
+	_, prob := client.ListUsers(context.Background())
+	if prob == nil {
+		t.Fatal("a gateway error was taken for an answer")
+	}
+	if prob.Slug() != problem.SlugInternal {
+		t.Errorf("problem is %s, want internal", prob.Slug())
+	}
+	// The detail the agent sees is the generic one; the cause is the log line,
+	// and it is the cause that is bounded.
+	if strings.Contains(prob.Detail, "xxxx") {
+		t.Errorf("the body reached the agent: %q", prob.Detail)
 	}
 }
 

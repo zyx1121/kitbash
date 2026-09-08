@@ -153,9 +153,18 @@ func TestMemberWriteUnderTheSharedRootIsQueuedOverTheSurface(t *testing.T) {
 // Approving runs the queued call in the admin's session: the commit is
 // authored by the requester and carries the trailer, and the result is stored
 // where the requester reads it.
-func TestApproveExecutesTheQueuedWrite(t *testing.T) {
+// approving is a session kitbashd calls an admin, with the fixture root
+// standing in for /org: an approval is executed only under the shared root.
+func approving(t *testing.T) *traced {
+	t.Helper()
 	tr := newTracedWithDaemon(t)
 	tr.daemon.SetAdmin(true)
+	tr.files.SetShared(tr.root)
+	return tr
+}
+
+func TestApproveExecutesTheQueuedWrite(t *testing.T) {
+	tr := approving(t)
 	target := filepath.Join(tr.root, "handbook", "kitbash.yaml")
 	input, _ := json.Marshal(map[string]any{
 		"path":    target,
@@ -227,8 +236,7 @@ func TestApproveExecutesTheQueuedWrite(t *testing.T) {
 // An approved call is not privileged by having been approved: it goes through
 // the same rules, and a failure is stored on the approval and returned.
 func TestApproveStoresTheProblemWhenTheToolFails(t *testing.T) {
-	tr := newTracedWithDaemon(t)
-	tr.daemon.SetAdmin(true)
+	tr := approving(t)
 	input, _ := json.Marshal(map[string]any{
 		"path":    filepath.Join(tr.root, "handbook", "kitbash.yaml"),
 		"content": "name: Not Kebab Case\n",
@@ -261,8 +269,7 @@ func TestApproveStoresTheProblemWhenTheToolFails(t *testing.T) {
 
 // Rejecting is kitbashd's decision; the surface forwards it and nothing runs.
 func TestRejectForwardsToTheDaemon(t *testing.T) {
-	tr := newTracedWithDaemon(t)
-	tr.daemon.SetAdmin(true)
+	tr := approving(t)
 	target := filepath.Join(tr.root, "handbook", "kitbash.yaml")
 	input, _ := json.Marshal(map[string]any{
 		"path":    target,
@@ -285,6 +292,135 @@ func TestRejectForwardsToTheDaemon(t *testing.T) {
 	}
 	if _, err := os.Stat(target); err == nil {
 		t.Error("the rejected write was carried out")
+	}
+}
+
+// Only writes to the shared root are ever queued, so an approval naming
+// anything else is refused rather than run. Without this the admin's own home
+// is reachable through an approval, because the admin's roots include it and
+// the kernel would allow the write.
+func TestApproveRefusesAPathOutsideTheSharedRoot(t *testing.T) {
+	tr := newTracedWithDaemon(t)
+	tr.daemon.SetAdmin(true)
+	// The shared root is one folder of the fixture; the target is another,
+	// standing in for the admin's home.
+	tr.files.SetShared(filepath.Join(tr.root, "org"))
+	target := filepath.Join(tr.root, "home", "kitbash.yaml")
+	input, _ := json.Marshal(map[string]any{
+		"path":    target,
+		"content": handbookManifest,
+		"message": "Add the handbook",
+	})
+	queued := tr.daemon.AddApproval(teltest.Approval{
+		Requester: "member", Tool: telemetry.ToolFSWrite, Input: input})
+
+	res := call(t, tr.session, "approvals_approve", map[string]any{"id": queued.ID})
+	ok(t, res, "approvals_approve")
+	out := structured[approved](t, res)
+	var refused problem.Problem
+	if err := json.Unmarshal(out.Result, &refused); err != nil {
+		t.Fatalf("the result is not problem details: %v", err)
+	}
+	if refused.Slug() != problem.SlugBadRequest {
+		t.Errorf("the stored problem is %s, want bad-request", refused.Slug())
+	}
+	if !strings.Contains(refused.Detail, "outside the shared root") {
+		t.Errorf("the detail is %q, want it to say the path is outside the shared root", refused.Detail)
+	}
+	if _, err := os.Stat(target); err == nil {
+		t.Fatal("the approval wrote outside the shared root")
+	}
+	// The admin reads why nothing happened off the approval as well.
+	held, _ := tr.daemon.Approval(queued.ID)
+	if !strings.Contains(string(held.Result), "outside the shared root") {
+		t.Errorf("the stored result is %s, want the refusal", held.Result)
+	}
+}
+
+// An approval that was decided already is kitbashd's to refuse, and its
+// conflict is the agent's answer: two admins cannot run the same call twice.
+func TestApproveOfADecidedApprovalIsTheDaemonsConflict(t *testing.T) {
+	tr := approving(t)
+	target := filepath.Join(tr.root, "handbook", "kitbash.yaml")
+	input, _ := json.Marshal(map[string]any{
+		"path":    target,
+		"content": handbookManifest,
+		"message": "Add the handbook",
+	})
+	queued := tr.daemon.AddApproval(teltest.Approval{
+		Requester: "member", Tool: telemetry.ToolFSWrite, Input: input,
+		State: telemetry.StateApproved})
+
+	p := problemOf(t, call(t, tr.session, "approvals_approve", map[string]any{"id": queued.ID}))
+	if p.Slug() != problem.SlugConflict || p.Status != 409 {
+		t.Errorf("problem is %s with status %d, want the daemon's conflict 409", p.Slug(), p.Status)
+	}
+	if _, err := os.Stat(target); err == nil {
+		t.Error("an approval that was already decided ran again")
+	}
+}
+
+// The tool has run by the time the outcome is stored, so a daemon that refuses
+// the result is reported to the admin rather than swallowed: the requester
+// will never see what happened and only the admin can say so.
+func TestApproveReportsAFailureToStoreTheResult(t *testing.T) {
+	tr := approving(t)
+	target := filepath.Join(tr.root, "handbook", "kitbash.yaml")
+	input, _ := json.Marshal(map[string]any{
+		"path":    target,
+		"content": handbookManifest,
+		"message": "Add the handbook",
+	})
+	queued := tr.daemon.AddApproval(teltest.Approval{
+		Requester: "member", Tool: telemetry.ToolFSWrite, Input: input})
+	tr.daemon.AnswerResult(teltest.Problem(409, "conflict", "Conflict",
+		"this approval already carries a result", "Read it with approvals_list."))
+
+	p := problemOf(t, call(t, tr.session, "approvals_approve", map[string]any{"id": queued.ID}))
+	if p.Slug() != problem.SlugConflict {
+		t.Errorf("problem is %s, want the daemon's conflict", p.Slug())
+	}
+	// The write itself happened, which is exactly why the admin is told.
+	if _, err := os.Stat(target); err != nil {
+		t.Errorf("the approved write did not land: %v", err)
+	}
+	held, _ := tr.daemon.Approval(queued.ID)
+	if len(held.Result) != 0 {
+		t.Errorf("the approval carries %s, want nothing: the store refused", held.Result)
+	}
+}
+
+// The requester reads the outcome with approvals_list, which is the only way
+// they learn what the admin's session did.
+func TestApprovalsListCarriesTheResult(t *testing.T) {
+	tr := approving(t)
+	input, _ := json.Marshal(map[string]any{
+		"path":    filepath.Join(tr.root, "handbook", "kitbash.yaml"),
+		"content": handbookManifest,
+		"message": "Add the handbook",
+	})
+	queued := tr.daemon.AddApproval(teltest.Approval{
+		Requester: "member", Tool: telemetry.ToolFSWrite, Input: input})
+	ok(t, call(t, tr.session, "approvals_approve", map[string]any{"id": queued.ID}), "approvals_approve")
+
+	res := call(t, tr.session, "approvals_list", map[string]any{"state": "approved"})
+	ok(t, res, "approvals_list")
+	page := structured[struct {
+		Approvals []telemetry.Approval `json:"approvals"`
+	}](t, res)
+	if len(page.Approvals) != 1 {
+		t.Fatalf("the approved page holds %d approvals, want the one that ran", len(page.Approvals))
+	}
+	listed := page.Approvals[0]
+	if listed.ID != queued.ID || listed.Requester != "member" {
+		t.Errorf("the listed approval is %+v, want the requester's own", listed)
+	}
+	var written fs.WriteResult
+	if err := json.Unmarshal(listed.Result, &written); err != nil {
+		t.Fatalf("the listed result is not an fs_write output: %v", err)
+	}
+	if len(written.Commit.Sha) != 40 || written.Commit.Author != "member" {
+		t.Errorf("the listed result is %+v, want the commit the requester authored", written)
 	}
 }
 

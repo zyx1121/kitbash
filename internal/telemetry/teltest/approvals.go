@@ -34,6 +34,15 @@ func (d *Daemon) AnswerApprovals(r Response) {
 	d.approvalsAnswer = r
 }
 
+// AnswerResult replaces what storing a result returns, and only that, so a
+// test can let an approval be claimed and executed and then have the daemon
+// refuse the outcome. The zero Response restores the fake's own behaviour.
+func (d *Daemon) AnswerResult(r Response) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.resultAnswer = r
+}
+
 // AddApproval seeds the queue, standing in for a call queued in another
 // session. An approval without an id or a state gets both.
 func (d *Daemon) AddApproval(approval Approval) Approval {
@@ -192,6 +201,12 @@ func (d *Daemon) storeResult(w http.ResponseWriter, r *http.Request) {
 	}
 	d.mu.Lock()
 	d.calls = append(d.calls, Call{Method: r.Method, Path: r.URL.Path, Body: string(body)})
+	if d.resultAnswer.Status != 0 {
+		answer := d.resultAnswer
+		d.mu.Unlock()
+		write(w, answer)
+		return
+	}
 	if override, ok := d.approvalsOverride(); ok {
 		d.mu.Unlock()
 		write(w, override)

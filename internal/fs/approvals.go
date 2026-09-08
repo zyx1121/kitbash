@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
+	"strings"
 
 	"github.com/zyx1121/kitbash/internal/problem"
 	"github.com/zyx1121/kitbash/internal/telemetry"
@@ -14,9 +16,10 @@ import (
 // which keeps the socket out of this package.
 type Approvals interface {
 	// Admin reports whether the caller is in kitbash-admin, asked once per
-	// session. A daemon that cannot be reached answers false, so an
-	// unreachable daemon queues nothing and the kernel refuses the write.
-	Admin(ctx context.Context) bool
+	// session. The second return says whether kitbashd answered: a daemon
+	// that is not there makes the caller neither, and the write goes to the
+	// kernel unqueued.
+	Admin(ctx context.Context) (admin, known bool)
 	// CreateApproval queues one call with the tool's input verbatim.
 	CreateApproval(ctx context.Context, tool string, input json.RawMessage) (*telemetry.Approval, *problem.Problem)
 }
@@ -38,6 +41,24 @@ func (s *Service) SetShared(root string) {
 
 // Shared is the root writes are queued under, empty when this service has none.
 func (s *Service) Shared() string { return s.shared }
+
+// UnderShared reports whether a path lies under the shared root. It is the
+// check an admin's session makes on an approved call before running it: the
+// only calls that queue are writes to the shared root, so an approval naming
+// anything else is not a call this session should carry out on someone else's
+// behalf. A service with no shared root queues nothing and so approves
+// nothing.
+func (s *Service) UnderShared(path string) bool {
+	if s.shared == "" || path == "" || !filepath.IsAbs(path) {
+		return false
+	}
+	for _, seg := range strings.Split(path, string(filepath.Separator)) {
+		if seg == ".." {
+			return false
+		}
+	}
+	return within(filepath.Clean(path), s.shared)
+}
 
 // Queue offers one call to the approval queue before it is carried out. It
 // returns the queued problem when the call was queued, the daemon's problem
@@ -65,6 +86,12 @@ func (s *Service) Queue(ctx context.Context, path, tool string, input json.RawMe
 
 // queues reports whether a call about this path goes to the queue instead of
 // to the filesystem.
+//
+// Only a caller kitbashd named a member is queued. An admin writes /org
+// directly, and so does a session that could not ask, because a queue nothing
+// answers for is not a queue: the write is attempted and the kernel decides,
+// which is the whole permission model in version 1 and the same answer a host
+// without kitbashd gives.
 func (s *Service) queues(ctx context.Context, clean string) bool {
 	if s.approvals == nil || s.shared == "" {
 		return false
@@ -72,8 +99,6 @@ func (s *Service) queues(ctx context.Context, clean string) bool {
 	if !within(clean, s.shared) {
 		return false
 	}
-	// An admin writes /org directly. The permission is the kernel's, granted
-	// by the kitbash-admin group on the folder, not by anything kitbash
-	// decides here, see PLAN.md section 2.1.
-	return !s.approvals.Admin(ctx)
+	admin, known := s.approvals.Admin(ctx)
+	return known && !admin
 }
