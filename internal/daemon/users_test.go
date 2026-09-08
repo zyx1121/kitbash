@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"os/user"
 	"testing"
@@ -326,6 +327,80 @@ func TestUsersRemove(t *testing.T) {
 	res, body = h.do(http.MethodDelete, usersPath+"/alice", "", nil)
 	if res.StatusCode != http.StatusNotFound {
 		t.Errorf("second remove status = %d, body %s", res.StatusCode, body)
+	}
+}
+
+// TestUsersOnlyTouchMembers is the boundary of the whole family: an account on
+// the host that is not a member of kitbash-users is not something users_remove
+// deletes or users_add_key hands a key to. Without this rule, DELETE on root
+// archives /root and kills the daemon, and a key added to root is the host.
+func TestUsersOnlyTouchMembers(t *testing.T) {
+	h, fake := serveUsers(t, true)
+	fake.AddAccount(sysusers.Member{Name: "root", UID: 0, Home: "/root", Groups: []string{"root"}})
+	fake.AddAccount(sysusers.Member{Name: "sshd", UID: 22, Home: "/var/empty", Groups: []string{"sshd"}})
+	fake.AddAccount(sysusers.Member{Name: "builder", UID: 300, Home: "/var/lib/builder", Groups: []string{"builder"}})
+
+	for _, name := range []string{"root", "sshd", "builder"} {
+		t.Run(name, func(t *testing.T) {
+			res, body := h.do(http.MethodDelete, usersPath+"/"+name, "", nil)
+			// root is refused by name, the others are simply not members.
+			want := http.StatusNotFound
+			if name == "root" {
+				want = http.StatusForbidden
+			}
+			if res.StatusCode != want {
+				t.Fatalf("delete status = %d, want %d, body %s", res.StatusCode, want, body)
+			}
+
+			res, body = h.postJSON(http.MethodPost, usersPath+"/"+name+"/keys",
+				keyRequest{SSHKey: publicKey("intruder")})
+			if res.StatusCode != http.StatusNotFound {
+				t.Fatalf("add key status = %d, want 404, body %s", res.StatusCode, body)
+			}
+		})
+	}
+	if len(fake.Removed) != 0 || len(fake.AddedKeys) != 0 {
+		t.Errorf("the host was asked to touch %v and %+v, want neither", fake.Removed, fake.AddedKeys)
+	}
+}
+
+// TestUsersRemoveKeepsTheStoreUntilTheAccountIsGone is the order removal
+// follows: the host first, the store second. A registration deleted for an
+// account that is still there is a Process whose token was revoked for nothing.
+func TestUsersRemoveKeepsTheStoreUntilTheAccountIsGone(t *testing.T) {
+	h, fake := serveUsers(t, true)
+	fake.Add(sysusers.Member{Name: "alice", UID: 1005})
+	fake.RemoveErr = errors.New("userdel: alice is currently used by process 941")
+
+	ctx := context.Background()
+	_, hash, err := store.NewToken()
+	if err != nil {
+		t.Fatalf("NewToken: %v", err)
+	}
+	id := uuid.V7()
+	if err := h.store.RegisterProcess(ctx, store.Process{
+		ID: id, Owner: "alice", Package: "/home/alice/echo", Container: "kitbash-echo",
+		Expose: ExposeNone, RegisteredAt: time.Now().UTC(),
+	}, hash, 0); err != nil {
+		t.Fatalf("RegisterProcess: %v", err)
+	}
+	if err := h.store.CreateApproval(ctx, store.Approval{
+		ID: uuid.V7(), Requester: "alice", Tool: store.ToolFSWrite,
+		Input: json.RawMessage(`{"path":"/org/handbook/x.md"}`), RequestedAt: time.Now().UTC(),
+	}, 0); err != nil {
+		t.Fatalf("CreateApproval: %v", err)
+	}
+
+	res, body := h.do(http.MethodDelete, usersPath+"/alice", "", nil)
+	if res.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500, body %s", res.StatusCode, body)
+	}
+	if _, found, err := h.store.Process(ctx, id); err != nil || !found {
+		t.Errorf("the Process was unregistered for an account that is still there (%t, %v)", found, err)
+	}
+	left, err := h.store.Approvals(ctx, "alice", "")
+	if err != nil || len(left) != 1 {
+		t.Errorf("approvals = %d, %v, want the one that was queued", len(left), err)
 	}
 }
 

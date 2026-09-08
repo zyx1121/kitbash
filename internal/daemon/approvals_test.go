@@ -1,7 +1,9 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -248,6 +250,33 @@ func TestApprovalsPendingCap(t *testing.T) {
 	}
 	if slug := h.problemOf(res, body).Slug(); slug != problem.SlugConflict {
 		t.Errorf("slug = %q, want conflict", slug)
+	}
+}
+
+// TestApprovalsCarryALegalWrite is what the cap is for: fs_write carries a
+// megabyte of content, base64 grows it by a third, and a call the surface
+// accepts must not be one the queue refuses.
+func TestApprovalsCarryALegalWrite(t *testing.T) {
+	h, _ := serveUsers(t, false)
+	content := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte("k"), 1<<20))
+	input, err := json.Marshal(map[string]string{
+		"path":          "/org/handbook/big.bin",
+		"message":       "Add a megabyte",
+		"contentBase64": content,
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if len(input) <= 1<<20 {
+		t.Fatalf("the input is %d bytes, which does not exercise the old cap", len(input))
+	}
+
+	res, body := h.postJSON(http.MethodPost, approvalsPath, approvalRequest{
+		Tool:  store.ToolFSWrite,
+		Input: json.RawMessage(input),
+	})
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 for a %d byte input, body %s", res.StatusCode, len(input), body)
 	}
 }
 

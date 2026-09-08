@@ -78,8 +78,12 @@ func TestValidateKeyRefuses(t *testing.T) {
 		"a body of another type":    "ssh-ed25519 " + blob("ssh-rsa", 32),
 		"two lines": key("ssh-ed25519") + "\n" +
 			`command="rm -rf /" ` + key("ssh-ed25519"),
-		"an options prefix":           `no-pty ` + key("ssh-ed25519"),
-		"a control character":         "ssh-ed25519\x00 " + blob("ssh-ed25519", 32),
+		"an options prefix":   `no-pty ` + key("ssh-ed25519"),
+		"a control character": "ssh-ed25519\x00 " + blob("ssh-ed25519", 32),
+		// A byte under 0x20 inside a sequence that is not valid UTF-8 would
+		// decode as one replacement rune, so the check is byte by byte.
+		"a control byte in bad UTF-8": "ssh-ed25519 \xff\x01" + blob("ssh-ed25519", 32),
+		"a delete byte":               "ssh-ed25519 \x7f" + blob("ssh-ed25519", 32),
 		"a body that is empty":        "ssh-ed25519 ",
 		"a truncated blob":            "ssh-ed25519 " + base64.StdEncoding.EncodeToString([]byte{0, 0}),
 		"over the size a key carries": key("ssh-ed25519") + " " + strings.Repeat("a", sysusers.MaxKeyBytes),

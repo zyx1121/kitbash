@@ -69,11 +69,30 @@ type fakeMember struct {
 func NewFake() *Fake { return &Fake{} }
 
 // Add puts a member into the fake host without going through Create, which is
-// how a test gets the user it is already running as, or a second admin.
+// how a test gets the user it is already running as, or a second admin. What
+// the caller leaves empty is filled in the way a host would: a uid, a home
+// under /home, and membership of kitbash-users.
 func (f *Fake) Add(m Member) Member {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.add(m, nil).member
+}
+
+// AddAccount puts an account in exactly as it is given, uid included. It is
+// how a test gets root, sshd or any other account that lives on a host and is
+// not an organization member.
+func (f *Fake) AddAccount(m Member) Member {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.members == nil {
+		f.members = map[string]*fakeMember{}
+	}
+	if m.Groups == nil {
+		m.Groups = []string{}
+	}
+	entry := &fakeMember{member: m}
+	f.members[m.Name] = entry
+	return entry.member
 }
 
 // add is Add without the lock.
@@ -90,11 +109,25 @@ func (f *Fake) add(m Member, keys []string) *fakeMember {
 	if m.Home == "" {
 		m.Home = path.Join("/home", m.Name)
 	}
-	m.Groups = groupsOf(m)
+	if m.Groups == nil {
+		m.Groups = groupsOf(m)
+	}
 	m.Keys = len(keys)
 	entry := &fakeMember{member: m, keys: keys}
 	f.members[m.Name] = entry
 	return entry
+}
+
+// member is the lookup the two calls that write share: the account has to be
+// an organization member, which is what keeps this family away from root, from
+// sshd and from every other account on the host. It is called with the lock
+// held.
+func (f *Fake) member(name string) (*fakeMember, error) {
+	entry, held := f.members[name]
+	if !held || !entry.member.IsMember() {
+		return nil, fmt.Errorf("%w: %s", ErrNotFound, name)
+	}
+	return entry, nil
 }
 
 // uid hands out the next uid, starting at FirstUID.
@@ -144,9 +177,9 @@ func (f *Fake) AddKey(_ context.Context, name, key string) (Member, error) {
 	if f.AddKeyErr != nil {
 		return Member{}, f.AddKeyErr
 	}
-	entry, held := f.members[name]
-	if !held {
-		return Member{}, fmt.Errorf("%w: %s", ErrNotFound, name)
+	entry, err := f.member(name)
+	if err != nil {
+		return Member{}, err
 	}
 	f.AddedKeys = append(f.AddedKeys, KeyCall{Name: name, Key: line})
 	for _, existing := range entry.keys {
@@ -167,8 +200,8 @@ func (f *Fake) Remove(_ context.Context, name string) (string, error) {
 	if f.RemoveErr != nil {
 		return "", f.RemoveErr
 	}
-	if _, held := f.members[name]; !held {
-		return "", fmt.Errorf("%w: %s", ErrNotFound, name)
+	if _, err := f.member(name); err != nil {
+		return "", err
 	}
 	f.Removed = append(f.Removed, name)
 	delete(f.members, name)

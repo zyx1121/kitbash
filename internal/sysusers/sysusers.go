@@ -38,6 +38,12 @@ var (
 	// ErrNoContainer reports a container the runtime does not have, which is
 	// what restore unregisters rather than retries.
 	ErrNoContainer = errors.New("sysusers: no such container")
+	// ErrHomeShape reports a home that is not the shape kitbashd writes into:
+	// a .ssh that is a link or belongs to somebody else, an authorized_keys
+	// that is not a regular file the member owns. kitbashd is root and a
+	// member owns every name under their home, so this is refused rather than
+	// repaired.
+	ErrHomeShape = errors.New("sysusers: the home is not the shape kitbash writes into")
 )
 
 // Member is one organization member. Keys is how many public keys their
@@ -52,6 +58,24 @@ type Member struct {
 	Home   string
 	Keys   int
 	Groups []string
+}
+
+// InGroup reports whether the member belongs to a group by name.
+func (m Member) InGroup(name string) bool {
+	for _, g := range m.Groups {
+		if g == name {
+			return true
+		}
+	}
+	return false
+}
+
+// IsMember reports whether this account is an organization member rather than
+// some other account on the host. Only a member of kitbash-users is one, and
+// root is never one however it is grouped: the users family writes SSH keys
+// and deletes accounts, so the accounts it may touch are named exactly.
+func (m Member) IsMember() bool {
+	return m.UID != 0 && m.InGroup(UsersGroup)
 }
 
 // Spec is one member to create.

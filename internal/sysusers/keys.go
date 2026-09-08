@@ -45,9 +45,11 @@ func ValidateKey(line string) (string, error) {
 		return "", fmt.Errorf("%w: a key is one line and this is more than one", ErrKey)
 	}
 	// A NUL or any other control byte in a file sshd parses line by line is
-	// never anything an honest key generator wrote.
-	for _, r := range trimmed {
-		if r < 0x20 && r != '\t' {
+	// never anything an honest key generator wrote. The check is byte by
+	// byte: ranging over the string would decode UTF-8 first, and a control
+	// byte inside a sequence that does not decode would pass as one rune.
+	for i := 0; i < len(trimmed); i++ {
+		if b := trimmed[i]; (b < 0x20 && b != '\t') || b == 0x7f {
 			return "", fmt.Errorf("%w: the line carries a control character", ErrKey)
 		}
 	}

@@ -16,6 +16,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 
 	"github.com/zyx1121/kitbash/internal/daemon"
@@ -72,7 +73,7 @@ func run() error {
 	storePath := flag.String("store", env(storeEnv, defaultStore), "SQLite file holding Telemetry")
 	otlpListen := flag.String("otlp-listen", env(otlpListenEnv, defaultOTLPListen),
 		"address of the Process receiver, empty to serve the socket alone")
-	noRestore := flag.Bool("no-restore", os.Getenv(noRestoreEnv) != "",
+	noRestore := flag.Bool("no-restore", truthy(os.Getenv(noRestoreEnv)),
 		"do not start the registered Processes at boot")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
@@ -171,6 +172,14 @@ func run() error {
 	}
 	logger.Printf("stopped")
 	return nil
+}
+
+// truthy reads a switch from the environment. Only 1 and true turn one on: a
+// variable set to 0 or to false is an operator saying no, and reading any
+// value as yes would leave a host without its Processes because somebody wrote
+// KITBASH_NO_RESTORE=0.
+func truthy(v string) bool {
+	return v == "1" || strings.EqualFold(v, "true")
 }
 
 // env reads an override, falling back to the default of the API spec.

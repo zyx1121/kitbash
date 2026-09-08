@@ -14,9 +14,10 @@ import (
 )
 
 // MaxApprovalBytes bounds the tool input one approval carries and the result
-// stored on it. A write queued for an admin is a file the admin will commit,
-// and a megabyte is far above what a manifest or a source file needs.
-const MaxApprovalBytes = 1 << 20
+// stored on it. fs_write carries a megabyte of content, and base64 makes that
+// 1.37 MiB on the wire, so the cap is two megabytes: a call the surface
+// accepts must not become one the queue refuses.
+const MaxApprovalBytes = 2 << 20
 
 // MaxPendingApprovals is how many approvals one member may have waiting. The
 // queue is what an admin reads, so a member who cannot be refused could push
@@ -353,7 +354,7 @@ func approvalObject(instance, field string, raw json.RawMessage) *problem.Proble
 	if len(raw) > MaxApprovalBytes {
 		return problem.TooLarge(instance,
 			fmt.Sprintf("the %s is %d bytes, over the %d an approval carries", field, len(raw), MaxApprovalBytes),
-			"Queue a smaller call; an approval carries at most a megabyte of arguments.")
+			"Queue a smaller call; an approval carries at most two megabytes of arguments.")
 	}
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || trimmed[0] != '{' {

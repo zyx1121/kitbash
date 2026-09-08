@@ -266,7 +266,19 @@ func (s *Server) removeUser(w http.ResponseWriter, r *http.Request, caller Calle
 		writeProblem(w, problem.Internal(r.URL.Path, err.Error(), ""))
 		return
 	}
-	if !found {
+	// root is refused by name before anything else looks at it. The
+	// membership test below would refuse it too, but the account that runs
+	// this daemon is worth its own sentence.
+	if found && target.UID == 0 {
+		writeProblem(w, problem.NotPermitted(r.URL.Path,
+			fmt.Sprintf("%s is the host's own account and is not a member", name),
+			"Members are the accounts users_list answers with; the host's own accounts are not managed here."))
+		return
+	}
+	// An account that is not a member of kitbash-users is not found as far as
+	// this family is concerned. Without this rule the path is a way to delete
+	// sshd, the build user or any other account on the host.
+	if !found || !target.IsMember() {
 		writeProblem(w, problem.NotFoundFix(r.URL.Path,
 			fmt.Sprintf("%s is not a member of this host", name),
 			"List the members to see which names exist."))
@@ -286,9 +298,17 @@ func (s *Server) removeUser(w http.ResponseWriter, r *http.Request, caller Calle
 		}
 	}
 
-	// The registrations go before the account does: every one of them is a
-	// live Telemetry token, and a token outliving the member it names is a
-	// producer nobody owns, see spec/kitbashd-api.yaml.
+	// The host goes first: the containers stop, the sessions end, the account
+	// is deleted and the home is archived. Only then does the store forget the
+	// member, because a registration deleted for an account that is still
+	// there is a Process whose Telemetry token was revoked for nothing.
+	archived, err := s.users.Remove(r.Context(), name)
+	if err != nil {
+		writeProblem(w, s.userProblem(r, err, name))
+		return
+	}
+	// Every registration is a live Telemetry token, and a token outliving the
+	// member it names is a producer nobody owns, see spec/kitbashd-api.yaml.
 	ids, err := s.store.DeleteProcessesByOwner(r.Context(), name)
 	if err != nil {
 		writeProblem(w, problem.Internal(r.URL.Path, err.Error(), ""))
@@ -299,12 +319,6 @@ func (s *Server) removeUser(w http.ResponseWriter, r *http.Request, caller Calle
 	}
 	if _, err := s.store.DeleteApprovals(r.Context(), name); err != nil {
 		writeProblem(w, problem.Internal(r.URL.Path, err.Error(), ""))
-		return
-	}
-
-	archived, err := s.users.Remove(r.Context(), name)
-	if err != nil {
-		writeProblem(w, s.userProblem(r, err, name))
 		return
 	}
 	logger.Printf("%s removed the member %s, home archived at %s", caller.User, name, archived)

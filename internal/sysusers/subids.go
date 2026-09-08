@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 // The subordinate id layout rootless podman needs, see PLAN.md section 4.2.
@@ -17,6 +18,42 @@ const (
 	SubIDCount = 65536
 	SubIDMode  = 0o644
 )
+
+// SubIDLockSuffix names the lock file beside /etc/subuid. The lock is on a
+// file of its own rather than on /etc/subuid, because an allocation replaces
+// /etc/subuid by renaming a new file over it: a lock held on the old inode
+// would guard a file nobody reads any more.
+//
+// kitbash-adduser takes the same lock, so an admin creating a member through
+// kitbashd and an operator running the console script cannot hand out the same
+// range.
+const SubIDLockSuffix = ".lock"
+
+// SubIDAttempts is how often an allocation is tried before it gives up. One
+// attempt is enough under the lock; the retry is what makes the allocation
+// converge anyway if a lock is ever weaker than it looks, because the file is
+// read back and a block shared with another name is dropped and asked for
+// again.
+const SubIDAttempts = 5
+
+// lockSubIDs takes the cross process lock and returns the release. The lock is
+// advisory, which is enough: the two writers of these files are kitbashd and
+// kitbash-adduser, and both take it.
+func lockSubIDs(path string) (func(), error) {
+	name := path + SubIDLockSuffix
+	f, err := os.OpenFile(name, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("sysusers: open %s: %w", name, err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("sysusers: lock %s: %w", name, err)
+	}
+	return func() {
+		syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		f.Close()
+	}, nil
+}
 
 // nextSubID reads a subordinate id file and answers the first free block above
 // the highest one it holds. A file that does not exist yet answers SubIDBase,
@@ -37,6 +74,64 @@ func nextSubID(path string) (int, error) {
 		}
 	}
 	return next, nil
+}
+
+// allocate gives one name a block in one file, then reads the file back: the
+// name has to appear exactly once and its block has to be nobody else's. An
+// allocation that lost a race is removed and asked for again rather than left
+// overlapping somebody, which is what sharing a subordinate range means for
+// two members' container files.
+func allocate(path, name string) error {
+	for range SubIDAttempts {
+		has, err := hasSubID(path, name)
+		if err != nil {
+			return err
+		}
+		if has {
+			return nil
+		}
+		start, err := nextSubID(path)
+		if err != nil {
+			return err
+		}
+		if err := appendSubID(path, name, start, SubIDCount); err != nil {
+			return err
+		}
+		ours, err := blockIsOurs(path, name, start)
+		if err != nil {
+			return err
+		}
+		if ours {
+			return nil
+		}
+		if _, err := removeSubID(path, name); err != nil {
+			return err
+		}
+	}
+	return fmt.Errorf("sysusers: could not allocate a subordinate id block for %s in %s", name, path)
+}
+
+// blockIsOurs reports whether the file gives this name one block and gives
+// that block to nobody else.
+func blockIsOurs(path, name string, start int) (bool, error) {
+	lines, err := readLines(path)
+	if err != nil {
+		return false, err
+	}
+	named, sharing := 0, 0
+	for _, line := range lines {
+		owner, at, _, ok := parseSubID(line)
+		if !ok {
+			continue
+		}
+		if owner == name {
+			named++
+		}
+		if at == start {
+			sharing++
+		}
+	}
+	return named == 1 && sharing == 1, nil
 }
 
 // hasSubID reports whether the file already carries a block for this name.
@@ -126,7 +221,9 @@ func readLines(path string) ([]string, error) {
 }
 
 // writeLines replaces a subordinate id file atomically, keeping the mode
-// shadow-utils expects.
+// shadow-utils expects. The content is on the disk before the rename, so a
+// host that loses power during an allocation comes back with the old file or
+// the new one and never with an empty one.
 func writeLines(path string, lines []string) error {
 	var b strings.Builder
 	for _, line := range lines {
@@ -145,6 +242,10 @@ func writeLines(path string, lines []string) error {
 		return fmt.Errorf("sysusers: write %s: %w", path, err)
 	}
 	if err := tmp.Chmod(SubIDMode); err != nil {
+		tmp.Close()
+		return fmt.Errorf("sysusers: write %s: %w", path, err)
+	}
+	if err := tmp.Sync(); err != nil {
 		tmp.Close()
 		return fmt.Errorf("sysusers: write %s: %w", path, err)
 	}
