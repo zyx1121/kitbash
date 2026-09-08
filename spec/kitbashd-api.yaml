@@ -41,6 +41,14 @@ tcp:
     KITBASH_USER: the member who ran it
     KITBASH_MCP_ENDPOINT: http://host.containers.internal:4318/mcp, see mcp_for_processes
     KITBASH_FANOUT_SECRET: the bearer every fan out request to this Process carries, see fan_out.authentication
+  environment_when_kitbashd_is_unreachable: >
+    kitbash-mcp removes every variable above from the manifest's environment
+    before it adds back what a registration answered, so a Process started
+    while kitbashd was unreachable carries none of them: no token, no fan out
+    secret, and neither endpoint. It exports nothing, and a subscriber among
+    them accepts what arrives because it was given no secret to check. A
+    manifest that declares any of these names is never honoured; a Package that
+    could name its own fan out secret would take records from whoever wrote it.
 
 mcp_for_processes:
   description: >

@@ -38,6 +38,12 @@ const HOST = "0.0.0.0";
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
 const DEFAULT_INTERVAL_MS = 10 * 1000;
 const EXPORT_TIMEOUT_MS = 5 * 1000;
+// What one inbound request may take. Without these a connection that sends a
+// header slowly, or a body slowly, holds a socket for the node defaults, and
+// this port is reachable by everything on the host. The fan out's own request
+// timeout is 5 s, so both are far above what a delivery needs.
+const HEADERS_TIMEOUT_MS = 10 * 1000;
+const REQUEST_TIMEOUT_MS = 30 * 1000;
 // The budget for the last export when the Process is stopping, the same three
 // seconds kitbash-mcp gives its own shutdown flush.
 const SHUTDOWN_TIMEOUT_MS = 3 * 1000;
@@ -491,6 +497,9 @@ const server = createServer(async (request, response) => {
   // The OTLP success response is an empty Export*ServiceResponse.
   json(response, 200, {});
 });
+
+server.headersTimeout = HEADERS_TIMEOUT_MS;
+server.requestTimeout = REQUEST_TIMEOUT_MS;
 
 server.on("clientError", (err, socket) => {
   if (socket.writable) socket.end("HTTP/1.1 400 Bad Request\r\nconnection: close\r\n\r\n");

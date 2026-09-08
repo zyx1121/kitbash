@@ -36,6 +36,21 @@ const (
 	EnvFanoutSecret = "KITBASH_FANOUT_SECRET"
 )
 
+// OwnedEnv is every variable kitbashd speaks for. A caller removes all of them
+// from a manifest's environment before it adds back the ones a registration
+// answered, so a Process started while kitbashd is unreachable carries none of
+// them rather than the values a Package author wrote: a container that names
+// its own fan out secret would take records from whoever wrote the manifest.
+var OwnedEnv = []string{
+	EnvEndpoint,
+	EnvToken,
+	EnvProcess,
+	EnvPackage,
+	EnvUser,
+	EnvMCPEndpoint,
+	EnvFanoutSecret,
+}
+
 // ProcessEndpoint is the address a rootless container reaches kitbashd's OTLP
 // receiver on. It is not the unix socket: rootless networking delivers
 // host.containers.internal to the host's primary address, so a Process exports

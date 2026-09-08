@@ -391,11 +391,16 @@ func (s *Service) Reconcile(ctx context.Context, running []Process) (registered,
 			s.logger.Printf("proc: registering Process %s at %s: %s", p.ID, p.Package, prob.Detail)
 			continue
 		}
-		// This registration replaced the secret as well as the token, and the
-		// running container holds the previous one, so it refuses the fan out
-		// the way it refuses to export. The caller says the same about the
-		// token; the secret is said here because nothing else would.
-		s.logger.Printf("proc: Process %s was registered again; the running container holds the previous fan out secret, so it refuses the fan out until it is run again", p.ID)
+		// This registration replaced the secret as well as the token. Which of
+		// the two states the running container is in cannot be seen from here,
+		// and they are not the same problem: a container started under an
+		// earlier registration holds a secret this one replaced and now
+		// refuses every delivery, while one started while kitbashd was
+		// unreachable holds none and takes records from anything that can
+		// reach its port. Running it again ends either one. The caller says
+		// the same about the token; the secret is said here because nothing
+		// else would.
+		s.logger.Printf("proc: Process %s was registered again; the running container holds the fan out secret this registration replaced and refuses every delivery, or was started with none and accepts a delivery from anything on the host. Run it again to end either state.", p.ID)
 		registered = append(registered, p.ID)
 	}
 	for _, entry := range mine {
@@ -407,21 +412,30 @@ func (s *Service) Reconcile(ctx context.Context, running []Process) (registered,
 }
 
 // telemetryEnv registers the Process and returns the environment its container
-// is started with: the manifest's own, plus the seven variables of
-// spec/kitbashd-api.yaml. The manifest cannot override them; they are the
-// Process's identity, not its configuration, and they are written after the
-// manifest's own keys so a manifest that names one of them loses. The second
-// return says whether the registration happened, so a container that never
-// starts can be taken back off the registry.
+// is started with: the manifest's own, minus everything kitbashd speaks for,
+// plus the seven variables of spec/kitbashd-api.yaml that this registration
+// answered. The manifest cannot name any of them; they are the Process's
+// identity and its two credentials, not its configuration. The second return
+// says whether the registration happened, so a container that never starts can
+// be taken back off the registry.
+//
+// The removal happens before anything is added back, and so on every path out
+// of here. Overwriting the keys at the end would leave a manifest's own
+// KITBASH_FANOUT_SECRET in place whenever no registration happened, and a
+// container that knows its own secret accepts fan out requests from whoever
+// wrote the manifest rather than from kitbashd alone.
 //
 // A registration that fails is not a reason to refuse to start the Process.
 // The container runtime does not depend on kitbashd, so the Process starts
-// with no token and produces no Telemetry of its own, and the session says so
-// once in the server log.
+// with neither credential and produces no Telemetry of its own, and the
+// session says so once in the server log.
 func (s *Service) telemetryEnv(ctx context.Context, env map[string]string, reg telemetry.Registration) (map[string]string, bool) {
-	merged := make(map[string]string, len(env)+7)
+	merged := make(map[string]string, len(env)+len(telemetry.OwnedEnv))
 	for k, v := range env {
 		merged[k] = v
+	}
+	for _, key := range telemetry.OwnedEnv {
+		delete(merged, key)
 	}
 	if s.registry == nil {
 		s.logger.Printf("proc: kitbashd is not running; Process %s starts untraced", reg.ID)

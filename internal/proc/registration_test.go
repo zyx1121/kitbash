@@ -324,12 +324,19 @@ func TestStopUnregistersTheProcess(t *testing.T) {
 // The container runtime does not depend on kitbashd, so a host without it
 // still runs Packages. The Process is simply untraced, and the session says so
 // once.
+//
+// The Package here is the one that names kitbashd's own environment, because
+// that is where a missing registration is dangerous: a Process that kept the
+// manifest's KITBASH_FANOUT_SECRET would accept fan out requests from whoever
+// wrote the manifest, and Reconcile registering it later would not take that
+// back. Nothing kitbashd speaks for survives a registration that did not
+// happen.
 func TestRunWithoutKitbashdStartsTheProcessUntraced(t *testing.T) {
 	f := newFixtureWithSocket(t, filepath.Join(t.TempDir(), "absent.sock"))
 	var lines bytes.Buffer
 	f.processes.SetLogger(log.New(&lines, "", 0))
-	folder := f.pack(t, "ffmpeg", mcpManifest)
-	f.build(folder, "ffmpeg")
+	folder := f.pack(t, "forger", forgedManifest)
+	f.build(folder, "forger")
 
 	process, prob := f.processes.Run(context.Background(), folder, "", "")
 	if prob != nil {
@@ -339,13 +346,9 @@ func TestRunWithoutKitbashdStartsTheProcessUntraced(t *testing.T) {
 		t.Errorf("state is %s, want running without kitbashd", process.State)
 	}
 	env := f.runner.Runs[0].Env
-	for _, key := range []string{
-		telemetry.EnvEndpoint, telemetry.EnvToken,
-		telemetry.EnvProcess, telemetry.EnvPackage, telemetry.EnvUser,
-		telemetry.EnvFanoutSecret,
-	} {
-		if _, set := env[key]; set {
-			t.Errorf("%s is in the environment, but no registration minted it", key)
+	for _, key := range telemetry.OwnedEnv {
+		if value, set := env[key]; set {
+			t.Errorf("%s is in the environment as %q, but no registration minted it", key, value)
 		}
 	}
 	if env["LOG_LEVEL"] != "debug" {
@@ -404,7 +407,7 @@ func TestReconcileRegistersWhatKitbashdDoesNotKnow(t *testing.T) {
 	// The re-registration minted a secret the running container does not
 	// have, so its fan out is refused until it is run again. That gap is the
 	// token's gap and is said rather than hidden.
-	want := "Process " + process.ID + " was registered again; the running container holds the previous fan out secret"
+	want := "Process " + process.ID + " was registered again; the running container holds the fan out secret this registration replaced and refuses every delivery, or was started with none"
 	if !strings.Contains(lines.String(), want) {
 		t.Errorf("the log is %q, want it to contain %q", lines.String(), want)
 	}
@@ -554,4 +557,35 @@ func registerCalls(daemon *teltest.Daemon) int {
 		}
 	}
 	return n
+}
+
+// The other way out of telemetryEnv before anything is minted: a session with
+// no registry at all, which is a host where kitbashd was never configured. The
+// manifest's claim on kitbashd's environment is dropped there too, so the two
+// paths cannot drift apart.
+func TestRunWithoutARegistryDropsTheEnvironmentKitbashdOwns(t *testing.T) {
+	f := newFixtureWithSocket(t, filepath.Join(t.TempDir(), "absent.sock"))
+	f.processes = proc.New(f.files, f.runner, nil)
+	var lines bytes.Buffer
+	f.processes.SetLogger(log.New(&lines, "", 0))
+	folder := f.pack(t, "forger", forgedManifest)
+	f.build(folder, "forger")
+
+	process, prob := f.processes.Run(context.Background(), folder, "", "")
+	if prob != nil {
+		t.Fatalf("Run: %s", prob.Detail)
+	}
+	env := f.runner.Runs[0].Env
+	for _, key := range telemetry.OwnedEnv {
+		if value, set := env[key]; set {
+			t.Errorf("%s is in the environment as %q, but there is no registry to mint it", key, value)
+		}
+	}
+	if env["LOG_LEVEL"] != "debug" {
+		t.Errorf("env is %v, want the manifest's own entries", env)
+	}
+	want := "kitbashd is not running; Process " + process.ID + " starts untraced"
+	if !strings.Contains(lines.String(), want) {
+		t.Errorf("the log is %q, want it to contain %q", lines.String(), want)
+	}
 }
