@@ -25,8 +25,6 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
 	"go.opentelemetry.io/otel/trace"
 
-	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp"
-	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 
@@ -145,30 +143,10 @@ func New(opts Options) (*Provider, error) {
 	client := socketClient(socket)
 	drops := &notice{socket: socket, logger: logger}
 
-	// The endpoint host is never resolved, see socketClient. It is here
-	// because the exporter needs a URL to build the standard OTLP paths on.
-	spans, err := otlptracehttp.New(context.Background(),
-		otlptracehttp.WithHTTPClient(client),
-		otlptracehttp.WithEndpoint("localhost"),
-		otlptracehttp.WithInsecure(),
-		// Retrying a socket that is not there only delays the drop.
-		otlptracehttp.WithRetry(otlptracehttp.RetryConfig{Enabled: false}),
-		otlptracehttp.WithTimeout(requestTimeout),
-	)
-	if err != nil {
-		return nil, err
-	}
-	records, err := otlploghttp.New(context.Background(),
-		otlploghttp.WithHTTPClient(client),
-		otlploghttp.WithEndpoint("localhost"),
-		otlploghttp.WithInsecure(),
-		otlploghttp.WithRetry(otlploghttp.RetryConfig{Enabled: false}),
-		otlploghttp.WithTimeout(requestTimeout),
-	)
-	if err != nil {
-		_ = spans.Shutdown(context.Background())
-		return nil, err
-	}
+	// The two exporters share the one client, which dials the socket whatever
+	// host the URL names, see socketClient and export.go.
+	spans := newSpanExporter(client)
+	records := newLogExporter(client)
 
 	version := opts.Version
 	if version == "" {
