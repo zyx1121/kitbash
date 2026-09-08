@@ -24,6 +24,10 @@ type RestoreCounts struct {
 	// Failed is how many the runtime refused to start, which stay registered
 	// so the next session or the next boot can try again.
 	Failed int
+	// Legacy is how many carried no container name, which are unregistered:
+	// a registration written before M5 names nothing restore could start, and
+	// no later boot will make it restorable.
+	Legacy int
 }
 
 // Restore starts every registered Process again as its owner, which is what
@@ -48,11 +52,21 @@ func (s *Server) Restore(ctx context.Context) RestoreCounts {
 		return RestoreCounts{}
 	}
 
+	var counts RestoreCounts
 	byOwner := map[string][]store.Process{}
 	for _, p := range list {
-		// A registration without a container name predates M5, or belongs to
-		// a Process that never had one. There is nothing to start.
+		// A registration without a container name was written before M5. It
+		// names nothing the runtime could start and no later boot will change
+		// that, so it goes: the row is deleted, which revokes its token and
+		// drops its fan out subscription.
 		if p.Container == "" {
+			counts.Legacy++
+			logger.Printf("restore: the Process %s of %s carries no container name, unregistering it",
+				p.ID, p.Owner)
+			if _, err := s.store.DeleteProcess(ctx, p.ID); err != nil {
+				logger.Printf("restore: unregistering %s: %v", p.ID, err)
+			}
+			s.fanout.untrack(p.ID)
 			continue
 		}
 		byOwner[p.Owner] = append(byOwner[p.Owner], p)
@@ -64,7 +78,6 @@ func (s *Server) Restore(ctx context.Context) RestoreCounts {
 	sort.Strings(owners)
 
 	var mu sync.Mutex
-	var counts RestoreCounts
 	var wg sync.WaitGroup
 	for _, owner := range owners {
 		processes := byOwner[owner]
@@ -81,7 +94,8 @@ func (s *Server) Restore(ctx context.Context) RestoreCounts {
 	}
 	wg.Wait()
 
-	logger.Printf("restore: started %d, missing %d, failed %d", counts.Started, counts.Missing, counts.Failed)
+	logger.Printf("restore: started %d, missing %d, failed %d, legacy %d",
+		counts.Started, counts.Missing, counts.Failed, counts.Legacy)
 	return counts
 }
 

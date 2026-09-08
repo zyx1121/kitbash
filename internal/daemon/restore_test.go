@@ -95,30 +95,32 @@ func TestRestoreUnregistersAMissingContainer(t *testing.T) {
 }
 
 // TestRestoreSkipsWhatItCannotStart covers the two registrations restore
-// leaves alone: one with no container name, from before M5, and one whose
-// owner is no longer a member of this host.
+// cannot act on: one with no container name, written before M5, and one whose
+// owner is no longer a member of this host. The first is unregistered, because
+// no later boot could ever start it; the second is left alone.
 func TestRestoreSkipsWhatItCannotStart(t *testing.T) {
 	h, fake := serveUsers(t, true)
 	fake.Add(sysusers.Member{Name: "alice", UID: 1005})
 
-	noContainer := h.registered("alice", "")
+	legacy := h.registered("alice", "")
 	stranger := h.registered("carol", "kitbash-echo")
 
 	counts := h.server.Restore(context.Background())
-	if counts != (RestoreCounts{Failed: 1}) {
-		t.Fatalf("counts = %+v, want one failed and nothing started", counts)
+	if counts != (RestoreCounts{Failed: 1, Legacy: 1}) {
+		t.Fatalf("counts = %+v, want one failed and one legacy, nothing started", counts)
 	}
 	if len(fake.Calls()) != 0 {
 		t.Errorf("started %+v, want nothing", fake.Calls())
 	}
 
-	// Neither registration is unregistered: only a container the runtime says
-	// is gone loses its record.
 	ctx := context.Background()
-	for _, id := range []string{noContainer, stranger} {
-		if _, found, err := h.store.Process(ctx, id); err != nil || !found {
-			t.Errorf("the registration %s was removed (%t, %v)", id, found, err)
-		}
+	if _, found, err := h.store.Process(ctx, legacy); err != nil || found {
+		t.Errorf("the registration with no container name is still registered (%t, %v)", found, err)
+	}
+	// A registration whose owner is gone keeps its record: the owner may come
+	// back, and running it as somebody else is not an option.
+	if _, found, err := h.store.Process(ctx, stranger); err != nil || !found {
+		t.Errorf("the registration of a stranger was removed (%t, %v)", found, err)
 	}
 }
 
