@@ -75,6 +75,10 @@ type mcpSession struct {
 	server     *mcp.Server
 	client     *mcp.ClientSession
 	cancel     context.CancelFunc
+	// done is closed when the session ends. Every request being served for
+	// this session watches it, so an event stream held open by a client whose
+	// session is over does not keep a listener from stopping.
+	done chan struct{}
 
 	// syncMu serialises publishing. Two notifications from the child can
 	// arrive at once and each reads the tool set and then writes it, so
@@ -273,32 +277,41 @@ func (sess *mcpSession) named() bool {
 	return sess.id != ""
 }
 
-// end closes the session: the server session goes, the client goes, and the
-// child goes with it. It is safe to call more than once, which matters because
-// a DELETE, an idle sweep and the child exiting can all reach it.
-func (sess *mcpSession) end(graceUntil time.Time) {
+// end closes the session: the slot goes back, the server session goes, and the
+// caller credential starts its grace. It answers the work that is left, which
+// is closing the child, or nil for a session that has already ended: a DELETE,
+// an idle sweep and the child exiting can all reach it.
+//
+// Closing the child is separated out because it waits: the MCP specification
+// ends a stdio server by closing its stdin and giving it time to exit, and a
+// listener shutting down must not stand in that queue behind every session it
+// was serving.
+func (sess *mcpSession) end(graceUntil time.Time) (closeChild func()) {
 	sess.mu.Lock()
 	if sess.ended {
 		sess.mu.Unlock()
-		return
+		return nil
 	}
 	sess.ended = true
 	id := sess.id
 	sess.mu.Unlock()
 
+	close(sess.done)
 	sess.registry.drop(sess, id, graceUntil)
 	if sess.server != nil {
 		for open := range sess.server.Sessions() {
 			open.Close()
 		}
 	}
-	if sess.client != nil {
-		// Closing the client closes the child's stdin, waits for it, and then
-		// signals it, which is how the MCP specification ends a stdio server.
-		sess.client.Close()
-	}
-	if sess.cancel != nil {
-		sess.cancel()
+	return func() {
+		if sess.client != nil {
+			// Closing the client closes the child's stdin, waits for it, and
+			// then signals it.
+			sess.client.Close()
+		}
+		if sess.cancel != nil {
+			sess.cancel()
+		}
 	}
 }
 
@@ -368,7 +381,9 @@ func (s *Server) serveMCP(w http.ResponseWriter, r *http.Request) {
 		// details by recovered, and a session whose hold was never released
 		// would never idle out and its child would never exit.
 		release := sess.hold(s.now(), true)
+		request, served := s.serving(r, sess)
 		defer func() {
+			served()
 			release(s.now())
 			if !sess.named() {
 				// The request was not one that opens a session, or the
@@ -377,7 +392,7 @@ func (s *Server) serveMCP(w http.ResponseWriter, r *http.Request) {
 				s.endMCPSession(sess)
 			}
 		}()
-		s.mcpHandler.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), mcpSessionKey{}, sess)))
+		s.mcpHandler.ServeHTTP(w, request)
 		return
 	}
 
@@ -397,13 +412,33 @@ func (s *Server) serveMCP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	release := sess.hold(s.now(), r.Method != http.MethodGet)
+	request, served := s.serving(r, sess)
 	defer func() {
+		served()
 		release(s.now())
 		if r.Method == http.MethodDelete {
 			s.endMCPSession(sess)
 		}
 	}()
-	s.mcpHandler.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), mcpSessionKey{}, sess)))
+	s.mcpHandler.ServeHTTP(w, request)
+}
+
+// serving hands the MCP handler the request with its session on it, and a
+// context that ends when the session does or when the daemon stops. A GET
+// holds the event stream open until one of the three happens, and without
+// this a client that kept listening after its session ended would keep the
+// listener from shutting down.
+func (s *Server) serving(r *http.Request, sess *mcpSession) (*http.Request, func()) {
+	ctx, cancel := context.WithCancel(context.WithValue(r.Context(), mcpSessionKey{}, sess))
+	go func() {
+		defer cancel()
+		select {
+		case <-ctx.Done():
+		case <-sess.done:
+		case <-s.stopped:
+		}
+	}()
+	return r.WithContext(ctx), cancel
 }
 
 // opensSession reports whether a request without a session identifier is the
@@ -475,6 +510,7 @@ func (s *Server) openMCPSession(ctx context.Context, id identity) (*mcpSession, 
 		process:    id.Process,
 		owner:      id.User,
 		credential: credential,
+		done:       make(chan struct{}),
 		last:       s.now(),
 		tools:      map[string]string{},
 	}
@@ -638,9 +674,19 @@ func (sess *mcpSession) forward(name string) mcp.ToolHandler {
 }
 
 // endMCPSession ends one session and starts the grace on its caller
-// credential, so the last records its child flushed still resolve.
+// credential, so the last records its child flushed still resolve. The child
+// is closed beside the caller rather than in front of it; Close waits for
+// those to finish, so a daemon that has stopped leaves no kitbash-mcp behind.
 func (s *Server) endMCPSession(sess *mcpSession) {
-	sess.end(s.now().Add(s.callerGrace))
+	closeChild := sess.end(s.now().Add(s.callerGrace))
+	if closeChild == nil {
+		return
+	}
+	s.teardown.Add(1)
+	go func() {
+		defer s.teardown.Done()
+		closeChild()
+	}()
 }
 
 // endMCPSessions ends every session of one Process, which is what
@@ -653,10 +699,28 @@ func (s *Server) endMCPSessions(process string) {
 }
 
 // closeMCPSessions ends every session the daemon holds, which is what stopping
-// it does.
+// it does. It returns as soon as the sessions are ended; waitForChildren is
+// what waits for the children to go.
 func (s *Server) closeMCPSessions() {
 	for _, sess := range s.mcpSessions.all() {
 		s.endMCPSession(sess)
+	}
+}
+
+// waitForChildren waits for the kitbash-mcp of every ended session to exit,
+// bounded the same way an in flight request is. A child that outlasts it is
+// left to the signals its transport is already sending, and the operator is
+// told rather than the daemon hanging on the way out.
+func (s *Server) waitForChildren() {
+	done := make(chan struct{})
+	go func() {
+		s.teardown.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(ShutdownTimeout):
+		logger.Printf("mcp: a session child had not exited after %s; it is being signalled", ShutdownTimeout)
 	}
 }
 

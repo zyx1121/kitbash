@@ -39,6 +39,14 @@ import (
 // the daemon's environment stays exact.
 const childMarker = "--kitbash-mcp-child"
 
+// childLingers tells the helper not to exit when its stdin closes, and
+// childLingerFor is how long it holds out: longer than the five seconds the
+// harness gives a listener to stop, so a shutdown that waited for the child
+// would be seen.
+const childLingers = "--kitbash-mcp-lingers"
+
+const childLingerFor = 8 * time.Second
+
 // TestMCPChildHelper is the fake kitbash-mcp. Under an ordinary test run it
 // does nothing; started with the marker it serves MCP over stdio, records the
 // environment it was given and notes when it exits, which is how the daemon
@@ -90,6 +98,11 @@ func TestMCPChildHelper(t *testing.T) {
 	})
 
 	err := srv.Run(context.Background(), &mcp.StdioTransport{})
+	if slices.Contains(os.Args, childLingers) {
+		// A child that does not exit when its stdin closes is what a loaded
+		// host looks like: the transport waits, then signals, then kills.
+		time.Sleep(childLingerFor)
+	}
 	os.WriteFile(dump+".exit", []byte("exited\n"), 0o600)
 	if err != nil && err != io.EOF {
 		os.Exit(1)
@@ -110,6 +123,8 @@ type sessionCall struct {
 // with the environment the host would give it and nothing more.
 type fakeSessions struct {
 	dir string
+	// lingers starts children that do not exit when their stdin closes.
+	lingers bool
 
 	mu    sync.Mutex
 	calls []sessionCall
@@ -127,7 +142,11 @@ func (f *fakeSessions) MCPCommand(ctx context.Context, m sysusers.Member, binary
 	f.calls = append(f.calls, sessionCall{Member: m, Binary: binary, Credential: credential, Dump: dump})
 	f.mu.Unlock()
 
-	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=TestMCPChildHelper", "--", childMarker, dump)
+	argv := []string{"-test.run=TestMCPChildHelper", "--", childMarker, dump}
+	if f.lingers {
+		argv = append(argv, childLingers)
+	}
+	cmd := exec.CommandContext(ctx, os.Args[0], argv...)
 	// The environment is the one the real runner builds, so what the child
 	// reports having is what a kitbash host would have given it.
 	cmd.Env = sysusers.MCPEnvironment(m, sysusers.DefaultRunUser, credential)
@@ -150,6 +169,11 @@ type mcpHarness struct {
 	process  string
 	sessions *fakeSessions
 	members  *sysusers.Fake
+	// transport is what every client in these tests dials with. It is closed
+	// before the listener stops: a connection an idle client has dialled and
+	// not yet sent a request on is one http.Server.Shutdown waits out, and
+	// that wait is the client's to avoid, not the daemon's to shorten.
+	transport *http.Transport
 }
 
 // serveMCPDaemon starts a daemon whose MCP sessions run the test binary, and
@@ -190,13 +214,27 @@ func serveMCPDaemonWith(t *testing.T, idle, grace time.Duration) *mcpHarness {
 	if res.StatusCode != http.StatusOK {
 		t.Fatalf("register: status %d, body %s", res.StatusCode, body)
 	}
+	base := h.serveTCP()
+	// Registered after the listener's own cleanup, so it runs before it.
+	transport := &http.Transport{}
+	t.Cleanup(transport.CloseIdleConnections)
 	return &mcpHarness{
-		harness:  h,
-		base:     h.serveTCP(),
-		token:    token,
-		process:  req.ID,
-		sessions: sessions,
-		members:  members,
+		harness:   h,
+		base:      base,
+		token:     token,
+		process:   req.ID,
+		sessions:  sessions,
+		members:   members,
+		transport: transport,
+	}
+}
+
+// client is one HTTP client of these tests, dialling with the harness's own
+// transport and carrying a token when it has one.
+func (m *mcpHarness) client(token string) *http.Client {
+	return &http.Client{
+		Transport: bearerHeader{token: token, next: m.transport},
+		Timeout:   10 * time.Second,
 	}
 }
 
@@ -230,7 +268,7 @@ func (m *mcpHarness) connect(t *testing.T, changed chan<- struct{}) *mcp.ClientS
 	})
 	session, err := client.Connect(context.Background(), &mcp.StreamableClientTransport{
 		Endpoint:   m.base + MCPPath,
-		HTTPClient: &http.Client{Transport: bearerHeader{token: m.token, next: http.DefaultTransport}, Timeout: 10 * time.Second},
+		HTTPClient: m.client(m.token),
 	}, nil)
 	if err != nil {
 		t.Fatalf("connect: %v", err)
@@ -251,10 +289,7 @@ func (m *mcpHarness) initialize(t *testing.T, token string) (*http.Response, []b
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-	res, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	res, err := m.client(token).Do(req)
 	if err != nil {
 		t.Fatalf("POST /mcp: %v", err)
 	}
@@ -570,9 +605,8 @@ func TestMCPSessionOfAnotherProcessIsNotReachable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+otherToken)
 	req.Header.Set(MCPSessionHeader, held)
-	answer, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	answer, err := m.client(otherToken).Do(req)
 	if err != nil {
 		t.Fatalf("DELETE /mcp: %v", err)
 	}
@@ -621,8 +655,7 @@ func TestMCPRefusesABodyOverTheCap(t *testing.T) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
-	req.Header.Set("Authorization", "Bearer "+m.token)
-	res, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	res, err := m.client(m.token).Do(req)
 	if err != nil {
 		t.Fatalf("POST /mcp: %v", err)
 	}
@@ -651,8 +684,7 @@ func TestMCPRefusesARequestThatOpensNoSession(t *testing.T) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
-	req.Header.Set("Authorization", "Bearer "+m.token)
-	res, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	res, err := m.client(m.token).Do(req)
 	if err != nil {
 		t.Fatalf("POST /mcp: %v", err)
 	}
@@ -855,4 +887,29 @@ func TestMCPSessionSurvivesAPanickingHandler(t *testing.T) {
 	}
 	waitFor(t, "the session of a panicking handler to idle out", func() bool { return m.live(t) == 0 })
 	waitFor(t, "its child to exit", func() bool { return exited(calls[0]) })
+}
+
+// TestMCPReceiverStopsWhileAChildLingers is the shutdown the CI runner found:
+// closing a child waits for it to exit, and a listener that stood in that
+// queue took the whole shutdown timeout to stop. The harness fails this test
+// if ServeTCP does not return promptly, and the child here outlasts that on
+// purpose.
+func TestMCPReceiverStopsWhileAChildLingers(t *testing.T) {
+	m := serveMCPDaemon(t, 0)
+	m.sessions.lingers = true
+	session := m.connect(t, nil)
+	defer session.Close()
+
+	if n := m.live(t); n != 1 {
+		t.Fatalf("health reports %d MCP sessions, want 1", n)
+	}
+	// Ending the session answers at once even though its child will not.
+	started := time.Now()
+	m.server.endMCPSessions(m.process)
+	if waited := time.Since(started); waited > time.Second {
+		t.Errorf("ending the session took %s, want it not to wait for the child", waited)
+	}
+	if n := m.live(t); n != 0 {
+		t.Errorf("health reports %d MCP sessions, want the slot back at once", n)
+	}
 }

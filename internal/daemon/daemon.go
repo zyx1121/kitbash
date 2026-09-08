@@ -177,6 +177,9 @@ type Server struct {
 	// idle sweep of the MCP sessions. Close closes it exactly once.
 	stopped   chan struct{}
 	closeOnce sync.Once
+	// teardown counts the session children that are being closed, which Close
+	// waits for so a daemon that has stopped leaves none behind.
+	teardown sync.WaitGroup
 
 	noRestore bool
 
@@ -305,6 +308,7 @@ func (s *Server) TCPHandler() http.Handler {
 func (s *Server) Close() {
 	s.closeOnce.Do(func() { close(s.stopped) })
 	s.closeMCPSessions()
+	s.waitForChildren()
 	s.fanout.close()
 }
 
