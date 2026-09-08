@@ -73,10 +73,14 @@ type processRequest struct {
 }
 
 // processResponse is what a registration answers. The token is returned once
-// and never again: the store holds only its hash.
+// and never again: the store holds only its hash. The fan out secret is
+// returned once as well, though the store keeps it: the caller has to put it in
+// the container, and processes_list never carries it, see
+// fan_out.authentication in spec/kitbashd-api.yaml.
 type processResponse struct {
-	ID    string `json:"id"`
-	Token string `json:"token"`
+	ID           string `json:"id"`
+	Token        string `json:"token"`
+	FanoutSecret string `json:"fanoutSecret"`
 }
 
 // processList is what processes_list answers, without a token anywhere in it.
@@ -124,6 +128,14 @@ func (s *Server) registerProcess(w http.ResponseWriter, r *http.Request, caller 
 		writeProblem(w, problem.Internal(r.URL.Path, err.Error(), ""))
 		return
 	}
+	// The secret is minted with the token and replaces whatever the previous
+	// registration of this id held, so a container that lost its token lost
+	// its secret too and a neighbour holding an old one is not believed.
+	secret, err := store.NewFanoutSecret()
+	if err != nil {
+		writeProblem(w, problem.Internal(r.URL.Path, err.Error(), ""))
+		return
+	}
 	p := store.Process{
 		ID:            req.ID,
 		Owner:         caller.User,
@@ -135,6 +147,7 @@ func (s *Server) registerProcess(w http.ResponseWriter, r *http.Request, caller 
 		Expose:        req.Expose,
 		Endpoint:      req.Endpoint,
 		Subscriptions: req.Subscriptions,
+		FanoutSecret:  secret,
 		RegisteredAt:  s.now().UTC(),
 	}
 	if err := s.store.RegisterProcess(r.Context(), p, hash, MaxProcessesPerMember); err != nil {
@@ -154,7 +167,7 @@ func (s *Server) registerProcess(w http.ResponseWriter, r *http.Request, caller 
 		return
 	}
 	s.fanout.track(p)
-	writeJSON(w, r.URL.Path, processResponse{ID: p.ID, Token: token})
+	writeJSON(w, r.URL.Path, processResponse{ID: p.ID, Token: token, FanoutSecret: secret})
 }
 
 // listProcesses answers with the caller's Processes, or every member's for an

@@ -13,7 +13,7 @@ import (
 	"github.com/zyx1121/kitbash/internal/telemetry/teltest"
 )
 
-func TestRegisterProcessSendsTheRegistrationAndReturnsTheToken(t *testing.T) {
+func TestRegisterProcessSendsTheRegistrationAndReturnsTheTokenAndTheSecret(t *testing.T) {
 	daemon := newDaemon(t)
 	client := telemetry.NewClient(daemon.Socket)
 	reg := telemetry.Registration{
@@ -25,12 +25,15 @@ func TestRegisterProcessSendsTheRegistrationAndReturnsTheToken(t *testing.T) {
 		Subscriptions: []string{"telemetry"},
 	}
 
-	token, prob := client.RegisterProcess(context.Background(), reg)
+	token, secret, prob := client.RegisterProcess(context.Background(), reg)
 	if prob != nil {
 		t.Fatalf("RegisterProcess: %s", prob.Detail)
 	}
 	if token == "" || token != daemon.Token(reg.ID) {
 		t.Errorf("token is %q, want the one the daemon minted", token)
+	}
+	if secret == "" || secret != daemon.FanoutSecret(reg.ID) {
+		t.Errorf("fan out secret is %q, want the one the daemon minted", secret)
 	}
 
 	calls := daemon.Calls()
@@ -65,7 +68,7 @@ func TestARefusedRegistrationKeepsTheDaemonsProblem(t *testing.T) {
 		"a Process with this id belongs to another member", "Run it under a name of your own."))
 	client := telemetry.NewClient(daemon.Socket)
 
-	_, prob := client.RegisterProcess(context.Background(), telemetry.Registration{ID: "taken"})
+	_, _, prob := client.RegisterProcess(context.Background(), telemetry.Registration{ID: "taken"})
 	if prob == nil {
 		t.Fatal("a refused registration was reported as a success")
 	}
@@ -158,7 +161,7 @@ func TestAListedProcessAcceptsBothSpellingsOfItsOwner(t *testing.T) {
 func TestRegisteringWithoutADaemonIsAProblemWithAFix(t *testing.T) {
 	client := telemetry.NewClient(filepath.Join(t.TempDir(), "absent.sock"))
 
-	_, prob := client.RegisterProcess(context.Background(), telemetry.Registration{ID: "orphan"})
+	_, _, prob := client.RegisterProcess(context.Background(), telemetry.Registration{ID: "orphan"})
 	if prob == nil {
 		t.Fatal("registering against a socket that is not there succeeded")
 	}

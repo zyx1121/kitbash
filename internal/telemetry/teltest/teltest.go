@@ -112,6 +112,7 @@ type Daemon struct {
 	// unregistered, and the answer that replaces the registry's own.
 	registrations map[string]Registration
 	minted        map[string]string
+	secrets       map[string]string
 	order         []string
 	unregistered  []string
 	processes     Response
@@ -165,6 +166,7 @@ func StartAt(socket string) (*Daemon, error) {
 			Body: `{"traces":"30d","logs":"14d","metrics":"30d"}`},
 		registrations: map[string]Registration{},
 		minted:        map[string]string{},
+		secrets:       map[string]string{},
 		approvals:     map[string]Approval{},
 		// The caller is a member until a test says otherwise, which is the
 		// side every rule in PLAN.md section 2.1 is written from.
@@ -435,6 +437,14 @@ func (d *Daemon) Token(id string) string {
 	return d.minted[id]
 }
 
+// FanoutSecret is the fan out secret minted for one Process id, so a test can
+// hold the environment of a container to the secret its registration returned.
+func (d *Daemon) FanoutSecret(id string) string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.secrets[id]
+}
+
 // Unregistered are the Process ids a DELETE named, in arrival order, including
 // the ones the registry did not know.
 func (d *Daemon) Unregistered() []string {
@@ -452,8 +462,9 @@ func (d *Daemon) store(reg Registration) {
 }
 
 // register answers processes_register: it records the Process and mints a
-// token for it. Registering an id again replaces the record and mints a new
-// token, the way spec/kitbashd-api.yaml says the daemon does.
+// token and a fan out secret for it. Registering an id again replaces the
+// record and mints both again, the way spec/kitbashd-api.yaml says the daemon
+// does.
 func (d *Daemon) register(w http.ResponseWriter, r *http.Request) {
 	d.wait()
 	body, err := readAll(r)
@@ -478,9 +489,11 @@ func (d *Daemon) register(w http.ResponseWriter, r *http.Request) {
 	d.store(reg)
 	d.tokens++
 	token := fmt.Sprintf("%x", sha256.Sum256([]byte(fmt.Sprintf("%s-%d", reg.ID, d.tokens))))
+	secret := fmt.Sprintf("%x", sha256.Sum256([]byte(fmt.Sprintf("%s-%d-fanout", reg.ID, d.tokens))))
 	d.minted[reg.ID] = token
+	d.secrets[reg.ID] = secret
 	d.mu.Unlock()
-	answer, _ := json.Marshal(map[string]string{"id": reg.ID, "token": token})
+	answer, _ := json.Marshal(map[string]string{"id": reg.ID, "token": token, "fanoutSecret": secret})
 	write(w, Response{Status: http.StatusOK, ContentType: "application/json", Body: string(answer)})
 }
 

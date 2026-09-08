@@ -15,14 +15,24 @@
 // The verdict is a threshold, not a model. The point is that the evaluate hook
 // needs nothing more than a subscriber that writes back.
 //
+// The three paths take records from kitbashd only: every fan out request
+// carries Authorization: Bearer KITBASH_FANOUT_SECRET, and anything else on the
+// host that can reach this port is answered 401 and judged nowhere. This kit is
+// run by an admin, so its judgments carry the subject attributes they arrive
+// with, and a record from a neighbour would be a judgment about whoever that
+// neighbour named. A kit started without that secret, by a kitbashd from before
+// the fan out was authenticated, accepts what arrives and says so once at start.
+//
 // Environment, all supplied by kitbashd: KITBASH_TELEMETRY_ENDPOINT and
 // KITBASH_TELEMETRY_TOKEN say where and how to write back, KITBASH_PROCESS
-// names this Process. KITBASH_EVAL_THRESHOLD_MS is the threshold in
-// milliseconds and defaults to 1000.
+// names this Process, KITBASH_FANOUT_SECRET is the bearer every fan out request
+// carries. KITBASH_EVAL_THRESHOLD_MS is the threshold in milliseconds and
+// defaults to 1000.
 //
 // Nothing is written to stdout. This Package speaks HTTP, not stdio, and its
 // log is stderr.
 
+import { createHash, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 
 const PORT = 8080;
@@ -39,6 +49,12 @@ const MAX_BATCH = 512;
 // judgment that cannot be written is worth less than the kit staying alive.
 const MAX_PENDING = 4096;
 const EXPORT_TIMEOUT_MS = 5 * 1000;
+// What one inbound request may take. Without these a connection that sends a
+// header slowly, or a body slowly, holds a socket for the node defaults, and
+// this port is reachable by everything on the host. The fan out's own request
+// timeout is 5 s, so both are far above what a delivery needs.
+const HEADERS_TIMEOUT_MS = 10 * 1000;
+const REQUEST_TIMEOUT_MS = 30 * 1000;
 // The budget for the last flush when the Process is stopping, the same three
 // seconds kitbash-mcp gives its own shutdown flush.
 const SHUTDOWN_TIMEOUT_MS = 3 * 1000;
@@ -66,8 +82,15 @@ function readThreshold() {
 
 const thresholdMs = readThreshold();
 const selfProcess = (process.env.KITBASH_PROCESS ?? "").trim();
+// The bearer kitbashd minted for this Process. Only kitbashd has it, so a
+// request carrying it came from the fan out and not from a neighbour on the
+// host that found this loopback port. An empty one means this kit was started
+// by a kitbashd from before the fan out was authenticated: it accepts what
+// arrives, the way it always did, and says so once at start.
+const fanoutSecret = (process.env.KITBASH_FANOUT_SECRET ?? "").trim();
+const expectedAuthorization = fanoutSecret === "" ? "" : `Bearer ${fanoutSecret}`;
 
-const state = { received: 0, spans: 0, judged: 0, written: 0, batches: 0, failures: 0, dropped: 0, dropping: false, failing: false, lastError: null };
+const state = { received: 0, refused: 0, spans: 0, judged: 0, written: 0, batches: 0, failures: 0, dropped: 0, dropping: false, failing: false, lastError: null };
 
 // ---------------------------------------------------------------- OTLP JSON
 
@@ -328,6 +351,40 @@ function problem(response, status, slug, title, detail, fix) {
   response.end(body);
 }
 
+// The two headers are compared as fixed width digests, so the comparison takes
+// the same time whatever arrives: neither the length of the secret nor how much
+// of it a caller guessed right is readable from how long the answer took.
+function sameSecret(given) {
+  const digest = (value) => createHash("sha256").update(value, "utf8").digest();
+  return timingSafeEqual(digest(given), digest(expectedAuthorization));
+}
+
+// Whether one request may be judged. A kit that was given no secret takes what
+// it is given, which is what an upgrade of kitbashd under a running Process
+// looks like.
+function authorized(request) {
+  if (expectedAuthorization === "") return true;
+  return sameSecret(request.headers.authorization ?? "");
+}
+
+// RFC 9110 wants a challenge with every 401, and the only 401 this kit answers
+// is a fan out request that did not come from kitbashd.
+function unauthorized(response) {
+  response.setHeader("www-authenticate", `Bearer realm="${SELF}"`);
+  // The body of the refused request is never read, so this connection has an
+  // unread request on it and cannot carry another. Saying so is what keeps a
+  // client from reusing it and reading a reset instead of an answer.
+  response.setHeader("connection", "close");
+  problem(
+    response,
+    401,
+    "not-permitted",
+    "Not permitted",
+    "This kit judges records from the kitbashd fan out only, and this request did not carry its secret.",
+    "Nothing to fix from the outside: kitbashd sends the secret it minted for this Process.",
+  );
+}
+
 function json(response, status, value) {
   const body = JSON.stringify(value);
   response.writeHead(status, { "content-type": "application/json", "content-length": Buffer.byteLength(body) });
@@ -392,7 +449,11 @@ const server = createServer(async (request, response) => {
       kit: SELF,
       process: selfProcess || null,
       thresholdMs,
+      // Whether the fan out is authenticated, and how many requests were
+      // refused because they carried no secret of kitbashd's or the wrong one.
+      authenticated: expectedAuthorization !== "",
       received: state.received,
+      refused: state.refused,
       spans: state.spans,
       judged: state.judged,
       written: state.written,
@@ -413,6 +474,13 @@ const server = createServer(async (request, response) => {
   }
   if (request.method !== "POST") {
     problem(response, 405, "bad-request", "Method not allowed", `${route} accepts POST.`, "POST an OTLP/HTTP JSON export.");
+    return;
+  }
+  // Before the body is read, so an unauthenticated caller cannot make this kit
+  // buffer 4 MiB, and nothing it sent is judged.
+  if (!authorized(request)) {
+    state.refused += 1;
+    unauthorized(response);
     return;
   }
 
@@ -440,6 +508,9 @@ const server = createServer(async (request, response) => {
   // The OTLP success response is an empty Export*ServiceResponse.
   json(response, 200, {});
 });
+
+server.headersTimeout = HEADERS_TIMEOUT_MS;
+server.requestTimeout = REQUEST_TIMEOUT_MS;
 
 server.on("clientError", (err, socket) => {
   if (socket.writable) socket.end("HTTP/1.1 400 Bad Request\r\nconnection: close\r\n\r\n");
@@ -471,4 +542,7 @@ process.on("SIGINT", () => shutdown("SIGINT"));
 
 server.listen(PORT, HOST, () => {
   console.error(`[evaluate-latency] listening on ${HOST}:${PORT}, judging spans slower than ${thresholdMs} ms`);
+  if (expectedAuthorization === "") {
+    console.error("[evaluate-latency] KITBASH_FANOUT_SECRET is not set: the fan out is unauthenticated and this kit judges records from anything on the host that can reach its port; run the Process again on a kitbashd that mints one");
+  }
 });

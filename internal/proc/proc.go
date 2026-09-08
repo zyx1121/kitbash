@@ -84,11 +84,12 @@ type LogsResult struct {
 }
 
 // Registry is the Process registry of kitbashd, see spec/kitbashd-api.yaml.
-// Registering mints the Telemetry token a Process exports with; unregistering
-// revokes it. It is an interface here so this package depends on the daemon's
-// contract rather than on a socket.
+// Registering mints the Telemetry token a Process exports with and the secret
+// its fan out carries; unregistering revokes the token. It is an interface
+// here so this package depends on the daemon's contract rather than on a
+// socket.
 type Registry interface {
-	RegisterProcess(ctx context.Context, reg telemetry.Registration) (string, *problem.Problem)
+	RegisterProcess(ctx context.Context, reg telemetry.Registration) (token, fanoutSecret string, prob *problem.Problem)
 	UnregisterProcess(ctx context.Context, id string) *problem.Problem
 	ListProcesses(ctx context.Context) ([]telemetry.Registered, *problem.Problem)
 }
@@ -334,9 +335,10 @@ func (s *Service) Stop(ctx context.Context, id string) (*StopResult, *problem.Pr
 // ones this host retired, and a registration whose endpoint is gone only costs
 // kitbashd a failed delivery.
 //
-// Re-registering mints a new token, which the running container does not have,
-// so its exports fail until the Process is run again. That gap is accepted in
-// version 1 and the caller logs it, see client_behaviour.processes in
+// Re-registering mints a new token and a new fan out secret, neither of which
+// the running container has, so its exports fail and it refuses the fan out
+// until the Process is run again. That gap is accepted in version 1 and this
+// says so once per Process, see client_behaviour.processes in
 // spec/kitbashd-api.yaml.
 func (s *Service) Reconcile(ctx context.Context, running []Process) (registered, stale []string, prob *problem.Problem) {
 	if s.registry == nil {
@@ -385,10 +387,20 @@ func (s *Service) Reconcile(ctx context.Context, running []Process) (registered,
 			reg.Package = folder
 			reg.Subscriptions = m.Subscriptions()
 		}
-		if _, prob := s.registry.RegisterProcess(ctx, reg); prob != nil {
+		if _, _, prob := s.registry.RegisterProcess(ctx, reg); prob != nil {
 			s.logger.Printf("proc: registering Process %s at %s: %s", p.ID, p.Package, prob.Detail)
 			continue
 		}
+		// This registration replaced the secret as well as the token. Which of
+		// the two states the running container is in cannot be seen from here,
+		// and they are not the same problem: a container started under an
+		// earlier registration holds a secret this one replaced and now
+		// refuses every delivery, while one started while kitbashd was
+		// unreachable holds none and takes records from anything that can
+		// reach its port. Running it again ends either one. The caller says
+		// the same about the token; the secret is said here because nothing
+		// else would.
+		s.logger.Printf("proc: Process %s was registered again; the running container holds the fan out secret this registration replaced and refuses every delivery, or was started with none and accepts a delivery from anything on the host. Run it again to end either state.", p.ID)
 		registered = append(registered, p.ID)
 	}
 	for _, entry := range mine {
@@ -400,26 +412,36 @@ func (s *Service) Reconcile(ctx context.Context, running []Process) (registered,
 }
 
 // telemetryEnv registers the Process and returns the environment its container
-// is started with: the manifest's own, plus the six variables of
-// spec/kitbashd-api.yaml. The manifest cannot override them; they are the
-// Process's identity, not its configuration. The second return says whether
-// the registration happened, so a container that never starts can be taken
-// back off the registry.
+// is started with: the manifest's own, minus everything kitbashd speaks for,
+// plus the seven variables of spec/kitbashd-api.yaml that this registration
+// answered. The manifest cannot name any of them; they are the Process's
+// identity and its two credentials, not its configuration. The second return
+// says whether the registration happened, so a container that never starts can
+// be taken back off the registry.
+//
+// The removal happens before anything is added back, and so on every path out
+// of here. Overwriting the keys at the end would leave a manifest's own
+// KITBASH_FANOUT_SECRET in place whenever no registration happened, and a
+// container that knows its own secret accepts fan out requests from whoever
+// wrote the manifest rather than from kitbashd alone.
 //
 // A registration that fails is not a reason to refuse to start the Process.
 // The container runtime does not depend on kitbashd, so the Process starts
-// with no token and produces no Telemetry of its own, and the session says so
-// once in the server log.
+// with neither credential and produces no Telemetry of its own, and the
+// session says so once in the server log.
 func (s *Service) telemetryEnv(ctx context.Context, env map[string]string, reg telemetry.Registration) (map[string]string, bool) {
-	merged := make(map[string]string, len(env)+6)
+	merged := make(map[string]string, len(env)+len(telemetry.OwnedEnv))
 	for k, v := range env {
 		merged[k] = v
+	}
+	for _, key := range telemetry.OwnedEnv {
+		delete(merged, key)
 	}
 	if s.registry == nil {
 		s.logger.Printf("proc: kitbashd is not running; Process %s starts untraced", reg.ID)
 		return merged, false
 	}
-	token, prob := s.registry.RegisterProcess(ctx, reg)
+	token, fanoutSecret, prob := s.registry.RegisterProcess(ctx, reg)
 	if prob != nil {
 		s.logger.Printf("proc: kitbashd is not running; Process %s starts untraced: %s", reg.ID, prob.Detail)
 		return merged, false
@@ -432,6 +454,14 @@ func (s *Service) telemetryEnv(ctx context.Context, env map[string]string, reg t
 	// The MCP endpoint is given with the token, not before it: without a
 	// token there is nothing for a Process to authenticate a session with.
 	merged[telemetry.EnvMCPEndpoint] = telemetry.MCPEndpointForProcesses()
+	// The fan out secret only when kitbashd minted one. A daemon of an earlier
+	// release answers without it, and a subscriber that is given no secret
+	// accepts the fan out as it did before rather than refusing every record.
+	// Like the token it reaches the container through the environment file
+	// podman reads, never through an argument, see internal/podman.
+	if fanoutSecret != "" {
+		merged[telemetry.EnvFanoutSecret] = fanoutSecret
+	}
 	return merged, true
 }
 
