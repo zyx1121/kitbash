@@ -38,6 +38,29 @@ tcp:
     KITBASH_PROCESS: the Process id
     KITBASH_PACKAGE: the Package path
     KITBASH_USER: the member who ran it
+    KITBASH_MCP_ENDPOINT: http://host.containers.internal:4318/mcp, see mcp_for_processes
+
+mcp_for_processes:
+  description: >
+    MCP over streamable HTTP (2025-06-18 revision) at POST, GET and DELETE
+    /mcp on the Process receiver, Authorization: Bearer <Process token>. For
+    each new session kitbashd starts /usr/bin/kitbash-mcp as the Process's
+    owner (setuid to the owner's uid and gid with HOME, USER, LOGNAME, PATH,
+    XDG_RUNTIME_DIR, and KITBASH_CALLER=<Process id>) and relays the session
+    to it, publishing the child's tools one for one. The child talks to
+    kitbashd over the unix socket like any member session, so identity,
+    Telemetry and the approval queue all behave as for the owner. The surface
+    is exactly the owner's; there is no narrowing in version 1.
+  limits: >
+    At most 8 live sessions per Process (429 with a problem beyond), a
+    session ends on DELETE, when the client is idle for 10 minutes, or when
+    the Process is unregistered; the child exits with it. Request bodies are
+    capped at 4 MiB like the OTLP paths.
+  environment_given_to_every_process:
+    KITBASH_MCP_ENDPOINT: http://host.containers.internal:4318/mcp
+  telemetry: >
+    kitbash-mcp started this way sets kitbash.caller = the Process id on every
+    span it records, alongside kitbash.user = the owner.
 
 producer_attribute:
   kitbash.producer: >

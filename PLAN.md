@@ -2,7 +2,7 @@
 
 > An operating system for AI agents. Files, Packages, Processes, Telemetry. Nothing built for a human at a terminal.
 
-This is the single living document for the product. It replaces a design doc, an architecture doc and a roadmap. When a decision changes, this file changes. Status: draft v0.5, 2026-09-08.
+This is the single living document for the product. It replaces a design doc, an architecture doc and a roadmap. When a decision changes, this file changes. Status: draft v0.6, 2026-09-08.
 
 ## 1. Positioning
 
@@ -84,6 +84,8 @@ A Process declares how it is exposed:
 **How `mcp` exposure works.** The image's entrypoint is a stdio MCP server. The Process runs it as PID 1 with stdin held open, which keeps the container alive and is the liveness signal. Every MCP session the owner opens execs one more instance of the same entrypoint inside the container and proxies calls to it, the same way an agent runs a stdio server on a laptop. The tools the surface publishes are the ones the manifest declares, with the manifest's schemas, so input is validated against the manifest before it reaches the container. A tool the server offers but the manifest does not declare is not on the surface. Tool names are `<package>_<tool>`; a Package whose name collides with a built in family (`fs`, `pkg`, `proc`, `tel`, `users`, `approvals`) cannot be run.
 
 Every Process carries labels `kitbash.id`, `kitbash.user`, `kitbash.package`, `kitbash.name` and `kitbash.digest`. The container runtime holds the Process state and kitbashd reads it back; there is no second record.
+
+**Every Process can be an agent.** The same MCP surface a member reaches over SSH is reachable from inside a Process: kitbashd serves MCP over streamable HTTP at `/mcp` on the Process receiver, authenticated by the Process token, and answers each session by running `kitbash-mcp` as the Process's owner and relaying to it. A Process therefore sees exactly what its owner sees, Files, Packages, Processes, Telemetry and the tools of the owner's other Processes, under the kernel's rules, with no code path of its own. Every span such a session records carries `kitbash.caller`, the calling Process id, so what a Process did on its owner's behalf is one query. The endpoint is given to every container as `KITBASH_MCP_ENDPOINT`.
 
 ### 2.4 Telemetry
 
@@ -185,7 +187,7 @@ A kit installs the same way as any Package and is versioned, traced and removabl
 
 **Built in versus installed.** Exactly two things are built into kitbashd because the system cannot boot without them: the OCI build path and the rootless podman runner. Everything else, including the workflow engine and every import kit, is installed. This boundary is fixed. Adding a third built in requires changing this document first.
 
-**Workflows are a kit.** A workflow engine is a Package that reads graph files from Files, calls tools on other Processes, and emits Telemetry. The core does not know what a workflow is. A workflow that references another workflow is the engine's concern, resolved by schema compatibility of inputs and outputs.
+**Workflows are a kit.** A workflow engine is a Package that reads graph files from Files, calls tools on other Processes, and emits Telemetry, all through the MCP surface every Process can reach. The core does not know what a workflow is: the graph format, the templating between steps and the way one workflow names another are the engine's contract, published in its manifest and its prompt file, never in this document or the specs. A workflow that references another workflow is the engine's concern, resolved by schema compatibility of inputs and outputs.
 
 **The contract, hook by hook.** A kit talks to kitbashd the way every Package does: through its manifest, its MCP tools and the Telemetry receiver. There is no plugin API.
 
@@ -328,6 +330,7 @@ The MCP tool surface is decided in `spec/mcp-surface.yaml`: six families, `fs` i
 - Fan out is best effort. A subscriber that must not miss a record should read the store through `tel_query` and treat the push as a wake up.
 - Approvals cover `fs_write` and `pkg_import` into `/org`. Whether `proc_run` of an `/org` Package by a member should run as a shared Process rather than a private one is open; today it runs privately under the member.
 - Sharing a built image between members is still open. An `/org` Package built by one member is built again by the next, from the same commit to the same image ID.
+- A Process acting as an agent has its owner's full surface. Narrowing what a Process may call (a per Process allow list in the manifest) is deferred until a kit needs less than its owner has.
 
 ## 6. Vocabulary
 

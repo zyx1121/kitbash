@@ -125,6 +125,7 @@ $defs:
       tool: { type: string }
       eval: { type: boolean }
       producer: { type: string, description: "Member name or Process id that wrote the record" }
+      caller: { type: string, description: "Process id whose MCP session recorded this span, when a Process acted for its owner" }
       subject: { type: object, description: "For evaluation records: traceId and spanId of the judged span", properties: { traceId: { type: string }, spanId: { type: string } } }
   spanRecord:
     type: object
@@ -386,7 +387,9 @@ families:
           container starts the Process is registered with kitbashd, which
           mints its Telemetry token; the container receives
           KITBASH_TELEMETRY_ENDPOINT, KITBASH_TELEMETRY_TOKEN, KITBASH_PROCESS,
-          KITBASH_PACKAGE and KITBASH_USER, see spec/kitbashd-api.yaml. A
+          KITBASH_PACKAGE, KITBASH_USER and KITBASH_MCP_ENDPOINT, see
+          spec/kitbashd-api.yaml; through the last one a Process reaches this
+          same surface as its owner. A
           Process whose manifest declares subscriptions: [telemetry] with
           expose: http and a port is registered as a fan out subscriber.
         input:
@@ -471,6 +474,7 @@ families:
             tool: { type: string, description: "Surface tool name, as kitbash.tool" }
             eval: { type: boolean, description: "Only evaluation results written back by kits" }
             producer: { type: string, description: "Member name or Process id that wrote the record" }
+            caller: { type: string, description: "Process id whose MCP session recorded the span, as kitbash.caller" }
             since: { type: string, format: date-time }
             until: { type: string, format: date-time }
             limit: { type: integer, minimum: 1, default: 100, maximum: 1000 }
