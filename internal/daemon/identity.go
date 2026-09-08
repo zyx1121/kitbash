@@ -136,8 +136,8 @@ const maxTokenBytes = 512
 func (s *Server) notServedOverTCP(w http.ResponseWriter, r *http.Request) {
 	writeProblem(w, problem.NotFoundFix(r.URL.Path,
 		fmt.Sprintf("%s is not served on the Process receiver", r.URL.Path),
-		fmt.Sprintf("Export Telemetry to %s, %s or %s; the rest of the API is on the kitbashd socket.",
-			pathTraces, pathLogs, pathMetrics)))
+		fmt.Sprintf("Export Telemetry to %s, %s or %s, or open an MCP session at %s; the rest of the API is on the kitbashd socket.",
+			pathTraces, pathLogs, pathMetrics, MCPPath)))
 }
 
 // The three OTLP paths, the only ones the Process receiver serves.

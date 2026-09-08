@@ -220,6 +220,9 @@ func (s *Server) unregisterProcess(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.fanout.untrack(id)
+	// The token that opened them is revoked, so the sessions it opened are
+	// over and the kitbash-mcp of each one exits.
+	s.endMCPSessions(id)
 	w.WriteHeader(http.StatusNoContent)
 }
 

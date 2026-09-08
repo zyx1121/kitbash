@@ -21,6 +21,7 @@ const (
 	AttrTool     = "kitbash.tool"
 	AttrEval     = "kitbash.eval"
 	AttrProducer = "kitbash.producer"
+	AttrCaller   = "kitbash.caller"
 )
 
 // The subject of an evaluation record: the span a judgment is about, see
@@ -39,6 +40,9 @@ const (
 //
 // kitbash.producer is lifted like the rest and then overwritten by the
 // receiver, so a producer naming itself something else changes nothing.
+// kitbash.caller is lifted and kept as sent: it names the Process whose MCP
+// session recorded the record, which only that session knows, see PLAN.md
+// section 2.3.
 func attributes(resource map[string]any, record []*commonpb.KeyValue) store.Attributes {
 	merged := make(map[string]any, len(resource)+len(record))
 	for k, v := range resource {
@@ -56,6 +60,7 @@ func attributes(resource map[string]any, record []*commonpb.KeyValue) store.Attr
 		AttrPath:     &attrs.Path,
 		AttrTool:     &attrs.Tool,
 		AttrProducer: &attrs.Producer,
+		AttrCaller:   &attrs.Caller,
 	} {
 		if s, ok := merged[key].(string); ok {
 			*target = s

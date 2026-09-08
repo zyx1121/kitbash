@@ -64,6 +64,38 @@ func (p *Podman) Start(ctx context.Context, m Member, container string) error {
 	return err
 }
 
+// MCPCommand builds the kitbash-mcp one MCP session of a Process runs as its
+// owner. It is the same drop to the member's uid, gid and group list as a
+// container start, with the member's environment and nothing of the daemon's:
+// kitbashd runs as root, and a child that inherited root's environment would
+// read root's kitbash socket variables and root's PATH.
+//
+// The command is returned unstarted. The caller connects an MCP client to its
+// stdin and stdout, and closing that connection is what ends the child, see
+// mcp_for_processes in spec/kitbashd-api.yaml.
+func (p *Podman) MCPCommand(ctx context.Context, m Member, binary, caller string) (*exec.Cmd, error) {
+	if binary == "" {
+		return nil, errors.New("sysusers: no kitbash-mcp binary to run")
+	}
+	credential, err := credentialOf(m)
+	if err != nil {
+		return nil, err
+	}
+	// The runtime directory is the member's, and a session that builds a
+	// Package reaches the same rootless podman a container start does.
+	if err := ensureRuntimeDir(p.runUser(), m); err != nil {
+		return nil, err
+	}
+	cmd := exec.CommandContext(ctx, binary)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: credential}
+	cmd.Dir = "/"
+	cmd.Env = MCPEnvironment(m, p.runUser(), caller)
+	// The child writes its own log lines to stderr, which is the daemon's, so
+	// an operator reads them beside everything else kitbashd logs.
+	cmd.Stderr = os.Stderr
+	return cmd, nil
+}
+
 // RemoveAll force removes every container labelled with this member. It is the
 // first step of removing a member: their Processes stop before their account
 // and their home go, see spec/kitbashd-api.yaml.
@@ -112,6 +144,16 @@ func (p *Podman) run(ctx context.Context, m Member, args ...string) (string, err
 			p.binary(), strings.Join(args, " "), m.Name, err, msg)
 	}
 	return stdout.String(), nil
+}
+
+// MCPEnvironment is what one kitbash-mcp session runs with: the member's own
+// environment and the Process that opened the session, and nothing else.
+// kitbashd runs as root, so a child that inherited its environment would read
+// root's socket overrides and root's PATH. It is exported because the daemon
+// tests the child against the environment the host would give it.
+func MCPEnvironment(m Member, runUser, caller string) []string {
+	p := &Podman{RunUser: runUser}
+	return append(p.environment(m), EnvCaller+"="+caller)
 }
 
 // environment is what a rootless podman needs and nothing more. Inheriting

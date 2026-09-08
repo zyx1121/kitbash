@@ -319,6 +319,11 @@ func migrate(db *sql.DB) error {
 		if err := addTextColumn(db, table, "producer"); err != nil {
 			return err
 		}
+		// kitbash.caller arrives with M6: the Process whose MCP session
+		// recorded the record. Every record written before it carries none.
+		if err := addTextColumn(db, table, "caller"); err != nil {
+			return err
+		}
 	}
 	// The container name and the image digest arrive with M5. A registration
 	// written before then simply carries neither, and restore skips it.

@@ -400,7 +400,7 @@ func (s *Service) Reconcile(ctx context.Context, running []Process) (registered,
 }
 
 // telemetryEnv registers the Process and returns the environment its container
-// is started with: the manifest's own, plus the five variables of
+// is started with: the manifest's own, plus the six variables of
 // spec/kitbashd-api.yaml. The manifest cannot override them; they are the
 // Process's identity, not its configuration. The second return says whether
 // the registration happened, so a container that never starts can be taken
@@ -411,7 +411,7 @@ func (s *Service) Reconcile(ctx context.Context, running []Process) (registered,
 // with no token and produces no Telemetry of its own, and the session says so
 // once in the server log.
 func (s *Service) telemetryEnv(ctx context.Context, env map[string]string, reg telemetry.Registration) (map[string]string, bool) {
-	merged := make(map[string]string, len(env)+5)
+	merged := make(map[string]string, len(env)+6)
 	for k, v := range env {
 		merged[k] = v
 	}
@@ -429,6 +429,9 @@ func (s *Service) telemetryEnv(ctx context.Context, env map[string]string, reg t
 	merged[telemetry.EnvProcess] = reg.ID
 	merged[telemetry.EnvPackage] = reg.Package
 	merged[telemetry.EnvUser] = s.files.User()
+	// The MCP endpoint is given with the token, not before it: without a
+	// token there is nothing for a Process to authenticate a session with.
+	merged[telemetry.EnvMCPEndpoint] = telemetry.MCPEndpointForProcesses()
 	return merged, true
 }
 

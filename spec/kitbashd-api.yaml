@@ -52,10 +52,14 @@ mcp_for_processes:
     Telemetry and the approval queue all behave as for the owner. The surface
     is exactly the owner's; there is no narrowing in version 1.
   limits: >
-    At most 8 live sessions per Process (429 with a problem beyond), a
-    session ends on DELETE, when the client is idle for 10 minutes, or when
-    the Process is unregistered; the child exits with it. Request bodies are
-    capped at 4 MiB like the OTLP paths.
+    At most 8 live sessions per Process; the ninth is refused with the
+    conflict problem at status 429, so a client tells it apart from a
+    refusal a different token would fix. A session ends on DELETE, when the
+    client is idle for 10 minutes, when the Process is unregistered, or when
+    the child exits; the child exits with it. Request bodies are capped at
+    4 MiB like the OTLP paths, and a request without a token is 401 before
+    the MCP handler runs. The kitbash-mcp a session runs is
+    /usr/bin/kitbash-mcp, which -mcp-binary and KITBASH_MCP_BINARY override.
   environment_given_to_every_process:
     KITBASH_MCP_ENDPOINT: http://host.containers.internal:4318/mcp
   telemetry: >

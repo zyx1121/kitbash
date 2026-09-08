@@ -178,6 +178,18 @@ func ConflictFix(instance, detail, fix string) *Problem {
 	return p
 }
 
+// TooManySessions reports a Process asking for one more MCP session than it
+// may hold at once, see mcp_for_processes.limits in spec/kitbashd-api.yaml.
+// The slug stays conflict, so a client matches one class of refusal however it
+// was refused, and the status is 429 because the same request works once a
+// session ends.
+func TooManySessions(instance, detail, fix string) *Problem {
+	if fix == "" {
+		fix = "End a session with DELETE /mcp before opening another one."
+	}
+	return newProblem(SlugConflict, "Conflict", http.StatusTooManyRequests, instance, detail, fix)
+}
+
 // Queued reports a call that was not run but put in the approval queue, which
 // is what a member's write under /org is, see PLAN.md section 2.1. It is the
 // one problem that is not a failure: the status is 202, the instance is the
