@@ -165,7 +165,7 @@ api:
     method: POST
     path: /kitbash/v1/users
     request: { name: "^[a-z][a-z0-9-]{1,31}$", sshKey: "one OpenSSH public key line", admin: false }
-    response: { user: "name", uid: 1005 }
+    response: { user: "name", uid: 1005, admin: false }
     authorization: admin only. Runs useradd -m -s /bin/sh -G kitbash-users, usermod -p '*', adds the member to kitbash-admin when admin is true, allocates a 65536 wide subuid and subgid range, writes authorized_keys 0600 in a 0700 .ssh, sets the home to 0700, creates /run/user/<uid> 0700 owned by the member.
     errors: [bad-request, not-permitted, conflict, internal]
   users_list:
@@ -195,7 +195,7 @@ api:
     path: /kitbash/v1/approvals
     request: { tool: "fs_write|pkg_import", input: { the tool's input verbatim } }
     response: { id: "UUIDv7", state: "pending", requestedAt }
-    authorization: any member; the requester is the peer. Input is capped at 1 MiB plus the tool's own limits; at most 64 pending approvals per member (409 beyond).
+    authorization: any member; the requester is the peer. Input is capped at 2 MiB plus the tool's own limits, which leaves room for the megabyte fs_write carries once base64 has grown it; at most 64 pending approvals per member (409 beyond).
   approvals_list:
     method: GET
     path: /kitbash/v1/approvals?state=pending|approved|rejected

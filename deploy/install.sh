@@ -88,10 +88,31 @@ if [ -d "$seed" ]; then
     fi
   done
 fi
-chown -R root:kitbash-users /org
-chmod 750 /org
-find /org -type d -exec chmod 750 {} +
-find /org -type f -exec chmod 640 {} +
+#    /org is group kitbash-admin and setgid, so what one admin adds stays
+#    writable by the next, and every repository is shared at group level so
+#    two admins committing do not fight over object permissions
+#    (PLAN.md 2.1). Members read it; only admins write it, and a member's
+#    write to /org is an approval rather than a permission.
+#    /org/.archive holds the homes of removed members and stays root only:
+#    it carries no kitbash.yaml, so the surface cannot see it either.
+prune=""
+[ -d /org/.archive ] && prune="-path /org/.archive -prune -o"
+# shellcheck disable=SC2086
+find /org $prune -exec chown root:kitbash-admin {} + 2>/dev/null || true
+# shellcheck disable=SC2086
+find /org $prune -type d -exec chmod 2775 {} +
+# g+w,o+r rather than a fixed mode: a file in /org may be a script, and 664
+# would take its executable bit away.
+# shellcheck disable=SC2086
+find /org $prune -type f -exec chmod g+w,o+r {} +
+for repo in /org/*/.git; do
+  [ -d "$repo" ] || continue
+  git -C "$(dirname "$repo")" config core.sharedRepository group
+done
+if [ -d /org/.archive ]; then
+  chown root:root /org/.archive
+  chmod 700 /org/.archive
+fi
 
 # 10. sshd: regular users get the MCP surface and nothing else.
 #     Port 22 is the only port this installer configures. kitbashd also opens
@@ -117,5 +138,6 @@ S
 sshd -t
 rc-service -q sshd restart
 
-log "done. add members with: kitbash-adduser <name> '<ssh public key>' [admin]"
-log "the admin argument puts the member in kitbash-admin, which tel_retention and reading another member's Telemetry both require"
+log "done. create the first admin on this console with: kitbash-adduser <name> '<ssh public key>' admin"
+log "that admin creates every other member through the MCP surface with users_create; kitbash-adduser stays as the bootstrap and break glass path"
+log "the admin argument puts the member in kitbash-admin, which users_create, approvals and reading another member's Telemetry all require"

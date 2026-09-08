@@ -18,7 +18,7 @@ test:
 
 ## test-race: the concurrent packages under the race detector (needs cgo)
 test-race:
-	CGO_ENABLED=1 go test -race -count=1 ./internal/daemon/... ./internal/store/... ./internal/otlp/... ./internal/telemetry/... ./internal/bridge/... ./internal/proc/...
+	CGO_ENABLED=1 go test -race -count=1 ./internal/daemon/... ./internal/store/... ./internal/sysusers/... ./internal/otlp/... ./internal/telemetry/... ./internal/bridge/... ./internal/proc/...
 
 ## lint: formatting and correctness
 lint:

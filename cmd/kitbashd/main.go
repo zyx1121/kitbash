@@ -16,6 +16,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 
 	"github.com/zyx1121/kitbash/internal/daemon"
@@ -44,6 +45,7 @@ const (
 	socketEnv     = "KITBASH_SOCKET"
 	storeEnv      = "KITBASH_STORE"
 	otlpListenEnv = "KITBASH_OTLP_LISTEN"
+	noRestoreEnv  = "KITBASH_NO_RESTORE"
 )
 
 // SocketGroup owns the socket with root, so every member may connect and
@@ -71,6 +73,8 @@ func run() error {
 	storePath := flag.String("store", env(storeEnv, defaultStore), "SQLite file holding Telemetry")
 	otlpListen := flag.String("otlp-listen", env(otlpListenEnv, defaultOTLPListen),
 		"address of the Process receiver, empty to serve the socket alone")
+	noRestore := flag.Bool("no-restore", truthy(os.Getenv(noRestoreEnv)),
+		"do not start the registered Processes at boot")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
 	if *showVersion {
@@ -115,7 +119,7 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	srv := daemon.New(st, daemon.Options{Version: version})
+	srv := daemon.New(st, daemon.Options{Version: version, NoRestore: *noRestore})
 	defer srv.Close()
 	if _, err := srv.Sweep(ctx); err != nil {
 		// A store that cannot be swept can still receive and answer, so this
@@ -151,6 +155,12 @@ func run() error {
 		logger.Printf("listening on %s, store %s, version %s", *socket, *storePath, version)
 	}
 
+	// Restore runs beside the listeners rather than before them: a host with
+	// many containers would otherwise keep every member's session waiting on
+	// podman. It logs one line when it is done, see PLAN.md section 2.3, and
+	// it does nothing at all when the daemon was started with restore off.
+	go srv.Restore(serve)
+
 	var failed error
 	for range listeners {
 		if err := <-errs; err != nil && failed == nil {
@@ -162,6 +172,14 @@ func run() error {
 	}
 	logger.Printf("stopped")
 	return nil
+}
+
+// truthy reads a switch from the environment. Only 1 and true turn one on: a
+// variable set to 0 or to false is an operator saying no, and reading any
+// value as yes would leave a host without its Processes because somebody wrote
+// KITBASH_NO_RESTORE=0.
+func truthy(v string) bool {
+	return v == "1" || strings.EqualFold(v, "true")
 }
 
 // env reads an override, falling back to the default of the API spec.

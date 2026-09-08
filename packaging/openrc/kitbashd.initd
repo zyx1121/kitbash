@@ -27,6 +27,10 @@ depend() {
 	# Telemetry of the sessions on it.
 	need localmount
 	use net
+	# local runs /etc/local.d/kitbash-rootless.start, which makes / rshared
+	# and creates every member's /run/user directory. Boot restore starts each
+	# registered Process as its owner and needs both, see PLAN.md section 2.3.
+	after local
 }
 
 start_pre() {

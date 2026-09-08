@@ -42,11 +42,17 @@ var ErrTooManyProcesses = errors.New("store: the member has too many Processes r
 // processes_list answers with and kitbash-mcp reads: a key that comes and goes
 // is a key a client has to guess at.
 type Process struct {
-	ID            string    `json:"id"`
-	Owner         string    `json:"owner"`
-	Admin         bool      `json:"admin"`
+	ID    string `json:"id"`
+	Owner string `json:"owner"`
+	Admin bool   `json:"admin"`
+	// Package is the folder the Process was built from, Container the name
+	// the runtime holds it under and Digest the image it runs. The last two
+	// are what boot restore needs: with them kitbashd starts a Process again
+	// without reading a manifest, see spec/kitbashd-api.yaml.
 	Package       string    `json:"package"`
 	Name          string    `json:"name"`
+	Container     string    `json:"container"`
+	Digest        string    `json:"digest"`
 	Expose        string    `json:"expose"`
 	Endpoint      string    `json:"endpoint"`
 	Subscriptions []string  `json:"subscriptions"`
@@ -125,14 +131,16 @@ func (s *Store) RegisterProcess(ctx context.Context, p Process, tokenHash string
 		return fmt.Errorf("store: encode subscriptions: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO processes
-		(id, owner, admin, package, name, expose, endpoint, subscriptions, token_hash, registered_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?)
+		(id, owner, admin, package, name, container, digest, expose, endpoint,
+		 subscriptions, token_hash, registered_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 			owner = excluded.owner, admin = excluded.admin, package = excluded.package,
-			name = excluded.name, expose = excluded.expose, endpoint = excluded.endpoint,
+			name = excluded.name, container = excluded.container, digest = excluded.digest,
+			expose = excluded.expose, endpoint = excluded.endpoint,
 			subscriptions = excluded.subscriptions, token_hash = excluded.token_hash,
 			registered_at = excluded.registered_at`,
-		p.ID, p.Owner, p.Admin, p.Package, p.Name, p.Expose, p.Endpoint,
+		p.ID, p.Owner, p.Admin, p.Package, p.Name, p.Container, p.Digest, p.Expose, p.Endpoint,
 		string(subscriptions), tokenHash, p.RegisteredAt.UnixNano()); err != nil {
 		return fmt.Errorf("store: register the Process %s: %w", p.ID, err)
 	}
@@ -156,6 +164,61 @@ func (s *Store) DeleteProcess(ctx context.Context, id string) (bool, error) {
 	return n > 0, nil
 }
 
+// DeleteProcessesByOwner removes every registration of one member and answers
+// the ids it removed, so the caller stops the fan out for each of them. It is
+// part of removing a member: their tokens are revoked with their account, see
+// spec/kitbashd-api.yaml.
+func (s *Store) DeleteProcessesByOwner(ctx context.Context, owner string) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, "SELECT id FROM processes WHERE owner = ?", owner)
+	if err != nil {
+		return nil, fmt.Errorf("store: list the Processes of %s: %w", owner, err)
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("store: list the Processes of %s: %w", owner, err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, fmt.Errorf("store: list the Processes of %s: %w", owner, err)
+	}
+	rows.Close()
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	if _, err := s.db.ExecContext(ctx, "DELETE FROM processes WHERE owner = ?", owner); err != nil {
+		return nil, fmt.Errorf("store: unregister the Processes of %s: %w", owner, err)
+	}
+	return ids, nil
+}
+
+// ProcessCounts is how many Processes each member holds registered, which is
+// the running Process count users_list answers with.
+func (s *Store) ProcessCounts(ctx context.Context) (map[string]int, error) {
+	rows, err := s.db.QueryContext(ctx, "SELECT owner, count(*) FROM processes GROUP BY owner")
+	if err != nil {
+		return nil, fmt.Errorf("store: count the Processes per member: %w", err)
+	}
+	defer rows.Close()
+	counts := map[string]int{}
+	for rows.Next() {
+		var owner string
+		var n int
+		if err := rows.Scan(&owner, &n); err != nil {
+			return nil, fmt.Errorf("store: count the Processes per member: %w", err)
+		}
+		counts[owner] = n
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: count the Processes per member: %w", err)
+	}
+	return counts, nil
+}
+
 // Process reads one registered Process by id.
 func (s *Store) Process(ctx context.Context, id string) (Process, bool, error) {
 	return s.process(ctx, "id = ?", id)
@@ -168,8 +231,7 @@ func (s *Store) ProcessByToken(ctx context.Context, token string) (Process, bool
 }
 
 func (s *Store) process(ctx context.Context, where string, arg any) (Process, bool, error) {
-	row := s.db.QueryRowContext(ctx,
-		"SELECT id, owner, admin, package, name, expose, endpoint, subscriptions, registered_at FROM processes WHERE "+where, arg)
+	row := s.db.QueryRowContext(ctx, processColumns+" FROM processes WHERE "+where, arg)
 	p, err := scanProcess(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Process{}, false, nil
@@ -183,7 +245,7 @@ func (s *Store) process(ctx context.Context, where string, arg any) (Process, bo
 // Processes lists registered Processes, newest first. An empty owner lists
 // every member's, which is what an admin reads and what the fan out loads.
 func (s *Store) Processes(ctx context.Context, owner string) ([]Process, error) {
-	query := "SELECT id, owner, admin, package, name, expose, endpoint, subscriptions, registered_at FROM processes"
+	query := processColumns + " FROM processes"
 	var args []any
 	if owner != "" {
 		query += " WHERE owner = ?"
@@ -210,6 +272,10 @@ func (s *Store) Processes(ctx context.Context, owner string) ([]Process, error) 
 	return out, nil
 }
 
+// processColumns is the one select every read of this table shares.
+const processColumns = `SELECT id, owner, admin, package, name, container, digest,
+	expose, endpoint, subscriptions, registered_at`
+
 // scanner is what both a single row and a row of a result set satisfy.
 type scanner interface {
 	Scan(dest ...any) error
@@ -219,8 +285,8 @@ func scanProcess(row scanner) (Process, error) {
 	var p Process
 	var subscriptions string
 	var registered int64
-	if err := row.Scan(&p.ID, &p.Owner, &p.Admin, &p.Package, &p.Name, &p.Expose, &p.Endpoint,
-		&subscriptions, &registered); err != nil {
+	if err := row.Scan(&p.ID, &p.Owner, &p.Admin, &p.Package, &p.Name, &p.Container, &p.Digest,
+		&p.Expose, &p.Endpoint, &subscriptions, &registered); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Process{}, err
 		}
@@ -250,16 +316,33 @@ func subscriptionList(in []string) []string {
 // rewrite, so a downgrade keeps reading the same records.
 func migrate(db *sql.DB) error {
 	for _, table := range []string{"spans", "logs", "metrics"} {
-		has, err := hasColumn(db, table, "producer")
-		if err != nil {
+		if err := addTextColumn(db, table, "producer"); err != nil {
 			return err
 		}
-		if has {
-			continue
+	}
+	// The container name and the image digest arrive with M5. A registration
+	// written before then simply carries neither, and restore skips it.
+	for _, column := range []string{"container", "digest"} {
+		if err := addTextColumn(db, "processes", column); err != nil {
+			return err
 		}
-		if _, err := db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN producer TEXT NOT NULL DEFAULT ''", table)); err != nil {
-			return fmt.Errorf("store: add the producer column to %s: %w", table, err)
-		}
+	}
+	return nil
+}
+
+// addTextColumn adds one text column with an empty default unless the table
+// already has it. A table that does not exist yet has no columns, which is the
+// answer a fresh store gives before the schema runs.
+func addTextColumn(db *sql.DB, table, column string) error {
+	has, err := hasColumn(db, table, column)
+	if err != nil {
+		return err
+	}
+	if has {
+		return nil
+	}
+	if _, err := db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s TEXT NOT NULL DEFAULT ''", table, column)); err != nil {
+		return fmt.Errorf("store: add the %s column to %s: %w", column, table, err)
 	}
 	return nil
 }

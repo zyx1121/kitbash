@@ -1,27 +1,166 @@
 #!/bin/sh
-# M1 stand in for the users_create MCP tool. Creates a member.
+# Create a member on the console.
+#
+# This is the bootstrap and break glass path, not the everyday one. From M5
+# members are created through the MCP surface with users_create, which kitbashd
+# serves as root over its socket (PLAN.md 4.5). The first admin has no admin to
+# create them, so this script does the same work by hand and stays for the day
+# kitbashd will not start.
+#
+# It does exactly what internal/sysusers does, step for step. Change one and
+# change the other.
+#
 # usage: kitbash-adduser <name> '<ssh public key>' [admin]
 set -eu
-name=$1; key=$2; role=${3:-}
+
+name=${1:?usage: kitbash-adduser <name> '<ssh public key>' [admin]}
+key=${2:?usage: kitbash-adduser <name> '<ssh public key>' [admin]}
+role=${3:-}
+
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
-echo "$name" | grep -Eq '^[a-z][a-z0-9-]{1,31}$' || { echo "bad name" >&2; exit 1; }
+
+# 1. The name is a member name, which is also a Linux user name.
+echo "$name" | grep -Eq '^[a-z][a-z0-9-]{1,31}$' || {
+  echo "bad name: 2 to 32 characters, starting with a letter, lower case letters, digits and hyphens" >&2
+  exit 1
+}
+
+# 2. The key is one OpenSSH public key line: a type kitbash accepts, a base64
+#    body, an optional comment, one line, at most 4096 bytes. authorized_keys
+#    is the whole authentication story for a member, so a line that is not a
+#    key is never written: an option string in that file changes what every
+#    key below it may do.
+[ "${#key}" -le 4096 ] || { echo "the key line is over 4096 bytes" >&2; exit 1; }
+[ "$(printf '%s' "$key" | wc -l)" = 0 ] || { echo "a key is one line" >&2; exit 1; }
+keytype=$(printf '%s' "$key" | awk '{print $1}')
+keybody=$(printf '%s' "$key" | awk '{print $2}')
+case "$keytype" in
+  ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521| \
+  sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com) ;;
+  *) echo "$keytype is not a key type kitbash accepts" >&2; exit 1 ;;
+esac
+[ -n "$keybody" ] || { echo "the key carries no body" >&2; exit 1; }
+printf '%s' "$keybody" | base64 -d >/dev/null 2>&1 || { echo "the key body is not base64" >&2; exit 1; }
+
+# 3. The account. useradd leaves the password field as "!", which sshd reads as
+#    a locked account and refuses even a key login; "*" means no password.
 if ! id "$name" >/dev/null 2>&1; then
   useradd -m -s /bin/sh -G kitbash-users "$name"
 fi
-# useradd leaves the password field as "!", which sshd treats as a locked
-# account and refuses even key logins. "*" means no password, not locked.
 usermod -p '*' "$name"
+if [ "$role" = admin ]; then usermod -aG kitbash-admin "$name"; fi
+
+uid=$(id -u "$name")
+gid=$(id -g "$name")
 home=$(getent passwd "$name" | cut -d: -f6)
+
+# 4. Subordinate ids: one 65536 wide block per member, the next free above
+#    100000, in both files. Two members sharing a block share the ownership of
+#    each other's container files, so the blocks never overlap.
+#
+#    Reading the highest block and appending the next are two steps, and
+#    kitbashd allocates from the same two files, so both take the same lock:
+#    /etc/subuid.lock, flock where there is one and a directory where there is
+#    not. The lock is on a file of its own because an allocation renames a new
+#    file over /etc/subuid, and a lock on the old inode would guard nothing.
+lockfile=/etc/subuid.lock
+lockdir=/etc/subuid.lock.d
+unlock() { :; }
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"$lockfile"
+  flock 9
+  unlock() { flock -u 9 2>/dev/null || true; }
+else
+  tries=0
+  until mkdir "$lockdir" 2>/dev/null; do
+    tries=$((tries + 1))
+    if [ "$tries" -ge 30 ]; then
+      echo "another allocation is holding $lockdir; remove it if no one is" >&2
+      exit 1
+    fi
+    sleep 1
+  done
+  unlock() { rmdir "$lockdir" 2>/dev/null || true; }
+fi
+trap 'unlock' EXIT INT TERM
+
+#    The block is read back after it is written: the name has to be in the
+#    file once and its start has to be nobody else's. A write that lost a race
+#    is dropped and asked for again, so the allocation converges even if a lock
+#    is ever weaker than it looks.
+for f in /etc/subuid /etc/subgid; do
+  [ -f "$f" ] || : > "$f"
+  chmod 644 "$f"
+  attempt=0
+  while ! grep -q "^$name:" "$f"; do
+    start=$(awk -F: 'NF==3 && $2+0>0 {e=$2+$3; if (e>m) m=e} END {print (m>100000)?m:100000}' "$f")
+    tmp=$(mktemp "$(dirname "$f")/.kitbash-subid-XXXXXX")
+    cat "$f" > "$tmp"
+    echo "$name:$start:65536" >> "$tmp"
+    chmod 644 "$tmp"
+    mv "$tmp" "$f"
+
+    named=$(grep -c "^$name:" "$f" || true)
+    sharing=$(awk -F: -v s="$start" 'NF==3 && $2==s {n++} END {print n+0}' "$f")
+    if [ "$named" = 1 ] && [ "$sharing" = 1 ]; then break; fi
+
+    tmp=$(mktemp "$(dirname "$f")/.kitbash-subid-XXXXXX")
+    grep -v "^$name:" "$f" > "$tmp" || true
+    chmod 644 "$tmp"
+    mv "$tmp" "$f"
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge 5 ]; then
+      echo "could not allocate a subordinate id block for $name in $f" >&2
+      exit 1
+    fi
+  done
+done
+#    The last word before the lock is dropped: both files carry a block for
+#    this member. A block that is not there now is one another writer replaced
+#    the file over, which a working lock makes impossible; saying so is better
+#    than leaving a member whose rootless podman will not start.
+for f in /etc/subuid /etc/subgid; do
+  if ! grep -q "^$name:" "$f"; then
+    echo "the subordinate id block for $name in $f was lost to another writer; run this again" >&2
+    exit 1
+  fi
+done
+
+unlock
+trap - EXIT INT TERM
+
+# 5. The home and the key. Both are the member's alone; sshd refuses an
+#    authorized_keys anyone else can write.
+#
+#    Everything below the home is written by the member, not by root. This
+#    script runs as root and the member owns every name under their home, so a
+#    .ssh replaced by a link to /etc would be followed by a root chown and a
+#    root write. As the member, the same trick reaches only what the member
+#    could reach anyway. The home itself is root's to set: its parent belongs
+#    to root, so a member cannot replace it.
+if [ -L "$home" ]; then echo "the home of $name is a symbolic link" >&2; exit 1; fi
+if [ ! -d "$home" ]; then echo "the home of $name is not a directory" >&2; exit 1; fi
 chmod 700 "$home"
-adduser "$name" kitbash-users >/dev/null 2>&1 || true
-[ "$role" = admin ] && adduser "$name" kitbash-admin >/dev/null 2>&1 || true
-grep -q "^$name:" /etc/subuid || usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$name" 2>/dev/null || {
-  # usermod cannot allocate when ranges overlap; pick the next free block
-  last=$(awk -F: '{print $2+$3}' /etc/subuid | sort -n | tail -1); last=${last:-100000}
-  echo "$name:$last:65536" >> /etc/subuid; echo "$name:$last:65536" >> /etc/subgid
-}
-install -d -m 700 -o "$name" -g "$name" "$home/.ssh"
-touch "$home/.ssh/authorized_keys"; chmod 600 "$home/.ssh/authorized_keys"; chown "$name:$name" "$home/.ssh/authorized_keys"
-grep -qF "$key" "$home/.ssh/authorized_keys" || echo "$key" >> "$home/.ssh/authorized_keys"
-uid=$(id -u "$name"); d=/run/user/$uid; mkdir -p "$d"; chown "$name" "$d"; chmod 700 "$d"
+chown "$uid:$gid" "$home"
+
+keyfile=$(mktemp)
+trap 'rm -f "$keyfile"' EXIT INT TERM
+printf '%s\n' "$key" > "$keyfile"
+chmod 644 "$keyfile"
+su -s /bin/sh -c "umask 077
+mkdir -p \"\$HOME/.ssh\"
+touch \"\$HOME/.ssh/authorized_keys\"
+chmod 700 \"\$HOME/.ssh\"
+chmod 600 \"\$HOME/.ssh/authorized_keys\"
+grep -qxF -f '$keyfile' \"\$HOME/.ssh/authorized_keys\" || cat '$keyfile' >> \"\$HOME/.ssh/authorized_keys\"" "$name"
+rm -f "$keyfile"
+trap - EXIT INT TERM
+
+# 6. The runtime directory rootless podman needs. It lives in tmpfs, so
+#    /etc/local.d/kitbash-rootless.start creates it again at every boot.
+d=/run/user/$uid
+mkdir -p "$d"
+chown "$uid:$gid" "$d"
+chmod 700 "$d"
+
 echo "$name uid=$uid groups=$(id -Gn "$name")"

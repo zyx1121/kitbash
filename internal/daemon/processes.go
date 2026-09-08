@@ -30,10 +30,11 @@ const LoopbackHost = "127.0.0.1"
 // Bounds on what a registration may carry. They are far above what a real
 // Process needs and stop one caller from filling the store with a field.
 const (
-	MaxPackageBytes  = 4096
-	MaxNameBytes     = 256
-	MaxEndpointBytes = 256
-	MaxSubscriptions = 8
+	MaxPackageBytes   = 4096
+	MaxNameBytes      = 256
+	MaxEndpointBytes  = 256
+	MaxSubscriptions  = 8
+	MaxContainerBytes = 128
 )
 
 // MaxProcessesPerMember is how many Processes one member may hold registered.
@@ -43,15 +44,29 @@ const (
 // different problem than this limit.
 const MaxProcessesPerMember = 64
 
-// processID is the UUIDv7 shape spec/kitbashd-api.yaml declares, the same one
-// internal/uuid writes.
-var processID = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+// uuidV7 is the identifier shape spec/kitbashd-api.yaml declares for a Process
+// and for an approval, the same one internal/uuid writes.
+// containerName and imageDigest are the two fields a registration gained in
+// M5. Restore starts a container by the name the runtime holds it under, so
+// the name is checked against the shape the runner writes and nothing else: it
+// reaches a command line as an argument.
+var (
+	containerName = regexp.MustCompile(`^kitbash-[a-z0-9-]+$`)
+	imageDigest   = regexp.MustCompile(`^sha256:[a-f0-9]{64}$`)
+)
+
+var uuidV7 = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 
 // processRequest is the processes_register input of spec/kitbashd-api.yaml.
+// Container and Digest are optional: a kitbash-mcp of the previous release
+// registers without them, and a registration that carries no container is one
+// restore leaves alone.
 type processRequest struct {
 	ID            string   `json:"id"`
 	Package       string   `json:"package"`
 	Name          string   `json:"name,omitempty"`
+	Container     string   `json:"container,omitempty"`
+	Digest        string   `json:"digest,omitempty"`
 	Expose        string   `json:"expose"`
 	Endpoint      string   `json:"endpoint,omitempty"`
 	Subscriptions []string `json:"subscriptions,omitempty"`
@@ -115,6 +130,8 @@ func (s *Server) registerProcess(w http.ResponseWriter, r *http.Request, caller 
 		Admin:         caller.Admin,
 		Package:       req.Package,
 		Name:          req.Name,
+		Container:     req.Container,
+		Digest:        req.Digest,
 		Expose:        req.Expose,
 		Endpoint:      req.Endpoint,
 		Subscriptions: req.Subscriptions,
@@ -222,7 +239,7 @@ func (s *Server) LoadSubscribers(ctx context.Context) error {
 // here is one spec/kitbashd-api.yaml states; the endpoint rule is the one that
 // matters for safety, see LoopbackHost.
 func validateProcess(instance string, req processRequest) *problem.Problem {
-	if !processID.MatchString(req.ID) {
+	if !uuidV7.MatchString(req.ID) {
 		return problem.BadRequest(instance,
 			fmt.Sprintf("%q is not a Process id", req.ID),
 			"Send the id as a version 7 UUID in its canonical 36 character form.")
@@ -243,6 +260,18 @@ func validateProcess(instance string, req processRequest) *problem.Problem {
 		return problem.BadRequest(instance,
 			fmt.Sprintf("the name is %d bytes, over the %d this API carries", len(req.Name), MaxNameBytes),
 			"Send a shorter Process name.")
+	}
+	if req.Container != "" {
+		if len(req.Container) > MaxContainerBytes || !containerName.MatchString(req.Container) {
+			return problem.BadRequest(instance,
+				fmt.Sprintf("%q is not a container name kitbash writes", req.Container),
+				"Send the container as the name the runtime holds it under, which starts with kitbash- and carries lower case letters, digits and hyphens.")
+		}
+	}
+	if req.Digest != "" && !imageDigest.MatchString(req.Digest) {
+		return problem.BadRequest(instance,
+			fmt.Sprintf("%q is not an image digest", req.Digest),
+			"Send the digest as sha256: followed by 64 hexadecimal characters.")
 	}
 	switch req.Expose {
 	case ExposeMCP, ExposeHTTP, ExposeNone:

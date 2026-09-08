@@ -24,6 +24,7 @@ import (
 
 	"github.com/zyx1121/kitbash/internal/problem"
 	"github.com/zyx1121/kitbash/internal/store"
+	"github.com/zyx1121/kitbash/internal/sysusers"
 )
 
 // AdminGroup is the group whose members read everyone's Telemetry and set
@@ -110,6 +111,16 @@ type Options struct {
 	Timeouts Timeouts
 	// MaxConnections caps concurrent connections. Zero means the default.
 	MaxConnections int
+	// Users is what the users family does to the host. Nil means the real
+	// one, which runs useradd and its neighbours as root.
+	Users sysusers.System
+	// Runner starts and removes containers as their owner, which is what
+	// restore and removing a member both need. Nil means the real one.
+	Runner sysusers.Runner
+	// NoRestore stops the daemon from starting the registered Processes,
+	// which an operator sets with KITBASH_NO_RESTORE to bring a host up
+	// without its Processes, and a test sets to keep the runtime out of it.
+	NoRestore bool
 }
 
 // Caller is the identity behind one request.
@@ -132,6 +143,10 @@ type Server struct {
 	timeouts Timeouts
 	maxConns int
 	fanout   *fanout
+	users    sysusers.System
+	runner   sysusers.Runner
+
+	noRestore bool
 
 	// bound is what health reports as its listeners, written when a listener
 	// starts serving and read by every health request.
@@ -150,6 +165,16 @@ func New(st *store.Store, opts Options) *Server {
 		timeouts: opts.Timeouts.withDefaults(),
 		maxConns: opts.MaxConnections,
 		fanout:   newFanout(),
+		users:    opts.Users,
+		runner:   opts.Runner,
+
+		noRestore: opts.NoRestore,
+	}
+	if s.runner == nil {
+		s.runner = sysusers.NewPodman()
+	}
+	if s.users == nil {
+		s.users = sysusers.NewHost(s.runner)
 	}
 	if s.maxConns <= 0 {
 		s.maxConns = MaxConnections
@@ -183,6 +208,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc(retentionPath, s.retention)
 	s.mux.HandleFunc(processesPath, s.processes)
 	s.mux.HandleFunc(processesPath+"/", s.unregisterProcess)
+	s.mux.HandleFunc(usersPath, s.usersFamily)
+	s.mux.HandleFunc(usersPath+"/", s.user)
+	s.mux.HandleFunc(approvalsPath, s.approvalsFamily)
+	s.mux.HandleFunc(approvalsPath+"/", s.approval)
 	s.mux.HandleFunc(healthPath, s.method(http.MethodGet, s.health))
 	s.mux.HandleFunc("/", s.notFound)
 
@@ -196,6 +225,8 @@ const (
 	queryPath     = "/kitbash/v1/query"
 	retentionPath = "/kitbash/v1/retention"
 	processesPath = "/kitbash/v1/processes"
+	usersPath     = "/kitbash/v1/users"
+	approvalsPath = "/kitbash/v1/approvals"
 	healthPath    = "/kitbash/v1/health"
 )
 
