@@ -1,10 +1,6 @@
 name: evaluate-latency
 description: >-
-  Judges every tool call span slower than a threshold and writes the judgment
-  back as an evaluation log record. Run it to have slow calls flagged in
-  Telemetry next to the calls they are about, found by the same query. It judges
-  the kitbashd fan out only: a request that does not carry this Process's fan
-  out secret is refused.
+  Judges every tool call span slower than a threshold and writes the judgment back as an evaluation log record, so slow calls are flagged in Telemetry next to the calls they are about. Deliveries must carry the fan out secret kitbashd gives this Process.
 tags: [kit, evaluate, observe]
 
 provides:
