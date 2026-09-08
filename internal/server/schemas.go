@@ -329,6 +329,7 @@ const telAttributesDef = `{
     "tool": { "type": "string" },
     "eval": { "type": "boolean" },
     "producer": { "type": "string", "description": "Member name or Process id that wrote the record" },
+    "caller": { "type": "string", "description": "Process id whose MCP session recorded this span, when a Process acted for its owner" },
     "subject": { "type": "object", "description": "For evaluation records: traceId and spanId of the judged span", "properties": { "traceId": { "type": "string" }, "spanId": { "type": "string" } } }
   }
 }`
@@ -392,6 +393,7 @@ var (
     "tool": { "type": "string", "description": "Surface tool name, as kitbash.tool" },
     "eval": { "type": "boolean", "description": "Only evaluation results written back by kits" },
     "producer": { "type": "string", "description": "Member name or Process id that wrote the record" },
+    "caller": { "type": "string", "description": "Process id whose MCP session recorded the span, as kitbash.caller" },
     "since": { "type": "string", "format": "date-time" },
     "until": { "type": "string", "format": "date-time" },
     "limit": { "type": "integer", "minimum": 1, "default": 100, "maximum": 1000 }
