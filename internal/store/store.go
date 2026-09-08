@@ -52,6 +52,11 @@ const (
 // Producer is who wrote the record: the member for a session record, the
 // Process id for one that arrived with a Process token. It is stamped by the
 // daemon and never read from the body.
+//
+// Caller is the Process whose MCP session recorded the record. The producer
+// sends the credential of its session and the daemon rewrites it to the
+// Process id, so this column is never what a producer claimed, see PLAN.md
+// section 2.3. It is empty for a record a member's own session wrote.
 type Attributes struct {
 	User     string         `json:"user,omitempty"`
 	Package  string         `json:"package,omitempty"`
@@ -60,6 +65,7 @@ type Attributes struct {
 	Tool     string         `json:"tool,omitempty"`
 	Eval     *bool          `json:"eval,omitempty"`
 	Producer string         `json:"producer,omitempty"`
+	Caller   string         `json:"caller,omitempty"`
 	Other    map[string]any `json:"-"`
 }
 
@@ -120,6 +126,7 @@ type Filter struct {
 	Tool     string
 	Eval     *bool
 	Producer string
+	Caller   string
 	Since    time.Time
 	Until    time.Time
 	Limit    int
@@ -256,6 +263,7 @@ CREATE TABLE IF NOT EXISTS spans (
   tool           TEXT    NOT NULL DEFAULT '',
   eval           INTEGER,
   producer       TEXT    NOT NULL DEFAULT '',
+  caller         TEXT    NOT NULL DEFAULT '',
   other          TEXT    NOT NULL DEFAULT ''
 );
 
@@ -273,6 +281,7 @@ CREATE TABLE IF NOT EXISTS logs (
   tool      TEXT    NOT NULL DEFAULT '',
   eval      INTEGER,
   producer  TEXT    NOT NULL DEFAULT '',
+  caller    TEXT    NOT NULL DEFAULT '',
   other     TEXT    NOT NULL DEFAULT ''
 );
 
@@ -289,6 +298,7 @@ CREATE TABLE IF NOT EXISTS metrics (
   tool    TEXT    NOT NULL DEFAULT '',
   eval    INTEGER,
   producer TEXT    NOT NULL DEFAULT '',
+  caller  TEXT    NOT NULL DEFAULT '',
   other   TEXT    NOT NULL DEFAULT ''
 );
 
@@ -334,16 +344,19 @@ CREATE INDEX IF NOT EXISTS spans_start    ON spans(start_ns);
 CREATE INDEX IF NOT EXISTS spans_user     ON spans(user, start_ns);
 CREATE INDEX IF NOT EXISTS spans_package  ON spans(package, start_ns);
 CREATE INDEX IF NOT EXISTS spans_producer ON spans(producer, start_ns);
+CREATE INDEX IF NOT EXISTS spans_caller   ON spans(caller, start_ns);
 
 CREATE INDEX IF NOT EXISTS logs_time     ON logs(time_ns);
 CREATE INDEX IF NOT EXISTS logs_user     ON logs(user, time_ns);
 CREATE INDEX IF NOT EXISTS logs_package  ON logs(package, time_ns);
 CREATE INDEX IF NOT EXISTS logs_producer ON logs(producer, time_ns);
+CREATE INDEX IF NOT EXISTS logs_caller   ON logs(caller, time_ns);
 
 CREATE INDEX IF NOT EXISTS metrics_time     ON metrics(time_ns);
 CREATE INDEX IF NOT EXISTS metrics_user     ON metrics(user, time_ns);
 CREATE INDEX IF NOT EXISTS metrics_package  ON metrics(package, time_ns);
 CREATE INDEX IF NOT EXISTS metrics_producer ON metrics(producer, time_ns);
+CREATE INDEX IF NOT EXISTS metrics_caller   ON metrics(caller, time_ns);
 
 CREATE INDEX IF NOT EXISTS processes_owner ON processes(owner);
 CREATE UNIQUE INDEX IF NOT EXISTS processes_token ON processes(token_hash);
@@ -367,8 +380,8 @@ func (s *Store) Insert(ctx context.Context, e Export) error {
 	if len(e.Spans) > 0 {
 		stmt, err := tx.PrepareContext(ctx, `INSERT INTO spans
 			(trace_id, span_id, parent_span_id, name, start_ns, end_ns, status, status_message,
-			 user, package, process, path, tool, eval, producer, other)
-			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+			 user, package, process, path, tool, eval, producer, caller, other)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 		if err != nil {
 			return fmt.Errorf("store: prepare spans: %w", err)
 		}
@@ -380,15 +393,15 @@ func (s *Store) Insert(ctx context.Context, e Export) error {
 			}
 			if _, err := stmt.ExecContext(ctx, sp.TraceID, sp.SpanID, sp.ParentSpanID, sp.Name,
 				sp.StartNS, sp.EndNS, status(sp.Status), sp.StatusMessage,
-				sp.User, sp.Package, sp.Process, sp.Path, sp.Tool, boolArg(sp.Eval), sp.Producer, other); err != nil {
+				sp.User, sp.Package, sp.Process, sp.Path, sp.Tool, boolArg(sp.Eval), sp.Producer, sp.Caller, other); err != nil {
 				return fmt.Errorf("store: insert span: %w", err)
 			}
 		}
 	}
 	if len(e.Logs) > 0 {
 		stmt, err := tx.PrepareContext(ctx, `INSERT INTO logs
-			(time_ns, severity, body, trace_id, span_id, user, package, process, path, tool, eval, producer, other)
-			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+			(time_ns, severity, body, trace_id, span_id, user, package, process, path, tool, eval, producer, caller, other)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 		if err != nil {
 			return fmt.Errorf("store: prepare logs: %w", err)
 		}
@@ -399,15 +412,15 @@ func (s *Store) Insert(ctx context.Context, e Export) error {
 				return err
 			}
 			if _, err := stmt.ExecContext(ctx, l.TimeNS, l.Severity, l.Body, l.TraceID, l.SpanID,
-				l.User, l.Package, l.Process, l.Path, l.Tool, boolArg(l.Eval), l.Producer, other); err != nil {
+				l.User, l.Package, l.Process, l.Path, l.Tool, boolArg(l.Eval), l.Producer, l.Caller, other); err != nil {
 				return fmt.Errorf("store: insert log: %w", err)
 			}
 		}
 	}
 	if len(e.Metrics) > 0 {
 		stmt, err := tx.PrepareContext(ctx, `INSERT INTO metrics
-			(time_ns, name, value, unit, user, package, process, path, tool, eval, producer, other)
-			VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
+			(time_ns, name, value, unit, user, package, process, path, tool, eval, producer, caller, other)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 		if err != nil {
 			return fmt.Errorf("store: prepare metrics: %w", err)
 		}
@@ -425,7 +438,7 @@ func (s *Store) Insert(ctx context.Context, e Export) error {
 				return err
 			}
 			if _, err := stmt.ExecContext(ctx, m.TimeNS, m.Name, m.Value, m.Unit,
-				m.User, m.Package, m.Process, m.Path, m.Tool, boolArg(m.Eval), m.Producer, other); err != nil {
+				m.User, m.Package, m.Process, m.Path, m.Tool, boolArg(m.Eval), m.Producer, m.Caller, other); err != nil {
 				return fmt.Errorf("store: insert metric: %w", err)
 			}
 		}
@@ -463,9 +476,9 @@ func (s *Store) Query(ctx context.Context, signal string, f Filter) (Page, error
 	}
 
 	columns := map[string]string{
-		"spans":   "trace_id, span_id, parent_span_id, name, start_ns, end_ns, status, status_message, user, package, process, path, tool, eval, producer, other",
-		"logs":    "time_ns, severity, body, trace_id, span_id, user, package, process, path, tool, eval, producer, other",
-		"metrics": "time_ns, name, value, unit, user, package, process, path, tool, eval, producer, other",
+		"spans":   "trace_id, span_id, parent_span_id, name, start_ns, end_ns, status, status_message, user, package, process, path, tool, eval, producer, caller, other",
+		"logs":    "time_ns, severity, body, trace_id, span_id, user, package, process, path, tool, eval, producer, caller, other",
+		"metrics": "time_ns, name, value, unit, user, package, process, path, tool, eval, producer, caller, other",
 	}[table]
 
 	where, args := conditions(timeColumn, f)
@@ -493,7 +506,7 @@ func (s *Store) Query(ctx context.Context, signal string, f Filter) (Page, error
 			var other string
 			if err := rows.Scan(&sp.TraceID, &sp.SpanID, &sp.ParentSpanID, &sp.Name, &sp.StartNS, &sp.EndNS,
 				&sp.Status, &sp.StatusMessage, &sp.User, &sp.Package, &sp.Process, &sp.Path, &sp.Tool,
-				&eval, &sp.Producer, &other); err != nil {
+				&eval, &sp.Producer, &sp.Caller, &other); err != nil {
 				return page, fmt.Errorf("store: scan span: %w", err)
 			}
 			sp.Eval = nullBool(eval)
@@ -506,7 +519,7 @@ func (s *Store) Query(ctx context.Context, signal string, f Filter) (Page, error
 			var eval sql.NullBool
 			var other string
 			if err := rows.Scan(&l.TimeNS, &l.Severity, &l.Body, &l.TraceID, &l.SpanID,
-				&l.User, &l.Package, &l.Process, &l.Path, &l.Tool, &eval, &l.Producer, &other); err != nil {
+				&l.User, &l.Package, &l.Process, &l.Path, &l.Tool, &eval, &l.Producer, &l.Caller, &other); err != nil {
 				return page, fmt.Errorf("store: scan log: %w", err)
 			}
 			l.Eval = nullBool(eval)
@@ -519,7 +532,7 @@ func (s *Store) Query(ctx context.Context, signal string, f Filter) (Page, error
 			var eval sql.NullBool
 			var other string
 			if err := rows.Scan(&m.TimeNS, &m.Name, &m.Value, &m.Unit,
-				&m.User, &m.Package, &m.Process, &m.Path, &m.Tool, &eval, &m.Producer, &other); err != nil {
+				&m.User, &m.Package, &m.Process, &m.Path, &m.Tool, &eval, &m.Producer, &m.Caller, &other); err != nil {
 				return page, fmt.Errorf("store: scan metric: %w", err)
 			}
 			m.Eval = nullBool(eval)
@@ -570,6 +583,9 @@ func conditions(timeColumn string, f Filter) (string, []any) {
 	}
 	if f.Producer != "" {
 		add("producer = ?", f.Producer)
+	}
+	if f.Caller != "" {
+		add("caller = ?", f.Caller)
 	}
 	if len(clauses) == 0 {
 		return "1", nil

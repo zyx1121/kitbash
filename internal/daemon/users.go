@@ -316,6 +316,7 @@ func (s *Server) removeUser(w http.ResponseWriter, r *http.Request, caller Calle
 	}
 	for _, id := range ids {
 		s.fanout.untrack(id)
+		s.endMCPSessions(id)
 	}
 	if _, err := s.store.DeleteApprovals(r.Context(), name); err != nil {
 		writeProblem(w, problem.Internal(r.URL.Path, err.Error(), ""))

@@ -77,6 +77,25 @@ const (
 	AttrError  = "kitbash.error"
 )
 
+// AttrCaller carries the caller credential of this session, which kitbashd
+// rewrites to the Process id of the session it minted the credential for. A
+// query then answers what a Process did on its owner's behalf, see PLAN.md
+// section 2.3. This process never learns the Process id and never sends one.
+const AttrCaller = "kitbash.caller"
+
+// EnvCaller carries that credential into this process. It is set by kitbashd
+// on the kitbash-mcp it starts for a Process and by nothing else; a session a
+// member opens over SSH carries none. The writer spells it in
+// internal/sysusers, which cannot import this package without pulling the
+// OpenTelemetry SDK into kitbashd.
+const EnvCaller = "KITBASH_CALLER"
+
+// Caller is the credential of the session this process serves, empty for a
+// member's own session. Unlike the socket and roots overrides it is honoured
+// in an SSH session too, and it costs nothing to allow: a credential kitbashd
+// did not mint resolves to no Process and is dropped when the record arrives.
+func Caller() string { return os.Getenv(EnvCaller) }
+
 // AttrApproval and AttrRequester name the queued call an approvals_approve
 // span executed and the member it was executed for. The admin's session
 // records the span, so without them a query for what a member asked for would
@@ -95,10 +114,15 @@ type Options struct {
 	// Logger receives the one line a dropping session is worth. Empty means
 	// the same stderr logger the rest of kitbash writes to.
 	Logger *log.Logger
+	// Caller is the credential of the session this process serves, recorded
+	// on every span as kitbash.caller. Empty means the one KITBASH_CALLER
+	// carries, which is nothing for a member's own session.
+	Caller string
 }
 
 // Provider owns the exporters of one session.
 type Provider struct {
+	caller string
 	tracer trace.Tracer
 	logger otellog.Logger
 	traces *sdktrace.TracerProvider
@@ -174,7 +198,12 @@ func New(opts Options) (*Provider, error) {
 		sdklog.WithAttributeValueLengthLimit(AttributeValueLimit),
 		sdklog.WithAttributeCountLimit(AttributeCountLimit),
 	)
+	caller := opts.Caller
+	if caller == "" {
+		caller = Caller()
+	}
 	return &Provider{
+		caller: caller,
 		tracer: traces.Tracer(scopeName),
 		logger: logs.Logger(scopeName),
 		traces: traces,
@@ -256,6 +285,10 @@ func (p *Provider) StartTool(ctx context.Context, tool, user string) (context.Co
 	s.ctx = ctx
 	s.Set(AttrUser, user)
 	s.Set(AttrTool, tool)
+	// A session kitbashd opened for a Process records the credential of that
+	// session, which the daemon resolves. Set is a no-op for the empty
+	// string, so a member's session carries none.
+	s.Set(AttrCaller, p.caller)
 	return ctx, s
 }
 
@@ -316,6 +349,7 @@ func Start(ctx context.Context, name string) (context.Context, *Span) {
 	s.ctx = ctx
 	s.Set(AttrUser, c.user)
 	s.Set(AttrTool, c.tool)
+	s.Set(AttrCaller, c.provider.caller)
 	return ctx, s
 }
 

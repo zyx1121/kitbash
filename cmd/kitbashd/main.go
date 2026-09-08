@@ -37,6 +37,10 @@ const (
 	defaultOTLPListen = "0.0.0.0:4318"
 )
 
+// defaultMCPBinary is the kitbash-mcp one MCP session of a Process runs, as
+// mcp_for_processes in spec/kitbashd-api.yaml declares it.
+const defaultMCPBinary = daemon.DefaultMCPBinary
+
 // Environment overrides, the same rule KITBASH_ROOTS follows for kitbash-mcp:
 // they exist for tests and for running outside a kitbash host. An empty
 // KITBASH_OTLP_LISTEN is not an override; pass -otlp-listen "" to serve the
@@ -46,6 +50,7 @@ const (
 	storeEnv      = "KITBASH_STORE"
 	otlpListenEnv = "KITBASH_OTLP_LISTEN"
 	noRestoreEnv  = "KITBASH_NO_RESTORE"
+	mcpBinaryEnv  = daemon.MCPBinaryEnv
 )
 
 // SocketGroup owns the socket with root, so every member may connect and
@@ -73,6 +78,8 @@ func run() error {
 	storePath := flag.String("store", env(storeEnv, defaultStore), "SQLite file holding Telemetry")
 	otlpListen := flag.String("otlp-listen", env(otlpListenEnv, defaultOTLPListen),
 		"address of the Process receiver, empty to serve the socket alone")
+	mcpBinary := flag.String("mcp-binary", env(mcpBinaryEnv, defaultMCPBinary),
+		"kitbash-mcp to run as the owner for each MCP session of a Process")
 	noRestore := flag.Bool("no-restore", truthy(os.Getenv(noRestoreEnv)),
 		"do not start the registered Processes at boot")
 	showVersion := flag.Bool("version", false, "print the version and exit")
@@ -80,6 +87,13 @@ func run() error {
 	if *showVersion {
 		fmt.Println(version)
 		return nil
+	}
+
+	// The kitbash-mcp of every MCP session is run as a member, so the path is
+	// held to an absolute one here rather than resolved against whatever
+	// working directory or PATH the daemon happens to have.
+	if !filepath.IsAbs(*mcpBinary) {
+		return fmt.Errorf("-mcp-binary %s is not an absolute path", *mcpBinary)
 	}
 
 	// The store directory is the daemon's alone: it holds every member's
@@ -119,7 +133,11 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	srv := daemon.New(st, daemon.Options{Version: version, NoRestore: *noRestore})
+	srv := daemon.New(st, daemon.Options{
+		Version:   version,
+		MCPBinary: *mcpBinary,
+		NoRestore: *noRestore,
+	})
 	defer srv.Close()
 	if _, err := srv.Sweep(ctx); err != nil {
 		// A store that cannot be swept can still receive and answer, so this

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"strings"
 
 	"github.com/zyx1121/kitbash/internal/problem"
 )
@@ -21,11 +22,12 @@ const ProcessesPath = "/kitbash/v1/processes"
 // manifest cannot override these: they are the Process's identity, not its
 // configuration.
 const (
-	EnvEndpoint = "KITBASH_TELEMETRY_ENDPOINT"
-	EnvToken    = "KITBASH_TELEMETRY_TOKEN"
-	EnvProcess  = "KITBASH_PROCESS"
-	EnvPackage  = "KITBASH_PACKAGE"
-	EnvUser     = "KITBASH_USER"
+	EnvEndpoint    = "KITBASH_TELEMETRY_ENDPOINT"
+	EnvToken       = "KITBASH_TELEMETRY_TOKEN"
+	EnvProcess     = "KITBASH_PROCESS"
+	EnvPackage     = "KITBASH_PACKAGE"
+	EnvUser        = "KITBASH_USER"
+	EnvMCPEndpoint = "KITBASH_MCP_ENDPOINT"
 )
 
 // ProcessEndpoint is the address a rootless container reaches kitbashd's OTLP
@@ -38,6 +40,20 @@ const ProcessEndpoint = "http://host.containers.internal:4318"
 // honoured only when the process is not serving an SSH session, the same rule
 // as SocketEnv and fs.RootsEnv.
 const ProcessEndpointEnv = "KITBASH_TELEMETRY_ENDPOINT_FOR_PROCESSES"
+
+// MCPPath is where kitbashd serves MCP over streamable HTTP on the Process
+// receiver, so every Process can reach the surface as its owner, see PLAN.md
+// section 2.3 and mcp_for_processes in spec/kitbashd-api.yaml.
+const MCPPath = "/mcp"
+
+// MCPEndpointForProcesses is the MCP endpoint this host gives its Processes.
+// It is the Process receiver's own address with the MCP path on it, so the
+// test override of the OTLP endpoint moves both at once: they are one
+// listener, and a test that redirects one and not the other is testing a host
+// that does not exist.
+func MCPEndpointForProcesses() string {
+	return strings.TrimSuffix(EndpointForProcesses(), "/") + MCPPath
+}
 
 // EndpointForProcesses is the OTLP endpoint this host gives its Processes.
 func EndpointForProcesses() string {

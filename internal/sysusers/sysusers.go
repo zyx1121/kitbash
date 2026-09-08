@@ -11,6 +11,7 @@ package sysusers
 import (
 	"context"
 	"errors"
+	"os/exec"
 	"regexp"
 )
 
@@ -118,6 +119,28 @@ type Runner interface {
 	// deleting the account.
 	RemoveAll(ctx context.Context, m Member) error
 }
+
+// Sessions starts one kitbash-mcp as a member, which is how a Process reaches
+// the MCP surface as its owner, see mcp_for_processes in
+// spec/kitbashd-api.yaml. It is a second interface rather than a method on
+// Runner because it runs a kitbash binary and not the container runtime.
+type Sessions interface {
+	// MCPCommand builds the command that runs binary as the member with the
+	// caller credential of one session. The command is not started: the
+	// caller owns its pipes, which are the MCP session.
+	MCPCommand(ctx context.Context, m Member, binary, credential string) (*exec.Cmd, error)
+}
+
+// EnvCaller is the variable that tells a kitbash-mcp which session it serves.
+// It carries a credential kitbashd minted for that session, not the Process
+// id: the child records it on every span and kitbashd resolves it back, so no
+// producer can name a Process it does not run as, see mcp_for_processes in
+// spec/kitbashd-api.yaml.
+//
+// It is read by internal/telemetry, whose constant of the same value is the
+// reader's spelling; this package cannot import that one without pulling the
+// OpenTelemetry SDK into kitbashd.
+const EnvCaller = "KITBASH_CALLER"
 
 // ValidName reports whether a name is one kitbash will create.
 func ValidName(name string) bool { return Name.MatchString(name) }

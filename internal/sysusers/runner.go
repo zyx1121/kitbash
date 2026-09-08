@@ -64,6 +64,115 @@ func (p *Podman) Start(ctx context.Context, m Member, container string) error {
 	return err
 }
 
+// MCPCommand builds the kitbash-mcp one MCP session of a Process runs as its
+// owner. It is the same drop to the member's uid, gid and group list as a
+// container start, with the member's environment and nothing of the daemon's:
+// kitbashd runs as root, and a child that inherited root's environment would
+// read root's kitbash socket variables and root's PATH.
+//
+// The command is returned unstarted. The caller connects an MCP client to its
+// stdin and stdout, and closing that connection is what ends the child, see
+// mcp_for_processes in spec/kitbashd-api.yaml.
+func (p *Podman) MCPCommand(ctx context.Context, m Member, binary, credential string) (*exec.Cmd, error) {
+	if binary == "" {
+		return nil, errors.New("sysusers: no kitbash-mcp binary to run")
+	}
+	// A relative path would be resolved against the working directory or the
+	// PATH of whoever configured it, which is not a program kitbashd may run
+	// as one of its members.
+	if !filepath.IsAbs(binary) {
+		return nil, fmt.Errorf("sysusers: %q is not an absolute path to kitbash-mcp", binary)
+	}
+	account, err := credentialOf(m)
+	if err != nil {
+		return nil, err
+	}
+	// The runtime directory is the member's, and a session that builds a
+	// Package reaches the same rootless podman a container start does.
+	if err := ensureRuntimeDir(p.runUser(), m); err != nil {
+		return nil, err
+	}
+	cmd := exec.CommandContext(ctx, binary)
+	// Setpgid puts the child in a process group of its own, so a signal sent
+	// to the daemon's group, which is what a terminal or a service manager
+	// sends, does not reach every member's session behind kitbashd's back.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: account, Setpgid: true}
+	cmd.Dir = "/"
+	cmd.Env = MCPEnvironment(m, p.runUser(), credential)
+	// The child's own log lines go through a pipe into the daemon log, named
+	// and bounded. Handing it the daemon's stderr would give a member's
+	// session a file descriptor of the daemon's and let it write as much as
+	// it liked into the operator's log.
+	cmd.Stderr = newChildLog(m.Name)
+	return cmd, nil
+}
+
+// ChildLogLines is how many lines of one child's stderr reach the daemon log
+// before the rest is dropped. A kitbash-mcp that is working writes none; one
+// that is broken writes the same line forever, and the log is the operator's,
+// not the child's.
+const ChildLogLines = 100
+
+// ChildLogLineBytes bounds one line, so a child cannot spend the cap in one
+// write either.
+const ChildLogLineBytes = 2 << 10
+
+// childLog turns one child's stderr into log lines, named by the member the
+// session runs as and bounded in both directions.
+type childLog struct {
+	member  string
+	pending []byte
+	written int
+	capped  bool
+}
+
+func newChildLog(member string) *childLog { return &childLog{member: member} }
+
+func (c *childLog) Write(p []byte) (int, error) {
+	n := len(p)
+	if c.capped {
+		return n, nil
+	}
+	c.pending = append(c.pending, p...)
+	for {
+		cut := bytes.IndexByte(c.pending, '\n')
+		if cut < 0 {
+			break
+		}
+		c.line(c.pending[:cut])
+		c.pending = c.pending[cut+1:]
+	}
+	// A child that never writes a newline is still bounded: the buffer is cut
+	// at one line's worth and reported as it stands.
+	if len(c.pending) > ChildLogLineBytes {
+		c.line(c.pending[:ChildLogLineBytes])
+		c.pending = c.pending[:0]
+	}
+	return n, nil
+}
+
+// line writes one line of a child's output, or the notice that the rest of it
+// will not be written at all.
+func (c *childLog) line(text []byte) {
+	if c.capped {
+		return
+	}
+	if c.written >= ChildLogLines {
+		c.capped = true
+		logger.Printf("kitbash-mcp[%s]: further output is not logged; the session wrote over %d lines",
+			c.member, ChildLogLines)
+		return
+	}
+	c.written++
+	if len(text) > ChildLogLineBytes {
+		text = text[:ChildLogLineBytes]
+	}
+	if len(bytes.TrimSpace(text)) == 0 {
+		return
+	}
+	logger.Printf("kitbash-mcp[%s]: %s", c.member, text)
+}
+
 // RemoveAll force removes every container labelled with this member. It is the
 // first step of removing a member: their Processes stop before their account
 // and their home go, see spec/kitbashd-api.yaml.
@@ -114,6 +223,16 @@ func (p *Podman) run(ctx context.Context, m Member, args ...string) (string, err
 	return stdout.String(), nil
 }
 
+// MCPEnvironment is what one kitbash-mcp session runs with: the member's own
+// environment and the credential of the session, and nothing else.
+// kitbashd runs as root, so a child that inherited its environment would read
+// root's socket overrides and root's PATH. It is exported because the daemon
+// tests the child against the environment the host would give it.
+func MCPEnvironment(m Member, runUser, credential string) []string {
+	p := &Podman{RunUser: runUser}
+	return append(p.environment(m), EnvCaller+"="+credential)
+}
+
 // environment is what a rootless podman needs and nothing more. Inheriting
 // root's environment would hand a member's runtime root's XDG_RUNTIME_DIR and
 // root's container store.
@@ -142,7 +261,8 @@ func (p *Podman) runUser() string {
 }
 
 // credentialOf is the uid, gid and supplementary groups one member's process
-// runs with. The supplementary list matters: kitbash-users is what the socket
+// runs with. It is the account a child runs as, not the caller credential of
+// an MCP session, which is minted by kitbashd. The supplementary list matters: kitbash-users is what the socket
 // is grouped to, and a container started without it cannot reach kitbashd.
 func credentialOf(m Member) (*syscall.Credential, error) {
 	if m.UID <= 0 {

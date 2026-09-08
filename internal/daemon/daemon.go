@@ -43,6 +43,9 @@ const QueryWindow = 24 * time.Hour
 // ProblemContentType is the media type of every error this API returns.
 const ProblemContentType = "application/problem+json"
 
+// RetryAfterSeconds is the Retry-After a 429 carries, in seconds.
+const RetryAfterSeconds = "60"
+
 // MaxConnections is how many connections the daemon serves at once. Every
 // member session holds one, so the cap is far above what a host with fifty
 // members needs, and it stops one caller from spending every file descriptor
@@ -117,6 +120,20 @@ type Options struct {
 	// Runner starts and removes containers as their owner, which is what
 	// restore and removing a member both need. Nil means the real one.
 	Runner sysusers.Runner
+	// Sessions starts one kitbash-mcp as the owner of a Process, which is
+	// what an MCP session on the Process receiver is. Nil means the runner
+	// when it starts one, and the real one otherwise.
+	Sessions sysusers.Sessions
+	// MCPBinary is the kitbash-mcp a session runs. Empty means the one
+	// KITBASH_MCP_BINARY names, and then the path of the API spec.
+	MCPBinary string
+	// MCPIdle is how long an MCP session may go without a request. Zero means
+	// MCPIdle, which is what spec/kitbashd-api.yaml declares.
+	MCPIdle time.Duration
+	// MCPCallerGrace is how long after a session ends its caller credential
+	// still resolves, so the records its child flushed on the way out are not
+	// stored without the Process that recorded them. Zero means CallerGrace.
+	MCPCallerGrace time.Duration
 	// NoRestore stops the daemon from starting the registered Processes,
 	// which an operator sets with KITBASH_NO_RESTORE to bring a host up
 	// without its Processes, and a test sets to keep the runtime out of it.
@@ -145,6 +162,24 @@ type Server struct {
 	fanout   *fanout
 	users    sysusers.System
 	runner   sysusers.Runner
+	sessions sysusers.Sessions
+
+	// The MCP endpoint of the Process receiver: the handler of the SDK, the
+	// live sessions, the binary each one runs and how long one may sit idle,
+	// see mcp_for_processes in spec/kitbashd-api.yaml.
+	mcpHandler  http.Handler
+	mcpSessions *mcpRegistry
+	mcpBinary   string
+	mcpIdle     time.Duration
+	callerGrace time.Duration
+
+	// stopped ends the workers the daemon starts for itself, which is the
+	// idle sweep of the MCP sessions. Close closes it exactly once.
+	stopped   chan struct{}
+	closeOnce sync.Once
+	// teardown counts the session children that are being closed, which Close
+	// waits for so a daemon that has stopped leaves none behind.
+	teardown sync.WaitGroup
 
 	noRestore bool
 
@@ -167,11 +202,27 @@ func New(st *store.Store, opts Options) *Server {
 		fanout:   newFanout(),
 		users:    opts.Users,
 		runner:   opts.Runner,
+		sessions: opts.Sessions,
+
+		mcpSessions: newMCPRegistry(),
+		mcpBinary:   mcpBinaryPath(opts.MCPBinary),
+		mcpIdle:     opts.MCPIdle,
+		callerGrace: opts.MCPCallerGrace,
+		stopped:     make(chan struct{}),
 
 		noRestore: opts.NoRestore,
 	}
 	if s.runner == nil {
 		s.runner = sysusers.NewPodman()
+	}
+	if s.sessions == nil {
+		s.sessions = mcpSessionsOf(s.runner)
+	}
+	if s.mcpIdle <= 0 {
+		s.mcpIdle = MCPIdle
+	}
+	if s.callerGrace <= 0 {
+		s.callerGrace = CallerGrace
 	}
 	if s.users == nil {
 		s.users = sysusers.NewHost(s.runner)
@@ -190,6 +241,7 @@ func New(st *store.Store, opts Options) *Server {
 	}
 	s.started = s.now()
 	s.routes()
+	go s.mcpSweepLoop()
 	return s
 }
 
@@ -217,6 +269,7 @@ func (s *Server) routes() {
 
 	s.otlpMux = http.NewServeMux()
 	s.otlpPaths(s.otlpMux, s.tokenIdentity)
+	s.routesMCP(s.otlpMux)
 	s.otlpMux.HandleFunc("/", s.notServedOverTCP)
 }
 
@@ -249,9 +302,13 @@ func (s *Server) TCPHandler() http.Handler {
 	return recovered(s.otlpMux)
 }
 
-// Close stops the fan out workers. The store is not owned by the server, so
-// nothing here closes it.
+// Close stops the fan out workers and ends every MCP session, which is what
+// takes the kitbash-mcp children with it. The store is not owned by the
+// server, so nothing here closes it.
 func (s *Server) Close() {
+	s.closeOnce.Do(func() { close(s.stopped) })
+	s.closeMCPSessions()
+	s.waitForChildren()
 	s.fanout.close()
 }
 
@@ -326,6 +383,14 @@ func (s *Server) serve(ctx context.Context, ln net.Listener, kind string, handle
 		}
 		return fmt.Errorf("daemon: serve: %w", err)
 	case <-ctx.Done():
+		if kind == listenerTCP {
+			// The MCP sessions of this listener hold an event stream open
+			// each, which is a request in flight that Shutdown would wait
+			// out. Ending them first closes those streams and takes every
+			// kitbash-mcp with them, which is what stopping the receiver
+			// means: a session nobody serves any more is over.
+			s.closeMCPSessions()
+		}
 		shutdown, cancel := context.WithTimeout(context.WithoutCancel(ctx), ShutdownTimeout)
 		defer cancel()
 		if err := srv.Shutdown(shutdown); err != nil {

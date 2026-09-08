@@ -33,6 +33,12 @@ type identity struct {
 	// their subject's identity. Only a Process an admin runs may, see
 	// PLAN.md section 2.4 Evaluation.
 	EvalClaims bool
+	// Callers resolves the caller credential a record carries to the Process
+	// whose MCP session recorded it. It is nil for a producer that may not
+	// carry one at all, which is every Process on the TCP receiver: only a
+	// session kitbashd started has a credential, and it reaches the daemon
+	// over the socket.
+	Callers func(credential string) (string, bool)
 }
 
 // identifier resolves who is on the other end of one request. There are two:
@@ -47,6 +53,12 @@ type identifier func(r *http.Request) (identity, *problem.Problem)
 // exception, and even there the producer is stamped, so a judgment is never
 // mistaken for the act it judges.
 func (id identity) apply(a *store.Attributes) {
+	// kitbash.caller is never taken from a producer either. What a session
+	// sends is the credential kitbashd gave its child, and only kitbashd can
+	// say which Process that names; a value it did not mint, or one whose
+	// session ended, names nothing and is dropped rather than stored.
+	a.Caller = id.caller(a.Caller)
+
 	if id.EvalClaims && a.Eval != nil && *a.Eval {
 		// The claims are about the subject of the judgment. Whatever the kit
 		// left out falls back to the kit's own identity, so no record ever
@@ -73,6 +85,21 @@ func (id identity) apply(a *store.Attributes) {
 	a.Producer = id.Producer
 }
 
+// caller resolves the credential on a record to the Process it names, and
+// answers the empty string for anything else. A member exporting a credential
+// they guessed, a Process repeating one it read off a record, and an SSH
+// session with KITBASH_CALLER set by hand all land here and are dropped.
+func (id identity) caller(credential string) string {
+	if credential == "" || id.Callers == nil {
+		return ""
+	}
+	process, known := id.Callers(credential)
+	if !known {
+		return ""
+	}
+	return process
+}
+
 // socketIdentity reads the member behind a unix socket connection. The member
 // is both the subject and the producer of everything they export.
 func (s *Server) socketIdentity(r *http.Request) (identity, *problem.Problem) {
@@ -80,7 +107,20 @@ func (s *Server) socketIdentity(r *http.Request) (identity, *problem.Problem) {
 	if prob != nil {
 		return identity{}, prob
 	}
-	return identity{User: caller.User, Producer: caller.User}, nil
+	return identity{
+		User:     caller.User,
+		Producer: caller.User,
+		// The kitbash-mcp of a Process session is a member session like any
+		// other: it exports over this socket as its owner, and its credential
+		// is what tells the two apart.
+		Callers: s.mcpCaller,
+	}, nil
+}
+
+// mcpCaller resolves one caller credential against the live sessions and the
+// ones still inside their grace.
+func (s *Server) mcpCaller(credential string) (string, bool) {
+	return s.mcpSessions.caller(credential, s.now())
 }
 
 // tokenIdentity reads the Process behind a request to the TCP receiver. A
@@ -101,6 +141,9 @@ func (s *Server) tokenIdentity(r *http.Request) (identity, *problem.Problem) {
 			"this token names no Process kitbashd is running",
 			"Run the Process again to mint a token; the one it holds was revoked.")
 	}
+	// No Callers: a Process exports as itself over this listener, and
+	// kitbash.process already says which one. A caller on a record here could
+	// only be a claim, so it is dropped.
 	return identity{
 		User:       p.Owner,
 		Package:    p.Package,
@@ -136,8 +179,8 @@ const maxTokenBytes = 512
 func (s *Server) notServedOverTCP(w http.ResponseWriter, r *http.Request) {
 	writeProblem(w, problem.NotFoundFix(r.URL.Path,
 		fmt.Sprintf("%s is not served on the Process receiver", r.URL.Path),
-		fmt.Sprintf("Export Telemetry to %s, %s or %s; the rest of the API is on the kitbashd socket.",
-			pathTraces, pathLogs, pathMetrics)))
+		fmt.Sprintf("Export Telemetry to %s, %s or %s, or open an MCP session at %s; the rest of the API is on the kitbashd socket.",
+			pathTraces, pathLogs, pathMetrics, MCPPath)))
 }
 
 // The three OTLP paths, the only ones the Process receiver serves.

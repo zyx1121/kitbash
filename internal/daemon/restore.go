@@ -67,6 +67,7 @@ func (s *Server) Restore(ctx context.Context) RestoreCounts {
 				logger.Printf("restore: unregistering %s: %v", p.ID, err)
 			}
 			s.fanout.untrack(p.ID)
+			s.endMCPSessions(p.ID)
 			continue
 		}
 		byOwner[p.Owner] = append(byOwner[p.Owner], p)
@@ -135,6 +136,7 @@ func (s *Server) restoreOwner(ctx context.Context, owner string, processes []sto
 				logger.Printf("restore: unregistering %s: %v", p.ID, err)
 			}
 			s.fanout.untrack(p.ID)
+			s.endMCPSessions(p.ID)
 		default:
 			counts.Failed++
 			logger.Printf("restore: starting %s of %s: %v", p.Container, owner, err)

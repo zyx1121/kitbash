@@ -23,6 +23,13 @@ func writeProblem(w http.ResponseWriter, p *problem.Problem) {
 	if p.Status == http.StatusUnauthorized {
 		w.Header().Set("WWW-Authenticate", BearerChallenge)
 	}
+	// RFC 9110 gives a 429 a Retry-After, and the only 429 this API answers is
+	// a Process holding every MCP session slot it may have. A minute is long
+	// enough for a session of that Process to end and short enough that a
+	// client waiting it out is not stuck.
+	if p.Status == http.StatusTooManyRequests {
+		w.Header().Set("Retry-After", RetryAfterSeconds)
+	}
 	w.WriteHeader(p.Status)
 	fmt.Fprintln(w, p.JSON())
 }
@@ -155,6 +162,7 @@ type queryRequest struct {
 	Tool     string `json:"tool,omitempty"`
 	Eval     *bool  `json:"eval,omitempty"`
 	Producer string `json:"producer,omitempty"`
+	Caller   string `json:"caller,omitempty"`
 	Since    string `json:"since,omitempty"`
 	Until    string `json:"until,omitempty"`
 	Limit    int    `json:"limit,omitempty"`
@@ -208,6 +216,7 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request) {
 		Tool:     req.Tool,
 		Eval:     req.Eval,
 		Producer: req.Producer,
+		Caller:   req.Caller,
 		Since:    now.Add(-QueryWindow),
 		Until:    now,
 		Limit:    req.Limit,
@@ -296,14 +305,15 @@ func (s *Server) retention(w http.ResponseWriter, r *http.Request) {
 }
 
 // healthResponse is what /kitbash/v1/health answers. The listeners say which
-// of the two receivers is bound, and subscribers how many Processes the fan
-// out is delivering to.
+// of the two receivers is bound, subscribers how many Processes the fan out is
+// delivering to, and mcpSessions how many MCP sessions Processes hold open.
 type healthResponse struct {
 	Version       string    `json:"version"`
 	Store         string    `json:"store"`
 	UptimeSeconds int64     `json:"uptimeSeconds"`
 	Listeners     listeners `json:"listeners"`
 	Subscribers   int       `json:"subscribers"`
+	MCPSessions   int       `json:"mcpSessions"`
 }
 
 // listeners are the addresses kitbashd is serving on, empty for one that is
@@ -324,6 +334,7 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		UptimeSeconds: int64(s.now().Sub(s.started) / time.Second),
 		Listeners:     s.listeners(),
 		Subscribers:   s.fanout.count(),
+		MCPSessions:   s.mcpSessions.count(),
 	})
 }
 

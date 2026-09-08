@@ -23,7 +23,8 @@ tcp:
     The Process receiver. kitbashd also listens for OTLP/HTTP on KITBASH_OTLP_LISTEN
     (default 0.0.0.0:4318) because rootless networking delivers
     host.containers.internal to the host's primary address, not to loopback.
-    Only the OTLP paths are served there; the /kitbash/v1 API is socket only.
+    The OTLP paths and /mcp are served there; the /kitbash/v1 API is socket
+    only.
   authorization: >
     Every request carries Authorization: Bearer <token>. The token was minted
     by POST /kitbash/v1/processes and names one Process; kitbashd stamps
@@ -45,22 +46,49 @@ mcp_for_processes:
     MCP over streamable HTTP (2025-06-18 revision) at POST, GET and DELETE
     /mcp on the Process receiver, Authorization: Bearer <Process token>. For
     each new session kitbashd starts /usr/bin/kitbash-mcp as the Process's
-    owner (setuid to the owner's uid and gid with HOME, USER, LOGNAME, PATH,
-    XDG_RUNTIME_DIR, and KITBASH_CALLER=<Process id>) and relays the session
-    to it, publishing the child's tools one for one. The child talks to
+    owner (setuid to the owner's uid and gid and its supplementary groups,
+    in a process group of its own, with HOME, USER, LOGNAME, PATH,
+    XDG_RUNTIME_DIR and KITBASH_CALLER=<caller credential> and nothing of the
+    daemon's) and relays the session to it, publishing the child's tools one
+    for one. The child's stderr goes into the daemon log, named by member and
+    bounded. A tools/list_changed from the child is relayed, so a Process the
+    owner starts later joins an open session. The child talks to
     kitbashd over the unix socket like any member session, so identity,
     Telemetry and the approval queue all behave as for the owner. The surface
     is exactly the owner's; there is no narrowing in version 1.
   limits: >
-    At most 8 live sessions per Process (429 with a problem beyond), a
-    session ends on DELETE, when the client is idle for 10 minutes, or when
-    the Process is unregistered; the child exits with it. Request bodies are
-    capped at 4 MiB like the OTLP paths.
+    At most 8 live sessions per Process; the ninth is refused with the
+    conflict problem at status 429, titled "Too many sessions" and carrying
+    Retry-After: 60, so a client tells it apart from a refusal a different
+    token would fix. A session ends on DELETE, when the client is idle for
+    10 minutes, when the Process is unregistered, when the child exits, or
+    when the receiver stops; the child exits with it. An open GET event
+    stream is not activity: a client listening on one and asking nothing for
+    10 minutes is the idle client this ends, and the stream closes with the
+    session. A request in flight is activity, so a slow call is never swept.
+    Request bodies are capped at 4 MiB like the OTLP paths, and a request
+    without a token is 401 before the MCP handler runs. The kitbash-mcp a
+    session runs is /usr/bin/kitbash-mcp, which -mcp-binary and
+    KITBASH_MCP_BINARY override; both must be absolute paths.
+  session_start: >
+    A POST carrying no Mcp-Session-Id opens a session only when its body is
+    an initialize request; anything else is 400 bad-request. A session costs
+    one kitbash-mcp, so a client probing for a protocol revision this daemon
+    does not speak, or sending a call before it has a session, starts no
+    child. Every later request carries the Mcp-Session-Id, and a session
+    identifier presented with another Process's token is not-permitted.
   environment_given_to_every_process:
     KITBASH_MCP_ENDPOINT: http://host.containers.internal:4318/mcp
   telemetry: >
-    kitbash-mcp started this way sets kitbash.caller = the Process id on every
-    span it records, alongside kitbash.user = the owner.
+    kitbash-mcp started this way sets kitbash.caller on every span it records,
+    alongside kitbash.user = the owner. The value it sends is the opaque
+    per-session credential kitbashd put in KITBASH_CALLER, not the Process id:
+    kitbashd resolves it back to the Process for the life of the session plus
+    a 30 s grace, so the last records a child flushes as it exits still
+    resolve. A caller kitbashd did not mint, one whose grace is over, and any
+    caller on a record that arrived over the TCP receiver are dropped rather
+    than stored. kitbash.caller is therefore never a claim a producer can
+    make, the same rule kitbash.user follows.
 
 producer_attribute:
   kitbash.producer: >
@@ -248,9 +276,10 @@ api:
     response: >
       { version: "v0.4.0", store: "/var/lib/kitbash/kitbashd.db",
       uptimeSeconds: 12, listeners: { socket: "/run/kitbash/kitbashd.sock",
-      tcp: "0.0.0.0:4318" }, subscribers: 1 }. A listener that is not bound is
-      absent; subscribers is how many registered Processes the fan out is
-      delivering to.
+      tcp: "0.0.0.0:4318" }, subscribers: 1, mcpSessions: 2 }. A listener that
+      is not bound is absent; subscribers is how many registered Processes the
+      fan out is delivering to, and mcpSessions how many MCP sessions
+      Processes hold open on the receiver, see mcp_for_processes.
 
 restore:
   description: >

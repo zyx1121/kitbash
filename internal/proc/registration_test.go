@@ -109,6 +109,12 @@ func TestRunRegistersTheProcessBeforeItStarts(t *testing.T) {
 	if env[telemetry.EnvUser] != "tester" {
 		t.Errorf("user is %q, want tester", env[telemetry.EnvUser])
 	}
+	// Every Process can reach the MCP surface as its owner, so every Process
+	// is told where, see PLAN.md section 2.3.
+	if env[telemetry.EnvMCPEndpoint] != telemetry.ProcessEndpoint+telemetry.MCPPath {
+		t.Errorf("the MCP endpoint is %q, want %q",
+			env[telemetry.EnvMCPEndpoint], telemetry.ProcessEndpoint+telemetry.MCPPath)
+	}
 	// The manifest's own environment is still there.
 	if env["LOG_LEVEL"] != "debug" {
 		t.Errorf("env is %v, want the manifest's LOG_LEVEL as well", env)
@@ -158,8 +164,9 @@ func TestRunRegistersTheEndpointOfAnHTTPProcess(t *testing.T) {
 	}
 }
 
-// The five variables are the Process's identity. A manifest that declares them
-// is overruled rather than trusted.
+// The six variables are the Process's identity and the two endpoints it
+// reaches kitbashd on. A manifest that declares them is overruled rather than
+// trusted.
 func TestManifestEnvironmentCannotOverrideTheTelemetryEnvironment(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
@@ -177,6 +184,8 @@ func TestManifestEnvironmentCannotOverrideTheTelemetryEnvironment(t *testing.T) 
 		telemetry.EnvProcess:  process.ID,
 		telemetry.EnvPackage:  folder,
 		telemetry.EnvUser:     "tester",
+
+		telemetry.EnvMCPEndpoint: telemetry.ProcessEndpoint + telemetry.MCPPath,
 	}
 	for k, v := range want {
 		if env[k] != v {
@@ -201,6 +210,10 @@ func TestTheProcessEndpointCanBeOverriddenOutsideSSH(t *testing.T) {
 	}
 	if got := f.runner.Runs[0].Env[telemetry.EnvEndpoint]; got != "http://127.0.0.1:4318" {
 		t.Errorf("endpoint is %q, want the override", got)
+	}
+	// The two endpoints are one listener, so the override moves both.
+	if got := f.runner.Runs[0].Env[telemetry.EnvMCPEndpoint]; got != "http://127.0.0.1:4318/mcp" {
+		t.Errorf("the MCP endpoint is %q, want the override with the MCP path", got)
 	}
 }
 
