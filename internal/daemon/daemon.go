@@ -43,6 +43,9 @@ const QueryWindow = 24 * time.Hour
 // ProblemContentType is the media type of every error this API returns.
 const ProblemContentType = "application/problem+json"
 
+// RetryAfterSeconds is the Retry-After a 429 carries, in seconds.
+const RetryAfterSeconds = "60"
+
 // MaxConnections is how many connections the daemon serves at once. Every
 // member session holds one, so the cap is far above what a host with fifty
 // members needs, and it stops one caller from spending every file descriptor
@@ -127,6 +130,10 @@ type Options struct {
 	// MCPIdle is how long an MCP session may go without a request. Zero means
 	// MCPIdle, which is what spec/kitbashd-api.yaml declares.
 	MCPIdle time.Duration
+	// MCPCallerGrace is how long after a session ends its caller credential
+	// still resolves, so the records its child flushed on the way out are not
+	// stored without the Process that recorded them. Zero means CallerGrace.
+	MCPCallerGrace time.Duration
 	// NoRestore stops the daemon from starting the registered Processes,
 	// which an operator sets with KITBASH_NO_RESTORE to bring a host up
 	// without its Processes, and a test sets to keep the runtime out of it.
@@ -164,6 +171,7 @@ type Server struct {
 	mcpSessions *mcpRegistry
 	mcpBinary   string
 	mcpIdle     time.Duration
+	callerGrace time.Duration
 
 	// stopped ends the workers the daemon starts for itself, which is the
 	// idle sweep of the MCP sessions. Close closes it exactly once.
@@ -196,6 +204,7 @@ func New(st *store.Store, opts Options) *Server {
 		mcpSessions: newMCPRegistry(),
 		mcpBinary:   mcpBinaryPath(opts.MCPBinary),
 		mcpIdle:     opts.MCPIdle,
+		callerGrace: opts.MCPCallerGrace,
 		stopped:     make(chan struct{}),
 
 		noRestore: opts.NoRestore,
@@ -208,6 +217,9 @@ func New(st *store.Store, opts Options) *Server {
 	}
 	if s.mcpIdle <= 0 {
 		s.mcpIdle = MCPIdle
+	}
+	if s.callerGrace <= 0 {
+		s.callerGrace = CallerGrace
 	}
 	if s.users == nil {
 		s.users = sysusers.NewHost(s.runner)

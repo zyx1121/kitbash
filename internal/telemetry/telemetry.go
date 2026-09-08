@@ -77,23 +77,23 @@ const (
 	AttrError  = "kitbash.error"
 )
 
-// AttrCaller names the Process whose MCP session recorded a span. kitbashd
-// starts one kitbash-mcp per session a Process opens on the Process receiver
-// and puts the Process id in its environment, so a query answers what a
-// Process did on its owner's behalf, see PLAN.md section 2.3.
+// AttrCaller carries the caller credential of this session, which kitbashd
+// rewrites to the Process id of the session it minted the credential for. A
+// query then answers what a Process did on its owner's behalf, see PLAN.md
+// section 2.3. This process never learns the Process id and never sends one.
 const AttrCaller = "kitbash.caller"
 
-// EnvCaller carries that Process id into this process. It is set by kitbashd
+// EnvCaller carries that credential into this process. It is set by kitbashd
 // on the kitbash-mcp it starts for a Process and by nothing else; a session a
 // member opens over SSH carries none. The writer spells it in
 // internal/sysusers, which cannot import this package without pulling the
 // OpenTelemetry SDK into kitbashd.
 const EnvCaller = "KITBASH_CALLER"
 
-// Caller is the Process this session is acting for, empty for a member's own
-// session. Unlike the socket and roots overrides it is honoured in an SSH
-// session too: it is an attribute on a record, never an identity claim, and
-// kitbashd stamps kitbash.user whatever this process sends.
+// Caller is the credential of the session this process serves, empty for a
+// member's own session. Unlike the socket and roots overrides it is honoured
+// in an SSH session too, and it costs nothing to allow: a credential kitbashd
+// did not mint resolves to no Process and is dropped when the record arrives.
 func Caller() string { return os.Getenv(EnvCaller) }
 
 // AttrApproval and AttrRequester name the queued call an approvals_approve
@@ -114,9 +114,9 @@ type Options struct {
 	// Logger receives the one line a dropping session is worth. Empty means
 	// the same stderr logger the rest of kitbash writes to.
 	Logger *log.Logger
-	// Caller is the Process this session acts for, recorded on every span as
-	// kitbash.caller. Empty means the one KITBASH_CALLER names, which is
-	// nothing for a member's own session.
+	// Caller is the credential of the session this process serves, recorded
+	// on every span as kitbash.caller. Empty means the one KITBASH_CALLER
+	// carries, which is nothing for a member's own session.
 	Caller string
 }
 
@@ -285,8 +285,9 @@ func (p *Provider) StartTool(ctx context.Context, tool, user string) (context.Co
 	s.ctx = ctx
 	s.Set(AttrUser, user)
 	s.Set(AttrTool, tool)
-	// A session kitbashd opened for a Process records which Process it was.
-	// Set is a no-op for the empty string, so a member's session carries none.
+	// A session kitbashd opened for a Process records the credential of that
+	// session, which the daemon resolves. Set is a no-op for the empty
+	// string, so a member's session carries none.
 	s.Set(AttrCaller, p.caller)
 	return ctx, s
 }

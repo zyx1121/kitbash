@@ -187,7 +187,7 @@ func TooManySessions(instance, detail, fix string) *Problem {
 	if fix == "" {
 		fix = "End a session with DELETE /mcp before opening another one."
 	}
-	return newProblem(SlugConflict, "Conflict", http.StatusTooManyRequests, instance, detail, fix)
+	return newProblem(SlugConflict, "Too many sessions", http.StatusTooManyRequests, instance, detail, fix)
 }
 
 // Queued reports a call that was not run but put in the approval queue, which

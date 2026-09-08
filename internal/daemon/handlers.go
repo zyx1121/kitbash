@@ -23,6 +23,13 @@ func writeProblem(w http.ResponseWriter, p *problem.Problem) {
 	if p.Status == http.StatusUnauthorized {
 		w.Header().Set("WWW-Authenticate", BearerChallenge)
 	}
+	// RFC 9110 gives a 429 a Retry-After, and the only 429 this API answers is
+	// a Process holding every MCP session slot it may have. A minute is long
+	// enough for a session of that Process to end and short enough that a
+	// client waiting it out is not stuck.
+	if p.Status == http.StatusTooManyRequests {
+		w.Header().Set("Retry-After", RetryAfterSeconds)
+	}
 	w.WriteHeader(p.Status)
 	fmt.Fprintln(w, p.JSON())
 }

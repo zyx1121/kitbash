@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -39,6 +40,11 @@ const MaxMCPSessions = 8
 // it and its child, see mcp_for_processes.limits in spec/kitbashd-api.yaml.
 const MCPIdle = 10 * time.Minute
 
+// CallerGrace is how long after a session ends its caller credential is still
+// resolved. A child flushes its last records as it exits, and they must not
+// land without the Process that recorded them.
+const CallerGrace = 30 * time.Second
+
 // DefaultMCPBinary is the kitbash-mcp a session runs. It is a flag and an
 // environment override so a test can point it at a binary of its own.
 const DefaultMCPBinary = "/usr/bin/kitbash-mcp"
@@ -61,9 +67,19 @@ type mcpSession struct {
 	registry *mcpRegistry
 	process  string
 	owner    string
-	server   *mcp.Server
-	client   *mcp.ClientSession
-	cancel   context.CancelFunc
+	// credential is what the child carries as KITBASH_CALLER and records on
+	// every span. kitbashd resolves it back to the Process id when the record
+	// arrives, so nothing a producer sends names a Process, see the caller
+	// rules in mcp_for_processes.
+	credential string
+	server     *mcp.Server
+	client     *mcp.ClientSession
+	cancel     context.CancelFunc
+
+	// syncMu serialises publishing. Two notifications from the child can
+	// arrive at once and each reads the tool set and then writes it, so
+	// without it one sync could publish what the other has just removed.
+	syncMu sync.Mutex
 
 	mu    sync.Mutex
 	id    string
@@ -80,10 +96,25 @@ type mcpRegistry struct {
 	mu        sync.Mutex
 	byID      map[string]*mcpSession
 	byProcess map[string][]*mcpSession
+	// byCredential maps a caller credential to the Process it names. An entry
+	// outlives its session by the grace, so the records of the last batch a
+	// child flushed on its way out still resolve.
+	byCredential map[string]*mcpCaller
+}
+
+// mcpCaller is one caller credential: the Process it names, and when it stops
+// being accepted. A zero until is a session that is still open.
+type mcpCaller struct {
+	process string
+	until   time.Time
 }
 
 func newMCPRegistry() *mcpRegistry {
-	return &mcpRegistry{byID: map[string]*mcpSession{}, byProcess: map[string][]*mcpSession{}}
+	return &mcpRegistry{
+		byID:         map[string]*mcpSession{},
+		byProcess:    map[string][]*mcpSession{},
+		byCredential: map[string]*mcpCaller{},
+	}
 }
 
 // add takes one of the Process's session slots, or reports that they are all
@@ -96,7 +127,39 @@ func (r *mcpRegistry) add(sess *mcpSession, max int) bool {
 		return false
 	}
 	r.byProcess[sess.process] = append(r.byProcess[sess.process], sess)
+	r.byCredential[sess.credential] = &mcpCaller{process: sess.process}
 	return true
+}
+
+// caller is the Process one credential names, and false for a credential
+// kitbashd did not mint or one whose grace is over.
+func (r *mcpRegistry) caller(credential string, now time.Time) (string, bool) {
+	if credential == "" {
+		return "", false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	held, known := r.byCredential[credential]
+	if !known {
+		return "", false
+	}
+	if !held.until.IsZero() && now.After(held.until) {
+		return "", false
+	}
+	return held.process, true
+}
+
+// expire forgets every credential whose grace is over. The idle sweep calls
+// it, so a daemon that runs for months does not keep one entry per session it
+// ever served.
+func (r *mcpRegistry) expire(now time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for credential, held := range r.byCredential {
+		if !held.until.IsZero() && now.After(held.until) {
+			delete(r.byCredential, credential)
+		}
+	}
 }
 
 // name indexes a session by the id the transport gave it.
@@ -106,12 +169,17 @@ func (r *mcpRegistry) name(sess *mcpSession, id string) {
 	r.byID[id] = sess
 }
 
-// drop removes one session from both indexes.
-func (r *mcpRegistry) drop(sess *mcpSession, id string) {
+// drop removes one session from the indexes and starts the grace on its
+// credential: the child is being closed, and the records it flushed on the way
+// out are still to arrive.
+func (r *mcpRegistry) drop(sess *mcpSession, id string, until time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if id != "" {
 		delete(r.byID, id)
+	}
+	if held, known := r.byCredential[sess.credential]; known && held.until.IsZero() {
+		held.until = until
 	}
 	rest := r.byProcess[sess.process][:0]
 	for _, held := range r.byProcess[sess.process] {
@@ -208,7 +276,7 @@ func (sess *mcpSession) named() bool {
 // end closes the session: the server session goes, the client goes, and the
 // child goes with it. It is safe to call more than once, which matters because
 // a DELETE, an idle sweep and the child exiting can all reach it.
-func (sess *mcpSession) end() {
+func (sess *mcpSession) end(graceUntil time.Time) {
 	sess.mu.Lock()
 	if sess.ended {
 		sess.mu.Unlock()
@@ -218,7 +286,7 @@ func (sess *mcpSession) end() {
 	id := sess.id
 	sess.mu.Unlock()
 
-	sess.registry.drop(sess, id)
+	sess.registry.drop(sess, id, graceUntil)
 	if sess.server != nil {
 		for open := range sess.server.Sessions() {
 			open.Close()
@@ -296,15 +364,20 @@ func (s *Server) serveMCP(w http.ResponseWriter, r *http.Request) {
 			writeProblem(w, prob)
 			return
 		}
+		// Both run however the handler leaves: a panic is turned into problem
+		// details by recovered, and a session whose hold was never released
+		// would never idle out and its child would never exit.
 		release := sess.hold(s.now(), true)
+		defer func() {
+			release(s.now())
+			if !sess.named() {
+				// The request was not one that opens a session, or the
+				// transport refused it. Nothing can address this session, so
+				// it goes rather than holding a slot and a child.
+				s.endMCPSession(sess)
+			}
+		}()
 		s.mcpHandler.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), mcpSessionKey{}, sess)))
-		release(s.now())
-		if !sess.named() {
-			// The request was not one that opens a session, or the transport
-			// refused it. Nothing can address this session, so it goes rather
-			// than holding a slot and a child.
-			sess.end()
-		}
 		return
 	}
 
@@ -324,11 +397,13 @@ func (s *Server) serveMCP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	release := sess.hold(s.now(), r.Method != http.MethodGet)
+	defer func() {
+		release(s.now())
+		if r.Method == http.MethodDelete {
+			s.endMCPSession(sess)
+		}
+	}()
 	s.mcpHandler.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), mcpSessionKey{}, sess)))
-	release(s.now())
-	if r.Method == http.MethodDelete {
-		sess.end()
-	}
 }
 
 // opensSession reports whether a request without a session identifier is the
@@ -391,12 +466,17 @@ func (s *Server) openMCPSession(ctx context.Context, id identity) (*mcpSession, 
 			"Ask an administrator to create the member again, then run the Process.")
 	}
 
+	credential, err := callerCredential()
+	if err != nil {
+		return nil, problem.Internal(MCPPath, err.Error(), "")
+	}
 	sess := &mcpSession{
-		registry: s.mcpSessions,
-		process:  id.Process,
-		owner:    id.User,
-		last:     s.now(),
-		tools:    map[string]string{},
+		registry:   s.mcpSessions,
+		process:    id.Process,
+		owner:      id.User,
+		credential: credential,
+		last:       s.now(),
+		tools:      map[string]string{},
 	}
 	if !s.mcpSessions.add(sess, MaxMCPSessions) {
 		return nil, problem.TooManySessions(MCPPath,
@@ -406,9 +486,9 @@ func (s *Server) openMCPSession(ctx context.Context, id identity) (*mcpSession, 
 
 	own, cancel := context.WithCancel(context.Background())
 	sess.cancel = cancel
-	cmd, err := s.sessions.MCPCommand(own, member, s.mcpBinary, id.Process)
+	cmd, err := s.sessions.MCPCommand(own, member, s.mcpBinary, sess.credential)
 	if err != nil {
-		sess.end()
+		s.endMCPSession(sess)
 		return nil, problem.Internal(MCPPath, fmt.Sprintf("building the session command: %v", err), "")
 	}
 
@@ -423,7 +503,7 @@ func (s *Server) openMCPSession(ctx context.Context, id identity) (*mcpSession, 
 	})
 	child, err := client.Connect(own, &mcp.CommandTransport{Command: cmd}, nil)
 	if err != nil {
-		sess.end()
+		s.endMCPSession(sess)
 		return nil, problem.Internal(MCPPath, fmt.Sprintf("starting %s as %s: %v", s.mcpBinary, id.User, err), "")
 	}
 	sess.client = child
@@ -440,14 +520,14 @@ func (s *Server) openMCPSession(ctx context.Context, id identity) (*mcpSession, 
 		},
 	})
 	if err := sess.sync(own); err != nil {
-		sess.end()
+		s.endMCPSession(sess)
 		return nil, problem.Internal(MCPPath, fmt.Sprintf("reading the tools of %s: %v", s.mcpBinary, err), "")
 	}
 	// A child that dies takes its session with it: the tools it answered are
 	// gone, and the client the Process holds is told rather than left waiting.
 	go func() {
 		child.Wait()
-		sess.end()
+		s.endMCPSession(sess)
 	}()
 	return sess, nil
 }
@@ -459,6 +539,11 @@ func (sess *mcpSession) sync(ctx context.Context) error {
 	if sess.client == nil || sess.server == nil {
 		return nil
 	}
+	// One publishing at a time: the read of the tool set and the writes that
+	// follow it are one change, not three.
+	sess.syncMu.Lock()
+	defer sess.syncMu.Unlock()
+
 	want := map[string]*mcp.Tool{}
 	for tool, err := range sess.client.Tools(ctx, nil) {
 		if err != nil {
@@ -535,6 +620,8 @@ func (sess *mcpSession) forward(name string) mcp.ToolHandler {
 		}
 		res, err := sess.client.CallTool(ctx, params)
 		if err != nil {
+			// The instance is the tool name: the Process called a tool, not a
+			// path, and the tool is the only thing it can act on here.
 			return &mcp.CallToolResult{
 				IsError: true,
 				Content: []mcp.Content{&mcp.TextContent{
@@ -550,12 +637,18 @@ func (sess *mcpSession) forward(name string) mcp.ToolHandler {
 	}
 }
 
+// endMCPSession ends one session and starts the grace on its caller
+// credential, so the last records its child flushed still resolve.
+func (s *Server) endMCPSession(sess *mcpSession) {
+	sess.end(s.now().Add(s.callerGrace))
+}
+
 // endMCPSessions ends every session of one Process, which is what
 // unregistering it does: the token that opened them is revoked, so the
 // sessions it opened are over too.
 func (s *Server) endMCPSessions(process string) {
 	for _, sess := range s.mcpSessions.of(process) {
-		sess.end()
+		s.endMCPSession(sess)
 	}
 }
 
@@ -563,7 +656,7 @@ func (s *Server) endMCPSessions(process string) {
 // it does.
 func (s *Server) closeMCPSessions() {
 	for _, sess := range s.mcpSessions.all() {
-		sess.end()
+		s.endMCPSession(sess)
 	}
 }
 
@@ -574,10 +667,13 @@ func (s *Server) sweepMCPSessions(now time.Time) int {
 	for _, sess := range s.mcpSessions.all() {
 		if sess.idle(now.Add(-s.mcpIdle)) {
 			logger.Printf("mcp: ending an idle session of the Process %s", sess.process)
-			sess.end()
+			s.endMCPSession(sess)
 			ended++
 		}
 	}
+	// The credentials of the sessions that ended before this one are given
+	// their grace and then forgotten.
+	s.mcpSessions.expire(now)
 	return ended
 }
 
@@ -616,6 +712,21 @@ func sessionID() string {
 	}
 	return hex.EncodeToString(b[:])
 }
+
+// callerCredential is what one session's child carries as KITBASH_CALLER: 32
+// random bytes, the same entropy as a Process token, and meaningful only to
+// the daemon that minted it. It is not the Process id, so a producer that
+// repeats what it saw on a record names nothing.
+func callerCredential() (string, error) {
+	var b [callerCredentialBytes]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("daemon: mint a caller credential: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(b[:]), nil
+}
+
+// callerCredentialBytes is the entropy of one caller credential.
+const callerCredentialBytes = 32
 
 // mcpBinaryPath is the kitbash-mcp a session runs: what the operator named,
 // what the environment names, or the path spec/kitbashd-api.yaml declares.

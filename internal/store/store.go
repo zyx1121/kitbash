@@ -53,9 +53,10 @@ const (
 // Process id for one that arrived with a Process token. It is stamped by the
 // daemon and never read from the body.
 //
-// Caller is the Process whose MCP session recorded the record, sent by the
-// kitbash-mcp kitbashd starts for a Process, see PLAN.md section 2.3. It is
-// empty for a record a member's own session wrote.
+// Caller is the Process whose MCP session recorded the record. The producer
+// sends the credential of its session and the daemon rewrites it to the
+// Process id, so this column is never what a producer claimed, see PLAN.md
+// section 2.3. It is empty for a record a member's own session wrote.
 type Attributes struct {
 	User     string         `json:"user,omitempty"`
 	Package  string         `json:"package,omitempty"`

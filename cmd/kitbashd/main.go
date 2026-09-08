@@ -89,6 +89,13 @@ func run() error {
 		return nil
 	}
 
+	// The kitbash-mcp of every MCP session is run as a member, so the path is
+	// held to an absolute one here rather than resolved against whatever
+	// working directory or PATH the daemon happens to have.
+	if !filepath.IsAbs(*mcpBinary) {
+		return fmt.Errorf("-mcp-binary %s is not an absolute path", *mcpBinary)
+	}
+
 	// The store directory is the daemon's alone: it holds every member's
 	// Telemetry, and the socket is the only way in. A directory that already
 	// exists is narrowed too, because an upgrade from a looser layout must

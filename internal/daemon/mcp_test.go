@@ -98,12 +98,12 @@ func TestMCPChildHelper(t *testing.T) {
 }
 
 // sessionCall is one recorded request for a child, with the member it was to
-// run as.
+// run as and the caller credential kitbashd minted for that session.
 type sessionCall struct {
-	Member sysusers.Member
-	Binary string
-	Caller string
-	Dump   string
+	Member     sysusers.Member
+	Binary     string
+	Credential string
+	Dump       string
 }
 
 // fakeSessions starts the test binary as the child rather than kitbash-mcp,
@@ -116,7 +116,7 @@ type fakeSessions struct {
 	fail  error
 }
 
-func (f *fakeSessions) MCPCommand(ctx context.Context, m sysusers.Member, binary, caller string) (*exec.Cmd, error) {
+func (f *fakeSessions) MCPCommand(ctx context.Context, m sysusers.Member, binary, credential string) (*exec.Cmd, error) {
 	f.mu.Lock()
 	if f.fail != nil {
 		err := f.fail
@@ -124,13 +124,13 @@ func (f *fakeSessions) MCPCommand(ctx context.Context, m sysusers.Member, binary
 		return nil, err
 	}
 	dump := filepath.Join(f.dir, fmt.Sprintf("child-%d.env", len(f.calls)))
-	f.calls = append(f.calls, sessionCall{Member: m, Binary: binary, Caller: caller, Dump: dump})
+	f.calls = append(f.calls, sessionCall{Member: m, Binary: binary, Credential: credential, Dump: dump})
 	f.mu.Unlock()
 
 	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=TestMCPChildHelper", "--", childMarker, dump)
 	// The environment is the one the real runner builds, so what the child
 	// reports having is what a kitbash host would have given it.
-	cmd.Env = sysusers.MCPEnvironment(m, sysusers.DefaultRunUser, caller)
+	cmd.Env = sysusers.MCPEnvironment(m, sysusers.DefaultRunUser, credential)
 	cmd.Dir = "/"
 	return cmd, nil
 }
@@ -156,15 +156,23 @@ type mcpHarness struct {
 // registers one Process of the current user.
 func serveMCPDaemon(t *testing.T, idle time.Duration) *mcpHarness {
 	t.Helper()
+	return serveMCPDaemonWith(t, idle, 0)
+}
+
+// serveMCPDaemonWith is serveMCPDaemon with the caller grace a test needs. The
+// grace is thirty seconds on a host, which no test waits out.
+func serveMCPDaemonWith(t *testing.T, idle, grace time.Duration) *mcpHarness {
+	t.Helper()
 	members := sysusers.NewFake()
 	sessions := &fakeSessions{dir: t.TempDir()}
 	h := serveWith(t, Options{
-		Admin:     func(*user.User) (bool, error) { return false, nil },
-		Users:     members,
-		Runner:    members,
-		Sessions:  sessions,
-		MCPBinary: "/usr/bin/kitbash-mcp",
-		MCPIdle:   idle,
+		Admin:          func(*user.User) (bool, error) { return false, nil },
+		Users:          members,
+		Runner:         members,
+		Sessions:       sessions,
+		MCPBinary:      "/usr/bin/kitbash-mcp",
+		MCPIdle:        idle,
+		MCPCallerGrace: grace,
 	})
 	me, err := user.Current()
 	if err != nil {
@@ -404,8 +412,13 @@ func TestMCPSessionRunsAsTheOwnerWithNothingOfTheDaemons(t *testing.T) {
 	if call.Member.Name != m.user {
 		t.Errorf("the child ran as %q, want the owner %q", call.Member.Name, m.user)
 	}
-	if call.Caller != m.process {
-		t.Errorf("%s = %q, want the Process id %q", sysusers.EnvCaller, call.Caller, m.process)
+	// The child is given a credential, never the Process id: a record it
+	// writes must not name a Process the daemon did not resolve itself.
+	if call.Credential == m.process || call.Credential == "" {
+		t.Errorf("%s = %q, want a credential rather than the Process id", sysusers.EnvCaller, call.Credential)
+	}
+	if len(call.Credential) < 40 {
+		t.Errorf("the credential is %d characters, want the entropy of a token", len(call.Credential))
 	}
 	if call.Binary != "/usr/bin/kitbash-mcp" {
 		t.Errorf("the child is %q, want the configured kitbash-mcp", call.Binary)
@@ -428,7 +441,7 @@ func TestMCPSessionRunsAsTheOwnerWithNothingOfTheDaemons(t *testing.T) {
 		"LOGNAME":          m.user,
 		"PATH":             sysusers.RunnerPath,
 		"XDG_RUNTIME_DIR":  filepath.Join(sysusers.DefaultRunUser, strconv.Itoa(call.Member.UID)),
-		sysusers.EnvCaller: m.process,
+		sysusers.EnvCaller: call.Credential,
 	}
 	for key, value := range want {
 		if got[key] != value {
@@ -478,6 +491,12 @@ func TestMCPNinthSessionIsRefused(t *testing.T) {
 	p := m.problemOf(res, body)
 	if p.Slug() != problem.SlugConflict {
 		t.Errorf("problem is %s, want conflict", p.Slug())
+	}
+	if p.Title != "Too many sessions" {
+		t.Errorf("title is %q, want the one that says which limit was reached", p.Title)
+	}
+	if got := res.Header.Get("Retry-After"); got != RetryAfterSeconds {
+		t.Errorf("Retry-After = %q, want %q", got, RetryAfterSeconds)
 	}
 	if calls := m.sessions.recorded(); len(calls) != MaxMCPSessions {
 		t.Errorf("children started = %d, want %d; the refusal must start none",
@@ -684,13 +703,21 @@ func callerExport(name, caller string, start time.Time) []byte {
 }
 
 // TestQueryFiltersByCaller is what makes "what a Process did on its owner's
-// behalf is one query" true, see PLAN.md section 2.3.
+// behalf is one query" true, see PLAN.md section 2.3. The record carries the
+// credential of the session and the daemon rewrites it to the Process id.
 func TestQueryFiltersByCaller(t *testing.T) {
 	m := serveMCPDaemon(t, 0)
+	session := m.connect(t, nil)
+	defer session.Close()
+	calls := m.sessions.recorded()
+	if len(calls) != 1 {
+		t.Fatalf("children started = %d, want one", len(calls))
+	}
+
 	now := time.Now()
 	for _, export := range [][]byte{
 		callerExport("fs_list", "", now.Add(-time.Minute)),
-		callerExport("fs_write", m.process, now.Add(-2*time.Minute)),
+		callerExport("fs_write", calls[0].Credential, now.Add(-2*time.Minute)),
 	} {
 		if res, body := m.do(http.MethodPost, pathTraces, otlp.ContentTypeProtobuf, export); res.StatusCode != http.StatusOK {
 			t.Fatalf("export = %d, body %s", res.StatusCode, body)
@@ -717,4 +744,115 @@ func TestQueryFiltersByCaller(t *testing.T) {
 	if !bytes.Contains(body, []byte(`"caller":"`+m.process+`"`)) {
 		t.Errorf("the record does not publish attributes.caller: %s", body)
 	}
+}
+
+// TestForgedCallerIsDropped is the rule that makes kitbash.caller worth
+// querying: what a producer sends is a credential kitbashd minted, and
+// anything else names no Process at all.
+func TestForgedCallerIsDropped(t *testing.T) {
+	m := serveMCPDaemon(t, 0)
+	base := m.base
+	now := time.Now()
+
+	// A member's own session, claiming a Process it does not run.
+	if res, body := m.do(http.MethodPost, pathTraces, otlp.ContentTypeProtobuf,
+		callerExport("fs_list", m.process, now.Add(-time.Minute))); res.StatusCode != http.StatusOK {
+		t.Fatalf("socket export = %d, body %s", res.StatusCode, body)
+	}
+	// A Process on the receiver, with its own token, claiming the same.
+	if res, body := m.exportTCP(base, pathTraces, m.token,
+		callerExport("proc_run", m.process, now.Add(-time.Minute))); res.StatusCode != http.StatusOK {
+		t.Fatalf("process export = %d, body %s", res.StatusCode, body)
+	}
+	// A credential shaped value nobody minted.
+	if res, body := m.do(http.MethodPost, pathTraces, otlp.ContentTypeProtobuf,
+		callerExport("fs_read", strings.Repeat("a", 43), now.Add(-time.Minute))); res.StatusCode != http.StatusOK {
+		t.Fatalf("socket export = %d, body %s", res.StatusCode, body)
+	}
+
+	page, err := m.store.Query(context.Background(), store.SignalTraces, store.Filter{})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(page.Spans) != 3 {
+		t.Fatalf("stored %d spans, want the three that were sent", len(page.Spans))
+	}
+	for _, span := range page.Spans {
+		if span.Caller != "" {
+			t.Errorf("%s kept caller %q, want a forged caller dropped", span.Name, span.Caller)
+		}
+	}
+}
+
+// TestCallerOfAnEndedSessionIsRejectedAfterTheGrace is the other half: the
+// credential resolves while the child is flushing its last records, and names
+// nothing once the grace is over.
+func TestCallerOfAnEndedSessionIsRejectedAfterTheGrace(t *testing.T) {
+	grace := 300 * time.Millisecond
+	m := serveMCPDaemonWith(t, 0, grace)
+	session := m.connect(t, nil)
+	calls := m.sessions.recorded()
+	if len(calls) != 1 {
+		t.Fatalf("children started = %d, want one", len(calls))
+	}
+	credential := calls[0].Credential
+
+	if err := session.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	// Inside the grace: the record of a child that has just exited still
+	// names the Process it ran for.
+	if res, body := m.do(http.MethodPost, pathTraces, otlp.ContentTypeProtobuf,
+		callerExport("fs_list", credential, time.Now().Add(-time.Minute))); res.StatusCode != http.StatusOK {
+		t.Fatalf("export = %d, body %s", res.StatusCode, body)
+	}
+	page, err := m.store.Query(context.Background(), store.SignalTraces, store.Filter{Caller: m.process})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(page.Spans) != 1 {
+		t.Fatalf("inside the grace the store holds %+v, want the flushed span", page.Spans)
+	}
+
+	time.Sleep(2 * grace)
+	if res, body := m.do(http.MethodPost, pathTraces, otlp.ContentTypeProtobuf,
+		callerExport("fs_write", credential, time.Now().Add(-time.Minute))); res.StatusCode != http.StatusOK {
+		t.Fatalf("export = %d, body %s", res.StatusCode, body)
+	}
+	page, err = m.store.Query(context.Background(), store.SignalTraces, store.Filter{Caller: m.process})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(page.Spans) != 1 || page.Spans[0].Name != "fs_list" {
+		t.Fatalf("after the grace the store holds %+v, want the credential to have expired", page.Spans)
+	}
+}
+
+// panicking is a handler that answers and then panics, which is what a bug in
+// the MCP handler looks like from the guard: recovered turns it into problem
+// details, and everything the guard was holding has to be given back anyway.
+type panicking struct{ next http.Handler }
+
+func (p panicking) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	p.next.ServeHTTP(w, r)
+	panic("the MCP handler failed")
+}
+
+// TestMCPSessionSurvivesAPanickingHandler is the leak a panic used to cause: a
+// hold that was never released kept the session out of every idle sweep, so
+// its kitbash-mcp ran until the daemon stopped.
+func TestMCPSessionSurvivesAPanickingHandler(t *testing.T) {
+	m := serveMCPDaemon(t, 100*time.Millisecond)
+	m.server.mcpHandler = panicking{next: m.server.mcpHandler}
+
+	res, body := m.initialize(t, m.token)
+	if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, body %s", res.StatusCode, body)
+	}
+	calls := m.sessions.recorded()
+	if len(calls) != 1 {
+		t.Fatalf("children started = %d, want one", len(calls))
+	}
+	waitFor(t, "the session of a panicking handler to idle out", func() bool { return m.live(t) == 0 })
+	waitFor(t, "its child to exit", func() bool { return exited(calls[0]) })
 }

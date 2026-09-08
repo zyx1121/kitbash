@@ -40,9 +40,10 @@ const (
 //
 // kitbash.producer is lifted like the rest and then overwritten by the
 // receiver, so a producer naming itself something else changes nothing.
-// kitbash.caller is lifted and kept as sent: it names the Process whose MCP
-// session recorded the record, which only that session knows, see PLAN.md
-// section 2.3.
+// kitbash.caller is lifted like the rest and then resolved by the receiver:
+// what a producer sends is a credential kitbashd minted for one session, which
+// the receiver rewrites to the Process id or drops. Nothing that arrives here
+// is trusted to name a Process, see PLAN.md section 2.3.
 func attributes(resource map[string]any, record []*commonpb.KeyValue) store.Attributes {
 	merged := make(map[string]any, len(resource)+len(record))
 	for k, v := range resource {
