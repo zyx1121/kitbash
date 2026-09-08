@@ -88,13 +88,15 @@ inside it.
 
 ## Example: a flat graph
 
-The two tools below are the ones used throughout this file. Check their schemas
-on your own surface before you copy the inputs.
+The two tools below are the ones used throughout this file. Both answer with
+text and no structured content, so both are read as `${steps.<id>.output.text}`.
+Check on your own surface what a tool takes and what it answers with before you
+copy an input or a reference.
 
 ```yaml
 # /org/flows/sum-and-say.yaml
 name: sum and say
-description: Adds two numbers and says the total.
+description: Adds two numbers and says what came back.
 input:
   type: object
   required: [a, b]
@@ -111,12 +113,12 @@ steps:
   - id: say
     tool: echo_echo
     input:
-      message: "the total is ${steps.total.output.sum}"
+      message: "the tool said: ${steps.total.output.text}"
     output:
       said: ${result.content.0.text}
 
 output:
-  sum: ${steps.total.output.sum}
+  total: ${steps.total.output.text}
   said: ${steps.say.output.said}
 ```
 
@@ -150,29 +152,38 @@ steps:
   - id: report
     tool: echo_echo
     input:
-      message: "sum ${steps.totals.output.sum}, said ${steps.totals.output.said}"
+      message: "total ${steps.totals.output.total}, said ${steps.totals.output.said}"
 
 output:
-  sum: ${steps.totals.output.sum}
+  total: ${steps.totals.output.total}
   report: ${steps.report.output.text}
 ```
 
 ## Limits and failures
 
 - A graph file is read whole and must be at most 256 KiB.
+- A run takes at most 256 steps, the steps of nested graphs included.
 - Graphs nest at most 8 deep, and a graph may not run itself, directly or
   through the graphs it runs.
 - One tool call has 60 seconds, and one run has 5 minutes in total.
+- Every step's output is kept until the run ends, so what a step returns is
+  clipped at 4 MiB, and a run that would keep more than 16 MiB across its steps
+  stops with `too-large` naming the step that crossed it. A step whose output
+  was clipped says so with `"clipped": true` in its entry. Pass large data by
+  writing it into Files and referencing the path.
 - A step whose tool fails stops the run. `run` answers that tool's own problem,
   with the step named in `detail` and `<graph path>#<step id>` in `instance`, so
   a missing file in a step is still a `not-found` and not an engine failure.
-- A step naming a tool that is not on your surface is a `not-found` before the
-  run starts calling it. Run the Package that provides the tool first.
+- Every tool a graph names is resolved against your surface when that graph is
+  loaded, before any of its steps run. A name that is not there is a `not-found`
+  naming the step and the tool: run the Package that provides it first. A nested
+  graph is loaded when the step that runs it is reached, so its tools are
+  resolved then, after the steps before it have run.
 
 ## Telemetry
 
 Every call this engine makes is a span kitbashd already records, carrying
 `kitbash.caller` set to this Process. The engine adds one span per run, named
 `workflow.run`, with `kitbash.path` set to the graph and
-`kitbash.workflow.steps` set to the number of steps it ran. A run that failed
-carries an error status. Query it like anything else with `tel_query`.
+`kitbash.workflow.steps` set to the number of steps it ran, nested graphs
+included. A run that failed carries an error status. Query it like anything else with `tel_query`.

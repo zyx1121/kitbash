@@ -63,12 +63,19 @@ provides:
                   description: >-
                     Always ok. A step that fails stops the run, and run answers
                     a problem instead of this output.
+                clipped:
+                  type: boolean
+                  description: >-
+                    Present and true when this step returned more than 4 MiB,
+                    so what later steps and the output see is clipped.
 
 deploy:
   units:
     - type: container
       build: .
       expose: mcp
-      # The engine holds one graph and the outputs of its steps in memory, and
-      # a graph is capped at 256 KiB, so this is generous rather than tight.
+      # What the engine holds at once: one 256 KiB graph, at most 16 MiB of step
+      # outputs across the run, and the result of the step that is running,
+      # which arrives whole and is clipped to 4 MiB as it is kept. This limit is
+      # the backstop for that last one, which a tool decides the size of.
       limits: { memory: 512Mi }

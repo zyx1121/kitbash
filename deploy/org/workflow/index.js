@@ -41,6 +41,19 @@ const SELF = "workflow";
 const MAX_GRAPH_BYTES = 256 * 1024;
 // The graph run counts as one, so a graph may run graphs seven deep below it.
 const MAX_DEPTH = 8;
+// Steps a run may take in total, nested graphs included.
+const MAX_STEPS = 256;
+// What one step may leave behind. Every step's output is kept until the run
+// ends, because a later step may reference it, so both the single output and
+// the total are bounded: a tool that answers 100 MiB cannot make the engine
+// hold 100 MiB, and a hundred such tools cannot make it hold ten times that.
+const MAX_STEP_OUTPUT_BYTES = 4 * 1024 * 1024;
+const MAX_RUN_OUTPUT_BYTES = 16 * 1024 * 1024;
+// What is read of a failing tool's problem, and what is carried outward of it.
+// Past the first, a tool is not answering with a problem at all.
+const MAX_PROBLEM_BYTES = 1024 * 1024;
+const MAX_PROBLEM_TITLE = 200;
+const MAX_PROBLEM_DETAIL = 4 * 1024;
 const RUN_TIMEOUT_MS = 5 * 60 * 1000;
 const CALL_TIMEOUT_MS = 60 * 1000;
 const EXPORT_TIMEOUT_MS = 4 * 1000;
@@ -54,6 +67,9 @@ const WHOLE_REFERENCE = /^\$\{([^{}]+)\}$/;
 const EMBEDDED_REFERENCE = /\$\{([^{}]+)\}/g;
 const GRAPH_KEYS = new Set(["name", "description", "input", "steps", "output"]);
 const STEP_KEYS = new Set(["id", "tool", "workflow", "input", "output"]);
+// A reference walks values a stranger's tool returned. These segments name the
+// prototype chain rather than data, so they are refused rather than followed.
+const FORBIDDEN_SEGMENTS = new Set(["__proto__", "constructor", "prototype"]);
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -100,32 +116,62 @@ const tooLarge = (detail, fix, instance, title = "Graph is too large") =>
 const internal = (detail, fix, instance, title = "Run failed") =>
   new WorkflowError({ type: errorType("internal"), status: 500, title, detail, fix, instance });
 
+// Everything below this line that comes back from a tool is a stranger's text.
+// It is carried outward only in the shapes an agent can act on, and never at
+// the size the stranger chose.
+function clipTo(text, bytes) {
+  if (bytes <= 0) return "";
+  const head = text.slice(0, bytes);
+  if (Buffer.byteLength(head, "utf8") <= bytes) return head;
+  // Slicing by characters cannot keep fewer than the bytes allow, so this only
+  // ever cuts a multi-byte character in half, and the decoder's replacement
+  // character at the end is what says so.
+  const decoded = new TextDecoder("utf-8").decode(Buffer.from(head, "utf8").subarray(0, bytes));
+  return decoded.replace(/�+$/, "");
+}
+
+// A problem type is a stable URI, spec/mcp-surface.yaml $error. Anything that
+// is not an https URI is not one, whatever the tool called it.
+function passthroughType(type) {
+  if (typeof type !== "string" || type.length > 512) return undefined;
+  try {
+    return new URL(type).protocol === "https:" ? type : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 // A tool that fails answers its own RFC 9457 problem. The run carries that
 // problem's class outward, so an agent sees why the step failed and not that
 // something inside this kit went wrong. Anything that does not parse as a
 // problem is this kit's problem, and that is internal.
-function problemFrom(result, { detail, fix, instance }) {
-  const first = Array.isArray(result?.content) ? result.content.find((block) => block?.type === "text") : undefined;
+function parseProblem(text, { detail, fix, instance }) {
+  if (typeof text !== "string" || text.length === 0 || Buffer.byteLength(text, "utf8") > MAX_PROBLEM_BYTES) return undefined;
   let parsed;
-  if (typeof first?.text === "string") {
-    try {
-      parsed = JSON.parse(first.text);
-    } catch {
-      parsed = undefined;
-    }
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return undefined;
   }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || typeof parsed.type !== "string") {
-    const text = typeof first?.text === "string" ? first.text.replace(/\s+/g, " ").trim().slice(0, 280) : "";
-    return internal(text === "" ? detail : `${detail} ${text}`, fix, instance);
-  }
+  if (!isPlainObject(parsed)) return undefined;
+  const type = passthroughType(parsed.type);
+  if (!type) return undefined;
   return new WorkflowError({
-    type: parsed.type,
+    type,
     status: Number.isInteger(parsed.status) ? parsed.status : 500,
-    title: typeof parsed.title === "string" ? parsed.title : "Step failed",
-    detail: `${detail} ${typeof parsed.detail === "string" ? parsed.detail : ""}`.trim(),
-    fix: typeof parsed.fix === "string" ? parsed.fix : fix,
+    title: clipTo(typeof parsed.title === "string" ? parsed.title : "Step failed", MAX_PROBLEM_TITLE),
+    detail: clipTo(`${detail} ${typeof parsed.detail === "string" ? parsed.detail : ""}`.trim(), MAX_PROBLEM_DETAIL),
+    fix: typeof parsed.fix === "string" ? clipTo(parsed.fix, MAX_PROBLEM_DETAIL) : fix,
     instance,
   });
+}
+
+function problemFrom(result, { detail, fix, instance }) {
+  const first = Array.isArray(result?.content) ? result.content.find((block) => block?.type === "text") : undefined;
+  const passed = parseProblem(first?.text, { detail, fix, instance });
+  if (passed) return passed;
+  const text = typeof first?.text === "string" ? clipTo(first.text.replace(/\s+/g, " ").trim(), 280) : "";
+  return internal(text === "" ? detail : `${detail} ${text}`, fix, instance);
 }
 
 // ---------------------------------------------------------------- values
@@ -147,7 +193,21 @@ function splitReference(reference, where) {
       "Write a reference such as ${input.name} or ${steps.first.output.text}.",
     );
   }
-  return segments.map((segment) => segment.trim());
+  const trimmed = segments.map((segment) => segment.trim());
+  const forbidden = trimmed.find((segment) => FORBIDDEN_SEGMENTS.has(segment));
+  if (forbidden) {
+    throw badRequest(
+      `${where} carries the reference \${${reference}}, and ${forbidden} is not data.`,
+      "Reference a field of the input or of a step's output.",
+    );
+  }
+  return trimmed;
+}
+
+// Assigning a key a stranger chose must set a property and never reach a
+// setter on the prototype, so every copied key is defined rather than assigned.
+function set(target, key, value) {
+  Object.defineProperty(target, key, { value, writable: true, enumerable: true, configurable: true });
 }
 
 function referencesOf(value, where, out = []) {
@@ -174,7 +234,8 @@ function lookup(segments, scope, where) {
     if (Array.isArray(current) && /^[0-9]+$/.test(segment)) {
       current = current[Number(segment)];
     } else if (isPlainObject(current)) {
-      current = current[segment];
+      // Own properties only: a reference reads data, never the prototype chain.
+      current = Object.hasOwn(current, segment) ? current[segment] : undefined;
     } else {
       current = undefined;
     }
@@ -197,10 +258,58 @@ function resolve(template, scope, where) {
   if (Array.isArray(template)) return template.map((item) => resolve(item, scope, where));
   if (isPlainObject(template)) {
     const out = {};
-    for (const [key, value] of Object.entries(template)) out[key] = resolve(value, scope, where);
+    for (const [key, value] of Object.entries(template)) set(out, key, resolve(value, scope, where));
     return out;
   }
   return template;
+}
+
+// What a step leaves behind, copied into scope under a byte budget. Measuring
+// during the copy is what keeps a tool that answers 100 MiB from being
+// serialized whole just to find out how big it is; the copy also drops the
+// tool's own result, which is the object that was actually large.
+function copyWithin(value, state) {
+  if (typeof value === "string") {
+    const bytes = Buffer.byteLength(value, "utf8") + 2;
+    if (bytes <= state.left) {
+      state.left -= bytes;
+      return value;
+    }
+    state.clipped = true;
+    const kept = clipTo(value, state.left - 2);
+    state.left = 0;
+    return kept;
+  }
+  if (value === null || typeof value === "number" || typeof value === "boolean") {
+    state.left -= String(value).length;
+    return value;
+  }
+  if (Array.isArray(value)) {
+    const out = [];
+    for (const item of value) {
+      if (state.left <= 0) {
+        state.clipped = true;
+        break;
+      }
+      out.push(copyWithin(item, state));
+      state.left -= 1;
+    }
+    return out;
+  }
+  if (isPlainObject(value)) {
+    const out = {};
+    for (const [key, item] of Object.entries(value)) {
+      if (state.left <= 0) {
+        state.clipped = true;
+        break;
+      }
+      state.left -= Buffer.byteLength(key, "utf8") + 4;
+      set(out, key, copyWithin(item, state));
+    }
+    return out;
+  }
+  // undefined, a function, a symbol: nothing JSON can carry.
+  return null;
 }
 
 // ---------------------------------------------------------------- the graph
@@ -225,6 +334,9 @@ function validateGraph(doc, graphPath) {
   }
   if (!Array.isArray(doc.steps) || doc.steps.length === 0) {
     throw badRequest(`${where} declares no steps.`, "A graph is a steps list with at least one step. Read WORKFLOW.md.", where);
+  }
+  if (doc.steps.length > MAX_STEPS) {
+    throw badRequest(`${where} declares ${doc.steps.length} steps, and a run takes at most ${MAX_STEPS}.`, "Split the graph, and have one graph run the others.", where);
   }
 
   const ids = new Set();
@@ -312,7 +424,7 @@ function validateGraph(doc, graphPath) {
 function checkRequired(doc, input, graphPath) {
   const required = doc.input?.required;
   if (!Array.isArray(required)) return;
-  const missing = required.filter((name) => typeof name === "string" && !(name in input));
+  const missing = required.filter((name) => typeof name === "string" && !Object.hasOwn(input, name));
   if (missing.length > 0) {
     throw badRequest(
       `${graphPath} requires the input ${missing.join(", ")}.`,
@@ -324,15 +436,48 @@ function checkRequired(doc, input, graphPath) {
 
 // ---------------------------------------------------------------- the surface
 
+// The receiver answers a refusal with a problem body: 429 once this Process
+// holds its 8 sessions, spec/kitbashd-api.yaml. That is the caller's answer, so
+// it is carried outward rather than reported as an environment failure.
+function problemFromTransport(err, { detail, fix }) {
+  const message = typeof err?.message === "string" ? err.message : "";
+  const body = message.match(/Error POSTing to endpoint: ([\s\S]*)$/)?.[1];
+  const passed = parseProblem(body, { detail, fix });
+  if (!passed) return undefined;
+  if (Number.isInteger(err?.code) && err.code >= 400 && err.code < 600) passed.status = err.code;
+  return passed;
+}
+
 async function openSession(endpoint, token) {
+  let url;
+  try {
+    url = new URL(endpoint);
+  } catch {
+    url = undefined;
+  }
+  // A value with no scheme parses as a URL whose protocol is the host, so the
+  // scheme is checked rather than assumed.
+  if (!url || (url.protocol !== "http:" && url.protocol !== "https:")) {
+    throw internal(
+      `KITBASH_MCP_ENDPOINT is ${JSON.stringify(endpoint.slice(0, 200))}, which is not an http URL.`,
+      "Run this Package through kitbash: the endpoint comes from kitbashd as http://host.containers.internal:4318/mcp.",
+    );
+  }
+
   const client = new Client({ name: SELF, version: selfVersion }, { capabilities: {} });
-  const transport = new StreamableHTTPClientTransport(new URL(endpoint), {
+  const transport = new StreamableHTTPClientTransport(url, {
     requestInit: { headers: { authorization: `Bearer ${token}` } },
   });
   try {
     await client.connect(transport);
   } catch (err) {
     console.error(`[workflow] cannot open an MCP session at ${endpoint}: ${err?.stack ?? err}`);
+    await transport.close().catch(() => {});
+    const passed = problemFromTransport(err, {
+      detail: "The MCP surface refused a session for this run:",
+      fix: "Wait for this Process's other sessions to end, then run the graph again.",
+    });
+    if (passed) throw passed;
     throw internal(
       "The MCP surface this Process reaches did not open a session.",
       "Check that this Process is running and that KITBASH_MCP_ENDPOINT and KITBASH_TELEMETRY_TOKEN are the ones kitbashd gave it.",
@@ -373,14 +518,16 @@ async function listToolNames(client, deadline) {
   return names;
 }
 
+const outOfTime = (what, instance) =>
+  internal(
+    `The run exceeded its ${RUN_TIMEOUT_MS / 60000} minute budget while ${what}.`,
+    "Split the graph, or make the steps that take the time faster.",
+    instance,
+  );
+
 function budget(deadline, what) {
   const remaining = deadline - Date.now();
-  if (remaining <= 0) {
-    throw internal(
-      `The run passed its ${RUN_TIMEOUT_MS / 1000} second budget while ${what}.`,
-      "Split the graph, or make the steps that take the time faster.",
-    );
-  }
+  if (remaining <= 0) throw outOfTime(what);
   return Math.min(CALL_TIMEOUT_MS, remaining);
 }
 
@@ -392,7 +539,10 @@ async function callTool(client, name, args, deadline, { detail, fix, instance })
   } catch (err) {
     console.error(`[workflow] ${name} failed: ${err?.stack ?? err}`);
     if (err?.code === -32001) {
-      throw internal(`${detail} it did not answer within ${Math.round(timeout / 1000)} seconds.`, "Call a faster tool, or split the graph.", instance);
+      // The timeout is the smaller of the per-call limit and what is left of
+      // the run, so which one ran out is what the caller is told.
+      if (Date.now() >= deadline) throw outOfTime(`calling ${name}`, instance);
+      throw internal(`${detail} it did not answer within ${CALL_TIMEOUT_MS / 1000} seconds.`, "Call a faster tool, or split the graph.", instance);
     }
     throw internal(`${detail} the call did not complete: ${(err?.message ?? String(err)).slice(0, 200)}`, fix, instance);
   }
@@ -450,7 +600,42 @@ async function readGraph(client, graphPath, deadline, at) {
   return validateGraph(doc, graphPath);
 }
 
-async function runGraph({ client, tools, graphPath, input, chain, deadline }) {
+// Every tool a graph names is resolved against the surface when the graph is
+// loaded, before its first step calls anything. A nested graph is loaded when
+// the step that runs it is reached, so it is resolved then, which is still
+// before any of its own steps run.
+function preflight(doc, tools, graphPath) {
+  for (const step of doc.steps) {
+    if (step.tool === undefined || tools.has(step.tool)) continue;
+    throw notFound(
+      `Step ${JSON.stringify(step.id)} of ${graphPath} calls ${step.tool}, which is not on this Process's surface.`,
+      "Run the Package that provides the tool, then run the graph again. Tool names are <package>_<tool>.",
+      `${graphPath}#${step.id}`,
+      "Tool not found",
+    );
+  }
+}
+
+// What a step leaves behind is kept for the rest of the run, so it is copied
+// under a budget: one output is clipped at 4 MiB, and a run that would keep
+// more than 16 MiB in total stops at the step that crossed it.
+function keep(output, run, { named, instance }) {
+  const state = { left: MAX_STEP_OUTPUT_BYTES, clipped: false };
+  const kept = copyWithin(output, state);
+  run.bytes += MAX_STEP_OUTPUT_BYTES - Math.max(state.left, 0);
+  if (state.clipped) console.error(`[workflow] ${named} returned more than ${MAX_STEP_OUTPUT_BYTES} bytes; what the rest of the run sees is clipped`);
+  if (run.bytes > MAX_RUN_OUTPUT_BYTES) {
+    throw tooLarge(
+      `${named} took the outputs this run keeps past ${MAX_RUN_OUTPUT_BYTES} bytes.`,
+      "Have the steps return less, or write the large part into Files and pass the path on.",
+      instance,
+      "The run keeps too much",
+    );
+  }
+  return { output: kept, clipped: state.clipped };
+}
+
+async function runGraph({ client, tools, graphPath, input, chain, deadline, run }) {
   const at = `The graph ${graphPath}`;
   if (chain.includes(graphPath)) {
     throw badRequest(
@@ -468,43 +653,53 @@ async function runGraph({ client, tools, graphPath, input, chain, deadline }) {
   }
 
   const doc = await readGraph(client, graphPath, deadline, at);
+  preflight(doc, tools, graphPath);
   checkRequired(doc, input, graphPath);
 
-  const scope = { input, steps: {} };
+  const scope = Object.assign(Object.create(null), { input, steps: Object.create(null) });
   const steps = [];
   for (const step of doc.steps) {
     const named = `Step ${JSON.stringify(step.id)} of ${graphPath}`;
     const instance = `${graphPath}#${step.id}`;
+    if (run.steps >= MAX_STEPS) {
+      throw badRequest(
+        `${named} would be step ${run.steps + 1}, and a run takes at most ${MAX_STEPS} steps, nested graphs included.`,
+        "Split the run, and call run once per part.",
+        instance,
+      );
+    }
+    run.steps += 1;
     const args = resolve(step.input ?? {}, scope, named);
     const startedAt = Date.now();
 
     let raw;
     if (step.tool !== undefined) {
-      if (!tools.has(step.tool)) {
-        throw notFound(
-          `${named} calls ${step.tool}, which is not on this Process's surface.`,
-          "Run the Package that provides the tool, then run the graph again. Tool names are <package>_<tool>.",
-          instance,
-          "Tool not found",
-        );
-      }
       raw = await callTool(client, step.tool, args, deadline, {
         detail: `${named} called ${step.tool} and it failed:`,
         fix: "Fix the step input, or the tool it calls.",
         instance,
       });
     } else {
-      const nested = await runGraph({ client, tools, graphPath: step.workflow, input: args, chain: [...chain, graphPath], deadline });
+      const nested = await runGraph({ client, tools, graphPath: step.workflow, input: args, chain: [...chain, graphPath], deadline, run });
       raw = nested.outputs;
     }
 
-    const output = step.output === undefined ? (step.tool === undefined ? raw : defaultOutput(raw)) : resolve(step.output, { result: raw }, `The output of ${named}`);
-    scope.steps[step.id] = { output };
+    const shaped =
+      step.output === undefined
+        ? step.tool === undefined
+          ? raw
+          : defaultOutput(raw)
+        : resolve(step.output, Object.assign(Object.create(null), { result: raw }), `The output of ${named}`);
+    // A nested graph's output is already inside the budget, counted as its own
+    // steps ran, so it is kept as it is rather than counted a second time.
+    const { output, clipped } = step.tool === undefined ? { output: shaped, clipped: false } : keep(shaped, run, { named, instance });
+    set(scope.steps, step.id, { output });
     steps.push({
       id: step.id,
       ...(step.tool === undefined ? { workflow: step.workflow } : { tool: step.tool }),
       durationMs: Date.now() - startedAt,
       status: "ok",
+      ...(clipped ? { clipped: true } : {}),
     });
   }
 
@@ -589,8 +784,10 @@ async function run(args) {
 
   const startedAt = Date.now();
   const deadline = startedAt + RUN_TIMEOUT_MS;
+  // What the whole run has spent, nested graphs included: steps taken and bytes
+  // of step output kept.
+  const state = { steps: 0, bytes: 0 };
   let session;
-  let ran = 0;
   let failure;
   try {
     session = await openSession(endpoint, token);
@@ -598,16 +795,15 @@ async function run(args) {
     if (!tools.has("fs_read")) {
       throw internal("The surface this Process reaches has no fs_read, so no graph can be read.", "Report this: a Process session is the owner's whole surface.", graphPath);
     }
-    const result = await runGraph({ client: session.client, tools, graphPath, input, chain: [], deadline });
-    ran = result.steps.length;
-    console.error(`[workflow] ${graphPath} ran ${ran} steps in ${Date.now() - startedAt} ms`);
+    const result = await runGraph({ client: session.client, tools, graphPath, input, chain: [], deadline, run: state });
+    console.error(`[workflow] ${graphPath} ran ${state.steps} steps, keeping ${state.bytes} bytes, in ${Date.now() - startedAt} ms`);
     return { path: graphPath, outputs: result.outputs, steps: result.steps };
   } catch (err) {
     failure = err instanceof WorkflowError ? `${err.type} ${err.detail}` : `${err?.message ?? err}`;
     throw err;
   } finally {
     if (session) await closeSession(session);
-    await exportRun({ graphPath, steps: ran, startedAt, endedAt: Date.now(), failure });
+    await exportRun({ graphPath, steps: state.steps, startedAt, endedAt: Date.now(), failure });
   }
 }
 
