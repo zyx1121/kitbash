@@ -34,7 +34,7 @@ claude mcp add kitbash -- ssh alice@kitbash.example.org
 
 ## Status
 
-M5 Multi user done (v0.5.0). M6 Workflow kit is next. Read [PLAN.md](PLAN.md): positioning, the four object model, kits, kitbashOS, and version 1 milestones. Machine readable definitions live in [`spec/`](spec/).
+Version 1 complete (v0.6.0): all six milestones done; what stays open is in PLAN.md 5.5. Read [PLAN.md](PLAN.md): positioning, the four object model, kits, kitbashOS, and version 1 milestones. Machine readable definitions live in [`spec/`](spec/).
 
 ## Development
 
