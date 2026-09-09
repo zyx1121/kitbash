@@ -1,0 +1,145 @@
+name: E2E
+
+# The whole system on one host, driven the way an organization uses it, see
+# issue #73 and the e2e half of #74. CI covers units and fakes; this job is the
+# only place a real rootless container is built, run and called, and the only
+# place a store the previous release wrote is opened by the current one.
+#
+# The runner is Ubuntu and deploy/install.sh is written for Alpine, so
+# e2e/setup-host.sh replicates the parts of it the surface depends on. What the
+# job asserts lives in e2e/, not here.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    # The budget of issue #73. A job that has spent it is a job that hung: it
+    # runs in about two and a half minutes.
+    timeout-minutes: 8
+    env:
+      KITBASH_E2E: "1"
+      KITBASH_E2E_ADMIN: admin1
+      KITBASH_E2E_MEMBER: member1
+      KITBASH_E2E_SECOND: member2
+      KITBASH_E2E_SSH_KEY: ${{ github.workspace }}/e2e/artifacts/member.pub
+      KITBASH_E2E_LOGS: ${{ github.workspace }}/e2e/artifacts
+      KITBASH_E2E_STATE: ${{ github.workspace }}/e2e/artifacts/upgrade.json
+      # The upgrade half: one store, opened by the previous release and then by
+      # this one. The surface half gets a store of its own.
+      KITBASH_E2E_STORE: /var/tmp/kitbash-e2e/upgrade.db
+      # Beside the stores rather than under them: the store directory is
+      # kitbashd's alone, and the daemon narrows it to itself at every start.
+      KITBASH_E2E_CLIENT: /var/tmp/kitbash-e2e-client
+      MAIN_STORE: /var/tmp/kitbash-e2e/surface.db
+      PREVIOUS: v0.6.2
+      PREVIOUS_TREE: /var/tmp/kitbash-previous
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          check-latest: true
+
+      - name: Build both binaries
+        run: |
+          make build-linux
+          mkdir -p e2e/artifacts
+          # The release every later step is checked against, daemon and session
+          # binary alike, so the upgrade half cannot pass with the wrong one.
+          echo "CURRENT=$(bin/kitbashd-linux-amd64 -version)" >> "$GITHUB_ENV"
+
+      - name: Generate the key every member is created with
+        run: ssh-keygen -t ed25519 -N '' -C e2e@kitbash -f e2e/artifacts/member
+
+      - name: Build the host
+        run: sudo KITBASH_BIN=bin KITBASH_E2E_ADMIN="$KITBASH_E2E_ADMIN" KITBASH_E2E_MEMBER="$KITBASH_E2E_MEMBER" KITBASH_E2E_SSH_KEY="$KITBASH_E2E_SSH_KEY" sh e2e/setup-host.sh
+
+      - name: Install the second MCP client
+        # It is staged outside the checkout because a member has to read it:
+        # podman copies it into the container as the admin, and the runner's
+        # home is not somewhere a member may go.
+        run: |
+          npm ci --prefix e2e/client --no-audit --no-fund --loglevel error
+          rm -rf "$KITBASH_E2E_CLIENT"
+          mkdir -p "$(dirname "$KITBASH_E2E_CLIENT")"
+          cp -R e2e/client "$KITBASH_E2E_CLIENT"
+          chmod -R a+rX "$KITBASH_E2E_CLIENT"
+
+      - name: Start kitbashd
+        run: sudo sh e2e/daemon.sh start /usr/bin/kitbashd "$MAIN_STORE" "$KITBASH_E2E_LOGS/kitbashd.log"
+
+      - name: Warm the image the Package is built on
+        # Pulled here, by digest, as the member whose store the build reads, so
+        # a slow or unreachable registry fails this step by name instead of the
+        # build. Once, then once more: a pull is the one thing in this job that
+        # depends on somebody else's service.
+        run: |
+          image=$(sed -n 's/^FROM //p' e2e/fixtures/echo/Dockerfile | head -1)
+          sh e2e/as-member.sh "$KITBASH_E2E_ADMIN" podman pull "$image" \
+            || { sleep 10; sh e2e/as-member.sh "$KITBASH_E2E_ADMIN" podman pull "$image"; }
+
+      - name: Drive the surface as two members
+        env:
+          KITBASH_E2E_VERSION: ${{ env.CURRENT }}
+        run: go test -v -count=1 -timeout 15m -run TestSurface ./e2e
+
+      # ------------------------------------------------------------------ the
+      # upgrade half. There are no binary releases, so the previous tag is built
+      # from source in this job; the module cache actions/setup-go restored is
+      # what keeps it inside its two minutes.
+      - name: Build the previous release
+        run: |
+          git worktree add --detach "$PREVIOUS_TREE" "$PREVIOUS"
+          make -C "$PREVIOUS_TREE" build-linux
+          "$PREVIOUS_TREE/bin/kitbashd-linux-amd64" -version
+
+      - name: Install the previous release and start it on a new store
+        run: |
+          sudo sh e2e/daemon.sh stop
+          sh e2e/as-member.sh "$KITBASH_E2E_ADMIN" podman rm --all --force
+          sudo install -m 0755 "$PREVIOUS_TREE/bin/kitbash-mcp-linux-amd64" /usr/bin/kitbash-mcp
+          sudo install -m 0755 "$PREVIOUS_TREE/bin/kitbashd-linux-amd64" /usr/bin/kitbashd
+          sudo sh e2e/daemon.sh start /usr/bin/kitbashd "$KITBASH_E2E_STORE" "$KITBASH_E2E_LOGS/kitbashd-previous.log"
+
+      - name: Register a Process with the previous release
+        env:
+          KITBASH_E2E_VERSION: ${{ env.PREVIOUS }}
+        run: go test -v -count=1 -timeout 10m -run TestUpgradePreviousRelease ./e2e
+
+      - name: Install this release over it, on the same store
+        run: |
+          sudo sh e2e/daemon.sh stop
+          sudo install -m 0755 bin/kitbash-mcp-linux-amd64 /usr/bin/kitbash-mcp
+          sudo install -m 0755 bin/kitbashd-linux-amd64 /usr/bin/kitbashd
+          sudo sh e2e/daemon.sh start /usr/bin/kitbashd "$KITBASH_E2E_STORE" "$KITBASH_E2E_LOGS/kitbashd-upgraded.log"
+
+      - name: Read the old store with this release
+        env:
+          KITBASH_E2E_VERSION: ${{ env.CURRENT }}
+        run: go test -v -count=1 -timeout 10m -run TestUpgradeCurrentRelease ./e2e
+
+      - name: Collect what the daemons and the sessions said
+        if: failure()
+        run: |
+          sudo sh e2e/collect.sh "$KITBASH_E2E_ADMIN" "$KITBASH_E2E_MEMBER" > "$KITBASH_E2E_LOGS/host.txt" 2>&1 || true
+          sudo sh e2e/daemon.sh stop || true
+          sudo chmod -R a+r "$KITBASH_E2E_LOGS" || true
+          sh e2e/as-member.sh "$KITBASH_E2E_ADMIN" podman ps --all > "$KITBASH_E2E_LOGS/podman-ps.txt" 2>&1 || true
+          sh e2e/as-member.sh "$KITBASH_E2E_ADMIN" podman logs kitbash-echo-echo > "$KITBASH_E2E_LOGS/echo-container.log" 2>&1 || true
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: e2e-logs
+          path: |
+            e2e/artifacts/*.log
+            e2e/artifacts/*.stderr
+            e2e/artifacts/*.txt
+          if-no-files-found: warn

@@ -613,7 +613,26 @@ cgroups:
     A host whose cgroup filesystem is not version 2 or not writable runs that
     Process unplaced: the limits are still passed to the runtime and recorded,
     and the daemon log says so on that start. The fail open is per member and
-    per attempt; the daemon never turns placement off for itself.
+    per attempt; the daemon never turns placement off for itself. It covers a
+    host with no tree to place anything in, and not a host that places some
+    processes outside the one kitbashd built, which is what logind does, see
+    logind below.
+  logind: >
+    A member must be a user logind knows nothing about. Given a session, logind
+    removes that member's /run/user/<uid> when the session ends, and given a
+    lingering one it starts a systemd user manager; rootless podman then asks
+    that manager for a scope to hold its pause process, and the scope is under
+    the user's slice rather than under /sys/fs/cgroup/kitbash. The common
+    ancestor of that scope and the container's cgroup is then the root cgroup,
+    whose cgroup.procs is root's alone, so the kernel refuses to move the
+    container into its own cgroup and the start fails with
+    "writing file .../cgroup.procs: Permission denied". This is not the fail
+    open above: the Process does not start at all. A kitbash host runs OpenRC
+    and carries no logind, which is why deploy/install.sh makes /run/user/<uid>
+    in /etc/local.d/kitbash-rootless.start at boot instead of leaving it to a
+    session. On a systemd host, whoever runs kitbash there keeps its members
+    out of logind, opening no PAM session for them, and makes that directory
+    the same way; .github/workflows/e2e.yml does both.
 
 client_behaviour:
   processes: >
