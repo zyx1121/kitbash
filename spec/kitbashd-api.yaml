@@ -366,8 +366,11 @@ api:
       The record is checked against the caller's own image store before it is
       written, with podman image inspect as the caller: they must hold the
       digest, and the image's own kitbash.path and kitbash.commit labels must
-      be the path and the commit being recorded. Neither is 400 bad-request,
-      "the image you recorded is not a build of this commit". A digest is a
+      be the path and the commit being recorded. A digest the caller does not
+      hold is 400 bad-request, "you do not hold the image", and labels that do
+      not match are 400 "the image you recorded is not a build of this commit";
+      a runtime that could not answer at all is internal, because that is the
+      host's failure and not the caller's. A digest is a
       number the caller chose and the labels are what the build stamped inside
       the image, so this is the whole of what kitbashd knows about provenance.
       Without it a member could record any digest against any /org path and

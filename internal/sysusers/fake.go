@@ -40,6 +40,9 @@ type Fake struct {
 	RemoveContainerErr error
 	RemoveAllErr       error
 	CopyErr            error
+	// ImageInfoErr makes reading an image fail for a reason that is not a
+	// missing image, which is the host's failure and not the caller's.
+	ImageInfoErr error
 	// LoseCopies makes a copy succeed without the image arriving, which is
 	// the one failure a caller cannot see from the exit status of the two
 	// children: a save and a load that both said nothing and moved nothing.
@@ -463,6 +466,9 @@ func (f *Fake) CopyImage(_ context.Context, from, to Member, digest, fromCgroup,
 func (f *Fake) ImageInfo(_ context.Context, m Member, digest string) (ImageInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.ImageInfoErr != nil {
+		return ImageInfo{}, f.ImageInfoErr
+	}
 	info, held := f.images[m.Name][digest]
 	if !held {
 		return ImageInfo{}, fmt.Errorf("%w: %s", ErrNoImage, digest)

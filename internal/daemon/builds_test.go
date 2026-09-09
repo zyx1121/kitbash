@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"os"
 	"os/user"
@@ -205,9 +206,33 @@ func TestRecordingADigestYouDoNotHoldIsRefused(t *testing.T) {
 	if res.StatusCode != http.StatusBadRequest {
 		t.Fatalf("record = %d %s, want 400", res.StatusCode, body)
 	}
+	// The caller is told what is wrong with what they sent, which is a thing
+	// they can act on. It reaches the host as podman 4 exiting 1 and podman 5
+	// exiting 125 with "image not known", see sysusers.NoImageOutput.
+	if p := h.problemOf(res, body); !strings.Contains(p.Detail, "you do not hold the image") {
+		t.Errorf("the detail is %q, want it to say the caller does not hold the image", p.Detail)
+	}
 	held, err := h.store.Builds(context.Background(), store.BuildFilter{Path: "/org/ffmpeg"})
 	if err != nil || len(held) != 0 {
 		t.Errorf("the store holds %+v, %v, want nothing recorded", held, err)
+	}
+}
+
+// TestRecordingWhenTheRuntimeFailsIsInternal is the other side of the same
+// mapping: a runtime that could not answer is the host's failure and not the
+// caller's, so it is not reported as an image they do not hold.
+func TestRecordingWhenTheRuntimeFailsIsInternal(t *testing.T) {
+	h, fake := sharing(t, false)
+	fake.ImageInfoErr = errors.New("podman: unknown flag: --format")
+
+	res, body := h.postJSON(http.MethodPost, buildsPath, buildRequest{
+		Path: "/org/ffmpeg", Commit: testCommit, Digest: testDigest,
+	})
+	if res.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("record = %d %s, want 500", res.StatusCode, body)
+	}
+	if p := h.problemOf(res, body); p.Slug() != "internal" {
+		t.Errorf("the problem is %s, want internal", p.Slug())
 	}
 }
 

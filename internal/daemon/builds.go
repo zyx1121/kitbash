@@ -190,8 +190,11 @@ func (s *Server) recordedImage(r *http.Request, caller Caller, folder string, re
 	info, err := s.runner.ImageInfo(r.Context(), m, req.Digest)
 	if err != nil {
 		if errors.Is(err, sysusers.ErrNoImage) {
+			// A record of an image the caller does not hold is the caller's
+			// mistake, not the host's: kitbashd would be asked to copy it out
+			// of a store that does not have it.
 			return sysusers.ImageInfo{}, problem.BadRequest(r.URL.Path,
-				fmt.Sprintf("you do not have the image %s", req.Digest),
+				fmt.Sprintf("you do not hold the image %s", req.Digest),
 				"Record the digest pkg_build answered, in the session that built it.")
 		}
 		logger.Printf("builds: reading %s in %s's store: %v", req.Digest, caller.User, err)

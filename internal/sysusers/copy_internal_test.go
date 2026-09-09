@@ -109,16 +109,29 @@ func TestImageInfoReadsAnInspect(t *testing.T) {
 		t.Errorf("imageInfo of an image with no labels = %+v, %v, want an empty label set", info, err)
 	}
 
-	// Exit 1 is the image the member does not have, which is the one failure
-	// a caller acts on.
-	if _, err := imageInfo("no such image", exitError(t, 1)); !errors.Is(err, ErrNoImage) {
+	// Exit 1 is the image the member does not have, which is what podman 4
+	// answers an inspect of an unknown image with.
+	if _, err := imageInfo("", exitError(t, 1)); !errors.Is(err, ErrNoImage) {
 		t.Errorf("imageInfo after exit 1 = %v, want ErrNoImage", err)
 	}
-	// Exit 125 is podman refusing the command itself. Reporting it as a
+	// podman 5 answers the same question with 125, which is otherwise the
+	// status it refuses a command line with, so the message decides. The
+	// runtime's own words arrive in the error, which is where the runner puts
+	// its standard error.
+	notKnown := fmt.Errorf("sysusers: podman image inspect as loki: %w: Error: sha256:abc: image not known",
+		exitError(t, usageExit))
+	if _, err := imageInfo("", notKnown); !errors.Is(err, ErrNoImage) {
+		t.Errorf("imageInfo after podman 5 said image not known = %v, want ErrNoImage", err)
+	}
+	if _, err := imageInfo("Error: no such image sha256:abc", exitError(t, usageExit)); !errors.Is(err, ErrNoImage) {
+		t.Errorf("imageInfo after no such image = %v, want ErrNoImage", err)
+	}
+	// Every other 125 is podman refusing the command itself. Reporting it as a
 	// missing image would send a member off to build something that is
 	// already there.
-	err125 := exitError(t, usageExit)
-	if _, err := imageInfo("unknown flag", err125); errors.Is(err, ErrNoImage) {
+	refused := fmt.Errorf("sysusers: podman image inspect as loki: %w: Error: unknown flag: --format",
+		exitError(t, usageExit))
+	if _, err := imageInfo("", refused); errors.Is(err, ErrNoImage) {
 		t.Errorf("imageInfo after exit %d = %v, want the failure as it is", usageExit, err)
 	}
 	// Anything else is the host's failure and is reported as it is.

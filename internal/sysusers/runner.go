@@ -365,15 +365,23 @@ type inspectJSON struct {
 	} `json:"Config"`
 }
 
-// imageInfo reads one podman image inspect. Exit 1 is the image the member
-// does not have, which is the one failure a caller acts on; exit 125 is podman
+// NoImageOutput is what a container runtime says when it does not have the
+// image it was asked about. podman 4 answers an inspect of an unknown image
+// with exit 1 and podman 5 with exit 125, which is otherwise the status it
+// refuses a command line with, so the status alone does not say which happened
+// and the message is read as well.
+var NoImageOutput = []string{"image not known", "no such image", "image not found"}
+
+// imageInfo reads one podman image inspect. An image the member does not have
+// is the one failure a caller acts on: exit 1 is that and nothing else, and
+// exit 125 is that only when the runtime said so. Every other 125 is podman
 // refusing the command itself and is reported as it is, because turning it
 // into a missing image would send a member off to build something that is
 // already there.
 func imageInfo(out string, err error) (ImageInfo, error) {
 	if err != nil {
-		if exitCode(err, 1) {
-			return ImageInfo{}, fmt.Errorf("%w: %s", ErrNoImage, clipOutput(out))
+		if exitCode(err, 1) || (exitCode(err, usageExit) && saysNoImage(out, err)) {
+			return ImageInfo{}, fmt.Errorf("%w: %s", ErrNoImage, clipOutput(out+" "+err.Error()))
 		}
 		return ImageInfo{}, err
 	}
@@ -391,6 +399,23 @@ func imageInfo(out string, err error) (ImageInfo, error) {
 		info.Labels = map[string]string{}
 	}
 	return info, nil
+}
+
+// saysNoImage reports whether the runtime said the image is not there. The
+// standard error of the child is in the error, which is where runFor puts it,
+// and the standard output is passed as well because a runtime that writes the
+// message the other way round is still saying the same thing.
+func saysNoImage(out string, err error) bool {
+	said := strings.ToLower(out)
+	if err != nil {
+		said += " " + strings.ToLower(err.Error())
+	}
+	for _, phrase := range NoImageOutput {
+		if strings.Contains(said, phrase) {
+			return true
+		}
+	}
+	return false
 }
 
 // clipOutput bounds one child's standard error for the daemon log.
