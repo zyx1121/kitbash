@@ -105,6 +105,7 @@ jobs:
       - name: Collect what the daemons and the sessions said
         if: failure()
         run: |
+          sudo sh e2e/collect.sh "$KITBASH_E2E_ADMIN" "$KITBASH_E2E_MEMBER" > "$KITBASH_E2E_LOGS/host.txt" 2>&1 || true
           sudo sh e2e/daemon.sh stop || true
           sudo chmod -R a+r "$KITBASH_E2E_LOGS" || true
           sh e2e/as-member.sh "$KITBASH_E2E_ADMIN" podman ps --all > "$KITBASH_E2E_LOGS/podman-ps.txt" 2>&1 || true
