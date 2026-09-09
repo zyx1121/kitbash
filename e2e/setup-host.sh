@@ -87,15 +87,24 @@ sh deploy/kitbash-adduser "$member" "$key"
 #    cleared here too rather than only between these two.
 unlock_subids
 
-# 6b. /run/user/<uid> is where rootless podman keeps its state. On a systemd
-#     host that directory belongs to logind, which removes the one
-#     kitbash-adduser made as soon as the last session of that account ends,
-#     and a member here has no session at all. Lingering is what keeps it for
-#     an account nobody logs into. install.sh writes no equivalent: Alpine runs
-#     no logind, and /etc/local.d/kitbash-rootless.start makes the directory at
-#     every boot instead.
+# 6b. /run/user/<uid> is where rootless podman keeps its state, and on this
+#     host nothing but this loop makes it. A kitbash host runs no logind:
+#     install.sh writes /etc/local.d/kitbash-rootless.start, which makes the
+#     directory for every member at boot, and this is that step.
+#
+#     A member here must stay a user logind knows nothing about. Given a
+#     session, logind removes this directory as soon as the session ends, and
+#     given a lingering one it starts a systemd user manager, which rootless
+#     podman then asks for a scope to keep its pause process in: that scope is
+#     outside the cgroup tree kitbashd delegates, and a container started from
+#     it cannot be moved into its own cgroup. The sessions the accounts were
+#     created through are ended here, and every later command runs through
+#     setpriv, which opens none.
+if command -v loginctl >/dev/null 2>&1; then
+  for m in "$admin" "$member"; do loginctl terminate-user "$m" >/dev/null 2>&1 || true; done
+  sleep 2
+fi
 for m in "$admin" "$member"; do
-  if command -v loginctl >/dev/null 2>&1; then loginctl enable-linger "$m" || true; fi
   uid=$(id -u "$m")
   mkdir -p "/run/user/$uid"
   chown "$m" "/run/user/$uid"

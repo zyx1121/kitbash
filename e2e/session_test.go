@@ -106,7 +106,13 @@ func asUser(t *testing.T, name string, argv ...string) *exec.Cmd {
 		"XDG_RUNTIME_DIR=/run/user/" + u.Uid,
 		"TMPDIR=/tmp",
 	}
-	args := append([]string{"-n", "-u", name, "env", "-i"}, env...)
+	// setpriv rather than sudo -u, which is what kitbashd does for the
+	// sessions of a Process: it changes user without opening a PAM session,
+	// and a PAM session here would hand the member to logind, which removes
+	// their runtime directory when it ends and gives rootless podman a systemd
+	// to place its pause process in, outside the cgroups kitbashd delegates.
+	args := []string{"-n", "setpriv", "--reuid", u.Uid, "--regid", u.Gid, "--init-groups", "env", "-i"}
+	args = append(args, env...)
 	cmd := exec.Command("sudo", append(args, argv...)...)
 	// The session inherits its working directory, and podman's children chdir
 	// to it: the job's own directory is under a home the member cannot reach,
