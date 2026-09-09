@@ -8,6 +8,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/zyx1121/kitbash/internal/bridge"
 	"github.com/zyx1121/kitbash/internal/manifest"
 	"github.com/zyx1121/kitbash/internal/problem"
 	"github.com/zyx1121/kitbash/internal/telemetry"
@@ -23,6 +24,20 @@ const (
 	PermitsFix     = "Declare the tool in provides.permits.tools of this Package's kitbash.yaml."
 	PermitsPathFix = "Declare the path prefix in provides.permits.paths of this Package's kitbash.yaml."
 )
+
+// packageTools is the predicate the reserved word packages is read with: the
+// bridge published the tools of the owner's running Processes, so it is the
+// one that can say which names are theirs. A session with no bridge has no
+// Package tools, and packages admits nothing there.
+func packageTools(b *bridge.Bridge) manifest.PackageTool {
+	if b == nil {
+		return nil
+	}
+	return func(name string) bool {
+		_, _, ok := b.Owner(name)
+		return ok
+	}
+}
 
 // pathArgument names, for each built in tool that acts on a Files path, the
 // argument that carries it. A tool that takes no path is governed by the
@@ -81,7 +96,7 @@ func PermitsFromEnv() (*manifest.Permits, error) {
 // Process may call them, because the bridge publishes a Process's tools as it
 // starts it and the surface is one set. What tools/list leaves out is what
 // tools/call refuses.
-func permitsGuard(permits manifest.Permits) mcp.Middleware {
+func permitsGuard(permits manifest.Permits, isPackage manifest.PackageTool) mcp.Middleware {
 	return func(next mcp.MethodHandler) mcp.MethodHandler {
 		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
 			switch method {
@@ -94,10 +109,10 @@ func permitsGuard(permits manifest.Permits) mcp.Middleware {
 				if !ok {
 					return result, nil
 				}
-				return permittedTools(permits, list), nil
+				return permittedTools(permits, list, isPackage), nil
 			case callToolMethod:
 				name := toolName(req)
-				if !permits.Match(name) {
+				if !permits.Match(name, isPackage) {
 					return errorResult(problem.NotPermitted(name,
 						fmt.Sprintf("this Process may not call %s", name), PermitsFix)), nil
 				}
@@ -115,10 +130,10 @@ func permitsGuard(permits manifest.Permits) mcp.Middleware {
 // taken out. The page is filtered rather than refilled: a cursor the SDK
 // answered still names the same place in the whole set, so a client paging
 // through reads every permitted tool and no others.
-func permittedTools(permits manifest.Permits, list *mcp.ListToolsResult) *mcp.ListToolsResult {
+func permittedTools(permits manifest.Permits, list *mcp.ListToolsResult, isPackage manifest.PackageTool) *mcp.ListToolsResult {
 	kept := make([]*mcp.Tool, 0, len(list.Tools))
 	for _, tool := range list.Tools {
-		if tool != nil && permits.Match(tool.Name) {
+		if tool != nil && permits.Match(tool.Name, isPackage) {
 			kept = append(kept, tool)
 		}
 	}

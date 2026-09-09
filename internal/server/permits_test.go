@@ -149,6 +149,31 @@ func TestPermitsPublishOnlyPermittedTools(t *testing.T) {
 	}
 }
 
+// TestPermitsPackagesAdmitsTheOtherKitsAndNoBuiltIn is the reserved word on a
+// live surface: the bridge says which names are a running Process's, so a kit
+// that composes other kits declares packages and gets their tools and not one
+// built in.
+func TestPermitsPackagesAdmitsTheOtherKitsAndNoBuiltIn(t *testing.T) {
+	n := serveNarrowed(t, func(w *whole) *manifest.Permits {
+		return &manifest.Permits{
+			Tools: []string{"fs_read", "fs_list", manifest.PermitPackages},
+			Paths: []string{w.root},
+		}
+	})
+
+	want := []string{"ffmpeg_transcode", "fs_list", "fs_read"}
+	if got := listed(t, n.session); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("tools/list is %v, want exactly %v", got, want)
+	}
+	ok(t, call(t, n.session, "ffmpeg_transcode", map[string]any{}), "ffmpeg_transcode")
+
+	// Every built in the word looks like it might cover is refused, including
+	// the ones a *_* glob would have let in.
+	for _, name := range []string{"fs_write", "users_remove", "pkg_build", "proc_run"} {
+		refused(t, call(t, n.session, name, map[string]any{}), server.PermitsFix)
+	}
+}
+
 // TestPermitsRefuseANonPermittedCall is the answer to a tool the listing left
 // out. The SDK would answer that it knows no such tool, which is true of the
 // Process and not of the surface, so the guard answers first and says what to
@@ -271,7 +296,7 @@ func TestAMemberSessionIsNarrowedByNothing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PermitsFromEnv: %v", err)
 	}
-	if permits == nil || !permits.Match("fs_read") || permits.Match("fs_write") {
+	if permits == nil || !permits.Match("fs_read", nil) || permits.Match("fs_write", nil) {
 		t.Errorf("a Process session read %+v, want the declared block", permits)
 	}
 

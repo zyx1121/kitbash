@@ -52,7 +52,7 @@ func New(version string, deps Deps) *mcp.Server {
 		// Between the two, so a refusal is still one span: tracing wraps it
 		// and problemGuard is behind it, which is where a call this Process
 		// may make goes on to fail on its own terms.
-		s.AddReceivingMiddleware(permitsGuard(*deps.Permits))
+		s.AddReceivingMiddleware(permitsGuard(*deps.Permits, packageTools(deps.Bridge)))
 	}
 	// Middleware added later wraps middleware added earlier, so tracing goes
 	// on last: the span is open before the arguments are validated and closes

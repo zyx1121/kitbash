@@ -71,7 +71,10 @@ mcp_for_processes:
     with the Process and lists it on processes_list. Every session of that
     Process is started with KITBASH_PERMITS set to that block as JSON, an
     empty object when the Package declared none and for a registration written
-    before this field existed. kitbash-mcp publishes only the tools a glob
+    before this field existed. A tool entry is a glob over literal surface
+    names, built in tools included, or the reserved word packages, which is
+    every tool the owner's running Processes publish and no built in.
+    kitbash-mcp publishes only the tools an entry
     names, built in and Package tools alike, and answers not-permitted at 403
     to a call the block does not name and to one whose path or package
     argument is outside every prefix. A Process with no permits therefore

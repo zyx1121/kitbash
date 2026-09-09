@@ -80,8 +80,8 @@
       "properties": {
         "tools": {
           "type": "array",
-          "description": "Surface tool names this Package may call, as globs. A * matches any run of characters within a name, so fs_* is the fs family and *_* is every namespaced tool. A tool that matches none of them is not published to the Process and calling it is not-permitted.",
-          "items": { "type": "string", "pattern": "^[A-Za-z0-9_*-]+$", "maxLength": 63 },
+          "description": "Surface tool names this Package may call, as globs, plus the reserved word packages. A * matches any run of characters within a name, so fs_* is the fs family; a glob matches whatever it matches, built in tools included, because writing one is declaring them. The word packages stands for every tool the owner's running Processes publish and for no built in, which is what a kit that composes other kits needs. A tool that matches nothing here is not published to the Process and calling it is not-permitted.",
+          "items": { "type": "string", "pattern": "^(packages|[A-Za-z0-9_*-]+)$", "maxLength": 63 },
           "maxItems": 64,
           "uniqueItems": true
         },

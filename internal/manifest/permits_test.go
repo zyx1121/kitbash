@@ -27,7 +27,7 @@ func TestPermitsMatchTools(t *testing.T) {
 		{"", false},
 	}
 	for _, c := range cases {
-		if got := permits.Match(c.tool); got != c.want {
+		if got := permits.Match(c.tool, nil); got != c.want {
 			t.Errorf("Match(%q) = %v, want %v", c.tool, got, c.want)
 		}
 	}
@@ -35,7 +35,7 @@ func TestPermitsMatchTools(t *testing.T) {
 	// The zero block is the empty surface every Process starts from.
 	var none manifest.Permits
 	for _, tool := range []string{"fs_read", "proc_list", "anything"} {
-		if none.Match(tool) {
+		if none.Match(tool, nil) {
 			t.Errorf("a Package that declares no permits matched %q", tool)
 		}
 	}
@@ -43,8 +43,65 @@ func TestPermitsMatchTools(t *testing.T) {
 	// A * on its own is every tool, which is what an owner's own kit declares
 	// when it means the whole surface.
 	all := manifest.Permits{Tools: []string{"*"}}
-	if !all.Match("users_remove") {
+	if !all.Match("users_remove", nil) {
 		t.Error(`the glob "*" matched no tool`)
+	}
+}
+
+// packageTools is the predicate the surface hands Match: on a real session it
+// is the bridge, which published the tools of the owner's Processes.
+func packageTools(names ...string) manifest.PackageTool {
+	held := map[string]bool{}
+	for _, name := range names {
+		held[name] = true
+	}
+	return func(name string) bool { return held[name] }
+}
+
+// TestPermitsPackagesIsTheOtherKitsAndNoBuiltIn is the reserved word: a kit
+// that composes other kits says packages and gets exactly their tools. The
+// glob that looks like it would say the same, *_*, says every built in too,
+// which is the reason the word exists.
+func TestPermitsPackagesIsTheOtherKitsAndNoBuiltIn(t *testing.T) {
+	permits := manifest.Permits{Tools: []string{"fs_read", "fs_list", manifest.PermitPackages}}
+	running := packageTools("echo_echo", "ffmpeg_transcode")
+
+	for _, tool := range []string{"echo_echo", "ffmpeg_transcode", "fs_read", "fs_list"} {
+		if !permits.Match(tool, running) {
+			t.Errorf("Match(%q) is false, want the declared tools and the Package tools", tool)
+		}
+	}
+	for _, tool := range []string{"fs_write", "users_remove", "approvals_approve", "proc_run", "tel_query"} {
+		if permits.Match(tool, running) {
+			t.Errorf("Match(%q) is true; packages must admit no built in", tool)
+		}
+	}
+	// A Package tool of a Process that is not running is not on the surface
+	// and is not admitted either.
+	if permits.Match("ffmpeg_probe", running) {
+		t.Error("packages admitted a tool no running Process publishes")
+	}
+	// Without the predicate there are no Package tools, so the word admits
+	// nothing and the two named tools are all that is left.
+	if permits.Match("echo_echo", nil) {
+		t.Error("packages admitted a tool with no predicate to ask")
+	}
+	if !permits.Match("fs_read", nil) {
+		t.Error("a literal name stopped matching when the predicate was absent")
+	}
+
+	// A glob is still a glob: an author who writes one has declared what it
+	// matches, built ins included.
+	wide := manifest.Permits{Tools: []string{"*_*"}}
+	if !wide.Match("fs_write", running) || !wide.Match("echo_echo", running) {
+		t.Error(`the glob "*_*" stopped matching what it says`)
+	}
+	// And the word is not a name: nothing is called packages.
+	if !permits.Match("packages", packageTools("packages")) {
+		t.Error("a Package tool named packages was refused by the predicate")
+	}
+	if permits.Match("packages", running) {
+		t.Error("the reserved word matched itself as a literal tool name")
 	}
 }
 
@@ -105,7 +162,7 @@ func TestPermitsRefuseGlobsTheyCannotHonour(t *testing.T) {
 			t.Errorf("Validate said %q, which does not name %s", err, want)
 		}
 	}
-	if bad.Match("fs read") || bad.Match("fs/read") {
+	if bad.Match("fs read", nil) || bad.Match("fs/read", nil) {
 		t.Error("a tool glob that does not validate still matched")
 	}
 	if bad.AnyPath() || bad.Allows("/home/alice") || bad.Allows("/org/secrets") {
@@ -130,10 +187,10 @@ provides:
 	if err := permits.Validate(); err != nil {
 		t.Fatalf("Validate: %v", err)
 	}
-	if !permits.Match("fs_read") || !permits.Match("ffmpeg_transcode") {
+	if !permits.Match("fs_read", nil) || !permits.Match("ffmpeg_transcode", nil) {
 		t.Errorf("permits.tools = %v, which does not carry the declared globs", permits.Tools)
 	}
-	if permits.Match("nounderscore") {
+	if permits.Match("nounderscore", nil) {
 		t.Error("a tool matching no glob was permitted")
 	}
 	if !permits.Allows("/org/flows/nightly.yaml") || !permits.Allows("/home/tester/notes") {
@@ -150,7 +207,7 @@ description: How this organization works. Read before writing anything into /org
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	if got := plain.Permits(); got.Match("fs_read") || got.AnyPath() {
+	if got := plain.Permits(); got.Match("fs_read", nil) || got.AnyPath() {
 		t.Errorf("a manifest with no permits block answered %+v", got)
 	}
 }
@@ -200,7 +257,7 @@ func TestPermitsJSONRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParsePermits of an empty object: %v", err)
 	}
-	if empty.Match("fs_read") || empty.AnyPath() {
+	if empty.Match("fs_read", nil) || empty.AnyPath() {
 		t.Errorf("the empty block permitted something: %+v", empty)
 	}
 	if _, err := manifest.ParsePermits(nil); err != nil {

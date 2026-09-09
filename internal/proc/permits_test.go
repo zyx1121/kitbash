@@ -67,7 +67,7 @@ func TestRunRegistersNoPermitsWhenTheManifestDeclaresNone(t *testing.T) {
 	if len(permits.Tools) != 0 || len(permits.Paths) != 0 {
 		t.Errorf("permits = %+v, want an empty block", permits)
 	}
-	if permits.Match("fs_read") || permits.AnyPath() {
+	if permits.Match("fs_read", nil) || permits.AnyPath() {
 		t.Error("the empty block permitted something")
 	}
 }

@@ -78,7 +78,7 @@ func TestMCPSessionCarriesThePermitsOfTheProcess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the child could not read the block: %v", err)
 	}
-	if !permits.Match("fs_read") || !permits.Allows("/home/tester/flows") || permits.Match("nounderscore") {
+	if !permits.Match("fs_read", nil) || !permits.Allows("/home/tester/flows") || permits.Match("nounderscore", nil) {
 		t.Errorf("the child was given %+v", permits)
 	}
 }

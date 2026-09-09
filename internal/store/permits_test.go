@@ -50,7 +50,7 @@ func TestProcessKeepsThePermitsItWasRegisteredWith(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Processes: %v", err)
 	}
-	if len(listed) != 1 || !listed[0].Permits.Match("fs_read") || !listed[0].Permits.Allows("/org/flows") {
+	if len(listed) != 1 || !listed[0].Permits.Match("fs_read", nil) || !listed[0].Permits.Allows("/org/flows") {
 		t.Errorf("the listing carries %+v, want the registered block", listed)
 	}
 
@@ -74,7 +74,7 @@ func TestProcessKeepsThePermitsItWasRegisteredWith(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("Process: %v, found %v", err, found)
 	}
-	if after.Permits.Match("fs_read") || after.Permits.AnyPath() {
+	if after.Permits.Match("fs_read", nil) || after.Permits.AnyPath() {
 		t.Errorf("the replaced registration kept %+v", after.Permits)
 	}
 }
@@ -132,7 +132,7 @@ func TestARegistrationWrittenBeforePermitsExistedPermitsNothing(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("Process: %v, found %v", err, found)
 	}
-	if got.Permits.Match("fs_read") || got.Permits.AnyPath() {
+	if got.Permits.Match("fs_read", nil) || got.Permits.AnyPath() {
 		t.Errorf("a legacy registration permitted %+v", got.Permits)
 	}
 }

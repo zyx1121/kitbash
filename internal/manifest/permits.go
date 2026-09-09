@@ -26,6 +26,27 @@ const (
 // one is not a way to narrow, or to widen, that session.
 const EnvPermits = "KITBASH_PERMITS"
 
+// PermitPackages is the one reserved word of permits.tools. It stands for
+// every tool the owner's running Processes publish, the <package>_<tool>
+// names the bridge puts on the surface, and for no built in family tool ever.
+//
+// It exists because the glob that would otherwise say "the tools of my
+// neighbours", *_*, says rather more than that: every built in name carries an
+// underscore too, so a kit asking to call other kits would be asking for
+// fs_write and users_remove as well. A glob still matches whatever it matches,
+// built ins included: a Package that writes fs_* has declared the fs family and
+// is read as having meant it.
+//
+// It is a word and not a name: no tool is called packages, because a built in
+// is <family>_<verb> and a Package tool is <package>_<tool>.
+const PermitPackages = "packages"
+
+// PackageTool reports whether one surface name is a tool of a running Process
+// rather than a built in. The surface supplies it from the bridge, which is
+// what published those names; a nil one is a session with no Processes on it,
+// where PermitPackages admits nothing.
+type PackageTool func(name string) bool
+
 // Permits is provides.permits: what a Process of this Package may call over
 // /mcp, see PLAN.md section 2.3. It is a declaration and not a filter on top
 // of a surface the Process would otherwise have: a Process whose Package
@@ -33,9 +54,9 @@ const EnvPermits = "KITBASH_PERMITS"
 // nothing.
 //
 // Tools are surface names as tools/list publishes them, with * standing for
-// any run of characters inside one name. Paths are absolute Files prefixes,
-// each of which covers the path itself and everything below it, with * as one
-// whole component.
+// any run of characters inside one name, plus the reserved word packages.
+// Paths are absolute Files prefixes, each of which covers the path itself and
+// everything below it, with * as one whole component.
 type Permits struct {
 	Tools []string `json:"tools,omitempty"`
 	Paths []string `json:"paths,omitempty"`
@@ -150,11 +171,23 @@ func (p Permits) Validate() error {
 // Match reports whether one surface tool name is permitted. A Package that
 // declares no tools matches none, which is the empty surface of PLAN.md
 // section 2.3.
-func (p Permits) Match(tool string) bool {
+//
+// isPackage says which names belong to the owner's running Processes, which is
+// what the reserved word packages admits and what no glob has to know about.
+// It may be nil, and then packages admits nothing.
+func (p Permits) Match(tool string, isPackage PackageTool) bool {
 	if tool == "" {
 		return false
 	}
 	for _, glob := range p.Tools {
+		if glob == PermitPackages {
+			// The word never matches a literal name, so a built in cannot be
+			// let in by it however it is spelled.
+			if isPackage != nil && isPackage(tool) {
+				return true
+			}
+			continue
+		}
 		if !validToolGlob(glob) {
 			// A glob this build cannot read permits nothing. Honouring it as
 			// a literal would turn a typo into a rule nobody wrote.
