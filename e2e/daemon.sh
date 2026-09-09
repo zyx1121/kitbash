@@ -60,6 +60,15 @@ case "${1:?usage: daemon.sh start <binary> <store> <log> | stop}" in
       kill -9 "$pid" 2>/dev/null || true
     fi
     rm -f "$pidfile" "$socket"
+    # A stop that left something answering on the socket is a stop that did
+    # not happen, and the next start would open its store under a daemon that
+    # still holds it. The health path is the same one the service script's
+    # healthcheck uses.
+    if health >/dev/null 2>&1; then
+      log "something is still answering on $socket after the stop"
+      exit 1
+    fi
+    log "nothing answers on $socket"
     ;;
   *)
     echo "usage: daemon.sh start <binary> <store> <log> | stop" >&2

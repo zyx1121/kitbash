@@ -1,6 +1,11 @@
 # echo: a stdio MCP server. kitbash runs it as PID 1 with stdin held open and
 # execs one more instance of this entrypoint for every MCP session.
-FROM docker.io/library/node:22-alpine
+#
+# The base is pinned by digest. A tag is a moving target, and a job that fails
+# because the registry moved node:22-alpine under it is a job nobody trusts;
+# the workflow pulls this digest before the surface test so the build itself
+# never waits on the network.
+FROM docker.io/library/node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32
 
 WORKDIR /app
 

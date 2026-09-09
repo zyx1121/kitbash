@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -38,6 +39,11 @@ const upgradePackage = "upgrade"
 // upgraded from. It runs against that release's binaries and its daemon.
 func TestUpgradePreviousRelease(t *testing.T) {
 	requireHost(t)
+	// The release under test is the one the job installed, daemon and session
+	// binary alike. Without this the whole half could run twice against the
+	// same build and still pass.
+	theRelease(t)
+
 	admin := dial(t, adminName())
 	pkgPath := "/home/" + adminName() + "/" + upgradePackage
 
@@ -96,18 +102,11 @@ func TestUpgradeCurrentRelease(t *testing.T) {
 	requireHost(t)
 	want := readState(t)
 
-	// 1. The daemon answers on the store the previous release wrote.
-	var health struct {
-		Version string `json:"version"`
-		Store   string `json:"store"`
+	// 1. This release answers on the store the previous release wrote.
+	answer := theRelease(t)
+	if store := os.Getenv(storeEnv); store != "" && answer.Store != store {
+		t.Fatalf("the daemon answers for the store %s, want %s", answer.Store, store)
 	}
-	if err := json.Unmarshal(daemonHealth(t), &health); err != nil {
-		t.Fatalf("decoding the health of the daemon: %v", err)
-	}
-	if store := os.Getenv(storeEnv); store != "" && health.Store != store {
-		t.Fatalf("the daemon answers for the store %s, want %s", health.Store, store)
-	}
-	t.Logf("the current daemon is %s on %s", health.Version, health.Store)
 
 	// 2. The registration the previous release wrote is still a Process.
 	admin := dial(t, adminName())
@@ -155,6 +154,47 @@ func TestUpgradeCurrentRelease(t *testing.T) {
 		t.Fatalf("proc_run answered %+v after the upgrade, want a running Process", restarted)
 	}
 	admin.close()
+}
+
+// health is what the health path answers, as far as these tests read it.
+type health struct {
+	Version string `json:"version"`
+	Store   string `json:"store"`
+}
+
+// theRelease requires the daemon on the socket and the kitbash-mcp a session
+// runs to be the release this step installed, which KITBASH_E2E_VERSION names.
+// The upgrade half is two halves of the same job on one host: if either binary
+// were the other release, both halves would pass and prove nothing.
+func theRelease(t *testing.T) health {
+	t.Helper()
+	want := os.Getenv(versionEnv)
+	if want == "" {
+		t.Fatalf("%s does not name the release this step installed", versionEnv)
+	}
+	var answer health
+	if err := json.Unmarshal(daemonHealth(t), &answer); err != nil {
+		t.Fatalf("decoding the health of the daemon: %v", err)
+	}
+	if answer.Version != want {
+		t.Fatalf("the daemon on %s is %s, want %s", socketPath, answer.Version, want)
+	}
+	out, err := runAs(t, adminName(), mcpBinary(), "--version")
+	if err != nil {
+		t.Fatalf("asking %s its version: %v\n%s", mcpBinary(), err, out)
+	}
+	if got := lastLine(out); got != want {
+		t.Fatalf("%s is %s, want %s", mcpBinary(), got, want)
+	}
+	t.Logf("the daemon and %s are both %s, on %s", mcpBinary(), want, answer.Store)
+	return answer
+}
+
+// lastLine is the answer a command printed, after whatever the job's own sudo
+// and cgroup placement said before it.
+func lastLine(out string) string {
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	return strings.TrimSpace(lines[len(lines)-1])
 }
 
 func statePath(t *testing.T) string {

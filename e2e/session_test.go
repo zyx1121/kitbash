@@ -24,8 +24,14 @@ const (
 	memberEnv  = "KITBASH_E2E_MEMBER"
 	secondEnv  = "KITBASH_E2E_SECOND" // the member users_create adds
 	keyEnv     = "KITBASH_E2E_SSH_KEY"
-	logDirEnv  = "KITBASH_E2E_LOGS" // where session stderr is kept for the artifact
+	logDirEnv  = "KITBASH_E2E_LOGS"    // where session stderr is kept for the artifact
+	versionEnv = "KITBASH_E2E_VERSION" // the version the binaries of this step were built as
 	socketPath = "/run/kitbash/kitbashd.sock"
+
+	// noCgroupsEnv is for a host with no cgroup v2 to delegate, where a Process
+	// runs unplaced and its limits are recorded and not enforced. Everywhere
+	// else a missing ceiling is a failure.
+	noCgroupsEnv = "KITBASH_E2E_NO_CGROUPS"
 )
 
 // How long one call may take. A build pulls a base image the first time, so it

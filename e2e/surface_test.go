@@ -6,15 +6,25 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 )
 
-// builtInTools is the whole built in surface: 4 fs, 4 pkg, 4 proc, 2 tel,
-// 5 users and 3 approvals, the number the README's verify step counts.
-const builtInTools = 22
+// builtIn is the whole built in surface, named rather than counted: 4 fs,
+// 4 pkg, 4 proc, 2 tel, 5 users and 3 approvals, the 22 the README's verify
+// step counts and the families of spec/mcp-surface.yaml one for one. A tool
+// that is renamed is a client that breaks, so the names are the assertion.
+var builtIn = []string{
+	"approvals_approve", "approvals_list", "approvals_reject",
+	"fs_history", "fs_list", "fs_read", "fs_write",
+	"pkg_build", "pkg_import", "pkg_inspect", "pkg_list",
+	"proc_list", "proc_logs", "proc_run", "proc_stop",
+	"tel_query", "tel_retention",
+	"users_add_key", "users_create", "users_list", "users_me", "users_remove",
+}
 
 // The Package this job writes, builds and runs. The folder is the admin's own,
 // the manifest is fixtures/echo, and the container name is the one proc_run
@@ -62,6 +72,7 @@ func TestSurface(t *testing.T) {
 		name string
 		run  func(*testing.T, *state)
 	}{
+		{"the host runs the release the job built", theHostsRelease},
 		{"the admin is served the built in surface", theBuiltInSurface},
 		{"fs_write writes the echo Package", writeThePackage},
 		{"a schema violation is a bad request", schemaViolation},
@@ -84,12 +95,20 @@ func TestSurface(t *testing.T) {
 	}
 }
 
+// theHostsRelease is the first step because everything after it is about a
+// build: the daemon on the socket and the kitbash-mcp a session runs are the
+// binaries this job built, not whatever was on the host before.
+func theHostsRelease(t *testing.T, _ *state) {
+	theRelease(t)
+}
+
 func theBuiltInSurface(t *testing.T, s *state) {
 	s.admin = dial(t, adminName())
 	names := s.admin.tools()
-	if len(names) != builtInTools {
-		t.Fatalf("the admin was served %d tools, want %d: %s",
-			len(names), builtInTools, strings.Join(names, " "))
+	sort.Strings(names)
+	if strings.Join(names, " ") != strings.Join(builtIn, " ") {
+		t.Fatalf("the admin was served %d tools:\n%s\nwant %d:\n%s",
+			len(names), strings.Join(names, " "), len(builtIn), strings.Join(builtIn, " "))
 	}
 	var me struct {
 		User  string `json:"user"`
@@ -184,9 +203,12 @@ func runThePackage(t *testing.T, s *state) {
 	// The Package's tool joins the session that started it, and answering it
 	// is a podman exec into the container that is now running.
 	names := s.admin.tools()
-	if len(names) != builtInTools+1 {
-		t.Fatalf("the surface is %d tools after proc_run, want %d: %s",
-			len(names), builtInTools+1, strings.Join(names, " "))
+	sort.Strings(names)
+	want := append(append([]string{}, builtIn...), echoTool)
+	sort.Strings(want)
+	if strings.Join(names, " ") != strings.Join(want, " ") {
+		t.Fatalf("the surface after proc_run is\n%s\nwant the built ins and %s",
+			strings.Join(names, " "), echoTool)
 	}
 	var echoed struct {
 		Text string `json:"text"`
@@ -201,16 +223,23 @@ func runThePackage(t *testing.T, s *state) {
 // manifest asks for 256Mi and a member cannot write that file, which is what
 // makes the limit an enforcement rather than a record.
 //
-// A host that could not build the cgroup tree runs its Processes unplaced and
-// says so in the daemon log. That is a host without delegation, not a broken
-// one, so it is reported here rather than failed.
+// A host that cannot delegate runs its Processes unplaced, which is a host
+// worth running the rest of this on and not one this job accepts by default:
+// the runner has cgroup v2 and kitbashd runs as root there, so a missing
+// ceiling is a regression. KITBASH_E2E_NO_CGROUPS is for the host that really
+// has none, and it says so here rather than passing quietly.
 func theCeiling(t *testing.T, id string) {
 	const want = 256 * 1024 * 1024
 	path := filepath.Join("/sys/fs/cgroup/kitbash", adminName(), id, "memory.max")
 	out, err := exec.Command("sudo", "-n", "cat", path).Output()
 	if err != nil {
-		t.Logf("this host placed no ceiling at %s, so its limits are recorded and not enforced: %v", path, err)
-		return
+		if os.Getenv(noCgroupsEnv) != "" {
+			t.Logf("%s is set and this host placed no ceiling at %s, so its limits are recorded and not enforced: %v",
+				noCgroupsEnv, path, err)
+			return
+		}
+		t.Fatalf("no ceiling at %s: kitbashd placed this Process nowhere, and the daemon log says why. "+
+			"Set %s if this host really has no cgroup v2 to delegate: %v", path, noCgroupsEnv, err)
 	}
 	got := strings.TrimSpace(string(out))
 	if got != strconv.Itoa(want) {
@@ -277,6 +306,32 @@ func anotherHome(t *testing.T, s *state) {
 	s.member = dial(t, memberName())
 	res := s.member.call("fs_list", map[string]any{"path": filepath.Join("/home", adminName())})
 	res.mustProblem(t, "fs_list", "invalid-path")
+
+	// Nor does the member see what the admin is running. proc_list is the
+	// caller's own Processes, and this member has none.
+	var mine struct {
+		Processes []struct {
+			ID      string `json:"id"`
+			Package string `json:"package"`
+		} `json:"processes"`
+	}
+	s.member.ok("proc_list", map[string]any{}, &mine)
+	for _, process := range mine.Processes {
+		if process.ID == s.processID || strings.HasPrefix(process.Package, "/home/"+adminName()) {
+			t.Fatalf("proc_list answered %s the admin's Process %+v", memberName(), process)
+		}
+	}
+	if len(mine.Processes) != 0 {
+		t.Fatalf("proc_list answered %s %d Processes, want none", memberName(), len(mine.Processes))
+	}
+
+	// The surface a member is served is the built ins alone: the admin's
+	// Package publishes its tool to the admin.
+	names := s.member.tools()
+	sort.Strings(names)
+	if strings.Join(names, " ") != strings.Join(builtIn, " ") {
+		t.Fatalf("%s was served\n%s\nwant the built ins alone", memberName(), strings.Join(names, " "))
+	}
 }
 
 func queuedWrite(t *testing.T, s *state) {
@@ -377,6 +432,13 @@ func queryTelemetry(t *testing.T, s *state) {
 		if record.Attributes.User != adminName() {
 			t.Fatalf("a span of %s is attributed to %s", echoTool, record.Attributes.User)
 		}
+		if record.Attributes.Tool != echoTool {
+			t.Fatalf("a span answered for tool %s carries kitbash.tool %q",
+				echoTool, record.Attributes.Tool)
+		}
+		if record.Name != echoTool {
+			t.Fatalf("a span of %s is named %q", echoTool, record.Name)
+		}
 	}
 
 	var logs struct {
@@ -397,8 +459,13 @@ func queryTelemetry(t *testing.T, s *state) {
 	if len(logs.Records) == 0 {
 		t.Fatalf("tel_query answered no pkg_build log record")
 	}
-	if logs.Records[0].Body == "" {
-		t.Fatalf("the pkg_build log record carries no body: %+v", logs.Records[0])
+	build := logs.Records[0]
+	if build.Body == "" {
+		t.Fatalf("the pkg_build log record carries no body: %+v", build)
+	}
+	if build.Attributes.Tool != "pkg_build" || build.Attributes.Package != s.pkgPath {
+		t.Fatalf("the build log record carries tool %q and package %q, want pkg_build and %s",
+			build.Attributes.Tool, build.Attributes.Package, s.pkgPath)
 	}
 	t.Logf("tel_query answered %d spans and %d log records", len(traces.Records), len(logs.Records))
 }

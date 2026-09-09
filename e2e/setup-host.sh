@@ -38,6 +38,9 @@ for pair in "newuidmap uidmap" "fuse-overlayfs fuse-overlayfs" "crun crun" "curl
 done
 if [ -n "$missing" ]; then
   log "installing$missing"
+  # The runner's package lists are as old as its image, so a version that has
+  # been superseded since is a 404 rather than an install.
+  DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null
   # shellcheck disable=SC2086
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $missing >/dev/null
 fi
