@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/zyx1121/kitbash/internal/problem"
 )
@@ -20,6 +21,16 @@ const (
 	startAction  = "start"
 	stopAction   = "stop"
 	removeAction = "remove"
+)
+
+// What one action is given to come back. kitbashd is not answering out of its
+// own store here: it is waiting for podman to create a container, or to let a
+// PID 1 that ignores SIGTERM run out its whole stop grace. Both are wider than
+// the budget the daemon gives the child, so the answer arrives rather than the
+// deadline, see internal/sysusers.
+const (
+	startTimeout  = 150 * time.Second
+	actionTimeout = 60 * time.Second
 )
 
 // StartOptions is the command line the session would have run, as
@@ -99,7 +110,10 @@ func (c *Client) action(ctx context.Context, id, action string, body []byte) (st
 	if id == "" {
 		return startResponse{}, problem.Internal(id, "no Process id was given to "+action, "")
 	}
-	status, payload, prob := c.send(ctx, http.MethodPost, ProcessesPath+"/"+id+"/"+action, body, id)
+	ctx, cancel := context.WithTimeout(ctx, budgetOf(action))
+	defer cancel()
+	status, payload, prob := c.sendWith(ctx, c.supervisor,
+		http.MethodPost, ProcessesPath+"/"+id+"/"+action, body, id)
 	if prob != nil {
 		return startResponse{}, prob
 	}
@@ -112,6 +126,14 @@ func (c *Client) action(ctx context.Context, id, action string, body []byte) (st
 			fmt.Sprintf("%s answered %s with a body that is not a Process: %v", ProcessesPath, action, err), "")
 	}
 	return answer, nil
+}
+
+// budgetOf is how long one action may take.
+func budgetOf(action string) time.Duration {
+	if action == startAction {
+		return startTimeout
+	}
+	return actionTimeout
 }
 
 // encode renders one request body.

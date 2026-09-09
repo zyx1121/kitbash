@@ -288,6 +288,44 @@ func TestStartMapsAUsageFailureOntoTheUnit(t *testing.T) {
 	}
 }
 
+// The bug the first host run found: podman is given ten seconds to let a
+// container exit on its own, and a PID 1 that ignores SIGTERM takes every one
+// of them, so a child killed after five seconds is a container left half down.
+// The budget the runner gives the child has to be wider than the grace the
+// daemon asks for.
+func TestTheStopBudgetIsWiderThanTheGraceItAsksFor(t *testing.T) {
+	if sysusers.StopBudget <= StopTimeout*time.Second {
+		t.Errorf("a stop is given %s and the container %d seconds to exit; the child would be killed mid stop",
+			sysusers.StopBudget, StopTimeout)
+	}
+	// And the response outlives the work, or the caller is told nothing while
+	// the daemon is still doing it.
+	if ActionDeadline <= sysusers.StopBudget || StartDeadline <= sysusers.RunTimeout {
+		t.Errorf("the response deadlines (%s, %s) are not wider than the runtime budgets (%s, %s)",
+			ActionDeadline, StartDeadline, sysusers.StopBudget, sysusers.RunTimeout)
+	}
+}
+
+// A runtime that was still working when its budget ran out is not a Package
+// that is wrong: the answer says so, and says what to do next.
+func TestARuntimeThatRanOutOfTimeSaysSo(t *testing.T) {
+	h, fake := supervised(t)
+	fake.StopErr = fmt.Errorf("%w: podman stop as loki after 40s", sysusers.ErrTimeout)
+	id := h.supervise(h.user, "kitbash-echo-echo")
+
+	res, body := h.postJSON(http.MethodPost, processesPath+"/"+id+"/stop", nil)
+	if res.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("stop = %d %s, want 500", res.StatusCode, body)
+	}
+	prob := h.problemOf(res, body)
+	if prob.Detail != "the container runtime did not answer in time" {
+		t.Errorf("detail is %q, want the runtime's silence named", prob.Detail)
+	}
+	if !strings.Contains(prob.Fix, "proc_list") {
+		t.Errorf("fix is %q, want it to say how to find out what state the Process is in", prob.Fix)
+	}
+}
+
 // An image the member does not have is a Package that was never built here.
 func TestStartWithoutTheImageIsNotFound(t *testing.T) {
 	h, fake := supervised(t)

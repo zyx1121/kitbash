@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/zyx1121/kitbash/internal/cgroups"
 	"github.com/zyx1121/kitbash/internal/podman"
@@ -158,6 +159,11 @@ func (s *Server) processAction(w http.ResponseWriter, r *http.Request, id, actio
 		writeProblem(w, prob)
 		return
 	}
+	deadline := ActionDeadline
+	if action == actionStart {
+		deadline = StartDeadline
+	}
+	extendResponse(w, deadline)
 	switch action {
 	case actionStart:
 		s.startProcess(w, r, p, m)
@@ -283,6 +289,26 @@ func (s *Server) removeProcess(w http.ResponseWriter, r *http.Request, p store.P
 // seconds spec/mcp-surface.yaml publishes for proc_stop.
 const StopTimeout = 10
 
+// The response deadline one action gets. A container start is minutes of work
+// in the worst case and a stop waits out the whole grace of a PID 1 that
+// ignores SIGTERM, so the write timeout every other path serves under is
+// extended for these three. Both are wider than the budget the runner gives
+// the child, so the daemon answers before the deadline rather than at it.
+const (
+	StartDeadline  = 180 * time.Second
+	ActionDeadline = 90 * time.Second
+)
+
+// extendResponse gives one response longer than the write timeout the daemon
+// serves every other path under. A server that cannot extend it is not a
+// reason to refuse the call: the work still happens and the answer is late,
+// which is said in the log rather than to the caller.
+func extendResponse(w http.ResponseWriter, deadline time.Duration) {
+	if err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(deadline)); err != nil {
+		logger.Printf("processes: the response deadline could not be extended to %s: %v", deadline, err)
+	}
+}
+
 // runProblem turns a runtime failure into the answer the agent reads. The
 // runtime's own output is in the error and goes to the daemon log only: it
 // carries host paths, and on a run it names the environment file.
@@ -297,6 +323,15 @@ func (s *Server) runProblem(r *http.Request, err error, p store.Process, opts po
 		return problem.NotFoundFix(r.URL.Path,
 			fmt.Sprintf("%s has no container %s", p.Owner, p.Container),
 			"Call proc_run to start this Process again.")
+	case errors.Is(err, sysusers.ErrTimeout):
+		// The runtime was still working when its budget ran out, so what
+		// happened to the container is not known here. Saying so is the whole
+		// answer: nothing about the Package is wrong and running it again is
+		// safe, which is the invariant of PLAN.md 2.6.
+		return problem.InternalDetail(r.URL.Path,
+			fmt.Sprintf("%s of %s: %v", p.Container, p.Owner, err),
+			"the container runtime did not answer in time",
+			"Call proc_list to see what state the Process is in, then run or stop it again.")
 	case errors.Is(err, sysusers.ErrUsage):
 		// Exit 125 is podman refusing to parse the command at all, and every
 		// part of it that a caller chose comes from the unit.

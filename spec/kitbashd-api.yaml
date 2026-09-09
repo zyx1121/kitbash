@@ -284,6 +284,15 @@ api:
       A host whose cgroup filesystem is not version 2 or not writable runs the
       Process without placing it, records the limits, and says so once in the
       daemon log.
+    timeouts: >
+      The runtime gets 120 s for a run and 40 s for a stop or a forced removal,
+      which is the ten second grace the container is given plus room to kill it
+      and tear it down: a budget shorter than the grace kills the child in the
+      middle of the stop. The response deadline is extended to 180 s and 90 s
+      so the answer arrives rather than the deadline. A caller that hangs up
+      does not cancel the child: a stop that has begun finishes. A runtime that
+      is still working when its budget runs out is internal with the detail
+      "the container runtime did not answer in time".
     limits: >
       pidsLimit is 1 to 4096 and defaults to 512, at most 8 published ports, 64
       environment variables of at most 4096 bytes each and no line breaks in
@@ -438,7 +447,10 @@ restore:
   cgroups: >
     The child that runs podman start is placed in the owner's leaf, the same
     way processes_start places one. A container keeps the cgroup parent it was
-    created with, so a restored Process holds the limits it was started with.
+    created with, so a restored Process holds the limits it was started with,
+    and one created before kitbashd supervised Processes keeps its empty parent
+    however often it is restored: it gains limits when the Process is run
+    again, which creates the container.
 
 backup:
   description: >

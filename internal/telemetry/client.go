@@ -36,6 +36,9 @@ const maxResponseBytes = 4 << 20
 type Client struct {
 	socket string
 	http   *http.Client
+	// supervisor is the same socket with a longer patience, for the three
+	// calls that make kitbashd run the container runtime, see run.go.
+	supervisor *http.Client
 
 	// The one identity question the session asks, users_me, and whether it
 	// has been answered. Admin holds them, see users.go.
@@ -49,7 +52,11 @@ func NewClient(socket string) *Client {
 	if socket == "" {
 		socket = SocketPath()
 	}
-	return &Client{socket: socket, http: socketClient(socket)}
+	return &Client{
+		socket:     socket,
+		http:       socketClient(socket),
+		supervisor: socketClientWith(socket, supervisorTimeout),
+	}
 }
 
 // Query forwards a tel_query input verbatim and returns kitbashd's body
@@ -131,6 +138,12 @@ func (c *Client) do(ctx context.Context, method, path string, body json.RawMessa
 // means is the caller's to decide, because a 404 refuses a query and closes a
 // Process unregistration.
 func (c *Client) send(ctx context.Context, method, path string, body []byte, instance string) (int, []byte, *problem.Problem) {
+	return c.sendWith(ctx, c.http, method, path, body, instance)
+}
+
+// sendWith is send over one of this client's two HTTP clients, which differ
+// only in how long they wait.
+func (c *Client) sendWith(ctx context.Context, client *http.Client, method, path string, body []byte, instance string) (int, []byte, *problem.Problem) {
 	var reader io.Reader
 	if body != nil {
 		reader = bytes.NewReader(body)
@@ -144,7 +157,7 @@ func (c *Client) send(ctx context.Context, method, path string, body []byte, ins
 	}
 	req.Header.Set("Accept", "application/json")
 
-	res, err := c.http.Do(req)
+	res, err := client.Do(req)
 	if err != nil {
 		// A socket that is absent or refuses is the same story to the agent:
 		// this host has no Telemetry right now and only an operator can

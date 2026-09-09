@@ -142,4 +142,18 @@ func TestTheRealTreeOnAWritableCgroupV2Mount(t *testing.T) {
 	if !ownedBy(info, os.Getuid()) {
 		t.Error("the subtree was not given to the member")
 	}
+	// The member's own cgroup carries no limit: a limit here would be a cap on
+	// everything they run at once, which is not what a manifest declares. The
+	// limits are the container's, and podman writes them into the container's
+	// own cgroup under this one.
+	for _, file := range []string{"memory.max", "pids.max"} {
+		limit, err := os.ReadFile(filepath.Join(cgroups.MemberDir(root, name), file))
+		if err != nil {
+			continue
+		}
+		if strings.TrimSpace(string(limit)) != "max" {
+			t.Errorf("%s of the member's cgroup is %q, want max: only containers are limited",
+				file, strings.TrimSpace(string(limit)))
+		}
+	}
 }

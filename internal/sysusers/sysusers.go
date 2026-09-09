@@ -48,6 +48,11 @@ var (
 	// exit 125: the options of the unit are wrong, and the member is the one
 	// who can change them.
 	ErrUsage = errors.New("sysusers: the container runtime refused the options")
+	// ErrTimeout reports a runtime that was still working when its budget ran
+	// out. It is not a failure of the Package: stopping a container that
+	// ignores SIGTERM takes the whole grace, and a host under load takes
+	// longer still.
+	ErrTimeout = errors.New("sysusers: the container runtime did not answer in time")
 	// ErrHomeShape reports a home that is not the shape kitbashd writes into:
 	// a .ssh that is a link or belongs to somebody else, an authorized_keys
 	// that is not a regular file the member owns. kitbashd is root and a

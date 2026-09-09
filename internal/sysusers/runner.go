@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/zyx1121/kitbash/internal/podman"
 )
@@ -22,9 +23,23 @@ import (
 // paths and the output of the host's own tools.
 var logger = log.New(os.Stderr, "kitbashd: ", log.LstdFlags)
 
-// ContainerTimeout bounds one podman call made as a member, which is what
-// spec/kitbashd-api.yaml gives restore per container.
+// ContainerTimeout bounds one podman call that only looks something up or
+// starts an existing container, which is what spec/kitbashd-api.yaml gives
+// restore per container.
 const ContainerTimeout = RemoveTimeout
+
+// RunTimeout is what one podman run gets. Creating a container is more work
+// than starting one, and the runtime may still have to unpack an image layer,
+// so it is the widest budget here.
+const RunTimeout = 120 * time.Second
+
+// StopBudget is what one podman stop or one forced removal gets. podman is
+// given StopGrace seconds to let the container exit on its own, and a PID 1
+// that ignores SIGTERM takes every one of them, so the child needs that grace
+// plus room to kill the container and tear it down. A budget shorter than the
+// grace kills the child in the middle of the stop, which is a container left
+// half down and a caller told nothing useful.
+const StopBudget = 40 * time.Second
 
 // usageExit is the status podman exits with when it will not run the command
 // at all: the options are wrong, or the image is not there. kitbashd checks
@@ -72,7 +87,7 @@ func (p *Podman) Run(ctx context.Context, m Member, opts podman.RunOptions, cgro
 	// Nothing of the environment is on this command line: the values are in
 	// the file opts.EnvFile names, which the daemon wrote 0600 for this
 	// member, see internal/daemon/run.go.
-	out, err := p.runIn(ctx, m, cgroup, podman.RunArgs(opts, nil)...)
+	out, err := p.runFor(ctx, m, cgroup, RunTimeout, podman.RunArgs(opts, nil)...)
 	if err != nil {
 		if exitCode(err, usageExit) {
 			return "", fmt.Errorf("%w: %v", ErrUsage, err)
@@ -109,7 +124,9 @@ func (p *Podman) Stop(ctx context.Context, m Member, container string, timeout i
 	if err := p.exists(ctx, m, container); err != nil {
 		return err
 	}
-	_, err := p.run(ctx, m, "stop", "--time", strconv.Itoa(timeout), container)
+	// The budget is the runtime's grace plus room to finish: the container is
+	// given timeout seconds to exit on its own and only then killed.
+	_, err := p.runFor(ctx, m, "", StopBudget, "stop", "--time", strconv.Itoa(timeout), container)
 	return err
 }
 
@@ -126,7 +143,9 @@ func (p *Podman) RemoveContainer(ctx context.Context, m Member, container string
 	if force {
 		args = append(args, "--force")
 	}
-	_, err := p.run(ctx, m, append(args, container)...)
+	// A forced removal stops the container first, on the same grace a stop
+	// gets, so it gets the same budget.
+	_, err := p.runFor(ctx, m, "", StopBudget, append(args, container)...)
 	return err
 }
 
@@ -283,7 +302,20 @@ func (p *Podman) run(ctx context.Context, m Member, args ...string) (string, err
 // where the daemon is: the host enforces no limits and the command is
 // otherwise the same one, see internal/cgroups.
 func (p *Podman) runIn(ctx context.Context, m Member, cgroup string, args ...string) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, ContainerTimeout)
+	return p.runFor(ctx, m, cgroup, ContainerTimeout, args...)
+}
+
+// runFor is runIn with the budget this command needs. A command that runs out
+// of it is ErrTimeout rather than a runtime failure: the runtime was working,
+// it did not finish, and only that distinction tells an operator whether to
+// look at the Package or at the host.
+//
+// The caller's cancellation does not reach the child. A podman stop that has
+// begun is tearing a container down, and a session that hung up, or a request
+// whose response deadline passed, must not leave one half stopped: the budget
+// is what bounds this, not the client.
+func (p *Podman) runFor(ctx context.Context, m Member, cgroup string, budget time.Duration, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), budget)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, p.binary(), args...)
@@ -309,6 +341,10 @@ func (p *Podman) runIn(ctx context.Context, m Member, cgroup string, args ...str
 		msg := strings.TrimSpace(stderr.String())
 		if msg == "" {
 			msg = strings.TrimSpace(stdout.String())
+		}
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return stdout.String(), fmt.Errorf("%w: %s %s as %s after %s: %s",
+				ErrTimeout, p.binary(), strings.Join(args, " "), m.Name, budget, msg)
 		}
 		return stdout.String(), fmt.Errorf("sysusers: %s %s as %s: %w: %s",
 			p.binary(), strings.Join(args, " "), m.Name, err, msg)
