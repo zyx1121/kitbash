@@ -450,9 +450,8 @@ func TestMigratedSchemaEqualsAFreshOne(t *testing.T) {
 			}
 
 			gotNames := masterNames(t, path)
-			if strings.Join(gotNames, "\n") != strings.Join(wantNames, "\n") {
-				t.Errorf("the migrated store holds\n%s\nand a fresh one holds\n%s",
-					strings.Join(gotNames, " "), strings.Join(wantNames, " "))
+			for _, line := range differences(gotNames, wantNames) {
+				t.Errorf("the schema of the migrated store differs: %s", line)
 			}
 			gotColumns := tableColumns(t, path, gotNames)
 			for table, want := range wantColumns {
@@ -461,9 +460,8 @@ func TestMigratedSchemaEqualsAFreshOne(t *testing.T) {
 					t.Errorf("the migrated store has no %s table", table)
 					continue
 				}
-				if strings.Join(got, "\n") != strings.Join(want, "\n") {
-					t.Errorf("%s in the migrated store is\n  %s\nand in a fresh one\n  %s",
-						table, strings.Join(got, " "), strings.Join(want, " "))
+				for _, line := range differences(got, want) {
+					t.Errorf("the %s table of the migrated store differs: %s", table, line)
 				}
 			}
 		})
@@ -523,21 +521,36 @@ func openRaw(t *testing.T, path string) *sql.DB {
 
 // masterNames is every table and index of a store, sorted, with the ones
 // SQLite creates for a primary key included: they are part of the shape.
+//
+// An index carries its definition and not only its name. CREATE INDEX IF NOT
+// EXISTS keeps the index an old store already has, so an index that is
+// redefined over other columns under the same name is never reapplied on an
+// upgrade, and a comparison of names alone would call that migrated store
+// equal to a fresh one. A table carries its name only: what a table is made of
+// is compared column by column below, and ALTER TABLE rewrites the statement
+// SQLite stored for it, so its text differs between the two by construction.
 func masterNames(t *testing.T, path string) []string {
 	t.Helper()
 	rows, err := openRaw(t, path).Query(
-		"SELECT type, name FROM sqlite_master WHERE type IN ('table','index') ORDER BY type, name")
+		"SELECT type, name, ifnull(sql, '') FROM sqlite_master WHERE type IN ('table','index') ORDER BY type, name")
 	if err != nil {
 		t.Fatalf("read the schema of %s: %v", path, err)
 	}
 	defer rows.Close()
 	var names []string
 	for rows.Next() {
-		var kind, name string
-		if err := rows.Scan(&kind, &name); err != nil {
+		var kind, name, statement string
+		if err := rows.Scan(&kind, &name, &statement); err != nil {
 			t.Fatalf("read the schema of %s: %v", path, err)
 		}
-		names = append(names, kind+" "+name)
+		entry := kind + " " + name
+		if kind == "index" {
+			// The alignment inside the statement is not the schema: the
+			// columns it names are. An index SQLite created for a primary key
+			// has no statement at all, which is the empty string.
+			entry += " " + strings.Join(strings.Fields(statement), " ")
+		}
+		names = append(names, entry)
 	}
 	if err := rows.Err(); err != nil {
 		t.Fatalf("read the schema of %s: %v", path, err)
@@ -597,6 +610,25 @@ func columnNames(t *testing.T, path string) map[string][]string {
 		}
 	}
 	return out
+}
+
+// differences reports what one sorted schema listing holds that the other does
+// not, in both directions. A missed migration step is one or two lines of it,
+// so the failure names them rather than printing two whole schemas to compare
+// by eye.
+func differences(got, want []string) []string {
+	var lines []string
+	for _, entry := range got {
+		if !has(want, entry) {
+			lines = append(lines, "the migrated store has "+entry+" and a fresh one does not")
+		}
+	}
+	for _, entry := range want {
+		if !has(got, entry) {
+			lines = append(lines, "a fresh store has "+entry+" and the migrated one does not")
+		}
+	}
+	return lines
 }
 
 func has(list []string, want string) bool {
