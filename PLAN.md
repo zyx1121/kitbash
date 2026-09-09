@@ -65,7 +65,9 @@ Every commit is a version. Files has no separate version object.
 
 A Package is a folder in Files whose manifest carries a `deploy` section. Building it produces an OCI image. The image digest is the Package version, and the build records which Files commit it came from. The chain commit to digest to process is the entire provenance story and needs no extra object.
 
-The digest of a locally built image is its OCI image ID, the sha256 of the image configuration. The build stamps the image with labels `kitbash.path`, `kitbash.name`, `kitbash.commit` and `kitbash.user`, so the image store is the build history and no second record is kept. Packages a member builds live in that member's image store; sharing a built image between members is M5 work.
+The digest of a locally built image is its OCI image ID, the sha256 of the image configuration. The build stamps the image with labels `kitbash.path`, `kitbash.name`, `kitbash.commit` and `kitbash.user`, so the image store is the build history and no second record is kept.
+
+**A built image is shared, not built again.** Packages a member builds live in that member's rootless image store, which no other member can read, so an `/org` Package would otherwise be built once per member from the same commit to a digest each of them has to trust separately. kitbashd records every build of an `/org` path as `(path, commit, digest, builder)` and copies one image between two members on request: it runs `podman save --format oci-archive <digest>` as the builder piped into `podman load` as the requester, two setuid children joined by a pipe the kernel holds, each in its own member's cgroup leaf, and then checks the requester's own store for the digest before it answers. `pkg_build` of an `/org` path asks for the builds of the current commit first and copies rather than builds when another member has one, so one commit is one digest for everybody; `proc_run` with a digest this member does not have fetches it the same way; `pkg_inspect` merges the records with the local image list, so an agent sees who built what. A copy is served only for a build somebody recorded, and only for `/org`: a Package in a home is that member's alone, and kitbashd is root, so it never reads a private image store on somebody else's behalf. Every failure falls back to building, which is what happened before the record existed.
 
 There are no package kinds. A skill, a tool server, a workflow engine and an observability kit are all Packages. What distinguishes them is what their manifest declares, not a category the platform maintains. Tags exist for humans to search by. Platform logic never reads tags.
 
@@ -343,7 +345,6 @@ The MCP tool surface is decided in `spec/mcp-surface.yaml`: six families, `fs` i
 - Build and run kits: the contract is declared, dispatch is not implemented, and the manifest has no field to name a builder or runner. Add the field when a second builder or runner exists.
 - Fan out is best effort. A subscriber that must not miss a record should read the store through `tel_query` and treat the push as a wake up.
 - Approvals cover `fs_write` and `pkg_import` into `/org`. Whether `proc_run` of an `/org` Package by a member should run as a shared Process rather than a private one is open; today it runs privately under the member.
-- Sharing a built image between members is still open. An `/org` Package built by one member is built again by the next, from the same commit to the same image ID.
 - A Process acting as an agent has its owner's full surface. Narrowing what a Process may call (a per Process allow list in the manifest) is deferred until a kit needs less than its owner has.
 
 ## 6. Vocabulary

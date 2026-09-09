@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -63,11 +64,15 @@ type ListResult struct {
 	Packages []Entry `json:"packages"`
 }
 
-// Build is one entry of a Package's build history.
+// Build is one entry of a Package's build history. Builder is the member who
+// made it, which only kitbashd knows: an image in this member's store says
+// nothing about who else has it, see PLAN.md section 2.2. It is empty for a
+// build nobody recorded, which is every build of a Package in a home.
 type Build struct {
 	Digest  string `json:"digest"`
 	Commit  string `json:"commit"`
 	BuiltAt string `json:"builtAt"`
+	Builder string `json:"builder,omitempty"`
 }
 
 // InspectResult is the output of pkg_inspect.
@@ -108,17 +113,44 @@ type ImportResult struct {
 	Commit fs.Commit `json:"commit"`
 }
 
+// Builds is the build registry of kitbashd: who built which image of which
+// Package, and the copy of one image between two members' stores. It is an
+// interface here so this package depends on the daemon's contract rather than
+// on a socket, the same way proc.Registry does.
+//
+// A session without one is a host without kitbashd: every build is a local
+// build and nothing is shared, which is what pkg_build did before this
+// existed, see PLAN.md section 2.2.
+type Builds interface {
+	// Builds is what kitbashd knows about one Package path, newest first. An
+	// empty commit and digest ask for every build of that path.
+	Builds(ctx context.Context, path, commit, digest string) ([]telemetry.Build, *problem.Problem)
+	// RecordBuild tells kitbashd what this member built.
+	RecordBuild(ctx context.Context, b telemetry.Build) *problem.Problem
+	// FetchImage asks kitbashd to copy one image into this member's store
+	// from the member who built it.
+	FetchImage(ctx context.Context, digest, path, from string) (*telemetry.FetchResult, *problem.Problem)
+}
+
 // Service answers the pkg family for one caller.
 type Service struct {
 	files  *fs.Service
 	runner podman.Runner
 	kits   Kits
+	builds Builds
 }
 
 // New builds the Service the server runs with. The kits argument is the MCP
 // bridge, which pkg_import needs and the other tools do not; it may be nil.
 func New(files *fs.Service, runner podman.Runner, kits Kits) *Service {
 	return &Service{files: files, runner: runner, kits: kits}
+}
+
+// SetBuilds gives the service the build registry of kitbashd. Without it a
+// build of an /org Package is a local build and is not recorded, which is a
+// host whose daemon is not running, the same shape fs.SetApprovals has.
+func (s *Service) SetBuilds(builds Builds) {
+	s.builds = builds
 }
 
 // Build answers pkg_build: it builds the Package at path from its current
@@ -172,6 +204,13 @@ func (s *Service) build(ctx context.Context, span *telemetry.Span, path string) 
 	}
 
 	tag := TagPrefix + m.Name + ":" + shortSha(head.Sha)
+	// A Package under /org is one Package for the whole organization, so a
+	// build of this commit that another member already made is copied rather
+	// than made again: one commit is then one digest for everybody, see
+	// PLAN.md section 2.2.
+	if result := s.copied(ctx, span, folder, head.Sha, tag); result != nil {
+		return result, nil
+	}
 	labels := map[string]string{
 		podman.LabelPath:   folder,
 		podman.LabelName:   m.Name,
@@ -195,12 +234,83 @@ func (s *Service) build(ctx context.Context, span *telemetry.Span, path string) 
 	}
 	span.SetDigest(digest)
 	span.Info(tail(log))
+	// The record is what the next member's build reads instead of building.
+	// It is best effort: a build that is not recorded is a build somebody
+	// repeats, which is what every build did before this record existed.
+	s.record(ctx, span, folder, head.Sha, digest)
 	return &BuildResult{
 		Path:   folder,
 		Digest: digest,
 		Commit: head.Sha,
 		Log:    tail(log),
 	}, nil
+}
+
+// copied is the build another member already made, copied into this member's
+// store instead of made again. It answers nil when there is nothing to copy
+// and when the copy failed, which are the same thing to the caller: build it.
+//
+// Only /org Packages take part. A Package in a home is that member's alone,
+// so nothing about it is recorded and nothing about it is fetched.
+func (s *Service) copied(ctx context.Context, span *telemetry.Span, folder, commit, tag string) *BuildResult {
+	if s.builds == nil || !s.files.UnderShared(folder) {
+		return nil
+	}
+	builds, prob := s.builds.Builds(ctx, folder, commit, "")
+	if prob != nil {
+		// kitbashd is not answering, which costs a build that could have been
+		// a copy and nothing else.
+		span.Error("the builds of this Package could not be read from kitbashd: " + prob.Detail)
+		return nil
+	}
+	local, err := s.runner.Images(ctx, podman.Filter{podman.LabelPath: folder})
+	if err != nil {
+		span.Error("the local images of this Package could not be read: " + err.Error())
+		return nil
+	}
+	held := map[string]bool{}
+	for _, image := range local {
+		held[image.ID] = true
+	}
+	for _, build := range builds {
+		// A build of this member's own is not fetched: either they have the
+		// image, or they removed it and are building it again on purpose.
+		if build.Builder == "" || build.Builder == s.files.User() || held[build.Digest] {
+			continue
+		}
+		result, prob := s.builds.FetchImage(ctx, build.Digest, folder, build.Builder)
+		if prob != nil {
+			span.Error("the image " + build.Digest + " could not be copied from " +
+				build.Builder + ": " + prob.Detail)
+			return nil
+		}
+		// The tag is the one a local build would have written, so podman
+		// images reads the same whether this Package was built here or
+		// copied. A tag that fails is a name, not an image: the copy stands.
+		if err := s.runner.Tag(ctx, build.Digest, tag); err != nil {
+			span.Error("the copied image could not be tagged " + tag + ": " + err.Error())
+		}
+		span.SetDigest(build.Digest)
+		log := fmt.Sprintf("copied from %s", build.Builder)
+		span.Info(log)
+		return &BuildResult{Path: folder, Digest: result.Digest, Commit: commit, Log: log}
+	}
+	return nil
+}
+
+// record tells kitbashd what this member built, so the next member copies it.
+// Only /org Packages are recorded: a Package in a home is never fetched, and a
+// record of one would be a list of a member's private Packages that every
+// admin reads.
+func (s *Service) record(ctx context.Context, span *telemetry.Span, folder, commit, digest string) {
+	if s.builds == nil || !s.files.UnderShared(folder) {
+		return
+	}
+	if prob := s.builds.RecordBuild(ctx, telemetry.Build{
+		Path: folder, Commit: commit, Digest: digest,
+	}); prob != nil {
+		span.Error("this build was not recorded with kitbashd: " + prob.Detail)
+	}
 }
 
 // List answers pkg_list: the visible Packages with their newest build.
@@ -267,9 +377,56 @@ func (s *Service) Inspect(ctx context.Context, path string) (*InspectResult, *pr
 			Digest:  image.ID,
 			Commit:  image.Labels[podman.LabelCommit],
 			BuiltAt: image.Created.UTC().Format(time.RFC3339),
+			// The image's own label says who built it, which for a copied
+			// image is the member it was copied from. kitbashd's record is
+			// merged over it below when there is one.
+			Builder: image.Labels[podman.LabelUser],
 		})
 	}
+	s.merge(ctx, folder, result)
 	return result, nil
+}
+
+// merge folds kitbashd's build records into the local image list, so an agent
+// reading an /org Package sees the builds of every member and not only the
+// ones that reached this store. A record for an image that is here names its
+// builder; one for an image that is not is a build this member can fetch by
+// running it, see PLAN.md section 2.2.
+func (s *Service) merge(ctx context.Context, folder string, result *InspectResult) {
+	if s.builds == nil || !s.files.UnderShared(folder) {
+		return
+	}
+	records, prob := s.builds.Builds(ctx, folder, "", "")
+	if prob != nil {
+		// The local history is still the answer. A daemon that is not
+		// answering is not a reason to refuse to describe a Package.
+		return
+	}
+	at := map[string]int{}
+	for i, build := range result.Builds {
+		at[build.Digest] = i
+	}
+	for _, record := range records {
+		if i, held := at[record.Digest]; held {
+			result.Builds[i].Builder = record.Builder
+			if result.Builds[i].Commit == "" {
+				result.Builds[i].Commit = record.Commit
+			}
+			continue
+		}
+		result.Builds = append(result.Builds, Build{
+			Digest:  record.Digest,
+			Commit:  record.Commit,
+			BuiltAt: record.BuiltAt,
+			Builder: record.Builder,
+		})
+		at[record.Digest] = len(result.Builds) - 1
+	}
+	// Newest first, which is what the tool publishes and what the local list
+	// already was before anything was merged into it.
+	sort.SliceStable(result.Builds, func(i, j int) bool {
+		return result.Builds[i].BuiltAt > result.Builds[j].BuiltAt
+	})
 }
 
 // source is what the build reads: the unit's own context, or, for a unit that

@@ -326,6 +326,13 @@ func (s *Server) removeUser(w http.ResponseWriter, r *http.Request, caller Calle
 		writeProblem(w, problem.Internal(r.URL.Path, err.Error(), ""))
 		return
 	}
+	// Their build records go with their image store: a row naming an account
+	// that is gone would send the next fetch to a member this host no longer
+	// has, see builds.go.
+	if _, err := s.store.DeleteBuildsByBuilder(r.Context(), name); err != nil {
+		writeProblem(w, problem.Internal(r.URL.Path, err.Error(), ""))
+		return
+	}
 	// Their containers are gone, so the cgroups those containers ran in go
 	// too. One that is still busy is left for the next boot rather than
 	// holding up an account that is already deleted.

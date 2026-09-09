@@ -382,7 +382,12 @@ families:
                   builtAt: { type: string, format: date-time }
                   running: { type: integer, description: "Number of Processes of this Package" }
       pkg_inspect:
-        description: Manifest, build history and provenance of one Package. Builds are newest first.
+        description: >
+          Manifest, build history and provenance of one Package. Builds are
+          newest first. For a Package under /org the local image store is
+          merged with the builds kitbashd recorded, so a build carries the
+          member who made it and a build another member has is listed even
+          though this member's store does not hold it, see PLAN.md section 2.2.
         input: { type: object, additionalProperties: false, required: [path], properties: { path: { type: string } } }
         output:
           type: object
@@ -392,7 +397,7 @@ families:
             manifest: { type: object }
             builds:
               type: array
-              items: { type: object, required: [digest, commit, builtAt], properties: { digest: { type: string }, commit: { type: string }, builtAt: { type: string, format: date-time } } }
+              items: { type: object, required: [digest, commit, builtAt], properties: { digest: { type: string }, commit: { type: string }, builtAt: { type: string, format: date-time }, builder: { type: string, description: "The member who built it, for a Package under /org" } } }
         errors: [not-found, not-visible, not-permitted, invalid-path, invalid-manifest, internal]
 
   # ---------------------------------------------------------------- proc (M2)

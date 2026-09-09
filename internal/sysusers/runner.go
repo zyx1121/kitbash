@@ -41,6 +41,17 @@ const RunTimeout = 120 * time.Second
 // half down and a caller told nothing useful.
 const StopBudget = 40 * time.Second
 
+// CopyTimeout is what one image copy between two members gets. A save piped
+// into a load moves every layer of an image through a pipe and writes them
+// into a second store, which is minutes for an image of a few hundred
+// megabytes on a machine that is also building something else.
+const CopyTimeout = 300 * time.Second
+
+// CopyLogBytes is how much of each child's standard error is kept for the
+// daemon log when a copy fails. The runtime says what it could not do in a
+// line or two; the rest is progress output.
+const CopyLogBytes = 4 << 10
+
 // usageExit is the status podman exits with when it will not run the command
 // at all: the options are wrong, or the image is not there. kitbashd checks
 // the image itself, so what is left of this status is the options, which the
@@ -161,6 +172,151 @@ func (p *Podman) RemoveContainer(ctx context.Context, m Member, container string
 	// gets, so it gets the same budget.
 	_, err := p.runFor(ctx, m, "", StopBudget, append(args, container)...)
 	return err
+}
+
+// CopyImage copies one image out of one member's store into another's, by
+// running podman save as the member who has it into podman load as the member
+// who wants it. The two children are joined by a pipe: the archive never
+// touches the disk and never passes through the daemon, which would otherwise
+// hold a few hundred megabytes of somebody else's image.
+//
+// Both children run as their own member, in their own member's cgroup leaf,
+// because a copy is that member's work and spends that member's memory. The
+// whole copy shares one budget: a save that hangs holds the load open, so
+// timing them separately would only decide which of the two is blamed.
+//
+// It is what makes an /org Package built by one member usable by the next,
+// see PLAN.md section 2.2.
+func (p *Podman) CopyImage(ctx context.Context, from, to Member, digest, fromCgroup, toCgroup string) error {
+	if err := ensureRuntimeDir(p.runUser(), from); err != nil {
+		return err
+	}
+	if err := ensureRuntimeDir(p.runUser(), to); err != nil {
+		return err
+	}
+	// The caller's cancellation does not reach the children, the same rule
+	// every other command here follows: a load that has begun is writing into
+	// a member's store, and a client that hung up must not leave half an image
+	// in it.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), CopyTimeout)
+	defer cancel()
+
+	// oci-archive is the format both ends of this pipe agree on without a
+	// registry: it carries the image configuration, so the digest the loaded
+	// image gets is the digest that was saved.
+	save, closeSave, err := p.command(ctx, from, fromCgroup, "save", "--format", "oci-archive", digest)
+	defer closeSave()
+	if err != nil {
+		return err
+	}
+	load, closeLoad, err := p.command(ctx, to, toCgroup, "load")
+	defer closeLoad()
+	if err != nil {
+		return err
+	}
+
+	var saveErr, loadErr, loadOut bytes.Buffer
+	save.Stderr = &saveErr
+	load.Stderr = &loadErr
+	load.Stdout = &loadOut
+
+	saveWait, loadWait := pipeline(save, load)
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf("%w: copying %s from %s to %s after %s",
+			ErrTimeout, digest, from.Name, to.Name, CopyTimeout)
+	}
+	// The save is reported first: a load that failed because the archive
+	// stopped mid stream is the consequence, not the cause.
+	if saveWait != nil {
+		return fmt.Errorf("sysusers: podman save %s as %s: %w: %s",
+			digest, from.Name, saveWait, clipOutput(saveErr.String()))
+	}
+	if loadWait != nil {
+		return fmt.Errorf("sysusers: podman load as %s: %w: %s",
+			to.Name, loadWait, clipOutput(loadErr.String()))
+	}
+	return nil
+}
+
+// pipeline runs the output of one child into the input of another and answers
+// what each of them exited with. The two are joined by a pipe the kernel
+// holds, so nothing of what crosses it is ever in this process: an image is
+// hundreds of megabytes, and the daemon is not a buffer for it.
+//
+// It is a function of its own because it is the part worth testing without
+// dropping to another member, which needs root.
+func pipeline(first, second *exec.Cmd) (firstErr, secondErr error) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		return fmt.Errorf("sysusers: the pipe between two children: %w", err), nil
+	}
+	// The files are handed to the children as they are, so the kernel joins
+	// the two processes and no goroutine of this one copies bytes.
+	first.Stdout = writer
+	second.Stdin = reader
+	if err := first.Start(); err != nil {
+		reader.Close()
+		writer.Close()
+		return err, nil
+	}
+	if err := second.Start(); err != nil {
+		reader.Close()
+		writer.Close()
+		// The first child is already running with nothing to read its output,
+		// so it is ended here rather than left to fill a pipe nobody drains.
+		_ = first.Process.Kill()
+		_ = first.Wait()
+		return nil, err
+	}
+	// This process's own ends of the pipe are closed once the children hold
+	// theirs. Without this the second never reads end of file and waits for a
+	// writer that is this process.
+	writer.Close()
+	reader.Close()
+
+	secondErr = second.Wait()
+	firstErr = first.Wait()
+	return firstErr, secondErr
+}
+
+// ImageSize answers the size in bytes of one image in a member's store, and
+// ErrNoImage when they do not have it. It is the check on both ends of a copy:
+// that the member who is asked for an image still has it, and that the member
+// who asked for it has it once the copy is over.
+func (p *Podman) ImageSize(ctx context.Context, m Member, digest string) (int64, error) {
+	if err := ensureRuntimeDir(p.runUser(), m); err != nil {
+		return 0, err
+	}
+	return imageSize(p.run(ctx, m, "image", "inspect", "--format", "{{.Size}}", digest))
+}
+
+// imageSize reads one podman image inspect. An image the member does not have
+// is the one failure this call is asked about, and podman has answered it with
+// both of these statuses across releases; neither means anything else for an
+// inspect of one image by digest.
+func imageSize(out string, err error) (int64, error) {
+	if err != nil {
+		if exitCode(err, 1) || exitCode(err, usageExit) {
+			return 0, fmt.Errorf("%w: %s", ErrNoImage, strings.TrimSpace(out))
+		}
+		return 0, err
+	}
+	size, parseErr := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
+	if parseErr != nil {
+		// The image is there; only its size is unreadable, which is not worth
+		// failing a copy over.
+		return 0, nil
+	}
+	return size, nil
+}
+
+// clipOutput bounds one child's standard error for the daemon log.
+func clipOutput(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) > CopyLogBytes {
+		return s[len(s)-CopyLogBytes:]
+	}
+	return s
 }
 
 // exists answers ErrNoContainer for a container this member's runtime does not
@@ -332,21 +488,11 @@ func (p *Podman) runFor(ctx context.Context, m Member, cgroup string, budget tim
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), budget)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, p.binary(), args...)
-	credential, err := credentialOf(m)
-	if err != nil {
-		return "", err
-	}
-	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: credential}
-	// The descriptor is held until the child has run: the kernel reads it at
-	// clone time, and there is nothing to keep afterwards.
-	closer, err := place(cmd.SysProcAttr, cgroup)
+	cmd, closer, err := p.command(ctx, m, cgroup, args...)
 	defer closer()
 	if err != nil {
 		return "", err
 	}
-	cmd.Dir = "/"
-	cmd.Env = p.environment(m)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -364,6 +510,29 @@ func (p *Podman) runFor(ctx context.Context, m Member, cgroup string, budget tim
 			p.binary(), strings.Join(args, " "), m.Name, err, msg)
 	}
 	return stdout.String(), nil
+}
+
+// command builds one podman child that runs as a member, in a cgroup, with
+// that member's environment and nothing of the daemon's. It is unstarted and
+// its pipes are the caller's, which is what lets a copy join two of them.
+//
+// The closer releases the cgroup descriptor. The kernel reads it at clone
+// time, so the caller holds it until the child has started; calling it before
+// that starts the child where the daemon is.
+func (p *Podman) command(ctx context.Context, m Member, cgroup string, args ...string) (*exec.Cmd, func(), error) {
+	cmd := exec.CommandContext(ctx, p.binary(), args...)
+	credential, err := credentialOf(m)
+	if err != nil {
+		return nil, func() {}, err
+	}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: credential}
+	closer, err := place(cmd.SysProcAttr, cgroup)
+	if err != nil {
+		return nil, closer, err
+	}
+	cmd.Dir = "/"
+	cmd.Env = p.environment(m)
+	return cmd, closer, nil
 }
 
 // MCPEnvironment is what one kitbash-mcp session runs with: the member's own
