@@ -180,6 +180,10 @@ func (s *Server) createUser(w http.ResponseWriter, r *http.Request, caller Calle
 		writeProblem(w, s.userProblem(r, err, req.Name))
 		return
 	}
+	// The member's cgroup subtree is created with the account, so their first
+	// Process is placed without waiting for the next daemon start, see
+	// internal/cgroups.
+	s.memberCgroup(r.Context(), m)
 	logger.Printf("%s created the member %s (uid %d, admin %t)", caller.User, m.Name, m.UID, m.Admin)
 	writeJSON(w, r.URL.Path, userResponse{User: m.Name, UID: m.UID, Admin: m.Admin})
 }

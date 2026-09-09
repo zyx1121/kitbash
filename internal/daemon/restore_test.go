@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zyx1121/kitbash/internal/cgroups"
 	"github.com/zyx1121/kitbash/internal/store"
 	"github.com/zyx1121/kitbash/internal/sysusers"
 	"github.com/zyx1121/kitbash/internal/uuid"
@@ -66,6 +67,20 @@ func TestRestoreStartsEveryProcessAsItsOwner(t *testing.T) {
 	}
 	if got := started["kitbash-observe-count"]; got.Member != "bob" || got.UID != 1006 {
 		t.Errorf("kitbash-observe-count ran as %+v, want bob with his uid", got)
+	}
+	// A container keeps the cgroup parent it was created with, so a restored
+	// Process holds the limits it was started with as long as the child that
+	// starts it is placed in the owner's leaf, see internal/cgroups.
+	if got := started["kitbash-echo-one"]; got.Cgroup != cgroups.LeafDir(h.cgroups.Base, "alice") {
+		t.Errorf("the child was placed in %q, want alice's leaf", got.Cgroup)
+	}
+	if got := started["kitbash-observe-count"]; got.Cgroup != cgroups.LeafDir(h.cgroups.Base, "bob") {
+		t.Errorf("the child was placed in %q, want bob's leaf", got.Cgroup)
+	}
+	// One subtree per owner, not one per container: the leaf is the same for
+	// every Process of a member.
+	if len(h.cgroups.Calls()) != 2 {
+		t.Errorf("the subtrees prepared are %+v, want one per owner", h.cgroups.Calls())
 	}
 }
 

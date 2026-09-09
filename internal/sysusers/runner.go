@@ -26,6 +26,12 @@ var logger = log.New(os.Stderr, "kitbashd: ", log.LstdFlags)
 // spec/kitbashd-api.yaml gives restore per container.
 const ContainerTimeout = RemoveTimeout
 
+// usageExit is the status podman exits with when it will not run the command
+// at all: the options are wrong, or the image is not there. kitbashd checks
+// the image itself, so what is left of this status is the options, which the
+// member can change in their manifest.
+const usageExit = 125
+
 // RunnerPath is the PATH a member's podman is started with. kitbashd runs as
 // root and inherits root's environment, which is not the member's, so every
 // variable a rootless podman reads is set here and nothing is inherited.
@@ -45,23 +51,96 @@ type Podman struct {
 // NewPodman returns the Runner kitbashd uses on a kitbash host.
 func NewPodman() *Podman { return &Podman{Binary: podman.Binary, RunUser: DefaultRunUser} }
 
+// Run starts one container as the member, inside their cgroup leaf, and
+// returns the runtime id it printed. The options are the whole command line:
+// kitbashd built them, wrote the env file the member can read, and named the
+// cgroup parent the container's own cgroup goes under.
+//
+// The image is checked first, because an image the member does not have and a
+// command line the runtime will not parse are the same exit status, and only
+// the first of the two is worth telling the caller to build.
+func (p *Podman) Run(ctx context.Context, m Member, opts podman.RunOptions, cgroup string) (string, error) {
+	if err := ensureRuntimeDir(p.runUser(), m); err != nil {
+		return "", err
+	}
+	if _, err := p.run(ctx, m, "image", "exists", opts.Image); err != nil {
+		if exitCode(err, 1) {
+			return "", fmt.Errorf("%w: %s", ErrNoImage, opts.Image)
+		}
+		return "", err
+	}
+	// Nothing of the environment is on this command line: the values are in
+	// the file opts.EnvFile names, which the daemon wrote 0600 for this
+	// member, see internal/daemon/run.go.
+	out, err := p.runIn(ctx, m, cgroup, podman.RunArgs(opts, nil)...)
+	if err != nil {
+		if exitCode(err, usageExit) {
+			return "", fmt.Errorf("%w: %v", ErrUsage, err)
+		}
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
 // Start creates the member's runtime directory and starts one container as
 // them. A container the runtime does not have is ErrNoContainer, which restore
 // answers by unregistering the Process rather than by trying again.
-func (p *Podman) Start(ctx context.Context, m Member, container string) error {
+//
+// The container keeps the cgroup parent it was created with, so a restored
+// Process holds the limits it was started with as long as the child that
+// starts it is placed in the member's leaf.
+func (p *Podman) Start(ctx context.Context, m Member, container, cgroup string) error {
 	if err := ensureRuntimeDir(p.runUser(), m); err != nil {
 		return err
 	}
-	// podman container exists answers 0 for a container it has and 1 for one
-	// it does not, which is the one distinction restore acts on.
+	if err := p.exists(ctx, m, container); err != nil {
+		return err
+	}
+	_, err := p.runIn(ctx, m, cgroup, "start", container)
+	return err
+}
+
+// Stop stops one container as the member. The runtime is given the same
+// timeout the surface publishes, and the call itself the daemon's.
+func (p *Podman) Stop(ctx context.Context, m Member, container string, timeout int) error {
+	if err := ensureRuntimeDir(p.runUser(), m); err != nil {
+		return err
+	}
+	if err := p.exists(ctx, m, container); err != nil {
+		return err
+	}
+	_, err := p.run(ctx, m, "stop", "--time", strconv.Itoa(timeout), container)
+	return err
+}
+
+// RemoveContainer removes one container as the member, which is what a
+// replacement run does to the Process it takes the place of.
+func (p *Podman) RemoveContainer(ctx context.Context, m Member, container string, force bool) error {
+	if err := ensureRuntimeDir(p.runUser(), m); err != nil {
+		return err
+	}
+	if err := p.exists(ctx, m, container); err != nil {
+		return err
+	}
+	args := []string{"rm"}
+	if force {
+		args = append(args, "--force")
+	}
+	_, err := p.run(ctx, m, append(args, container)...)
+	return err
+}
+
+// exists answers ErrNoContainer for a container this member's runtime does not
+// have. podman container exists answers 0 for one it has and 1 for one it does
+// not, which is the one distinction the callers act on.
+func (p *Podman) exists(ctx context.Context, m Member, container string) error {
 	if _, err := p.run(ctx, m, "container", "exists", container); err != nil {
 		if exitCode(err, 1) {
 			return fmt.Errorf("%w: %s", ErrNoContainer, container)
 		}
 		return err
 	}
-	_, err := p.run(ctx, m, "start", container)
-	return err
+	return nil
 }
 
 // MCPCommand builds the kitbash-mcp one MCP session of a Process runs as its
@@ -197,6 +276,13 @@ func (p *Podman) RemoveAll(ctx context.Context, m Member) error {
 // run executes one podman command as the member and returns its standard
 // output. The error carries the runtime's standard error for the server log.
 func (p *Podman) run(ctx context.Context, m Member, args ...string) (string, error) {
+	return p.runIn(ctx, m, "", args...)
+}
+
+// runIn is run with the child placed in one cgroup. An empty cgroup runs it
+// where the daemon is: the host enforces no limits and the command is
+// otherwise the same one, see internal/cgroups.
+func (p *Podman) runIn(ctx context.Context, m Member, cgroup string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, ContainerTimeout)
 	defer cancel()
 
@@ -206,6 +292,13 @@ func (p *Podman) run(ctx context.Context, m Member, args ...string) (string, err
 		return "", err
 	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: credential}
+	// The descriptor is held until the child has run: the kernel reads it at
+	// clone time, and there is nothing to keep afterwards.
+	closer, err := place(cmd.SysProcAttr, cgroup)
+	defer closer()
+	if err != nil {
+		return "", err
+	}
 	cmd.Dir = "/"
 	cmd.Env = p.environment(m)
 

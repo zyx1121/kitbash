@@ -22,12 +22,12 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
+	"github.com/zyx1121/kitbash/internal/manifest"
 	collogspb "github.com/zyx1121/kitbash/internal/otlpproto/collector/logs/v1"
 	coltracepb "github.com/zyx1121/kitbash/internal/otlpproto/collector/trace/v1"
 	commonpb "github.com/zyx1121/kitbash/internal/otlpproto/common/v1"
 	tracepb "github.com/zyx1121/kitbash/internal/otlpproto/trace/v1"
-
-	"github.com/zyx1121/kitbash/internal/manifest"
+	"github.com/zyx1121/kitbash/internal/podman"
 )
 
 // maxBodyBytes is the request limit of spec/kitbashd-api.yaml.
@@ -139,6 +139,14 @@ type Daemon struct {
 	members  []Member
 	users    Response
 
+	// The supervisor half: the runtime a start is mirrored into, the calls it
+	// served, the answer that replaces them and the address it gives its
+	// Processes, see run.go.
+	runtime    *podman.Fake
+	startCalls []StartCall
+	starts     Response
+	endpoint   string
+
 	// The approval queue and its state machine, mirroring the approvals
 	// family of spec/kitbashd-api.yaml.
 	approvals       map[string]Approval
@@ -199,6 +207,9 @@ func StartAt(socket string) (*Daemon, error) {
 	mux.HandleFunc("POST /kitbash/v1/processes", d.register)
 	mux.HandleFunc("GET /kitbash/v1/processes", d.listProcesses)
 	mux.HandleFunc("DELETE /kitbash/v1/processes/{id}", d.unregister)
+	mux.HandleFunc("POST /kitbash/v1/processes/{id}/start", d.start)
+	mux.HandleFunc("POST /kitbash/v1/processes/{id}/stop", d.stop)
+	mux.HandleFunc("POST /kitbash/v1/processes/{id}/remove", d.remove)
 	mux.HandleFunc("GET /kitbash/v1/users/me", d.me)
 	mux.HandleFunc("POST /kitbash/v1/users", d.createUser)
 	mux.HandleFunc("GET /kitbash/v1/users", d.listUsers)

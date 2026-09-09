@@ -3,8 +3,8 @@ package proc_test
 import (
 	"bytes"
 	"context"
-	"errors"
 	"log"
+	"net/http"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -207,11 +207,12 @@ func TestManifestEnvironmentCannotOverrideTheTelemetryEnvironment(t *testing.T) 
 	}
 }
 
-// The endpoint override exists for tests, the same rule as KITBASH_SOCKET.
-func TestTheProcessEndpointCanBeOverriddenOutsideSSH(t *testing.T) {
-	t.Setenv(telemetry.ProcessEndpointEnv, "http://127.0.0.1:4318")
-	t.Setenv("SSH_CONNECTION", "")
+// The endpoint a Process exports to is kitbashd's to give: the daemon writes
+// the environment of the container it starts, so a host that moves its
+// receiver moves every Process with it and no session has an opinion.
+func TestTheProcessEndpointIsTheOneKitbashdGives(t *testing.T) {
 	f := newFixture(t)
+	f.daemon.SetProcessEndpoint("http://127.0.0.1:4318")
 	folder := f.pack(t, "ffmpeg", mcpManifest)
 	f.build(folder, "ffmpeg")
 
@@ -219,11 +220,11 @@ func TestTheProcessEndpointCanBeOverriddenOutsideSSH(t *testing.T) {
 		t.Fatalf("Run: %s", prob.Detail)
 	}
 	if got := f.runner.Runs[0].Env[telemetry.EnvEndpoint]; got != "http://127.0.0.1:4318" {
-		t.Errorf("endpoint is %q, want the override", got)
+		t.Errorf("endpoint is %q, want the one kitbashd gave", got)
 	}
-	// The two endpoints are one listener, so the override moves both.
+	// The two endpoints are one listener, so they move together.
 	if got := f.runner.Runs[0].Env[telemetry.EnvMCPEndpoint]; got != "http://127.0.0.1:4318/mcp" {
-		t.Errorf("the MCP endpoint is %q, want the override with the MCP path", got)
+		t.Errorf("the MCP endpoint is %q, want the receiver with the MCP path", got)
 	}
 }
 
@@ -321,20 +322,17 @@ func TestStopUnregistersTheProcess(t *testing.T) {
 	}
 }
 
-// The container runtime does not depend on kitbashd, so a host without it
-// still runs Packages. The Process is simply untraced, and the session says so
-// once.
+// kitbashd writes the environment of the container it starts, so nothing the
+// manifest claims of it ever crosses the socket: the start request carries the
+// unit's own variables and none of kitbashd's, and the container ends up with
+// the daemon's values.
 //
 // The Package here is the one that names kitbashd's own environment, because
-// that is where a missing registration is dangerous: a Process that kept the
-// manifest's KITBASH_FANOUT_SECRET would accept fan out requests from whoever
-// wrote the manifest, and Reconcile registering it later would not take that
-// back. Nothing kitbashd speaks for survives a registration that did not
-// happen.
-func TestRunWithoutKitbashdStartsTheProcessUntraced(t *testing.T) {
-	f := newFixtureWithSocket(t, filepath.Join(t.TempDir(), "absent.sock"))
-	var lines bytes.Buffer
-	f.processes.SetLogger(log.New(&lines, "", 0))
+// that is where it matters: a Process that kept the manifest's
+// KITBASH_FANOUT_SECRET would accept fan out requests from whoever wrote the
+// manifest rather than from kitbashd alone.
+func TestTheEnvironmentKitbashdOwnsNeverCrossesTheSocket(t *testing.T) {
+	f := newFixture(t)
 	folder := f.pack(t, "forger", forgedManifest)
 	f.build(folder, "forger")
 
@@ -342,21 +340,26 @@ func TestRunWithoutKitbashdStartsTheProcessUntraced(t *testing.T) {
 	if prob != nil {
 		t.Fatalf("Run: %s", prob.Detail)
 	}
-	if process.State != proc.StateRunning {
-		t.Errorf("state is %s, want running without kitbashd", process.State)
+	start, ok := f.daemon.Started(process.ID)
+	if !ok {
+		t.Fatalf("kitbashd was asked to start %v, want one start of %s", f.daemon.Starts(), process.ID)
 	}
-	env := f.runner.Runs[0].Env
 	for _, key := range telemetry.OwnedEnv {
-		if value, set := env[key]; set {
-			t.Errorf("%s is in the environment as %q, but no registration minted it", key, value)
+		if value, set := start.Options.Env[key]; set {
+			t.Errorf("%s crossed the socket as %q, and it is kitbashd's to write", key, value)
 		}
 	}
-	if env["LOG_LEVEL"] != "debug" {
-		t.Errorf("env is %v, want the manifest's own entries", env)
+	if start.Options.Env["LOG_LEVEL"] != "debug" {
+		t.Errorf("the request environment is %v, want the manifest's own entries", start.Options.Env)
 	}
-	want := "kitbashd is not running; Process " + process.ID + " starts untraced"
-	if !strings.Contains(lines.String(), want) {
-		t.Errorf("the log is %q, want it to contain %q", lines.String(), want)
+	// What the container was started with is the daemon's answer, token and
+	// secret included, not the manifest's claim.
+	env := f.runner.Runs[0].Env
+	if env[telemetry.EnvFanoutSecret] != f.daemon.FanoutSecret(process.ID) {
+		t.Errorf("the fan out secret is %q, want the one kitbashd minted", env[telemetry.EnvFanoutSecret])
+	}
+	if env[telemetry.EnvToken] != f.daemon.Token(process.ID) {
+		t.Errorf("the token is %q, want the one kitbashd minted", env[telemetry.EnvToken])
 	}
 }
 
@@ -426,15 +429,16 @@ func TestARegistrationWhoseContainerFailedToStartIsWithdrawn(t *testing.T) {
 	f := newFixture(t)
 	folder := f.pack(t, "observer", observerManifest)
 	f.build(folder, "observer")
-	f.runner.RunErr = errors.New("the runtime refused the command")
+	f.daemon.AnswerStart(teltest.Problem(http.StatusInternalServerError, problem.SlugInternal,
+		"Internal error", "kitbash could not complete this call; the cause is in the server log", ""))
 
 	_, prob := f.processes.Run(context.Background(), folder, "", "")
 	if prob == nil {
 		t.Fatal("a run the runtime refused was reported as a success")
 	}
-	// The runtime's own words go to the server log, never to the agent: the
-	// command line they describe carries the Process's Telemetry token.
-	if prob.Detail != "kitbash could not complete this call; the cause is recorded for administrators" {
+	// The runtime's own words go to the daemon log, never to the agent: the
+	// command line they describe names the file holding the Process's token.
+	if prob.Detail != "kitbash could not complete this call; the cause is in the server log" {
 		t.Errorf("detail is %q, want the runtime's output kept out of it", prob.Detail)
 	}
 	registered := f.daemon.Registrations()
@@ -445,8 +449,15 @@ func TestARegistrationWhoseContainerFailedToStartIsWithdrawn(t *testing.T) {
 	if len(unregistered) != 1 {
 		t.Fatalf("unregistered %v, want the one Process that failed to start", unregistered)
 	}
-	if got := f.runner.Runs[0].Labels[podman.LabelID]; got != unregistered[0] {
-		t.Errorf("unregistered %s, want the id the run carried, %s", unregistered[0], got)
+	if len(f.runner.Runs) != 0 {
+		t.Errorf("the session ran %d containers of its own, want none: kitbashd runs them", len(f.runner.Runs))
+	}
+	starts := f.daemon.Starts()
+	if len(starts) != 1 {
+		t.Fatalf("kitbashd was asked for %d starts, want one", len(starts))
+	}
+	if got := starts[0].Options.Labels[podman.LabelID]; got != unregistered[0] {
+		t.Errorf("unregistered %s, want the id the start carried, %s", unregistered[0], got)
 	}
 }
 
@@ -559,11 +570,83 @@ func registerCalls(daemon *teltest.Daemon) int {
 	return n
 }
 
-// The other way out of telemetryEnv before anything is minted: a session with
-// no registry at all, which is a host where kitbashd was never configured. The
-// manifest's claim on kitbashd's environment is dropped there too, so the two
-// paths cannot drift apart.
-func TestRunWithoutARegistryDropsTheEnvironmentKitbashdOwns(t *testing.T) {
+// Every lifecycle call goes through kitbashd: it runs the container, it stops
+// it and it removes the one a replacement takes the place of, because the
+// cgroup the limits are enforced in is root's to write, see PLAN.md 2.3.
+func TestTheLifecycleGoesThroughKitbashd(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	folder := f.pack(t, "ffmpeg", mcpManifest)
+	f.build(folder, "ffmpeg")
+
+	first, prob := f.processes.Run(ctx, folder, "", "")
+	if prob != nil {
+		t.Fatalf("Run: %s", prob.Detail)
+	}
+	// A second build is a second digest, so this run replaces the first.
+	f.build(folder, "ffmpeg")
+	second, prob := f.processes.Run(ctx, folder, "", "")
+	if prob != nil {
+		t.Fatalf("Run again: %s", prob.Detail)
+	}
+	if _, prob := f.processes.Stop(ctx, second.ID); prob != nil {
+		t.Fatalf("Stop: %s", prob.Detail)
+	}
+
+	var actions []string
+	for _, call := range f.daemon.Starts() {
+		actions = append(actions, call.Action+" "+call.ID)
+	}
+	want := []string{
+		"start " + first.ID,
+		"remove " + first.ID,
+		"start " + second.ID,
+		"stop " + second.ID,
+	}
+	if len(actions) != len(want) {
+		t.Fatalf("kitbashd was asked for %v, want %v", actions, want)
+	}
+	for i := range want {
+		if actions[i] != want[i] {
+			t.Errorf("call %d is %q, want %q", i, actions[i], want[i])
+		}
+	}
+	// The session ran none of it itself: its own runtime saw the container
+	// only because the daemon started it there.
+	if len(f.runner.Stopped) != 1 || len(f.runner.Removed) != 1 {
+		t.Errorf("the session stopped %v and removed %v of its own", f.runner.Stopped, f.runner.Removed)
+	}
+}
+
+// A container kitbashd has no registration for is still the member's own, so
+// the session stops it itself rather than leaving them with a Process they
+// cannot stop.
+func TestStopFallsBackToTheSessionWhenKitbashdForgot(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	folder := f.pack(t, "ffmpeg", mcpManifest)
+	f.build(folder, "ffmpeg")
+	process, prob := f.processes.Run(ctx, folder, "", "")
+	if prob != nil {
+		t.Fatalf("Run: %s", prob.Detail)
+	}
+	// kitbashd restarted and lost the registration; the container is running.
+	if err := unregister(t, f.daemon, process.ID); err != nil {
+		t.Fatalf("unregistering: %v", err)
+	}
+
+	if _, prob := f.processes.Stop(ctx, process.ID); prob != nil {
+		t.Fatalf("Stop: %s", prob.Detail)
+	}
+	if len(f.runner.Stopped) != 1 || f.runner.Stopped[0] != process.Container {
+		t.Errorf("the session stopped %v, want the container kitbashd no longer knows", f.runner.Stopped)
+	}
+}
+
+// The other way to have no kitbashd: a session with no registry at all, which
+// is a host where the daemon was never configured. It refuses the same way a
+// socket that is not there does, and starts nothing.
+func TestRunWithoutARegistryIsRefused(t *testing.T) {
 	f := newFixtureWithSocket(t, filepath.Join(t.TempDir(), "absent.sock"))
 	f.processes = proc.New(f.files, f.runner, nil)
 	var lines bytes.Buffer
@@ -571,21 +654,14 @@ func TestRunWithoutARegistryDropsTheEnvironmentKitbashdOwns(t *testing.T) {
 	folder := f.pack(t, "forger", forgedManifest)
 	f.build(folder, "forger")
 
-	process, prob := f.processes.Run(context.Background(), folder, "", "")
-	if prob != nil {
-		t.Fatalf("Run: %s", prob.Detail)
+	_, prob := f.processes.Run(context.Background(), folder, "", "")
+	if prob == nil {
+		t.Fatal("a Process was started with no registry")
 	}
-	env := f.runner.Runs[0].Env
-	for _, key := range telemetry.OwnedEnv {
-		if value, set := env[key]; set {
-			t.Errorf("%s is in the environment as %q, but there is no registry to mint it", key, value)
-		}
+	if prob.Fix != telemetry.NotRunningFix {
+		t.Errorf("fix is %q, want %q", prob.Fix, telemetry.NotRunningFix)
 	}
-	if env["LOG_LEVEL"] != "debug" {
-		t.Errorf("env is %v, want the manifest's own entries", env)
-	}
-	want := "kitbashd is not running; Process " + process.ID + " starts untraced"
-	if !strings.Contains(lines.String(), want) {
-		t.Errorf("the log is %q, want it to contain %q", lines.String(), want)
+	if len(f.runner.Runs) != 0 {
+		t.Errorf("the runtime was asked to run %d containers, want none", len(f.runner.Runs))
 	}
 }

@@ -3,8 +3,10 @@ package sysusers_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
+	"github.com/zyx1121/kitbash/internal/podman"
 	"github.com/zyx1121/kitbash/internal/sysusers"
 )
 
@@ -71,15 +73,55 @@ func TestFakeRunner(t *testing.T) {
 	ctx := context.Background()
 	m := f.Add(sysusers.Member{Name: "alice"})
 
-	if err := f.Start(ctx, m, "kitbash-echo"); err != nil {
+	const leaf = "/sys/fs/cgroup/kitbash/alice/run"
+	if err := f.Start(ctx, m, "kitbash-echo", leaf); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if err := f.Start(ctx, m, "kitbash-gone"); !errors.Is(err, sysusers.ErrNoContainer) {
+	if err := f.Start(ctx, m, "kitbash-gone", leaf); !errors.Is(err, sysusers.ErrNoContainer) {
 		t.Errorf("Start of a missing container = %v, want ErrNoContainer", err)
 	}
 	calls := f.Calls()
 	if len(calls) != 1 || calls[0].Container != "kitbash-echo" || calls[0].Member != "alice" {
 		t.Errorf("calls = %+v, want one start of kitbash-echo as alice", calls)
+	}
+	// The leaf is recorded because it is what the child is placed in, which is
+	// the whole reason kitbashd starts a container instead of the session.
+	if calls[0].Cgroup != leaf {
+		t.Errorf("the child was placed in %q, want %q", calls[0].Cgroup, leaf)
+	}
+
+	// The three the daemon added with the supervisor: a run, a stop and a
+	// removal, each as the member.
+	image := "sha256:" + strings.Repeat("a", 64)
+	id, err := f.Run(ctx, m, podman.RunOptions{Name: "kitbash-echo", Image: image}, leaf)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if id == "" {
+		t.Error("Run answered no container id")
+	}
+	runs := f.Runs()
+	if len(runs) != 1 || runs[0].Cgroup != leaf || runs[0].Member != "alice" {
+		t.Fatalf("runs = %+v, want one run as alice in the leaf", runs)
+	}
+	if len(runs[0].Args) == 0 || runs[0].Args[0] != "run" {
+		t.Errorf("the command line is %v, want a podman run", runs[0].Args)
+	}
+	f.Missing[image] = true
+	if _, err := f.Run(ctx, m, podman.RunOptions{Name: "kitbash-echo", Image: image}, leaf); !errors.Is(err, sysusers.ErrNoImage) {
+		t.Errorf("Run of a missing image = %v, want ErrNoImage", err)
+	}
+	if err := f.Stop(ctx, m, "kitbash-echo", 10); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if stops := f.Stops(); len(stops) != 1 || stops[0].Timeout != 10 {
+		t.Errorf("stops = %+v, want one stop with the ten second timeout", stops)
+	}
+	if err := f.RemoveContainer(ctx, m, "kitbash-echo", true); err != nil {
+		t.Fatalf("RemoveContainer: %v", err)
+	}
+	if removed := f.Removals(); len(removed) != 1 || !removed[0].Force {
+		t.Errorf("removals = %+v, want one forced removal", removed)
 	}
 	if err := f.RemoveAll(ctx, m); err != nil {
 		t.Fatalf("RemoveAll: %v", err)

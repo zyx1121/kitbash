@@ -17,6 +17,8 @@ import (
 	"github.com/zyx1121/kitbash/internal/problem"
 	"github.com/zyx1121/kitbash/internal/proc"
 	"github.com/zyx1121/kitbash/internal/server"
+	"github.com/zyx1121/kitbash/internal/telemetry"
+	"github.com/zyx1121/kitbash/internal/telemetry/teltest"
 )
 
 // packageManifest declares one tool with a schema strict enough that the
@@ -81,8 +83,16 @@ func newHarness(t *testing.T, tool mcp.ToolHandler) *harness {
 	writeFile(t, filepath.Join(folder, "schemas", "transcode.out.json"), outputSchema)
 
 	runner := podman.NewFake()
+	// kitbashd runs every Process, so the bridge is exercised against a fake
+	// one whose starts land in this runtime, see PLAN.md section 2.3.
+	daemon, err := teltest.Start()
+	if err != nil {
+		t.Fatalf("teltest.Start: %v", err)
+	}
+	t.Cleanup(daemon.Close)
+	daemon.MirrorRuns(runner)
 	h := &harness{files: files, runner: runner, folder: folder, root: root}
-	h.processes = proc.New(files, runner, nil)
+	h.processes = proc.New(files, runner, telemetry.NewClient(daemon.Socket))
 	h.bridge = bridge.New(files, h.processes, runner)
 	h.server = server.New("test", server.Deps{
 		Files:     files,

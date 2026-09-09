@@ -17,6 +17,8 @@ import (
 	"github.com/zyx1121/kitbash/internal/problem"
 	"github.com/zyx1121/kitbash/internal/proc"
 	"github.com/zyx1121/kitbash/internal/server"
+	"github.com/zyx1121/kitbash/internal/telemetry"
+	"github.com/zyx1121/kitbash/internal/telemetry/teltest"
 )
 
 // packageManifest is a Package the fixture can build and run.
@@ -63,7 +65,15 @@ func newWhole(t *testing.T) *whole {
 func connectWhole(t *testing.T, w *whole) *mcp.ClientSession {
 	t.Helper()
 	ctx := context.Background()
-	processes := proc.New(w.files, w.runner, nil)
+	// Every Process is run by kitbashd, so the surface is served against a
+	// fake one, see PLAN.md section 2.3.
+	daemon, err := teltest.Start()
+	if err != nil {
+		t.Fatalf("teltest.Start: %v", err)
+	}
+	t.Cleanup(daemon.Close)
+	daemon.MirrorRuns(w.runner)
+	processes := proc.New(w.files, w.runner, telemetry.NewClient(daemon.Socket))
 	tools := bridge.New(w.files, processes, w.runner)
 	srv := server.New("test", server.Deps{
 		Files:     w.files,

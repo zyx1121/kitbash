@@ -47,7 +47,15 @@ func serveNarrowed(t *testing.T, permitsFor func(w *whole) *manifest.Permits) *n
 		t.Fatal(err)
 	}
 
-	processes := proc.New(w.files, w.runner, nil)
+	// Every Process is run by kitbashd, so the surface is served against a
+	// fake one whose starts land in this runtime, see PLAN.md section 2.3.
+	daemon, err := teltest.Start()
+	if err != nil {
+		t.Fatalf("teltest.Start: %v", err)
+	}
+	t.Cleanup(daemon.Close)
+	daemon.MirrorRuns(w.runner)
+	processes := proc.New(w.files, w.runner, telemetry.NewClient(daemon.Socket))
 	tools := bridge.New(w.files, processes, w.runner)
 	packageServer := mcp.NewServer(&mcp.Implementation{Name: "ffmpeg", Version: "1"}, nil)
 	packageServer.AddTool(&mcp.Tool{

@@ -3,9 +3,14 @@ package sysusers
 import (
 	"context"
 	"fmt"
+	"io/fs"
+	"os"
 	"path"
 	"sort"
 	"sync"
+	"syscall"
+
+	"github.com/zyx1121/kitbash/internal/podman"
 )
 
 // Fake is an in memory System and Runner. It keeps the state a host would keep,
@@ -27,20 +32,31 @@ type Fake struct {
 	AddKeyErr error
 	RemoveErr error
 	ListErr   error
-	// StartErr and RemoveAllErr make the runtime fail on demand.
-	StartErr     error
-	RemoveAllErr error
+	// StartErr, RunErr, StopErr, RemoveContainerErr and RemoveAllErr make the
+	// runtime fail on demand.
+	StartErr           error
+	RunErr             error
+	StopErr            error
+	RemoveContainerErr error
+	RemoveAllErr       error
+	// RunID is the container id Run answers. Empty means a fixed one.
+	RunID string
 
-	// Missing are containers Start answers ErrNoContainer for, by name.
+	// Missing are containers Start, Stop and Remove answer ErrNoContainer
+	// for, by name, and images Run answers ErrNoImage for.
 	Missing map[string]bool
 
 	// Created, AddedKeys and Removed record what the caller asked for, and
-	// Started and RemovedFor what the runtime was asked to do.
-	Created    []Spec
-	AddedKeys  []KeyCall
-	Removed    []string
-	Started    []StartCall
-	RemovedFor []string
+	// Started, Ran, Stopped, RemovedContainers and RemovedFor what the
+	// runtime was asked to do.
+	Created           []Spec
+	AddedKeys         []KeyCall
+	Removed           []string
+	Started           []StartCall
+	Ran               []RunCall
+	Stopped           []StopCall
+	RemovedContainers []StopCall
+	RemovedFor        []string
 
 	members map[string]*fakeMember
 	nextUID int
@@ -52,11 +68,41 @@ type KeyCall struct {
 	Key  string
 }
 
-// StartCall is one recorded container start, with the member it ran as.
+// StartCall is one recorded container start, with the member it ran as and
+// the cgroup leaf the child was placed in.
 type StartCall struct {
 	Member    string
 	UID       int
 	Container string
+	Cgroup    string
+}
+
+// RunCall is one recorded container run. Args is the command line the runtime
+// would have been given, built by the same function the real runner uses, so a
+// test asserts on the flags rather than on a struct kitbashd filled in.
+//
+// Env is what the environment file held when the run happened, with its mode
+// and owner: the file is the caller's to write and to remove, and a test that
+// only looked afterwards would find nothing.
+type RunCall struct {
+	Member  string
+	UID     int
+	Options podman.RunOptions
+	Args    []string
+	Cgroup  string
+	EnvFile string
+	Env     string
+	EnvMode fs.FileMode
+	EnvUID  int
+	EnvGID  int
+}
+
+// StopCall is one recorded stop or removal.
+type StopCall struct {
+	Member    string
+	Container string
+	Timeout   int
+	Force     bool
 }
 
 // fakeMember is one member of the fake host.
@@ -240,7 +286,7 @@ func (f *Fake) Lookup(_ context.Context, name string) (Member, bool, error) {
 
 // Start records a container start as one member. A container named in Missing
 // is ErrNoContainer, which is what restore unregisters.
-func (f *Fake) Start(_ context.Context, m Member, container string) error {
+func (f *Fake) Start(_ context.Context, m Member, container, cgroup string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.Missing[container] {
@@ -249,7 +295,79 @@ func (f *Fake) Start(_ context.Context, m Member, container string) error {
 	if f.StartErr != nil {
 		return f.StartErr
 	}
-	f.Started = append(f.Started, StartCall{Member: m.Name, UID: m.UID, Container: container})
+	f.Started = append(f.Started, StartCall{
+		Member: m.Name, UID: m.UID, Container: container, Cgroup: cgroup,
+	})
+	return nil
+}
+
+// Run records a container run as one member, reading the environment file
+// while it still exists. A container named in Missing is ErrNoImage: the fake
+// has no image store, so the one thing a caller stages is an image that is not
+// there.
+func (f *Fake) Run(_ context.Context, m Member, opts podman.RunOptions, cgroup string) (string, error) {
+	call := RunCall{
+		Member:  m.Name,
+		UID:     m.UID,
+		Options: opts,
+		Args:    podman.RunArgs(opts, nil),
+		Cgroup:  cgroup,
+		EnvFile: opts.EnvFile,
+	}
+	if opts.EnvFile != "" {
+		if body, err := os.ReadFile(opts.EnvFile); err == nil {
+			call.Env = string(body)
+		}
+		if info, err := os.Stat(opts.EnvFile); err == nil {
+			call.EnvMode = info.Mode().Perm()
+			if sys, ok := info.Sys().(*syscall.Stat_t); ok {
+				call.EnvUID = int(sys.Uid)
+				call.EnvGID = int(sys.Gid)
+			}
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.Missing[opts.Image] {
+		return "", fmt.Errorf("%w: %s", ErrNoImage, opts.Image)
+	}
+	if f.RunErr != nil {
+		return "", f.RunErr
+	}
+	f.Ran = append(f.Ran, call)
+	if f.RunID != "" {
+		return f.RunID, nil
+	}
+	return "container-" + opts.Name, nil
+}
+
+// Stop records a stop as one member.
+func (f *Fake) Stop(_ context.Context, m Member, container string, timeout int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.Missing[container] {
+		return fmt.Errorf("%w: %s", ErrNoContainer, container)
+	}
+	if f.StopErr != nil {
+		return f.StopErr
+	}
+	f.Stopped = append(f.Stopped, StopCall{Member: m.Name, Container: container, Timeout: timeout})
+	return nil
+}
+
+// RemoveContainer records a removal as one member.
+func (f *Fake) RemoveContainer(_ context.Context, m Member, container string, force bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.Missing[container] {
+		return fmt.Errorf("%w: %s", ErrNoContainer, container)
+	}
+	if f.RemoveContainerErr != nil {
+		return f.RemoveContainerErr
+	}
+	f.RemovedContainers = append(f.RemovedContainers, StopCall{
+		Member: m.Name, Container: container, Force: force,
+	})
 	return nil
 }
 
@@ -270,6 +388,33 @@ func (f *Fake) Calls() []StartCall {
 	defer f.mu.Unlock()
 	out := make([]StartCall, len(f.Started))
 	copy(out, f.Started)
+	return out
+}
+
+// Runs answers the recorded container runs, newest last.
+func (f *Fake) Runs() []RunCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]RunCall, len(f.Ran))
+	copy(out, f.Ran)
+	return out
+}
+
+// Stops answers the recorded stops, newest last.
+func (f *Fake) Stops() []StopCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]StopCall, len(f.Stopped))
+	copy(out, f.Stopped)
+	return out
+}
+
+// Removals answers the recorded container removals, newest last.
+func (f *Fake) Removals() []StopCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]StopCall, len(f.RemovedContainers))
+	copy(out, f.RemovedContainers)
 	return out
 }
 

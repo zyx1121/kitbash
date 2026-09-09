@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/zyx1121/kitbash/internal/cgroups"
 	"github.com/zyx1121/kitbash/internal/problem"
 	"github.com/zyx1121/kitbash/internal/store"
 	"github.com/zyx1121/kitbash/internal/sysusers"
@@ -118,8 +119,25 @@ type Options struct {
 	// one, which runs useradd and its neighbours as root.
 	Users sysusers.System
 	// Runner starts and removes containers as their owner, which is what
-	// restore and removing a member both need. Nil means the real one.
+	// every Process start, restore and removing a member need. Nil means the
+	// real one.
 	Runner sysusers.Runner
+	// Cgroups is the delegated cgroup tree Processes are placed in, which is
+	// what makes the manifest's limits an enforcement. Nil means the real
+	// one, which is Linux only and turns itself off on a host whose cgroup
+	// filesystem it cannot write.
+	Cgroups cgroups.Cgroups
+	// CgroupRoot is where the unified hierarchy is mounted. Empty means
+	// cgroups.DefaultRoot.
+	CgroupRoot string
+	// EnvDir is where the environment file of one Process is written before
+	// its container is started. Empty means DefaultEnvDir.
+	EnvDir string
+	// ProcessEndpoint is the address this host gives its Processes, which
+	// they export Telemetry to and reach the MCP surface on. Empty means
+	// DefaultProcessEndpoint. It exists for tests, the same way
+	// KITBASH_TELEMETRY_ENDPOINT_FOR_PROCESSES does for a session.
+	ProcessEndpoint string
 	// Sessions starts one kitbash-mcp as the owner of a Process, which is
 	// what an MCP session on the Process receiver is. Nil means the runner
 	// when it starts one, and the real one otherwise.
@@ -163,6 +181,9 @@ type Server struct {
 	users    sysusers.System
 	runner   sysusers.Runner
 	sessions sysusers.Sessions
+	cgroups  cgroups.Cgroups
+	envDir   string
+	endpoint string
 
 	// The MCP endpoint of the Process receiver: the handler of the SDK, the
 	// live sessions, the binary each one runs and how long one may sit idle,
@@ -213,6 +234,9 @@ func New(st *store.Store, opts Options) *Server {
 		users:    opts.Users,
 		runner:   opts.Runner,
 		sessions: opts.Sessions,
+		cgroups:  opts.Cgroups,
+		envDir:   opts.EnvDir,
+		endpoint: opts.ProcessEndpoint,
 
 		mcpSessions: newMCPRegistry(),
 		mcpBinary:   mcpBinaryPath(opts.MCPBinary),
@@ -227,6 +251,12 @@ func New(st *store.Store, opts Options) *Server {
 	}
 	if s.runner == nil {
 		s.runner = sysusers.NewPodman()
+	}
+	if s.cgroups == nil {
+		s.cgroups = cgroups.New(opts.CgroupRoot)
+	}
+	if s.envDir == "" {
+		s.envDir = DefaultEnvDir
 	}
 	if s.sessions == nil {
 		s.sessions = mcpSessionsOf(s.runner)
@@ -273,7 +303,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc(queryPath, s.method(http.MethodPost, s.query))
 	s.mux.HandleFunc(retentionPath, s.retention)
 	s.mux.HandleFunc(processesPath, s.processes)
-	s.mux.HandleFunc(processesPath+"/", s.unregisterProcess)
+	s.mux.HandleFunc(processesPath+"/", s.process)
 	s.mux.HandleFunc(usersPath, s.usersFamily)
 	s.mux.HandleFunc(usersPath+"/", s.user)
 	s.mux.HandleFunc(approvalsPath, s.approvalsFamily)

@@ -18,7 +18,10 @@ fi
 log "installing host packages"
 apk add -q --no-progress podman crun passt fuse-overlayfs shadow shadow-subids git openssh qemu-guest-agent curl
 
-# 3. cgroups v2 and kernel modules for rootless podman.
+# 3. cgroups v2 and kernel modules for rootless podman. kitbashd owns
+#    /sys/fs/cgroup/kitbash: it creates the tree, delegates memory, cpu and
+#    pids to one cgroup per member and starts every Process inside it, which is
+#    what makes the manifest's limits an enforcement. Nothing here creates it.
 sed -i 's/^#\?rc_cgroup_mode=.*/rc_cgroup_mode="unified"/' /etc/rc.conf
 grep -q '^rc_cgroup_mode="unified"' /etc/rc.conf || echo 'rc_cgroup_mode="unified"' >> /etc/rc.conf
 for m in tun fuse; do grep -qx "$m" /etc/modules || echo "$m" >> /etc/modules; modprobe "$m" 2>/dev/null || true; done

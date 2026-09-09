@@ -11,8 +11,8 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
-	"regexp"
 	"sort"
 	"strconv"
 	"time"
@@ -88,10 +88,22 @@ type LogsResult struct {
 // its fan out carries; unregistering revokes the token. It is an interface
 // here so this package depends on the daemon's contract rather than on a
 // socket.
+// It is also the supervisor: kitbashd runs, stops and removes the container
+// of a Process as its owner, because a member cannot place their own container
+// in a delegated cgroup and the manifest's limits are only enforced in one,
+// see PLAN.md section 2.3 and internal/cgroups.
 type Registry interface {
 	RegisterProcess(ctx context.Context, reg telemetry.Registration) (token, fanoutSecret string, prob *problem.Problem)
 	UnregisterProcess(ctx context.Context, id string) *problem.Problem
 	ListProcesses(ctx context.Context) ([]telemetry.Registered, *problem.Problem)
+	// StartProcess runs the container of a registered Process as its owner
+	// and answers the id the runtime gave it.
+	StartProcess(ctx context.Context, id string, opts telemetry.StartOptions) (string, *problem.Problem)
+	// StopProcess stops it, giving it StopTimeout seconds to exit.
+	StopProcess(ctx context.Context, id string) *problem.Problem
+	// RemoveProcess removes it, which is what a replacement does to the
+	// Process it takes the place of.
+	RemoveProcess(ctx context.Context, id string) *problem.Problem
 }
 
 // Service answers the proc family for one caller.
@@ -102,9 +114,10 @@ type Service struct {
 	logger   *log.Logger
 }
 
-// New builds the Service the server runs with. The registry may be nil, in
-// which case every Process starts untraced: the container runtime does not
-// depend on kitbashd and a host without it still runs Packages.
+// New builds the Service the server runs with. A nil registry is a host
+// without kitbashd: Packages still build and Processes still list, and
+// proc_run refuses rather than starting a Process nobody supervises, see
+// PLAN.md section 4.5.
 func New(files *fs.Service, runner podman.Runner, registry Registry) *Service {
 	return &Service{
 		files:    files,
@@ -146,6 +159,14 @@ func (s *Service) Run(ctx context.Context, path, digest, name string) (*Process,
 }
 
 func (s *Service) run(ctx context.Context, span *telemetry.Span, path, digest, name string) (*Process, *problem.Problem) {
+	// kitbashd runs the container, so a host without it starts nothing. The
+	// alternative is a Process with no token, no fan out secret and no cgroup,
+	// which is the untraced path PLAN.md section 2.6 does not have.
+	if s.registry == nil {
+		return nil, problem.Internal(path,
+			"kitbashd is not reachable from this session, and it is the one that runs a Process",
+			telemetry.NotRunningFix)
+	}
 	m, folder, prob := s.files.Manifest(ctx, path)
 	if prob != nil {
 		return nil, prob
@@ -179,7 +200,7 @@ func (s *Service) run(ctx context.Context, span *telemetry.Span, path, digest, n
 		Env:         unit.Env,
 		Restart:     restartPolicy(unit.Restart),
 		CPUs:        unit.Limits.CPU,
-		Memory:      memoryLimit(unit.Limits.Memory),
+		Memory:      podman.MemoryLimit(unit.Limits.Memory),
 		Detach:      true,
 		Interactive: true,
 	}
@@ -235,8 +256,8 @@ func (s *Service) run(ctx context.Context, span *telemetry.Span, path, digest, n
 		}
 		previous := s.describe(*existing, unit)
 		replaced = &previous
-		if err := s.runner.Remove(ctx, container, true); err != nil {
-			return nil, problem.Internal(folder, err.Error(), "")
+		if prob := s.remove(ctx, previous.ID, container); prob != nil {
+			return nil, prob
 		}
 		// The container is gone, so the token it held has to go with it. This
 		// happens after the removal: a Process that is still running keeps
@@ -244,10 +265,11 @@ func (s *Service) run(ctx context.Context, span *telemetry.Span, path, digest, n
 		s.unregister(ctx, previous.ID)
 	}
 
-	// The Process is registered before the container starts, so the token is
-	// in the environment the container is created with, see PLAN.md 2.4.
+	// The Process is registered before the container starts: the registration
+	// is what kitbashd reads the owner, the container name, the image and the
+	// two credentials from when it runs it, see PLAN.md 2.4.
 	id := opts.Labels[podman.LabelID]
-	env, registered := s.telemetryEnv(ctx, unit.Env, telemetry.Registration{
+	prob = s.register(ctx, telemetry.Registration{
 		ID:      id,
 		Package: folder,
 		Name:    name,
@@ -264,25 +286,24 @@ func (s *Service) run(ctx context.Context, span *telemetry.Span, path, digest, n
 		// surface rather than its owner's whole one, see PLAN.md section 2.3.
 		Permits: m.Permits(),
 	})
-	opts.Env = env
+	if prob != nil {
+		return nil, prob
+	}
 	// A registration whose container never started is worse than no
 	// registration: it names an endpoint on this host, so kitbashd would fan
 	// the member's records out to whatever takes that loopback port next.
 	orphan := func() {
-		if !registered {
-			return
-		}
 		s.logger.Printf("proc: Process %s did not start; unregistering it", id)
 		s.unregister(ctx, id)
 	}
 
-	if _, err := s.runner.Run(ctx, opts); err != nil {
-		// The runtime says only that it refused the command: the same exit
-		// status covers an image that is gone and a name taken since the
-		// lookup. The manifest cases are caught by checkOptions above, before
-		// anything is removed, so what is left is not the caller's to fix.
+	// kitbashd runs it, as this member, inside their delegated cgroup. The
+	// environment that crosses the socket is the manifest's own: the token and
+	// the fan out secret are written by the daemon into a file only the member
+	// can read, so neither is ever in a request body or on a command line.
+	if _, prob := s.registry.StartProcess(ctx, id, startOptions(opts)); prob != nil {
 		orphan()
-		return nil, problem.Internal(folder, err.Error(), "")
+		return nil, prob
 	}
 
 	started, prob := s.byName(ctx, container)
@@ -322,8 +343,8 @@ func (s *Service) Stop(ctx context.Context, id string) (*StopResult, *problem.Pr
 		return nil, prob
 	}
 	process := s.describe(*container, manifest.Unit{})
-	if err := s.runner.Stop(ctx, container.Name, StopTimeout); err != nil {
-		return nil, problem.Internal(id, err.Error(), "")
+	if prob := s.stop(ctx, id, container.Name); prob != nil {
+		return nil, prob
 	}
 	// The token outlives nothing: once the container is stopped it cannot
 	// export, so the registration goes with it.
@@ -418,58 +439,97 @@ func (s *Service) Reconcile(ctx context.Context, running []Process) (registered,
 	return registered, stale, nil
 }
 
-// telemetryEnv registers the Process and returns the environment its container
-// is started with: the manifest's own, minus everything kitbashd speaks for,
-// plus the seven variables of spec/kitbashd-api.yaml that this registration
-// answered. The manifest cannot name any of them; they are the Process's
-// identity and its two credentials, not its configuration. The second return
-// says whether the registration happened, so a container that never starts can
-// be taken back off the registry.
+// register records the Process with kitbashd, which is what mints the
+// Telemetry token it exports with and the secret its fan out carries. Both are
+// returned here and both are dropped: kitbashd puts them in the container
+// itself, so this session never holds a credential of a Process it started.
 //
-// The removal happens before anything is added back, and so on every path out
-// of here. Overwriting the keys at the end would leave a manifest's own
-// KITBASH_FANOUT_SECRET in place whenever no registration happened, and a
-// container that knows its own secret accepts fan out requests from whoever
-// wrote the manifest rather than from kitbashd alone.
-//
-// A registration that fails is not a reason to refuse to start the Process.
-// The container runtime does not depend on kitbashd, so the Process starts
-// with neither credential and produces no Telemetry of its own, and the
-// session says so once in the server log.
-func (s *Service) telemetryEnv(ctx context.Context, env map[string]string, reg telemetry.Registration) (map[string]string, bool) {
-	merged := make(map[string]string, len(env)+len(telemetry.OwnedEnv))
+// A registration that fails is a Process that does not start. kitbashd is the
+// one that runs the container, so there is nothing to fall back to and nothing
+// untraced to leave behind, see PLAN.md section 2.6.
+func (s *Service) register(ctx context.Context, reg telemetry.Registration) *problem.Problem {
+	if _, _, prob := s.registry.RegisterProcess(ctx, reg); prob != nil {
+		s.logger.Printf("proc: registering Process %s at %s: %s", reg.ID, reg.Package, prob.Detail)
+		return prob
+	}
+	return nil
+}
+
+// startOptions is the command line kitbashd runs, as
+// spec/kitbashd-api.yaml carries it. It is the same options this session would
+// have run, minus everything the daemon speaks for.
+func startOptions(opts podman.RunOptions) telemetry.StartOptions {
+	out := telemetry.StartOptions{
+		Container: opts.Name,
+		Image:     opts.Image,
+		Labels:    opts.Labels,
+		Env:       ownEnv(opts.Env),
+		Restart:   opts.Restart,
+		CPU:       opts.CPUs,
+		Memory:    opts.Memory,
+	}
+	for _, port := range opts.Publish {
+		out.Publish = append(out.Publish, telemetry.PortMapping{
+			HostPort: port.HostPort, ContainerPort: port.ContainerPort,
+		})
+	}
+	return out
+}
+
+// ownEnv is a unit's own environment with everything kitbashd speaks for taken
+// out. The daemon drops them too; they are dropped here as well so a manifest's
+// KITBASH_FANOUT_SECRET does not cross the socket in a body that could be
+// logged.
+func ownEnv(env map[string]string) map[string]string {
+	if len(env) == 0 {
+		return nil
+	}
+	own := make(map[string]string, len(env))
 	for k, v := range env {
-		merged[k] = v
+		own[k] = v
 	}
 	for _, key := range telemetry.OwnedEnv {
-		delete(merged, key)
+		delete(own, key)
 	}
-	if s.registry == nil {
-		s.logger.Printf("proc: kitbashd is not running; Process %s starts untraced", reg.ID)
-		return merged, false
+	if len(own) == 0 {
+		return nil
 	}
-	token, fanoutSecret, prob := s.registry.RegisterProcess(ctx, reg)
-	if prob != nil {
-		s.logger.Printf("proc: kitbashd is not running; Process %s starts untraced: %s", reg.ID, prob.Detail)
-		return merged, false
+	return own
+}
+
+// stop stops one container. kitbashd does it, as the owner; a Process the
+// daemon has no registration for is stopped through this session's own
+// runtime, which is the member's, so a container that outlived its
+// registration can still be stopped by the member who runs it.
+func (s *Service) stop(ctx context.Context, id, container string) *problem.Problem {
+	prob := s.registry.StopProcess(ctx, id)
+	if prob == nil {
+		return nil
 	}
-	merged[telemetry.EnvEndpoint] = telemetry.EndpointForProcesses()
-	merged[telemetry.EnvToken] = token
-	merged[telemetry.EnvProcess] = reg.ID
-	merged[telemetry.EnvPackage] = reg.Package
-	merged[telemetry.EnvUser] = s.files.User()
-	// The MCP endpoint is given with the token, not before it: without a
-	// token there is nothing for a Process to authenticate a session with.
-	merged[telemetry.EnvMCPEndpoint] = telemetry.MCPEndpointForProcesses()
-	// The fan out secret only when kitbashd minted one. A daemon of an earlier
-	// release answers without it, and a subscriber that is given no secret
-	// accepts the fan out as it did before rather than refusing every record.
-	// Like the token it reaches the container through the environment file
-	// podman reads, never through an argument, see internal/podman.
-	if fanoutSecret != "" {
-		merged[telemetry.EnvFanoutSecret] = fanoutSecret
+	if prob.Status != http.StatusNotFound {
+		return prob
 	}
-	return merged, true
+	s.logger.Printf("proc: kitbashd has no registration for Process %s; stopping %s in this session", id, container)
+	if err := s.runner.Stop(ctx, container, StopTimeout); err != nil {
+		return problem.Internal(id, err.Error(), "")
+	}
+	return nil
+}
+
+// remove removes one container, the same way and for the same reason.
+func (s *Service) remove(ctx context.Context, id, container string) *problem.Problem {
+	prob := s.registry.RemoveProcess(ctx, id)
+	if prob == nil {
+		return nil
+	}
+	if prob.Status != http.StatusNotFound {
+		return prob
+	}
+	s.logger.Printf("proc: kitbashd has no registration for Process %s; removing %s in this session", id, container)
+	if err := s.runner.Remove(ctx, container, true); err != nil {
+		return problem.Internal(id, err.Error(), "")
+	}
+	return nil
 }
 
 // unregister revokes one Process's token. A daemon that is not there is not a
@@ -627,42 +687,21 @@ func State(container podman.Container) string {
 // names allow no dots, so the dot form in PLAN.md is spelled with underscore.
 func ToolName(pkg, tool string) string { return pkg + "_" + tool }
 
-// memorySuffixes maps the manifest's Kubernetes style memory suffix onto the
-// runtime's own. spec/manifest.schema.json allows Ki, Mi and Gi only, so the
-// table is the whole conversion.
-var memorySuffixes = map[string]string{"Ki": "k", "Mi": "m", "Gi": "g"}
-
-// memoryLimit converts one limits.memory value. An unknown suffix is passed
-// through for the runtime to reject, which the manifest schema already
-// prevents from happening.
-func memoryLimit(memory string) string {
-	if len(memory) < 3 {
-		return memory
-	}
-	suffix, ok := memorySuffixes[memory[len(memory)-2:]]
-	if !ok {
-		return memory
-	}
-	return memory[:len(memory)-2] + suffix
-}
-
 // checkOptions is the second belt under spec/manifest.schema.json: it catches a
 // run command the runtime would refuse, before a replacement removes the
 // Process that is running now.
 func checkOptions(folder string, opts podman.RunOptions) *problem.Problem {
-	if opts.Memory != "" && !memoryValue.MatchString(opts.Memory) {
+	if opts.Memory != "" && !podman.ValidMemory(opts.Memory) {
 		return problem.InvalidManifestFix(folder,
 			fmt.Sprintf("limits.memory %q is not a size the container runtime takes", opts.Memory),
 			"Write limits.memory as a number with Ki, Mi or Gi, such as 512Mi.")
 	}
-	if opts.CPUs != "" && !cpuValue.MatchString(opts.CPUs) {
+	if opts.CPUs != "" && !podman.ValidCPUs(opts.CPUs) {
 		return problem.InvalidManifestFix(folder,
 			fmt.Sprintf("limits.cpu %q is not a number of cores", opts.CPUs),
 			"Write limits.cpu as a number, such as 1 or 0.5.")
 	}
-	switch opts.Restart {
-	case "always", "on-failure", "no":
-	default:
+	if !podman.ValidRestart(opts.Restart) {
 		return problem.InvalidManifestFix(folder,
 			fmt.Sprintf("restart %q is not a policy the container runtime takes", opts.Restart),
 			"Write restart as always, on-failure or never.")
@@ -670,15 +709,10 @@ func checkOptions(folder string, opts podman.RunOptions) *problem.Problem {
 	return nil
 }
 
-var (
-	memoryValue = regexp.MustCompile(`^[0-9]+[kmg]?$`)
-	cpuValue    = regexp.MustCompile(`^[0-9]+(\.[0-9]+)?$`)
-)
-
 // restartPolicy maps the manifest's spelling onto the runtime's.
 func restartPolicy(restart string) string {
 	if restart == manifest.RestartNever {
-		return "no"
+		return podman.RestartNo
 	}
 	return restart
 }

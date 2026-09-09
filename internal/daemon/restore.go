@@ -119,9 +119,13 @@ func (s *Server) restoreOwner(ctx context.Context, owner string, processes []sto
 		return counts
 	}
 
+	// The leaf is ensured once per owner: every container of theirs is placed
+	// in the same one, and a container keeps the cgroup parent it was created
+	// with, so a restored Process holds the limits it was started with.
+	leaf := s.memberCgroup(ctx, m)
 	for _, p := range processes {
 		start, cancel := context.WithTimeout(ctx, RestoreTimeout)
-		err := s.runner.Start(start, m, p.Container)
+		err := s.runner.Start(start, m, p.Container, leaf)
 		cancel()
 		switch {
 		case err == nil:

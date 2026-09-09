@@ -1,0 +1,493 @@
+package daemon
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	"os/user"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/zyx1121/kitbash/internal/cgroups"
+	"github.com/zyx1121/kitbash/internal/podman"
+	"github.com/zyx1121/kitbash/internal/problem"
+	"github.com/zyx1121/kitbash/internal/store"
+	"github.com/zyx1121/kitbash/internal/sysusers"
+	"github.com/zyx1121/kitbash/internal/uuid"
+)
+
+// testDigest is one image id, the shape a registration carries.
+const testDigest = "sha256:" + "ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34"
+
+// supervised is a daemon whose members are a fake host and whose runtime is
+// the fake runner, with the caller registered as a member of it. The caller's
+// own uid is used, because the environment file of a Process is chowned to the
+// member and only root may give a file away.
+func supervised(t *testing.T) (*harness, *sysusers.Fake) {
+	t.Helper()
+	fake := sysusers.NewFake()
+	h := serveWith(t, Options{
+		Admin:           func(*user.User) (bool, error) { return false, nil },
+		Users:           fake,
+		Runner:          fake,
+		ProcessEndpoint: "http://127.0.0.1:4318",
+	})
+	fake.Add(sysusers.Member{Name: h.user, UID: os.Getuid(), GID: os.Getgid()})
+	return h, fake
+}
+
+// register writes one registration for the caller straight to the store, the
+// way processes_register would, and answers its id.
+func (h *harness) supervise(owner, container string) string {
+	h.t.Helper()
+	_, hash, err := store.NewToken()
+	if err != nil {
+		h.t.Fatalf("NewToken: %v", err)
+	}
+	id := uuid.V7()
+	if err := h.store.RegisterProcess(context.Background(), store.Process{
+		ID:           id,
+		Owner:        owner,
+		Package:      "/home/" + owner + "/echo",
+		Name:         "echo",
+		Container:    container,
+		Digest:       testDigest,
+		Expose:       ExposeNone,
+		FanoutSecret: "the-secret",
+		RegisteredAt: time.Now().UTC(),
+	}, hash, 0); err != nil {
+		h.t.Fatalf("RegisterProcess: %v", err)
+	}
+	return id
+}
+
+// start calls processes_start for one Process.
+func (h *harness) start(id string, req startRequest) (*http.Response, []byte) {
+	h.t.Helper()
+	return h.postJSON(http.MethodPost, processesPath+"/"+id+"/start", req)
+}
+
+// TestStartRunsTheContainerAsTheOwnerInTheirCgroup is the acceptance sentence
+// of issue 69: kitbashd runs the Process, in the member's delegated cgroup,
+// with the limits the manifest declared.
+func TestStartRunsTheContainerAsTheOwnerInTheirCgroup(t *testing.T) {
+	h, fake := supervised(t)
+	id := h.supervise(h.user, "kitbash-echo-echo")
+
+	res, body := h.start(id, startRequest{
+		Image:     testDigest,
+		Container: "kitbash-echo-echo",
+		Labels:    map[string]string{podman.LabelCommit: "abc"},
+		Env:       map[string]string{"LOG_LEVEL": "debug"},
+		Restart:   "always",
+		CPU:       "1",
+		Memory:    "512Mi",
+		Publish:   []portMapping{{HostPort: 40275, ContainerPort: 8080}},
+	})
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("start = %d %s, want 200", res.StatusCode, body)
+	}
+	var answer startResponse
+	if err := json.Unmarshal(body, &answer); err != nil {
+		t.Fatalf("body %q: %v", body, err)
+	}
+	if answer.ID != id || answer.ContainerID == "" {
+		t.Errorf("answer is %+v, want the Process and the id the runtime gave it", answer)
+	}
+
+	runs := fake.Runs()
+	if len(runs) != 1 {
+		t.Fatalf("the runtime was asked for %d runs, want one", len(runs))
+	}
+	run := runs[0]
+	if run.Member != h.user {
+		t.Errorf("the container ran as %s, want %s", run.Member, h.user)
+	}
+	if run.Cgroup != cgroups.LeafDir(h.cgroups.Base, h.user) {
+		t.Errorf("the child was placed in %q, want the member's leaf", run.Cgroup)
+	}
+	want := [][2]string{
+		{"--cgroup-parent=" + cgroups.Parent(h.user), ""},
+		{"--memory", "512m"},
+		{"--cpus", "1"},
+		{"--pids-limit", "512"},
+		{"--restart", "always"},
+		{"--publish", "127.0.0.1:40275:8080"},
+		{"--env-file", run.EnvFile},
+	}
+	for _, pair := range want {
+		if !hasArg(run.Args, pair[0], pair[1]) {
+			t.Errorf("the command line is %v, want %s %s", run.Args, pair[0], pair[1])
+		}
+	}
+	if !slices.Contains(run.Args, "--cgroups=enabled") {
+		t.Errorf("the command line is %v, want --cgroups=enabled", run.Args)
+	}
+	// The environment is in a file, never on the command line: the token is
+	// one of its entries and a command line is readable on the host.
+	for _, arg := range run.Args {
+		if strings.HasPrefix(arg, "--env") && arg != "--env-file" {
+			t.Errorf("the command line carries %q, want the environment in a file only", arg)
+		}
+	}
+}
+
+// The environment file is the member's to read and nobody else's, and it does
+// not outlive the run: it holds a live Telemetry token.
+func TestStartWritesTheEnvironmentFileForTheMemberAndRemovesIt(t *testing.T) {
+	h, fake := supervised(t)
+	id := h.supervise(h.user, "kitbash-echo-echo")
+
+	res, body := h.start(id, startRequest{
+		Image: testDigest,
+		Env: map[string]string{
+			"LOG_LEVEL": "debug",
+			// A manifest that names what kitbashd speaks for is overruled.
+			EnvFanoutSecret:   "forged",
+			EnvTelemetryToken: "forged",
+		},
+	})
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("start = %d %s, want 200", res.StatusCode, body)
+	}
+	run := fake.Runs()[0]
+	if run.EnvFile != filepath.Join(h.envDir, id) {
+		t.Errorf("the environment file is %q, want one named by the Process id under %s", run.EnvFile, h.envDir)
+	}
+	if run.EnvMode != 0o600 {
+		t.Errorf("the environment file is %v, want 0600", run.EnvMode)
+	}
+	if run.EnvUID != os.Getuid() {
+		t.Errorf("the environment file belongs to uid %d, want the member's %d", run.EnvUID, os.Getuid())
+	}
+	env := parseEnvFile(run.Env)
+	if env["LOG_LEVEL"] != "debug" {
+		t.Errorf("the environment is %v, want the unit's own entries", env)
+	}
+	if env[EnvFanoutSecret] != "the-secret" {
+		t.Errorf("the fan out secret is %q, want the registration's", env[EnvFanoutSecret])
+	}
+	if env[EnvTelemetryToken] == "" || env[EnvTelemetryToken] == "forged" {
+		t.Errorf("the token is %q, want the one kitbashd minted", env[EnvTelemetryToken])
+	}
+	if env[EnvProcess] != id || env[EnvUser] != h.user {
+		t.Errorf("the environment is %v, want the Process id and its owner", env)
+	}
+	if env[EnvTelemetryEndpoint] != "http://127.0.0.1:4318" ||
+		env[EnvMCPEndpoint] != "http://127.0.0.1:4318/mcp" {
+		t.Errorf("the endpoints are %q and %q, want the receiver this host gives its Processes",
+			env[EnvTelemetryEndpoint], env[EnvMCPEndpoint])
+	}
+	// The token in the file is the one the Process can export with, and the
+	// one the registration answered is revoked with it.
+	p, found, err := h.store.ProcessByToken(context.Background(), env[EnvTelemetryToken])
+	if err != nil || !found || p.ID != id {
+		t.Errorf("the token in the file resolves to %+v (found %t, err %v), want the Process", p, found, err)
+	}
+	if _, err := os.Stat(run.EnvFile); !os.IsNotExist(err) {
+		t.Errorf("the environment file is still there after the run: %v", err)
+	}
+}
+
+// A host that cannot delegate cgroups still runs Processes: the limits are
+// passed to the runtime and recorded, and nothing is placed.
+func TestStartWithoutCgroupsRecordsTheLimits(t *testing.T) {
+	fake := sysusers.NewFake()
+	off := &cgroups.Fake{Off: true}
+	h := serveWith(t, Options{
+		Admin:   func(*user.User) (bool, error) { return false, nil },
+		Users:   fake,
+		Runner:  fake,
+		Cgroups: off,
+	})
+	fake.Add(sysusers.Member{Name: h.user, UID: os.Getuid(), GID: os.Getgid()})
+	id := h.supervise(h.user, "kitbash-echo-echo")
+
+	res, body := h.start(id, startRequest{Image: testDigest, Memory: "512Mi"})
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("start = %d %s, want 200", res.StatusCode, body)
+	}
+	run := fake.Runs()[0]
+	if run.Cgroup != "" {
+		t.Errorf("the child was placed in %q, want nowhere on a host without delegation", run.Cgroup)
+	}
+	for _, arg := range run.Args {
+		if strings.HasPrefix(arg, "--cgroup") {
+			t.Errorf("the command line carries %q, want no cgroup on a host without delegation", arg)
+		}
+	}
+	if !hasArg(run.Args, "--memory", "512m") {
+		t.Errorf("the command line is %v, want the limit passed to the runtime anyway", run.Args)
+	}
+}
+
+// A Process is run by the member who registered it and by nobody else: this
+// runs a program as them.
+func TestStartRefusesAnotherMembersProcess(t *testing.T) {
+	h, fake := supervised(t)
+	fake.Add(sysusers.Member{Name: "alice", UID: 1005})
+	id := h.supervise("alice", "kitbash-echo-echo")
+
+	res, body := h.start(id, startRequest{Image: testDigest})
+	if res.StatusCode != http.StatusForbidden {
+		t.Fatalf("start = %d %s, want 403", res.StatusCode, body)
+	}
+	if got := h.problemOf(res, body).Slug(); got != problem.SlugNotPermitted {
+		t.Errorf("problem is %s, want not-permitted", got)
+	}
+	if runs := fake.Runs(); len(runs) != 0 {
+		t.Errorf("the runtime ran %+v for the wrong member", runs)
+	}
+}
+
+// An id nobody registered is a Process kitbashd does not know, on all three
+// actions: the registration is what says who may run what.
+func TestActionsOnAnUnknownProcessAreNotFound(t *testing.T) {
+	h, _ := supervised(t)
+	id := uuid.V7()
+	for _, action := range []string{actionStart, actionStop, actionRemove} {
+		res, body := h.postJSON(http.MethodPost, processesPath+"/"+id+"/"+action, startRequest{Image: testDigest})
+		if res.StatusCode != http.StatusNotFound {
+			t.Fatalf("%s = %d %s, want 404", action, res.StatusCode, body)
+		}
+		if got := h.problemOf(res, body).Slug(); got != problem.SlugNotFound {
+			t.Errorf("%s problem is %s, want not-found", action, got)
+		}
+	}
+}
+
+// Exit 125 is podman refusing to parse the command, and every part of it a
+// caller chose comes from the unit, so it is the caller's to fix.
+func TestStartMapsAUsageFailureOntoTheUnit(t *testing.T) {
+	h, fake := supervised(t)
+	fake.RunErr = fmt.Errorf("%w: podman run: exit status 125", sysusers.ErrUsage)
+	id := h.supervise(h.user, "kitbash-echo-echo")
+
+	res, body := h.start(id, startRequest{Image: testDigest})
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("start = %d %s, want 400", res.StatusCode, body)
+	}
+	prob := h.problemOf(res, body)
+	if prob.Slug() != problem.SlugBadRequest {
+		t.Errorf("problem is %s, want bad-request", prob.Slug())
+	}
+	if !strings.Contains(prob.Fix, "deploy.units[0]") {
+		t.Errorf("fix is %q, want it to name the unit options", prob.Fix)
+	}
+	if strings.Contains(prob.Detail, "podman") {
+		t.Errorf("detail is %q, want the runtime's own words in the log only", prob.Detail)
+	}
+	// The environment file goes even when the run failed.
+	if _, err := os.Stat(filepath.Join(h.envDir, id)); !os.IsNotExist(err) {
+		t.Errorf("the environment file survived a failed run: %v", err)
+	}
+}
+
+// An image the member does not have is a Package that was never built here.
+func TestStartWithoutTheImageIsNotFound(t *testing.T) {
+	h, fake := supervised(t)
+	fake.Missing = map[string]bool{testDigest: true}
+	id := h.supervise(h.user, "kitbash-echo-echo")
+
+	res, body := h.start(id, startRequest{Image: testDigest})
+	if res.StatusCode != http.StatusNotFound {
+		t.Fatalf("start = %d %s, want 404", res.StatusCode, body)
+	}
+	if got := h.problemOf(res, body); !strings.Contains(got.Fix, "pkg_build") {
+		t.Errorf("fix is %q, want it to name pkg_build", got.Fix)
+	}
+}
+
+// The command line is held to the registration: the container it names and the
+// image it runs are the ones kitbashd recorded.
+func TestStartRefusesAContainerTheRegistrationDoesNotName(t *testing.T) {
+	h, _ := supervised(t)
+	id := h.supervise(h.user, "kitbash-echo-echo")
+
+	res, body := h.start(id, startRequest{Image: testDigest, Container: "kitbash-somebody-else"})
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("start = %d %s, want 400", res.StatusCode, body)
+	}
+}
+
+// The labels of a container are the Process record, so kitbashd writes the
+// ones that name the Process rather than taking a caller's word for them.
+func TestStartWritesTheIdentityLabelsItself(t *testing.T) {
+	h, fake := supervised(t)
+	id := h.supervise(h.user, "kitbash-echo-echo")
+
+	res, body := h.start(id, startRequest{
+		Image:  testDigest,
+		Labels: map[string]string{podman.LabelID: "forged", podman.LabelUser: "root"},
+	})
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("start = %d %s, want 200", res.StatusCode, body)
+	}
+	labels := fake.Runs()[0].Options.Labels
+	if labels[podman.LabelID] != id || labels[podman.LabelUser] != h.user {
+		t.Errorf("labels are %v, want the Process id and its owner from the registration", labels)
+	}
+}
+
+// A limit the runtime would refuse is refused here, before a command line is
+// built: the message names the field of the manifest it came from.
+func TestStartRefusesLimitsTheRuntimeWouldNotTake(t *testing.T) {
+	h, _ := supervised(t)
+	id := h.supervise(h.user, "kitbash-echo-echo")
+
+	cases := []struct {
+		name string
+		req  startRequest
+	}{
+		{name: "memory", req: startRequest{Image: testDigest, Memory: "lots"}},
+		{name: "cpu", req: startRequest{Image: testDigest, CPU: "many"}},
+		{name: "restart", req: startRequest{Image: testDigest, Restart: "sometimes"}},
+		{name: "pids", req: startRequest{Image: testDigest, PidsLimit: 100000}},
+		{name: "port", req: startRequest{Image: testDigest, Publish: []portMapping{{ContainerPort: 0}}}},
+		{name: "environment name", req: startRequest{Image: testDigest, Env: map[string]string{"not a name": "x"}}},
+		{name: "environment line break", req: startRequest{Image: testDigest, Env: map[string]string{"KEY": "a\nb"}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res, body := h.start(id, tc.req)
+			if res.StatusCode != http.StatusBadRequest {
+				t.Fatalf("start = %d %s, want 400", res.StatusCode, body)
+			}
+		})
+	}
+}
+
+// Stopping and removing are the same rule as starting: kitbashd does them as
+// the owner, because the container is in the member's own runtime.
+func TestStopAndRemoveRunAsTheOwner(t *testing.T) {
+	h, fake := supervised(t)
+	id := h.supervise(h.user, "kitbash-echo-echo")
+
+	res, body := h.postJSON(http.MethodPost, processesPath+"/"+id+"/stop", nil)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("stop = %d %s, want 200", res.StatusCode, body)
+	}
+	stops := fake.Stops()
+	if len(stops) != 1 || stops[0].Member != h.user || stops[0].Container != "kitbash-echo-echo" {
+		t.Fatalf("stops = %+v, want one stop of the Process as its owner", stops)
+	}
+	if stops[0].Timeout != StopTimeout {
+		t.Errorf("the container was given %d seconds, want %d", stops[0].Timeout, StopTimeout)
+	}
+
+	res, body = h.postJSON(http.MethodPost, processesPath+"/"+id+"/remove", nil)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("remove = %d %s, want 200", res.StatusCode, body)
+	}
+	removals := fake.Removals()
+	if len(removals) != 1 || !removals[0].Force || removals[0].Member != h.user {
+		t.Errorf("removals = %+v, want one forced removal as the owner", removals)
+	}
+	// Neither touches the registration: proc_stop unregisters, which is what
+	// revokes the token.
+	if _, found, err := h.store.Process(context.Background(), id); err != nil || !found {
+		t.Errorf("the registration went with the container (found %t, err %v)", found, err)
+	}
+}
+
+// A container the runtime no longer has is not-found rather than internal: the
+// Process can be run again.
+func TestStopOfAMissingContainerIsNotFound(t *testing.T) {
+	h, fake := supervised(t)
+	fake.Missing = map[string]bool{"kitbash-echo-echo": true}
+	id := h.supervise(h.user, "kitbash-echo-echo")
+
+	res, body := h.postJSON(http.MethodPost, processesPath+"/"+id+"/stop", nil)
+	if res.StatusCode != http.StatusNotFound {
+		t.Fatalf("stop = %d %s, want 404", res.StatusCode, body)
+	}
+}
+
+// Only POST, and only the three actions this API defines.
+func TestTheActionsAreThreeAndPostOnly(t *testing.T) {
+	h, _ := supervised(t)
+	id := h.supervise(h.user, "kitbash-echo-echo")
+
+	res, body := h.do(http.MethodGet, processesPath+"/"+id+"/start", "", nil)
+	if res.StatusCode != http.StatusNotFound {
+		t.Errorf("GET start = %d %s, want 404", res.StatusCode, body)
+	}
+	res, body = h.postJSON(http.MethodPost, processesPath+"/"+id+"/restart", startRequest{})
+	if res.StatusCode != http.StatusNotFound {
+		t.Errorf("a fourth action = %d %s, want 404", res.StatusCode, body)
+	}
+}
+
+// Creating a member creates their cgroup subtree, so their first Process is
+// placed without waiting for the next daemon start.
+func TestCreatingAMemberPreparesTheirCgroup(t *testing.T) {
+	fake := sysusers.NewFake()
+	h := serveWith(t, Options{
+		Admin:  func(*user.User) (bool, error) { return true, nil },
+		Users:  fake,
+		Runner: fake,
+	})
+	res, body := h.postJSON(http.MethodPost, usersPath, userRequest{Name: "alice", SSHKey: publicKey("alice")})
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("users_create = %d %s, want 200", res.StatusCode, body)
+	}
+	calls := h.cgroups.Calls()
+	if len(calls) != 1 || calls[0].Name != "alice" {
+		t.Fatalf("the cgroups prepared are %+v, want alice's", calls)
+	}
+	if calls[0].UID == 0 || calls[0].Leaf == "" {
+		t.Errorf("alice's subtree is %+v, want her uid and a leaf", calls[0])
+	}
+}
+
+// PrepareCgroups is what the daemon runs at start: the root, then one subtree
+// per member of the host.
+func TestPrepareCgroupsCoversEveryMember(t *testing.T) {
+	fake := sysusers.NewFake()
+	h := serveWith(t, Options{Users: fake, Runner: fake})
+	fake.Add(sysusers.Member{Name: "alice", UID: 1005})
+	fake.Add(sysusers.Member{Name: "bob", UID: 1006})
+
+	h.server.PrepareCgroups(context.Background())
+	if h.cgroups.Roots != 1 {
+		t.Errorf("the root was prepared %d times, want once", h.cgroups.Roots)
+	}
+	names := []string{}
+	for _, call := range h.cgroups.Calls() {
+		names = append(names, call.Name)
+	}
+	if !slices.Contains(names, "alice") || !slices.Contains(names, "bob") {
+		t.Errorf("the subtrees prepared are %v, want one per member", names)
+	}
+}
+
+// hasArg reports whether a command line carries a flag, with its value when
+// one is given.
+func hasArg(args []string, flag, value string) bool {
+	for i, arg := range args {
+		if arg != flag {
+			continue
+		}
+		if value == "" {
+			return true
+		}
+		return i+1 < len(args) && args[i+1] == value
+	}
+	return false
+}
+
+// parseEnvFile reads back the KEY=value lines of one environment file.
+func parseEnvFile(body string) map[string]string {
+	env := map[string]string{}
+	for _, line := range strings.Split(body, "\n") {
+		if key, value, found := strings.Cut(line, "="); found {
+			env[key] = value
+		}
+	}
+	return env
+}
