@@ -22,9 +22,10 @@ Version 1 complete (v0.6.2): all six milestones done and the backlog cleared; wh
 
 **Prerequisites.** One Proxmox VE virtual machine, not an LXC container: nested
 container runtimes inside LXC are unreliable and rootless podman is how every
-Process runs (PLAN.md 5.4). Alpine 3.23 cloud image, 4 cores, 4 GB of memory,
-40 GB of disk. Nothing else is installed on the host: install.sh adds the seven
-components of PLAN.md 4.2 and everything third party arrives as a Package.
+Process runs (PLAN.md 5.4). The Alpine cloud image install.sh was written for,
+3.23 at the time of writing, 4 cores, 4 GB of memory, 40 GB of disk. Nothing
+else is installed on the host: install.sh puts components 2 to 6 of PLAN.md 4.2
+there and everything third party arrives as a Package.
 
 **1. Build the apk.** On any Alpine host with `alpine-sdk` and `go`, as a non
 root user (abuild refuses root):
@@ -36,17 +37,19 @@ sh packaging/apk/build.sh kitbash-0.6.2.tar.gz
 
 The tarball must be named `kitbash-<pkgver>.tar.gz` for the `pkgver` in
 `packaging/apk/APKBUILD`. On its first run build.sh creates a signing key with
-`abuild-keygen -a -n -q`; the package lands in `~/packages/`. Copy the public
-half to the kitbash host once to install without `--allow-untrusted`:
+`abuild-keygen -a -n -q`; the package lands in `~/packages/`. Copy the package
+and the public half of the key to the kitbash host:
 
 ```sh
-cp ~/.abuild/*.rsa.pub /etc/apk/keys/
+scp ~/packages/*/*/kitbashd-0.6.2-r0.apk ~/.abuild/*.rsa.pub root@kitbash.example.org:
 ```
 
-**2. Install the host.** As root on the kitbash machine:
+**2. Install the host.** As root on the kitbash machine. The key goes in first,
+so apk verifies the signature it was built with:
 
 ```sh
-apk add --allow-untrusted kitbashd-0.6.2-r0.apk
+cp *.rsa.pub /etc/apk/keys/
+apk add kitbashd-0.6.2-r0.apk
 KITBASH_DNS=1.1.1.1 sh /usr/share/kitbash/install.sh
 ```
 
@@ -98,7 +101,7 @@ whose stdin closes first is a session that ends before it replies.
 **Upgrade.** Install the new package and run install.sh again:
 
 ```sh
-apk add --allow-untrusted kitbashd-<newver>-r0.apk
+apk add kitbashd-<newver>-r0.apk
 sh /usr/share/kitbash/install.sh
 ```
 
