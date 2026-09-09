@@ -262,6 +262,71 @@ func TestTheRealTreeOnAWritableCgroupV2Mount(t *testing.T) {
 	}
 }
 
+// An upgrade finds what an earlier release left: a member cgroup handed to the
+// member, and ceiling files they could write. Both are holes, and both are
+// closed by the daemon that starts next rather than by a reinstall.
+func TestEnsureMemberTakesBackWhatAnUpgradeLeft(t *testing.T) {
+	root := testRoot(t)
+	c := cgroups.New(root)
+	ctx := context.Background()
+	if err := c.EnsureRoot(ctx); err != nil {
+		t.Skipf("this host does not delegate the controllers kitbash needs: %v", err)
+	}
+	const name = "kitbash-test-member"
+	uid, gid := nobody(t)
+	if _, err := c.EnsureProcess(ctx, name, process, uid, gid, cgroups.Limits{Memory: "536870912"}); err != nil {
+		t.Fatalf("EnsureProcess: %v", err)
+	}
+	t.Cleanup(func() { c.RemoveMember(ctx, name) })
+
+	// Put the tree back the way the release before this one left it: the
+	// member owned their whole subtree, ceiling and all.
+	member := cgroups.MemberDir(root, name)
+	leaf := cgroups.LeafDir(root, name)
+	ceiling := cgroups.ProcessDir(root, name, process)
+	for _, path := range []string{
+		member, leaf, ceiling,
+		filepath.Join(leaf, "cgroup.procs"),
+		filepath.Join(ceiling, "memory.max"),
+		filepath.Join(ceiling, "cpu.max"),
+		filepath.Join(ceiling, "pids.max"),
+	} {
+		if err := os.Chown(path, uid, gid); err != nil {
+			t.Fatalf("chown %s: %v", path, err)
+		}
+	}
+
+	if _, err := c.EnsureMember(ctx, name, uid, gid); err != nil {
+		t.Fatalf("EnsureMember: %v", err)
+	}
+	// The member cgroup and the leaf are root's again, so nobody can make a
+	// cgroup beside the ceilings with no limits in it.
+	for _, path := range []string{member, leaf, filepath.Join(leaf, "cgroup.procs")} {
+		if owner := ownerOf(t, path); owner != 0 {
+			t.Errorf("%s still belongs to uid %d, want root", path, owner)
+		}
+	}
+	// The ceilings of the Processes already in here are root's again too.
+	for _, file := range []string{"memory.max", "cpu.max", "pids.max"} {
+		if owner := ownerOf(t, filepath.Join(ceiling, file)); owner != 0 {
+			t.Errorf("%s still belongs to uid %d, want root", file, owner)
+		}
+	}
+	// And what the member must keep is still theirs: the ceiling's directory,
+	// so their podman can create the container's cgroup, and the member
+	// cgroup's cgroup.procs, so it can move the container into it.
+	for _, path := range []string{ceiling, filepath.Join(member, "cgroup.procs")} {
+		if owner := ownerOf(t, path); owner != uid {
+			t.Errorf("%s belongs to uid %d, want the member's %d", path, owner, uid)
+		}
+	}
+	// The ceiling itself is untouched: taking ownership back does not reset a
+	// limit.
+	if got := read(t, filepath.Join(ceiling, "memory.max")); got != "536870912" {
+		t.Errorf("memory.max is %q, want the ceiling that was already written", got)
+	}
+}
+
 // The blocker this design answers: a member who owns their Process cgroup
 // could raise their own ceiling. They own the directory, and the limit files
 // in it are still root's, so the write is refused by the kernel.

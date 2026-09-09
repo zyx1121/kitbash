@@ -93,17 +93,33 @@ func (h *host) EnsureMember(ctx context.Context, name string, uid, gid int) (str
 	if err := delegate(dir); err != nil {
 		return "", err
 	}
+	// The ownership is set, not assumed. A host upgraded from a release that
+	// handed a member their whole subtree still has this directory as theirs,
+	// and a member who can write it can make a cgroup beside the ceilings with
+	// no limits in it. Setting it every time is what makes the fix arrive with
+	// the daemon rather than with a reinstall.
+	if err := takeBack(dir); err != nil {
+		return "", err
+	}
 	if err := handOverFiles(dir, uid, gid, procsFile, threadsFile); err != nil {
 		return "", err
 	}
 	// The leaf holds the member's own processes: their MCP sessions and the
-	// podman children that start and stop their containers. It stays root's,
-	// because kitbashd is what puts anything in it.
+	// podman children that start and stop their containers. It stays root's in
+	// full, because kitbashd is what puts anything in it.
 	leaf := LeafDir(h.root, name)
 	if err := mkdir(leaf); err != nil {
 		return "", err
 	}
-	return leaf, nil
+	if err := takeBack(leaf); err != nil {
+		return "", err
+	}
+	if err := takeBackFiles(leaf, delegated...); err != nil {
+		return "", err
+	}
+	// And the ceilings of the Processes already in here: the limit files are
+	// root's, whoever a previous release gave them to.
+	return leaf, takeBackCeilings(dir)
 }
 
 // EnsureProcess creates the ceiling of one Process, writes its limits as root
@@ -266,6 +282,51 @@ func handOverFiles(dir string, uid, gid int, files ...string) error {
 				continue
 			}
 			return fmt.Errorf("cgroups: give %s to %d: %w", path, uid, err)
+		}
+	}
+	return nil
+}
+
+// takeBack makes one cgroup directory root's again. It is what an upgrade
+// needs: a directory an earlier release handed to a member is a hole in the
+// ceiling, and nothing else here would close it.
+func takeBack(dir string) error {
+	if err := os.Chown(dir, 0, 0); err != nil {
+		return fmt.Errorf("cgroups: take %s back: %w", dir, err)
+	}
+	return nil
+}
+
+// takeBackFiles makes named files of a cgroup root's again.
+func takeBackFiles(dir string, files ...string) error {
+	for _, file := range files {
+		path := filepath.Join(dir, file)
+		if err := os.Chown(path, 0, 0); err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
+			return fmt.Errorf("cgroups: take %s back: %w", path, err)
+		}
+	}
+	return nil
+}
+
+// takeBackCeilings makes the limit files of every Process cgroup under one
+// member root's again. The directory of a Process cgroup is the member's, by
+// design: that is how their podman creates the container's cgroup. The three
+// files that say what it may spend are not, and a release that gave them away
+// is corrected here rather than left until the Process is run again.
+func takeBackCeilings(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("cgroups: read %s: %w", dir, err)
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() || !processID.MatchString(entry.Name()) {
+			continue
+		}
+		if err := takeBackFiles(filepath.Join(dir, entry.Name()), memoryMax, cpuMax, pidsMax); err != nil {
+			return err
 		}
 	}
 	return nil

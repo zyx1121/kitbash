@@ -602,6 +602,13 @@ cgroups:
     ceiling of a Process at every start and at every restore; a session at
     sessions_join. The cgroup of a Process goes at processes_remove, and a
     member's whole cgroup at users_remove.
+  upgrades: >
+    Preparing a member's cgroup sets the ownership rather than assuming it: the
+    member cgroup and the leaf are taken back for root and the limit files of
+    every Process cgroup in it with them, because a release that handed a
+    member their whole subtree left a directory they could make a cgroup in
+    with no ceiling. What they must keep is left alone: the directory of each
+    Process cgroup and cgroup.procs of their own.
   without_it: >
     A host whose cgroup filesystem is not version 2 or not writable runs that
     Process unplaced: the limits are still passed to the runtime and recorded,
