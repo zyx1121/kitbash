@@ -1,0 +1,10 @@
+{
+  "name": "kitbash-e2e-client",
+  "version": "1.0.0",
+  "private": true,
+  "description": "The second MCP client of the end to end job: the TypeScript SDK against /mcp, run inside a Process's container.",
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0"
+  }
+}
