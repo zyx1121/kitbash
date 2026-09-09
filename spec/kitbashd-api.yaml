@@ -81,7 +81,14 @@ mcp_for_processes:
     reaches nothing over /mcp. A block whose globs kitbashd cannot honour is
     refused at registration with bad-request; the variable is read by a child
     only beside KITBASH_CALLER, so a member's own SSH session is narrowed by
-    nothing. See PLAN.md section 2.3.
+    nothing. A child that finds KITBASH_CALLER set and no KITBASH_PERMITS at
+    all, which is what a daemon of an earlier release starts and what the
+    minutes between deploy/install.sh replacing the binaries and restarting
+    kitbashd produce, is permitted nothing rather than everything.
+    approvals_approve executes the queued tool inside its own handler, so it
+    checks the queued path against the same prefixes and stores a
+    not-permitted on the approval when it does not fit. See PLAN.md section
+    2.3.
   limits: >
     At most 8 live sessions per Process; the ninth is refused with the
     conflict problem at status 429, titled "Too many sessions" and carrying

@@ -12,6 +12,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/zyx1121/kitbash/internal/bridge"
+	"github.com/zyx1121/kitbash/internal/fs"
 	"github.com/zyx1121/kitbash/internal/manifest"
 	"github.com/zyx1121/kitbash/internal/pkg"
 	"github.com/zyx1121/kitbash/internal/podman"
@@ -19,6 +20,7 @@ import (
 	"github.com/zyx1121/kitbash/internal/proc"
 	"github.com/zyx1121/kitbash/internal/server"
 	"github.com/zyx1121/kitbash/internal/telemetry"
+	"github.com/zyx1121/kitbash/internal/telemetry/teltest"
 )
 
 // narrowed is the whole surface as a Process reaches it: one Package running
@@ -268,6 +270,88 @@ func TestPermitsEmptyBlockIsAnEmptySurface(t *testing.T) {
 	}
 }
 
+// TestPermitsRefuseApprovingAQueuedPathOutsideThePrefixes closes the one door
+// the guard cannot see through: approvals_approve runs the queued fs_write
+// inside its own handler, so without a check there a Process permitted that
+// tool could have anything under the shared root written for it.
+func TestPermitsRefuseApprovingAQueuedPathOutsideThePrefixes(t *testing.T) {
+	tr := newTracedWithDaemonPermits(t, func(w *whole) *manifest.Permits {
+		return &manifest.Permits{
+			Tools: []string{"approvals_*", "fs_*"},
+			// The Process may name its own folder and nothing else under the
+			// shared root.
+			Paths: []string{filepath.Join(w.root, "flows")},
+		}
+	})
+	tr.daemon.SetAdmin(true)
+	tr.files.SetShared(tr.root)
+
+	target := filepath.Join(tr.root, "handbook", "kitbash.yaml")
+	input, _ := json.Marshal(map[string]any{
+		"path": target, "content": handbookManifest, "message": "Add the handbook",
+	})
+	queued := tr.daemon.AddApproval(teltest.Approval{
+		Requester: "member",
+		Tool:      telemetry.ToolFSWrite,
+		Input:     input,
+	})
+
+	res := call(t, tr.session, "approvals_approve", map[string]any{"id": queued.ID})
+	ok(t, res, "approvals_approve")
+	out := structured[approved](t, res)
+
+	// The refusal is the approval's stored result, so the admin reads why
+	// nothing happened rather than finding an approval that did nothing.
+	var refusal problem.Problem
+	if err := json.Unmarshal(out.Result, &refusal); err != nil {
+		t.Fatalf("the result is not problem details: %v", err)
+	}
+	if refusal.Slug() != problem.SlugNotPermitted || refusal.Status != 403 {
+		t.Fatalf("the result is %+v, want not-permitted at 403", refusal)
+	}
+	if refusal.Fix != server.PermitsPathFix {
+		t.Errorf("fix is %q, want %q", refusal.Fix, server.PermitsPathFix)
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("%s exists; the queued write ran outside every permitted prefix", target)
+	}
+	held, _ := tr.daemon.Approval(queued.ID)
+	if !strings.Contains(string(held.Result), problem.SlugNotPermitted) {
+		t.Errorf("the stored result is %s, want the refusal", held.Result)
+	}
+}
+
+// TestApprovingIsUnchangedForAnAdminSession is the other side of the same
+// door: a member at their own SSH session has no permits block, and approving
+// executes the queued write exactly as it did.
+func TestApprovingIsUnchangedForAnAdminSession(t *testing.T) {
+	tr := approving(t)
+
+	target := filepath.Join(tr.root, "handbook", "kitbash.yaml")
+	input, _ := json.Marshal(map[string]any{
+		"path": target, "content": handbookManifest, "message": "Add the handbook",
+	})
+	queued := tr.daemon.AddApproval(teltest.Approval{
+		Requester: "member",
+		Tool:      telemetry.ToolFSWrite,
+		Input:     input,
+	})
+
+	res := call(t, tr.session, "approvals_approve", map[string]any{"id": queued.ID})
+	ok(t, res, "approvals_approve")
+	out := structured[approved](t, res)
+	var written fs.WriteResult
+	if err := json.Unmarshal(out.Result, &written); err != nil {
+		t.Fatalf("the result is not an fs_write output: %v, body %s", err, out.Result)
+	}
+	if written.Path != target || len(written.Commit.Sha) != 40 {
+		t.Fatalf("the result is %+v, want the file and its commit", written)
+	}
+	if _, err := os.Stat(target); err != nil {
+		t.Fatalf("the approved write did not land: %v", err)
+	}
+}
+
 // TestAMemberSessionIsNarrowedByNothing is the other half of the rule: an SSH
 // session has no permits block and is not filtered, and a member exporting
 // KITBASH_PERMITS in their own shell does not acquire one.
@@ -298,6 +382,22 @@ func TestAMemberSessionIsNarrowedByNothing(t *testing.T) {
 	}
 	if permits == nil || !permits.Match("fs_read", nil) || permits.Match("fs_write", nil) {
 		t.Errorf("a Process session read %+v, want the declared block", permits)
+	}
+
+	// A Process session with no variable at all is a Process permitted
+	// nothing. A daemon of an earlier release sets none, and so does this one
+	// between deploy/install.sh replacing the binaries and restarting
+	// kitbashd; the surface must not fall open to the owner's whole one there.
+	os.Unsetenv(manifest.EnvPermits)
+	permits, err = server.PermitsFromEnv()
+	if err != nil {
+		t.Fatalf("PermitsFromEnv without the variable: %v", err)
+	}
+	if permits == nil {
+		t.Fatal("a Process session with no permits variable was narrowed by nothing")
+	}
+	if permits.Match("fs_read", nil) || permits.AnyPath() {
+		t.Errorf("a Process session with no permits variable read %+v, want the empty block", permits)
 	}
 
 	// A block this build cannot read ends the session rather than widening it.

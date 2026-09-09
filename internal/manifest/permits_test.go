@@ -168,6 +168,31 @@ func TestPermitsRefuseGlobsTheyCannotHonour(t *testing.T) {
 	if bad.AnyPath() || bad.Allows("/home/alice") || bad.Allows("/org/secrets") {
 		t.Error("a path prefix that does not validate still allowed a path")
 	}
+
+	// One entry is bounded as well as the lists: a glob longer than the
+	// longest tool name MCP allows matches nothing this surface publishes, and
+	// a prefix longer than a Linux path names nothing.
+	long := manifest.Permits{
+		Tools: []string{strings.Repeat("a", manifest.MaxToolGlobBytes+1)},
+		Paths: []string{"/" + strings.Repeat("b", manifest.MaxPathPrefixBytes)},
+	}
+	err = long.Validate()
+	if err == nil {
+		t.Fatal("Validate accepted an entry over the per entry limit")
+	}
+	for _, want := range []string{"over the limit of 63", "over the limit of 4096"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Validate said %q, which does not name %s", err, want)
+		}
+	}
+	if long.Match(strings.Repeat("a", manifest.MaxToolGlobBytes+1), nil) || long.AnyPath() {
+		t.Error("an entry over the per entry limit still matched")
+	}
+	// The last entry that fits is still honoured.
+	fits := manifest.Permits{Tools: []string{strings.Repeat("a", manifest.MaxToolGlobBytes)}}
+	if err := fits.Validate(); err != nil {
+		t.Errorf("Validate refused an entry at the limit: %v", err)
+	}
 }
 
 // TestPermitsFromAManifest reads the block off provides, which is where a

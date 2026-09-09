@@ -74,10 +74,14 @@ func PermitsFromEnv() (*manifest.Permits, error) {
 	}
 	value, set := os.LookupEnv(manifest.EnvPermits)
 	if !set {
-		// A daemon of an earlier release starts a child without the variable.
-		// That session is the owner's surface, as it was before permits
-		// existed; the narrowing arrives with the daemon that declares it.
-		return nil, nil
+		// A session of a Process with no variable is a Process permitted
+		// nothing, not a Process permitted everything. A daemon of an earlier
+		// release sets no variable, and so does this one for the minutes
+		// between deploy/install.sh replacing the binaries and restarting
+		// kitbashd; an empty surface there is a kit that stops working until
+		// the daemon is back, and the other answer is a kit with its owner's
+		// whole surface, which is the thing permits exist to prevent.
+		return &manifest.Permits{}, nil
 	}
 	permits, err := manifest.ParsePermits([]byte(value))
 	if err != nil {

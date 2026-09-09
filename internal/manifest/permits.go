@@ -16,6 +16,16 @@ const (
 	MaxPermittedPaths = 32
 )
 
+// MaxToolGlobBytes and MaxPathPrefixBytes bound one entry. The first is the
+// longest tool name MCP allows, so a glob longer than that matches no name
+// this surface could ever publish; the second is the longest path Linux takes.
+// They are checked here as well as in the schema, for the same reason as the
+// counts above: a block also arrives as KITBASH_PERMITS.
+const (
+	MaxToolGlobBytes   = 63
+	MaxPathPrefixBytes = 4096
+)
+
 // EnvPermits carries one Process's permits block into the kitbash-mcp
 // kitbashd starts for its MCP session, see mcp_for_processes in
 // spec/kitbashd-api.yaml. The daemon writes it and the surface reads it; both
@@ -153,11 +163,24 @@ func (p Permits) Validate() error {
 			len(p.Paths), MaxPermittedPaths))
 	}
 	for _, glob := range p.Tools {
+		if glob == PermitPackages {
+			continue
+		}
+		if len(glob) > MaxToolGlobBytes {
+			bad = append(bad, fmt.Sprintf("a tool glob of %d bytes is over the limit of %d",
+				len(glob), MaxToolGlobBytes))
+			continue
+		}
 		if !validToolGlob(glob) {
 			bad = append(bad, fmt.Sprintf("%q is not a tool name glob", glob))
 		}
 	}
 	for _, prefix := range p.Paths {
+		if len(prefix) > MaxPathPrefixBytes {
+			bad = append(bad, fmt.Sprintf("a path prefix of %d bytes is over the limit of %d",
+				len(prefix), MaxPathPrefixBytes))
+			continue
+		}
 		if !validPathPrefix(prefix) {
 			bad = append(bad, fmt.Sprintf("%q is not an absolute path prefix", prefix))
 		}
@@ -273,7 +296,7 @@ func components(path string) ([]string, bool) {
 // validToolGlob holds a tool glob to the characters MCP allows in a tool name,
 // plus the wildcard.
 func validToolGlob(glob string) bool {
-	if glob == "" {
+	if glob == "" || len(glob) > MaxToolGlobBytes {
 		return false
 	}
 	for _, r := range glob {
@@ -291,6 +314,9 @@ func validToolGlob(glob string) bool {
 // components: /home/*/flows is a prefix, /home/al* is not, because a component
 // half matched is a rule nobody can read at a glance.
 func validPathPrefix(prefix string) bool {
+	if len(prefix) > MaxPathPrefixBytes {
+		return false
+	}
 	parts, ok := components(prefix)
 	if !ok {
 		return false
