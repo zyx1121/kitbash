@@ -81,14 +81,31 @@ if (!folders.includes(`${home}/echo`)) {
   fail(`fs_list ${home} answered ${folders.join(",") || "no folders"}, want ${home}/echo`);
 }
 
-// 4. A tool the block does not name is refused, not served.
-const refused = await client.callTool({ name: "users_me", arguments: {} });
-if (!refused.isError || !problemType(refused).endsWith("/not-permitted")) {
-  fail(`users_me answered ${JSON.stringify(refused)}, want a not-permitted problem`);
+// 4. A tool the block does not name is refused, not served. It is refused
+//    twice over: kitbashd publishes only the permitted tools to this session,
+//    so the receiver answers a protocol error for a name it never registered,
+//    and the kitbash-mcp behind it answers not-permitted for one it did. Both
+//    are a refusal; which one arrives is the daemon's to decide.
+let refusal = "";
+try {
+  const refused = await client.callTool({ name: "users_me", arguments: {} });
+  if (refused.isError) refusal = problemType(refused) || "an error result";
+} catch (error) {
+  refusal = error?.message ?? String(error);
+}
+if (!refusal.includes("not-permitted") && !refusal.includes("users_me")) {
+  fail(`users_me was answered with ${refusal || "a result"}, want a refusal`);
 }
 
 await client.close();
 clearTimeout(guard);
 
 // The line the Go driver reads back.
-console.log(JSON.stringify({ ok: true, endpoint, tools: listed, echoed: echoed.structuredContent, folders }));
+console.log(JSON.stringify({
+  ok: true,
+  endpoint,
+  tools: listed,
+  echoed: echoed.structuredContent,
+  folders,
+  refusal,
+}));
