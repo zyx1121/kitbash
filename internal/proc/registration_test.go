@@ -434,7 +434,7 @@ func TestARegistrationWhoseContainerFailedToStartIsWithdrawn(t *testing.T) {
 	}
 	// The runtime's own words go to the server log, never to the agent: the
 	// command line they describe carries the Process's Telemetry token.
-	if prob.Detail != "kitbash could not complete this call; the cause is in the server log" {
+	if prob.Detail != "kitbash could not complete this call; the cause is recorded for administrators" {
 		t.Errorf("detail is %q, want the runtime's output kept out of it", prob.Detail)
 	}
 	registered := f.daemon.Registrations()

@@ -15,6 +15,11 @@ output_log="/var/log/kitbashd.log"
 error_log="/var/log/kitbashd.log"
 respawn_delay=5
 respawn_max=0
+# The window respawn_max would count in. With respawn_max at 0 nothing is ever
+# given up on, and this is what keeps a daemon that fails in a loop from being
+# restarted as fast as it can exit: five minutes of failures are counted
+# together rather than each one starting the count again.
+respawn_period=300
 
 # supervise-daemon runs healthcheck() every healthcheck_timer seconds and
 # restarts kitbashd when it fails, which respawn_max=0 then keeps doing for as

@@ -188,7 +188,15 @@ func TooManySessions(instance, detail, fix string) *Problem {
 	if fix == "" {
 		fix = "End a session with DELETE /mcp before opening another one."
 	}
-	return newProblem(SlugConflict, "Too many sessions", http.StatusTooManyRequests, instance, detail, fix)
+	return TooMany("Too many sessions", instance, detail, fix)
+}
+
+// TooMany reports a caller asking for more of something than kitbash accepts
+// in a window, whatever that something is. The slug stays conflict, so a
+// client matches one class of refusal however it was refused, and the status
+// is 429 because the same request works later.
+func TooMany(title, instance, detail, fix string) *Problem {
+	return newProblem(SlugConflict, title, http.StatusTooManyRequests, instance, detail, fix)
 }
 
 // Queued reports a call that was not run but put in the approval queue, which
@@ -244,13 +252,13 @@ func Internal(instance, cause, fix string) *Problem {
 	logger.Printf("internal error at %s: %s", instance, cause)
 	record(instance, cause)
 	return newProblem(SlugInternal, "Internal error", http.StatusInternalServerError, instance,
-		"kitbash could not complete this call; the cause is in the server log", fix)
+		"kitbash could not complete this call; the cause is recorded for administrators", fix)
 }
 
 // InternalDetail is Internal with a detail the caller can act on. The failure
-// is still inside kitbash or inside a Package it ran, so the cause goes to the
-// server log, but saying which of the two broke helps the agent decide what to
-// do next.
+// is still inside kitbash or inside a Package it ran, so the cause goes where
+// only an admin reads it, but saying which of the two broke helps the agent
+// decide what to do next.
 func InternalDetail(instance, cause, detail, fix string) *Problem {
 	p := Internal(instance, cause, fix)
 	p.Detail = detail

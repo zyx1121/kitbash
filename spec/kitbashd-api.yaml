@@ -32,8 +32,8 @@ tcp:
     kitbash.producer to the Process id. A missing, unknown or revoked token
     is 401 not-permitted. Records from a Process may carry any other
     attribute except kitbash.caller and kitbash.internal, which are dropped
-    here; the eval rules below are the one exception where claims on the
-    stamped attributes are honoured.
+    from every export whatever listener it arrives on; the eval rules below are
+    the one exception where claims on the stamped attributes are honoured.
   environment_given_to_every_process:
     KITBASH_TELEMETRY_ENDPOINT: http://host.containers.internal:4318
     KITBASH_TELEMETRY_TOKEN: the Process token
@@ -169,7 +169,8 @@ otlp:
   identity:
     description: >
       kitbashd sets kitbash.user on every span, log record and metric point
-      from the peer uid, replacing whatever the producer sent. The other
+      from the peer uid, replacing whatever the producer sent, and drops
+      kitbash.internal from every record, see internal_records. The other
       attributes are stored as sent. Resource attributes are merged into each
       record's attributes, record attributes winning.
   response: >
@@ -297,6 +298,24 @@ api:
     request: { reason }
     response: { id, state: "rejected" }
     authorization: admin only; pending to rejected, 409 otherwise.
+  internal_record:
+    method: POST
+    path: /kitbash/v1/internal
+    request: { instance: "the problem instance the agent was given", cause: "the cause, never shown to the agent", tool: "the tool the call was, when there was one" }
+    response: 204 on success, no body
+    authorization: >
+      Any member; the record is stamped kitbash.user and kitbash.producer from
+      the peer credentials and kitbash.internal true, and only an admin's query
+      returns it, see internal_records. A member reporting a cause therefore
+      writes a record they cannot read back, which is the point: what they keep
+      is the instance to quote.
+    limits: >
+      The cause is cut to 8192 bytes with a note saying so, and a peer may
+      record 60 causes a minute; the ones beyond that are refused with the
+      conflict problem at status 429, titled "Too many causes" and carrying
+      Retry-After: 60. The write itself is queued, so this path answers without
+      waiting for the store.
+    errors: [bad-request, not-permitted, conflict, internal]
   health:
     method: GET
     path: /kitbash/v1/health
@@ -363,24 +382,29 @@ internal_records:
   description: >
     Every internal problem records its cause as a log record with
     kitbash.internal = true, severity ERROR, the cause as the body, the
-    problem's instance as kitbash.path and kitbash.error = internal.
-    kitbash-mcp exports them through its own exporter, carrying kitbash.tool of
-    the call in flight when there is exactly one; kitbashd has no exporter and
-    writes its own into the store directly, stamped kitbash.producer = kitbashd
-    and kitbash.user = kitbashd.
+    problem's instance as kitbash.path, the tool of the call it happened in as
+    kitbash.tool where there is one, and kitbash.error = internal.
+  claims: >
+    No producer may assert kitbash.internal. kitbashd drops the attribute from
+    every record that arrives over OTLP, on the socket and on the Process
+    receiver alike: a member with a shell on this host reaches the socket with
+    curl as easily as kitbash-mcp does, so honouring it there would let anyone
+    hide their own records from themselves and put their words in front of
+    every admin as kitbash's own. The path below is the only way a record is
+    marked.
+  writers: >
+    kitbash-mcp reports its causes to POST /kitbash/v1/internal, which stamps
+    the record from the peer credentials. kitbashd holds the store, so it
+    writes its own causes directly, stamped kitbash.producer and kitbash.user =
+    kitbashd. Both are written by one worker off the request path: a cause is
+    queued and the call that failed is already answering, and a queue that is
+    full drops rather than waits.
   attribution: >
     A cause kitbashd recorded is kitbash.user = kitbashd even when it was
     raised while serving a member: the daemon serves everyone, and a failure
     inside it is not a member's record. The instance is what ties the two
     together, so an admin queries by the path the member quotes rather than by
     the member's name.
-  claims: >
-    kitbash.internal is never taken from a producer over the Process receiver.
-    kitbashd drops it from every record that arrives with a Process token, the
-    same rule kitbash.caller follows: a Process that could set it would put its
-    own owner's records out of the owner's reach and its own words in front of
-    every admin. It is honoured on the socket, where the only producer is the
-    kitbash-mcp of a session.
   authorization: >
     A query returns these records to admins alone. A member's query excludes
     them, and a member asking for internal = true is answered with an empty
@@ -409,6 +433,12 @@ client_behaviour:
     new fan out secret, so the container keeps the old pair, its exports fail
     and it refuses the fan out until the Process is run again. That gap is
     accepted in version 1 and logged.
+  internal_causes: >
+    kitbash-mcp posts the cause of every internal problem to
+    /kitbash/v1/internal, queued and off the calling goroutine, so a call never
+    waits for it. A session whose causes cannot be recorded says so once in the
+    server log, the same courtesy a dropping exporter gets, and the agent is
+    told nothing beyond the problem it already has.
   description: >
     kitbash-mcp exports asynchronously and never blocks a tool call on the
     exporter. If the socket is absent or refuses, spans are dropped and one

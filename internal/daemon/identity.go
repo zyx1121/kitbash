@@ -39,11 +39,6 @@ type identity struct {
 	// session kitbashd started has a credential, and it reaches the daemon
 	// over the socket.
 	Callers func(credential string) (string, bool)
-	// InternalCauses is true when this producer's records may carry
-	// kitbash.internal. Only kitbash-mcp records the cause of an internal
-	// problem, and it exports over the socket; a Process may not mark its
-	// records as one, see PLAN.md section 2.4.
-	InternalCauses bool
 }
 
 // identifier resolves who is on the other end of one request. There are two:
@@ -64,15 +59,13 @@ func (id identity) apply(a *store.Attributes) {
 	// session ended, names nothing and is dropped rather than stored.
 	a.Caller = id.caller(a.Caller)
 
-	// kitbash.internal is not a producer's claim either. A record marked as
-	// the cause of an internal problem is answered to admins alone, so a
-	// Process that could set it would put its own owner's records out of
-	// their reach and its own words in front of every admin. Only the
-	// producer kitbash runs itself may say it, and it says it over the
-	// socket.
-	if !id.InternalCauses {
-		a.Internal = nil
-	}
+	// kitbash.internal is not anybody's claim. A record marked as the cause
+	// of an internal problem is answered to admins alone, so a producer that
+	// could set it would put records out of their own owner's reach and its
+	// words in front of every admin. It is dropped on both listeners, member
+	// and Process alike: a cause is reported to POST /kitbash/v1/internal,
+	// which is the one path that writes one, see PLAN.md section 2.4.
+	a.Internal = nil
 
 	if id.EvalClaims && a.Eval != nil && *a.Eval {
 		// The claims are about the subject of the judgment. Whatever the kit
@@ -129,9 +122,6 @@ func (s *Server) socketIdentity(r *http.Request) (identity, *problem.Problem) {
 		// other: it exports over this socket as its owner, and its credential
 		// is what tells the two apart.
 		Callers: s.mcpCaller,
-		// kitbash-mcp is what records an internal cause, and this is the
-		// listener it exports over.
-		InternalCauses: true,
 	}, nil
 }
 
@@ -159,10 +149,9 @@ func (s *Server) tokenIdentity(r *http.Request) (identity, *problem.Problem) {
 			"this token names no Process kitbashd is running",
 			"Run the Process again to mint a token; the one it holds was revoked.")
 	}
-	// No Callers and no internal causes: a Process exports as itself over this
-	// listener, and kitbash.process already says which one. A caller or an
-	// internal mark on a record here could only be a claim, so both are
-	// dropped.
+	// No Callers: a Process exports as itself over this listener, and
+	// kitbash.process already says which one. A caller on a record here could
+	// only be a claim, so it is dropped.
 	return identity{
 		User:       p.Owner,
 		Package:    p.Package,

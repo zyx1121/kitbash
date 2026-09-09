@@ -10,9 +10,10 @@ import (
 )
 
 // The cause of an internal problem never reaches the agent, so the one way an
-// admin reads it is as a log record. The provider of the session is what puts
-// it on the wire, see PLAN.md section 2.4.
-func TestAnInternalCauseIsExportedAsALogRecord(t *testing.T) {
+// admin reads it is as a record kitbashd stores. No export may claim
+// kitbash.internal, so the session reports the cause to the daemon's own path
+// instead, see PLAN.md section 2.4.
+func TestAnInternalCauseIsReportedToTheDaemon(t *testing.T) {
 	daemon := newDaemon(t)
 	p, _ := newProvider(t, daemon.Socket)
 	defer problem.OnInternal(nil)
@@ -28,36 +29,29 @@ func TestAnInternalCauseIsExportedAsALogRecord(t *testing.T) {
 		t.Fatalf("shutdown: %v", err)
 	}
 
-	records := daemon.Logs()
-	if len(records) != 1 {
-		t.Fatalf("want one log record, got %+v", records)
+	causes := daemon.InternalCauses()
+	if len(causes) != 1 {
+		t.Fatalf("want one reported cause, got %+v", causes)
 	}
-	got := records[0]
-	if got.Body != "git commit: exit status 128" {
-		t.Errorf("the record body is %q, want the cause", got.Body)
+	if causes[0].Cause != "git commit: exit status 128" {
+		t.Errorf("the reported cause is %q, want the cause", causes[0].Cause)
 	}
-	if got.Severity != "ERROR" {
-		t.Errorf("severity is %q, want ERROR", got.Severity)
+	if causes[0].Instance != "/org/handbook/README.md" {
+		t.Errorf("instance is %q, want the one the agent was given", causes[0].Instance)
 	}
-	if got.Attributes[telemetry.AttrInternal] != "true" {
-		t.Errorf("the record carries %v, want %s true so only admins are answered it",
-			got.Attributes, telemetry.AttrInternal)
+	if causes[0].Tool != "fs_write" {
+		t.Errorf("tool is %q, want the call in flight", causes[0].Tool)
 	}
-	if got.Attributes[telemetry.AttrError] != problem.SlugInternal {
-		t.Errorf("%s is %q, want %q", telemetry.AttrError,
-			got.Attributes[telemetry.AttrError], problem.SlugInternal)
-	}
-	if got.Attributes[telemetry.AttrTool] != "fs_write" {
-		t.Errorf("%s is %q, want the call in flight", telemetry.AttrTool, got.Attributes[telemetry.AttrTool])
-	}
-	if got.Attributes[telemetry.AttrPath] != "/org/handbook/README.md" {
-		t.Errorf("%s is %q, want the problem instance the agent was given",
-			telemetry.AttrPath, got.Attributes[telemetry.AttrPath])
+	// The cause is not exported: an export claiming kitbash.internal is
+	// dropped by the daemon, so sending one would only be a record nobody
+	// could read as a cause.
+	if records := daemon.Logs(); len(records) != 0 {
+		t.Errorf("the session exported %+v, want the cause reported and not exported", records)
 	}
 }
 
 // The tool is read from the call in flight, so a cause raised with none open
-// still carries the instance and is still exported.
+// is still reported, with the instance and no tool.
 func TestAnInternalCauseOutsideACallCarriesNoTool(t *testing.T) {
 	daemon := newDaemon(t)
 	p, _ := newProvider(t, daemon.Socket)
@@ -68,21 +62,47 @@ func TestAnInternalCauseOutsideACallCarriesNoTool(t *testing.T) {
 		t.Fatalf("shutdown: %v", err)
 	}
 
-	records := daemon.Logs()
-	if len(records) != 1 {
-		t.Fatalf("want one log record, got %+v", records)
+	causes := daemon.InternalCauses()
+	if len(causes) != 1 {
+		t.Fatalf("want one reported cause, got %+v", causes)
 	}
-	if tool, sent := records[0].Attributes[telemetry.AttrTool]; sent {
-		t.Errorf("%s is %q, want no tool when no call is in flight", telemetry.AttrTool, tool)
+	if causes[0].Tool != "" {
+		t.Errorf("tool is %q, want none when no call is in flight", causes[0].Tool)
 	}
-	if records[0].Attributes[telemetry.AttrInternal] != "true" {
-		t.Errorf("the record carries %v, want %s true", records[0].Attributes, telemetry.AttrInternal)
+	if causes[0].Instance != "/kitbash/v1/processes" {
+		t.Errorf("instance is %q, want the problem instance", causes[0].Instance)
 	}
 }
 
-// A provider that has shut down exports nothing, so a cause raised after the
-// session is over is not a write to a closed exporter.
-func TestShutdownStopsRecordingCauses(t *testing.T) {
+// A cause longer than the budget is cut rather than sent whole: kitbashd
+// applies the same bound, and a request over its body limit would be refused
+// entirely.
+func TestALongInternalCauseIsClipped(t *testing.T) {
+	daemon := newDaemon(t)
+	p, _ := newProvider(t, daemon.Socket)
+	defer problem.OnInternal(nil)
+
+	problem.Internal("/org/handbook", strings.Repeat("x", telemetry.InternalCauseLimit*2), "")
+	if err := p.Shutdown(context.Background()); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+
+	causes := daemon.InternalCauses()
+	if len(causes) != 1 {
+		t.Fatalf("want one reported cause, got %d", len(causes))
+	}
+	if len(causes[0].Cause) > telemetry.InternalCauseLimit+64 {
+		t.Errorf("the reported cause is %d bytes, want it cut to %d and a note",
+			len(causes[0].Cause), telemetry.InternalCauseLimit)
+	}
+	if !strings.Contains(causes[0].Cause, "truncated") {
+		t.Error("the cut cause does not say it was cut")
+	}
+}
+
+// A session that has ended reports nothing, so a cause raised after it is not
+// a request over a socket nobody is serving any more.
+func TestShutdownStopsReportingCauses(t *testing.T) {
 	daemon := newDaemon(t)
 	p, _ := newProvider(t, daemon.Socket)
 	defer problem.OnInternal(nil)
@@ -91,7 +111,28 @@ func TestShutdownStopsRecordingCauses(t *testing.T) {
 		t.Fatalf("shutdown: %v", err)
 	}
 	problem.Internal("/org/handbook/README.md", "a cause nobody records", "")
-	if records := daemon.Logs(); len(records) != 0 {
-		t.Errorf("a session that has ended exported %+v", records)
+	if causes := daemon.InternalCauses(); len(causes) != 0 {
+		t.Errorf("a session that has ended reported %+v", causes)
+	}
+}
+
+// A daemon that is not there costs the session one line and no call: the
+// surface still works, and the agent never learns that a cause was dropped.
+func TestAMissingDaemonCostsOneLinePerSession(t *testing.T) {
+	p, logs := newProvider(t, t.TempDir()+"/absent.sock")
+	defer problem.OnInternal(nil)
+
+	for range 3 {
+		problem.Internal("/org/handbook/README.md", "a cause nobody stores", "")
+	}
+	if err := p.Shutdown(context.Background()); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	written := logs.String()
+	if !strings.Contains(written, "not recording the causes") {
+		t.Errorf("the session log is %q, want one line about the causes", written)
+	}
+	if lines := strings.Count(strings.TrimSpace(written), "\n") + 1; lines > 2 {
+		t.Errorf("the session logged %d lines, want one per reason:\n%s", lines, written)
 	}
 }

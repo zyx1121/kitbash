@@ -14,6 +14,7 @@ package telemetry
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"sync"
@@ -77,15 +78,28 @@ const (
 	AttrError  = "kitbash.error"
 )
 
-// AttrInternal marks a record as the cause of an internal problem: the host
-// paths and third party output that never reach the agent. kitbashd answers
-// such a record to admins alone, see PLAN.md section 2.4.
-const AttrInternal = "kitbash.internal"
-
-// InternalCauseLimit bounds the body of one recorded cause. A cause is an
-// error message, and one that arrived from a command's standard error can be
-// as long as that command felt like being.
+// InternalCauseLimit bounds one reported cause, the same budget kitbashd
+// applies when it stores one. A cause is an error message, and one that
+// arrived from a command's standard error can be as long as that command felt
+// like being.
 const InternalCauseLimit = 8 << 10
+
+// InternalQueue is how many causes wait to be reported, and
+// InternalReportTimeout how long one report may take. Reporting a cause never
+// holds up the call that failed: the call is already answering with its
+// problem, so a report is queued, and a queue that is full drops.
+const (
+	InternalQueue         = 64
+	InternalReportTimeout = 5 * time.Second
+)
+
+// internalCause is one queued report: the problem instance the agent was
+// given, the cause, and the tool of the call it happened in.
+type internalCause struct {
+	instance string
+	cause    string
+	tool     string
+}
 
 // AttrCaller carries the caller credential of this session, which kitbashd
 // rewrites to the Process id of the session it minted the credential for. A
@@ -139,10 +153,21 @@ type Provider struct {
 	logs   *sdklog.LoggerProvider
 	client *Client
 
-	// calls are the tools/call spans open right now, which a recorded
+	// calls are the tools/call spans open right now, which a reported
 	// internal cause reads its tool from, see tool.
 	mu    sync.Mutex
 	calls map[*call]struct{}
+
+	// The internal causes of this session on their way to kitbashd: the
+	// queue, the signal that ends the reporter, and the channel it closes on
+	// its way out. sessionLog carries the one line a session that cannot
+	// report is worth.
+	causes     chan internalCause
+	stopping   chan struct{}
+	causesDone chan struct{}
+	stopOnce   sync.Once
+	sessionLog *log.Logger
+	causeOnce  sync.Once
 }
 
 // New builds the provider for one session. It opens no connection: the socket
@@ -198,17 +223,23 @@ func New(opts Options) (*Provider, error) {
 		caller = Caller()
 	}
 	p := &Provider{
-		caller: caller,
-		tracer: traces.Tracer(scopeName),
-		logger: logs.Logger(scopeName),
-		traces: traces,
-		logs:   logs,
-		client: NewClient(socket),
-		calls:  map[*call]struct{}{},
+		caller:     caller,
+		tracer:     traces.Tracer(scopeName),
+		logger:     logs.Logger(scopeName),
+		traces:     traces,
+		logs:       logs,
+		client:     NewClient(socket),
+		calls:      map[*call]struct{}{},
+		causes:     make(chan internalCause, InternalQueue),
+		stopping:   make(chan struct{}),
+		causesDone: make(chan struct{}),
+		sessionLog: logger,
 	}
+	go p.reportCauses()
 	// The cause of an internal problem is not for the agent, but it is for
-	// the admin of this host, so it leaves as a log record rather than only
-	// as a line in the server log, see PLAN.md section 2.4.
+	// the admin of this host, so it is reported to kitbashd rather than left
+	// as a line in a log file nobody can read through MCP, see PLAN.md
+	// section 2.4.
 	problem.OnInternal(p.RecordInternal)
 	return p, nil
 }
@@ -272,6 +303,7 @@ func (p *Provider) Shutdown(ctx context.Context) error {
 	if err == nil {
 		err = logErr
 	}
+	p.stopCauses(ctx)
 	return err
 }
 
@@ -459,40 +491,85 @@ func (p *Provider) tool() string {
 	return ""
 }
 
-// RecordInternal exports one internal cause as a log record: severity ERROR,
-// the cause as the body, and the attributes that make it an admin's to read.
-// The instance is kept as kitbash.path, because that is what the agent was
-// given and what an admin queries by to find the cause behind it.
+// RecordInternal reports one internal cause to kitbashd, which stores it as a
+// record only an admin reads. No export may claim kitbash.internal, so this
+// goes to POST /kitbash/v1/internal and not through the exporter; kitbashd
+// stamps the record from the peer credentials of the socket, so the session
+// says who it is by connecting and not by what it sends.
 //
 // It is what problem.Internal hands its cause to for the life of this
-// provider. A provider that is nil, which is a session running untraced,
-// records nothing.
+// provider, and it is called on the goroutine of the call that failed, so it
+// only queues. A provider that is nil, which is a session running untraced,
+// reports nothing.
 func (p *Provider) RecordInternal(instance, cause string) {
 	if p == nil {
 		return
 	}
-	var record otellog.Record
-	record.SetTimestamp(time.Now())
-	record.SetSeverity(otellog.SeverityError)
-	record.SetSeverityText("ERROR")
-	record.SetBody(attribute.StringValue(clip(cause, InternalCauseLimit)))
-	attrs := []attribute.KeyValue{
-		attribute.Bool(AttrInternal, true),
-		attribute.String(AttrError, problem.SlugInternal),
+	report := internalCause{
+		instance: instance,
+		cause:    clip(cause, InternalCauseLimit),
+		tool:     p.tool(),
 	}
-	if instance != "" {
-		attrs = append(attrs, attribute.String(AttrPath, instance))
+	select {
+	case p.causes <- report:
+	default:
+		// A session failing faster than kitbashd accepts causes is a session
+		// in a loop. The queue is what bounds this one, the rate limit on the
+		// daemon is what bounds every session together.
+		p.causeDropped(fmt.Errorf("the queue of %d is full", InternalQueue))
 	}
-	if tool := p.tool(); tool != "" {
-		attrs = append(attrs, attribute.String(AttrTool, tool))
+}
+
+// reportCauses is the one goroutine that posts causes, started with the
+// provider. Shutdown gives whatever is queued a last chance to go.
+func (p *Provider) reportCauses() {
+	defer close(p.causesDone)
+	for {
+		select {
+		case report := <-p.causes:
+			p.report(report)
+		case <-p.stopping:
+			for {
+				select {
+				case report := <-p.causes:
+					p.report(report)
+				default:
+					return
+				}
+			}
+		}
 	}
-	if p.caller != "" {
-		attrs = append(attrs, attribute.String(AttrCaller, p.caller))
+}
+
+// report sends one cause. A daemon that is not there costs the session one
+// line, the same courtesy a dropping exporter gets.
+func (p *Provider) report(c internalCause) {
+	ctx, cancel := context.WithTimeout(context.Background(), InternalReportTimeout)
+	defer cancel()
+	if err := p.client.Internal(ctx, c.instance, c.cause, c.tool); err != nil {
+		p.causeDropped(err)
 	}
-	record.AddAttributes(attrs...)
-	// kitbashd stamps kitbash.user from the peer credentials of the socket,
-	// so the record is the caller's without this process saying so.
-	p.logger.Emit(context.Background(), record)
+}
+
+// causeDropped says once per session that the causes of this session are not
+// reaching an administrator.
+func (p *Provider) causeDropped(err error) {
+	p.causeOnce.Do(func() {
+		if p.sessionLog == nil {
+			return
+		}
+		p.sessionLog.Printf("this session is not recording the causes of its internal problems: %v", err)
+	})
+}
+
+// stopCauses ends the reporter and waits for what is queued, within whatever
+// budget the caller has left.
+func (p *Provider) stopCauses(ctx context.Context) {
+	p.stopOnce.Do(func() { close(p.stopping) })
+	select {
+	case <-p.causesDone:
+	case <-ctx.Done():
+	}
 }
 
 // Info emits a log record under this span with the span's own attributes.

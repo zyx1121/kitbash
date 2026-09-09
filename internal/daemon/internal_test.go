@@ -13,8 +13,38 @@ import (
 	"github.com/zyx1121/kitbash/internal/store"
 )
 
-// recordInternalCause seeds one cause the way the daemon records its own, and
-// one ordinary record of the same member beside it.
+// window is the time range a test queries with: wide enough for a fixed clock
+// and for the wall clock both.
+func window() store.Filter {
+	return store.Filter{Since: time.Now().Add(-time.Hour), Until: time.Now().Add(time.Hour)}
+}
+
+// causes waits for the queued writes to land and returns the causes in the
+// store. Recording is asynchronous on purpose: the call that failed is already
+// answering, so a test waits where a caller does not.
+func causes(t *testing.T, h *harness, want int) []store.Log {
+	t.Helper()
+	yes := true
+	filter := window()
+	filter.Internal = &yes
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		page, err := h.store.Query(context.Background(), store.SignalLogs, filter)
+		if err != nil {
+			t.Fatalf("Query: %v", err)
+		}
+		if len(page.Logs) >= want {
+			return page.Logs
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the store holds %d causes after five seconds, want %d", len(page.Logs), want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// seedCause writes one cause the way the daemon records its own, and one
+// ordinary record of the same member beside it.
 func seedCause(t *testing.T, h *harness, instance, cause string) {
 	t.Helper()
 	yes := true
@@ -46,7 +76,7 @@ func queryLogs(t *testing.T, h *harness, body map[string]any) []logRecord {
 	return answer.Records
 }
 
-// The daemon has no exporter, so it writes its own causes into its store. The
+// The daemon holds the store, so it writes the causes it raises itself. The
 // record is the whole cause, stamped as the daemon's own.
 func TestTheDaemonStoresItsOwnInternalCauses(t *testing.T) {
 	h := serve(t, true)
@@ -54,20 +84,11 @@ func TestTheDaemonStoresItsOwnInternalCauses(t *testing.T) {
 	defer stop()
 
 	p := problem.Internal("/kitbash/v1/query", "store: query logs: disk I/O error", "")
-	if p.Detail == "store: query logs: disk I/O error" {
+	if strings.Contains(p.Detail, "disk I/O error") {
 		t.Fatal("the cause reached the caller's detail, which is what it must never do")
 	}
 
-	page, err := h.store.Query(context.Background(), store.SignalLogs, store.Filter{
-		Since: time.Now().Add(-time.Minute), Until: time.Now().Add(time.Minute),
-	})
-	if err != nil {
-		t.Fatalf("Query: %v", err)
-	}
-	if len(page.Logs) != 1 {
-		t.Fatalf("the store holds %d records, want the one cause", len(page.Logs))
-	}
-	got := page.Logs[0]
+	got := causes(t, h, 1)[0]
 	if got.Body != "store: query logs: disk I/O error" {
 		t.Errorf("body = %q, want the cause", got.Body)
 	}
@@ -87,19 +108,171 @@ func TestTheDaemonStoresItsOwnInternalCauses(t *testing.T) {
 	if got.Other[attrError] != problem.SlugInternal {
 		t.Errorf("%s = %v, want %q", attrError, got.Other[attrError], problem.SlugInternal)
 	}
+}
 
-	// Once the hook is removed the daemon records nothing more, which is what
-	// the store being closed after it depends on.
-	stop()
-	problem.Internal("/kitbash/v1/query", "a second cause", "")
-	page, err = h.store.Query(context.Background(), store.SignalLogs, store.Filter{
-		Since: time.Now().Add(-time.Minute), Until: time.Now().Add(time.Minute),
+// kitbash-mcp cannot write the store, so it reports its causes to this path
+// and kitbashd stamps the record from the peer credentials.
+func TestTheInternalPathRecordsForThePeer(t *testing.T) {
+	h := serve(t, false)
+	res, body := h.postJSON(http.MethodPost, internalPath, internalRequest{
+		Instance: "/org/handbook/README.md",
+		Cause:    "git commit: exit status 128",
+		Tool:     "fs_write",
 	})
+	if res.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, body %s", res.StatusCode, body)
+	}
+
+	got := causes(t, h, 1)[0]
+	if got.Body != "git commit: exit status 128" {
+		t.Errorf("body = %q, want the cause", got.Body)
+	}
+	if got.User != h.user || got.Producer != h.user {
+		t.Errorf("user %q and producer %q, want the peer %q", got.User, got.Producer, h.user)
+	}
+	if got.Path != "/org/handbook/README.md" {
+		t.Errorf("path = %q, want the problem instance", got.Path)
+	}
+	if got.Tool != "fs_write" {
+		t.Errorf("tool = %q, want the call the cause happened in", got.Tool)
+	}
+	if got.Internal == nil || !*got.Internal {
+		t.Error("the stored record does not carry internal true")
+	}
+
+	// The member who reported it does not read it back. What they have is the
+	// instance they already quoted in the problem.
+	if records := queryLogs(t, h, map[string]any{"signal": "logs"}); len(records) != 0 {
+		t.Errorf("the member's own query returned %d records, want none", len(records))
+	}
+}
+
+// A body without a cause is a request that would store an empty record.
+func TestTheInternalPathRefusesAnEmptyCause(t *testing.T) {
+	h := serve(t, false)
+	res, body := h.postJSON(http.MethodPost, internalPath, internalRequest{Instance: "/org/handbook"})
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, body %s", res.StatusCode, body)
+	}
+	if slug := h.problemOf(res, body).Slug(); slug != problem.SlugBadRequest {
+		t.Errorf("slug = %s, want bad-request", slug)
+	}
+}
+
+// A cause longer than the budget is cut, so one caller cannot decide how much
+// of the store a record takes.
+func TestALongCauseIsClipped(t *testing.T) {
+	h := serve(t, false)
+	res, body := h.postJSON(http.MethodPost, internalPath, internalRequest{
+		Instance: "/org/handbook",
+		Cause:    strings.Repeat("x", InternalCauseLimit*2),
+	})
+	if res.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, body %s", res.StatusCode, body)
+	}
+	got := causes(t, h, 1)[0]
+	if len(got.Body) > InternalCauseLimit+64 {
+		t.Errorf("the stored cause is %d bytes, want it cut to %d and a note", len(got.Body), InternalCauseLimit)
+	}
+	if !strings.Contains(got.Body, "truncated") {
+		t.Error("the cut cause does not say it was cut")
+	}
+}
+
+// A session in a loop is bounded: the causes over the rate are refused with a
+// 429, which is the answer that says the same request works later.
+func TestTheInternalPathIsRateLimited(t *testing.T) {
+	h := serve(t, false)
+	for i := range InternalRate {
+		res, body := h.postJSON(http.MethodPost, internalPath, internalRequest{Cause: "a cause"})
+		if res.StatusCode != http.StatusNoContent {
+			t.Fatalf("cause %d: status = %d, body %s", i, res.StatusCode, body)
+		}
+	}
+	res, body := h.postJSON(http.MethodPost, internalPath, internalRequest{Cause: "one too many"})
+	if res.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, body %s, want 429", res.StatusCode, body)
+	}
+	prob := h.problemOf(res, body)
+	if prob.Slug() != problem.SlugConflict {
+		t.Errorf("slug = %s, want conflict", prob.Slug())
+	}
+	if retry := res.Header.Get("Retry-After"); retry != RetryAfterSeconds {
+		t.Errorf("Retry-After = %q, want %q", retry, RetryAfterSeconds)
+	}
+}
+
+// Nobody asserts kitbash.internal over OTLP, member sessions included: a
+// member with a shell on the host can reach the socket with curl, and a record
+// they marked would be hidden from them and shown to every admin as kitbash's
+// own words. The export is stored without it and stays the member's to read.
+func TestAMemberExportMayNotClaimInternal(t *testing.T) {
+	h := serve(t, false)
+	res, body := h.do(http.MethodPost, pathTraces, otlp.ContentTypeProtobuf,
+		processExport("fs_list", map[string]any{otlp.AttrInternal: true}, false, time.Now().Add(-time.Minute)))
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("export: status %d, body %s", res.StatusCode, body)
+	}
+
+	page, err := h.store.Query(context.Background(), store.SignalTraces, window())
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
-	if len(page.Logs) != 1 {
-		t.Errorf("the store holds %d records after the hook was removed, want the first one alone", len(page.Logs))
+	if len(page.Spans) != 1 {
+		t.Fatalf("the store holds %d spans, want the one exported", len(page.Spans))
+	}
+	if page.Spans[0].Internal != nil {
+		t.Errorf("the stored span carries internal %v, want none: no export may claim it",
+			*page.Spans[0].Internal)
+	}
+	if raw, kept := page.Spans[0].Other[otlp.AttrInternal]; kept {
+		t.Errorf("%s survived as %v among the other attributes", otlp.AttrInternal, raw)
+	}
+
+	// The record is the member's own, so the member still reads it.
+	answer, out := h.postJSON(http.MethodPost, queryPath, map[string]any{"signal": "traces"})
+	if answer.StatusCode != http.StatusOK {
+		t.Fatalf("query status = %d, body %s", answer.StatusCode, out)
+	}
+	var records struct {
+		Records []spanRecord `json:"records"`
+	}
+	if err := json.Unmarshal(out, &records); err != nil {
+		t.Fatalf("query body %q: %v", out, err)
+	}
+	if len(records.Records) != 1 {
+		t.Fatalf("the member's query returned %d records, want their own span", len(records.Records))
+	}
+	if records.Records[0].Attributes.Internal != nil {
+		t.Error("the answered span is marked internal, so its own owner would stop seeing it")
+	}
+}
+
+// The same rule on the Process receiver, where the producer is a container.
+func TestAProcessMayNotMarkItsRecordsInternal(t *testing.T) {
+	h := serve(t, false)
+	base := h.serveTCP()
+	token, res, body := h.register(registration(""))
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("register: status %d, body %s", res.StatusCode, body)
+	}
+
+	res, body = h.exportTCP(base, pathTraces, token,
+		processExport("sensorium_read", map[string]any{otlp.AttrInternal: true}, false, time.Now().Add(-time.Minute)))
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("export: status %d, body %s", res.StatusCode, body)
+	}
+
+	page, err := h.store.Query(context.Background(), store.SignalTraces, window())
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(page.Spans) != 1 {
+		t.Fatalf("the store holds %d spans, want the one the Process sent", len(page.Spans))
+	}
+	if page.Spans[0].Internal != nil {
+		t.Errorf("the stored span carries internal %v, want none: a Process may not claim it",
+			*page.Spans[0].Internal)
 	}
 }
 
@@ -142,14 +315,14 @@ func TestAnAdminQueryReturnsInternalCauses(t *testing.T) {
 		t.Fatalf("an admin's query returned %d records, want both", len(all))
 	}
 
-	causes := queryLogs(t, h, map[string]any{"signal": "logs", "internal": true})
-	if len(causes) != 1 {
-		t.Fatalf("an admin asking for causes got %d records, want the one cause", len(causes))
+	found := queryLogs(t, h, map[string]any{"signal": "logs", "internal": true})
+	if len(found) != 1 {
+		t.Fatalf("an admin asking for causes got %d records, want the one cause", len(found))
 	}
-	if causes[0].Body != "git: exit status 128" {
-		t.Errorf("body = %q, want the cause", causes[0].Body)
+	if found[0].Body != "git: exit status 128" {
+		t.Errorf("body = %q, want the cause", found[0].Body)
 	}
-	if causes[0].Attributes.Internal == nil || !*causes[0].Attributes.Internal {
+	if found[0].Attributes.Internal == nil || !*found[0].Attributes.Internal {
 		t.Error("the answered record does not carry internal, so an admin cannot tell it apart")
 	}
 
@@ -199,56 +372,25 @@ func TestTheFanOutSendsCausesToAdminsOnly(t *testing.T) {
 	}
 }
 
-// kitbash.internal is not a Process's to claim. A kit that marked its records
-// as internal causes would hide them from its own owner and put its words in
-// front of every admin, so the attribute is dropped on the way in, the same
-// rule kitbash.caller follows.
-func TestAProcessMayNotMarkItsRecordsInternal(t *testing.T) {
-	h := serve(t, false)
-	base := h.serveTCP()
-	token, res, body := h.register(registration(""))
-	if res.StatusCode != http.StatusOK {
-		t.Fatalf("register: status %d, body %s", res.StatusCode, body)
+// One peer's rate does not spend another's, and a window that has passed is
+// forgotten rather than kept for the life of the daemon.
+func TestTheRateLimiterIsPerPeerAndPerWindow(t *testing.T) {
+	at := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
+	limiter := newRateLimiter(2, time.Minute)
+	if !limiter.allow("alice", at) || !limiter.allow("alice", at) {
+		t.Fatal("the first two causes of a peer were refused")
 	}
-
-	res, body = h.exportTCP(base, pathTraces, token,
-		processExport("sensorium_read", map[string]any{otlp.AttrInternal: true}, false, time.Now().Add(-time.Minute)))
-	if res.StatusCode != http.StatusOK {
-		t.Fatalf("export: status %d, body %s", res.StatusCode, body)
+	if limiter.allow("alice", at) {
+		t.Error("the third cause inside the window was allowed")
 	}
-
-	page, err := h.store.Query(context.Background(), store.SignalTraces, store.Filter{
-		Since: time.Now().Add(-time.Hour), Until: time.Now().Add(time.Minute),
-	})
-	if err != nil {
-		t.Fatalf("Query: %v", err)
+	if !limiter.allow("bob", at) {
+		t.Error("another peer was refused for the first peer's causes")
 	}
-	if len(page.Spans) != 1 {
-		t.Fatalf("the store holds %d spans, want the one the Process sent", len(page.Spans))
+	if !limiter.allow("alice", at.Add(time.Minute)) {
+		t.Error("a peer was refused after their window had passed")
 	}
-	if page.Spans[0].Internal != nil {
-		t.Errorf("the stored span carries internal %v, want none: a Process may not claim it",
-			*page.Spans[0].Internal)
-	}
-	if raw, kept := page.Spans[0].Other[otlp.AttrInternal]; kept {
-		t.Errorf("%s survived as %v among the other attributes", otlp.AttrInternal, raw)
-	}
-
-	// The record is the owner's, so the owner still reads it.
-	answer, out := h.postJSON(http.MethodPost, queryPath, map[string]any{"signal": "traces"})
-	if answer.StatusCode != http.StatusOK {
-		t.Fatalf("query status = %d, body %s", answer.StatusCode, out)
-	}
-	var records struct {
-		Records []spanRecord `json:"records"`
-	}
-	if err := json.Unmarshal(out, &records); err != nil {
-		t.Fatalf("query body %q: %v", out, err)
-	}
-	if len(records.Records) != 1 {
-		t.Fatalf("the owner's query returned %d records, want the Process's span", len(records.Records))
-	}
-	if records.Records[0].Attributes.Internal != nil {
-		t.Error("the answered span is marked internal, so its own owner would stop seeing it")
+	if len(limiter.peers) != 1 {
+		t.Errorf("the limiter holds %d peers after the windows passed, want the live one alone",
+			len(limiter.peers))
 	}
 }
