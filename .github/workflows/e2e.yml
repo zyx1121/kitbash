@@ -66,23 +66,11 @@ jobs:
         # podman copies it into the container as the admin, and the runner's
         # home is not somewhere a member may go.
         run: |
-          if [ -f e2e/client/package-lock.json ]; then
-            npm ci --prefix e2e/client --no-audit --no-fund --loglevel error
-          else
-            npm install --prefix e2e/client --no-audit --no-fund --loglevel error
-          fi
+          npm ci --prefix e2e/client --no-audit --no-fund --loglevel error
           rm -rf "$KITBASH_E2E_CLIENT"
           mkdir -p "$(dirname "$KITBASH_E2E_CLIENT")"
           cp -R e2e/client "$KITBASH_E2E_CLIENT"
           chmod -R a+rX "$KITBASH_E2E_CLIENT"
-
-      - name: Publish the client lock file
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: client-lock
-          path: e2e/client/package-lock.json
-          if-no-files-found: warn
 
       - name: Start kitbashd
         run: sudo sh e2e/daemon.sh start /usr/bin/kitbashd "$MAIN_STORE" "$KITBASH_E2E_LOGS/kitbashd.log"
