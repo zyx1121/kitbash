@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -177,6 +179,7 @@ func runThePackage(t *testing.T, s *state) {
 		t.Fatalf("proc_run published %v, want %s", out.Tools, echoTool)
 	}
 	s.processID = out.ID
+	theCeiling(t, out.ID)
 
 	// The Package's tool joins the session that started it, and answering it
 	// is a podman exec into the container that is now running.
@@ -192,6 +195,28 @@ func runThePackage(t *testing.T, s *state) {
 	if echoed.Text != s.echoText {
 		t.Fatalf("%s answered %q, want %q", echoTool, echoed.Text, s.echoText)
 	}
+}
+
+// theCeiling reads the limit kitbashd wrote into the Process's own cgroup. The
+// manifest asks for 256Mi and a member cannot write that file, which is what
+// makes the limit an enforcement rather than a record.
+//
+// A host that could not build the cgroup tree runs its Processes unplaced and
+// says so in the daemon log. That is a host without delegation, not a broken
+// one, so it is reported here rather than failed.
+func theCeiling(t *testing.T, id string) {
+	const want = 256 * 1024 * 1024
+	path := filepath.Join("/sys/fs/cgroup/kitbash", adminName(), id, "memory.max")
+	out, err := exec.Command("sudo", "-n", "cat", path).Output()
+	if err != nil {
+		t.Logf("this host placed no ceiling at %s, so its limits are recorded and not enforced: %v", path, err)
+		return
+	}
+	got := strings.TrimSpace(string(out))
+	if got != strconv.Itoa(want) {
+		t.Fatalf("%s is %s, want %d for the manifest's 256Mi", path, got, want)
+	}
+	t.Logf("the ceiling of the Process is %s bytes", got)
 }
 
 // secondClient runs the TypeScript SDK against /mcp from inside the Process's

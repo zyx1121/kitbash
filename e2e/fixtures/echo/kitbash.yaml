@@ -35,3 +35,7 @@ deploy:
     - type: container
       build: .
       expose: mcp
+      # A ceiling kitbashd writes into this Process's cgroup, which the job
+      # reads back: a limit that is only recorded is the thing delegation
+      # exists to fix. A Node process answering one tool needs far less.
+      limits: { memory: 256Mi }
