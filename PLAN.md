@@ -105,7 +105,7 @@ Every record also carries `kitbash.producer`, stamped by kitbashd: the member fo
 
 **Reading.** `tel_query` returns records of one signal filtered by the four attributes and a time range. A member reads their own records; an admin reads everyone's. `tel_retention` reads the window per signal and lets an admin set it.
 
-**Internal causes.** The cause of an internal problem is recorded as a log record with `kitbash.internal: true`, which `tel_query` answers to admins alone: the agent is given the problem's instance to quote, and the admin queries by it rather than reading a log file on the host.
+**Internal causes.** The cause of an internal problem is recorded as a log record with `kitbash.internal: true`, which `tel_query` answers to admins alone: the agent is given the problem's instance to quote, and the admin queries by it rather than reading a log file on the host. Only kitbash's own producers mark a record that way; the attribute is dropped from anything a Process sends, like `kitbash.caller`.
 
 Evaluation is not an object. An evaluation kit subscribes to Telemetry, computes whatever it computes, and writes the result back as Telemetry with an `eval` attribute. Asking how a package version is doing is the same query as asking what it did.
 

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zyx1121/kitbash/internal/otlp"
 	"github.com/zyx1121/kitbash/internal/problem"
 	"github.com/zyx1121/kitbash/internal/store"
 )
@@ -195,5 +196,59 @@ func TestTheFanOutSendsCausesToAdminsOnly(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "kitbash.internal") {
 		t.Error("the delivered record does not say it is internal")
+	}
+}
+
+// kitbash.internal is not a Process's to claim. A kit that marked its records
+// as internal causes would hide them from its own owner and put its words in
+// front of every admin, so the attribute is dropped on the way in, the same
+// rule kitbash.caller follows.
+func TestAProcessMayNotMarkItsRecordsInternal(t *testing.T) {
+	h := serve(t, false)
+	base := h.serveTCP()
+	token, res, body := h.register(registration(""))
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("register: status %d, body %s", res.StatusCode, body)
+	}
+
+	res, body = h.exportTCP(base, pathTraces, token,
+		processExport("sensorium_read", map[string]any{otlp.AttrInternal: true}, false, time.Now().Add(-time.Minute)))
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("export: status %d, body %s", res.StatusCode, body)
+	}
+
+	page, err := h.store.Query(context.Background(), store.SignalTraces, store.Filter{
+		Since: time.Now().Add(-time.Hour), Until: time.Now().Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(page.Spans) != 1 {
+		t.Fatalf("the store holds %d spans, want the one the Process sent", len(page.Spans))
+	}
+	if page.Spans[0].Internal != nil {
+		t.Errorf("the stored span carries internal %v, want none: a Process may not claim it",
+			*page.Spans[0].Internal)
+	}
+	if raw, kept := page.Spans[0].Other[otlp.AttrInternal]; kept {
+		t.Errorf("%s survived as %v among the other attributes", otlp.AttrInternal, raw)
+	}
+
+	// The record is the owner's, so the owner still reads it.
+	answer, out := h.postJSON(http.MethodPost, queryPath, map[string]any{"signal": "traces"})
+	if answer.StatusCode != http.StatusOK {
+		t.Fatalf("query status = %d, body %s", answer.StatusCode, out)
+	}
+	var records struct {
+		Records []spanRecord `json:"records"`
+	}
+	if err := json.Unmarshal(out, &records); err != nil {
+		t.Fatalf("query body %q: %v", out, err)
+	}
+	if len(records.Records) != 1 {
+		t.Fatalf("the owner's query returned %d records, want the Process's span", len(records.Records))
+	}
+	if records.Records[0].Attributes.Internal != nil {
+		t.Error("the answered span is marked internal, so its own owner would stop seeing it")
 	}
 }

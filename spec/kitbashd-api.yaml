@@ -31,8 +31,9 @@ tcp:
     kitbash.user, kitbash.package and kitbash.process from it and sets
     kitbash.producer to the Process id. A missing, unknown or revoked token
     is 401 not-permitted. Records from a Process may carry any other
-    attribute; the eval rules below are the one exception where claims on
-    the stamped attributes are honoured.
+    attribute except kitbash.caller and kitbash.internal, which are dropped
+    here; the eval rules below are the one exception where claims on the
+    stamped attributes are honoured.
   environment_given_to_every_process:
     KITBASH_TELEMETRY_ENDPOINT: http://host.containers.internal:4318
     KITBASH_TELEMETRY_TOKEN: the Process token
@@ -367,6 +368,19 @@ internal_records:
     the call in flight when there is exactly one; kitbashd has no exporter and
     writes its own into the store directly, stamped kitbash.producer = kitbashd
     and kitbash.user = kitbashd.
+  attribution: >
+    A cause kitbashd recorded is kitbash.user = kitbashd even when it was
+    raised while serving a member: the daemon serves everyone, and a failure
+    inside it is not a member's record. The instance is what ties the two
+    together, so an admin queries by the path the member quotes rather than by
+    the member's name.
+  claims: >
+    kitbash.internal is never taken from a producer over the Process receiver.
+    kitbashd drops it from every record that arrives with a Process token, the
+    same rule kitbash.caller follows: a Process that could set it would put its
+    own owner's records out of the owner's reach and its own words in front of
+    every admin. It is honoured on the socket, where the only producer is the
+    kitbash-mcp of a session.
   authorization: >
     A query returns these records to admins alone. A member's query excludes
     them, and a member asking for internal = true is answered with an empty
