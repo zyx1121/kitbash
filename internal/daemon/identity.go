@@ -59,6 +59,14 @@ func (id identity) apply(a *store.Attributes) {
 	// session ended, names nothing and is dropped rather than stored.
 	a.Caller = id.caller(a.Caller)
 
+	// kitbash.internal is not anybody's claim. A record marked as the cause
+	// of an internal problem is answered to admins alone, so a producer that
+	// could set it would put records out of their own owner's reach and its
+	// words in front of every admin. It is dropped on both listeners, member
+	// and Process alike: a cause is reported to POST /kitbash/v1/internal,
+	// which is the one path that writes one, see PLAN.md section 2.4.
+	a.Internal = nil
+
 	if id.EvalClaims && a.Eval != nil && *a.Eval {
 		// The claims are about the subject of the judgment. Whatever the kit
 		// left out falls back to the kit's own identity, so no record ever

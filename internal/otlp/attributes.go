@@ -22,6 +22,7 @@ const (
 	AttrEval     = "kitbash.eval"
 	AttrProducer = "kitbash.producer"
 	AttrCaller   = "kitbash.caller"
+	AttrInternal = "kitbash.internal"
 )
 
 // The subject of an evaluation record: the span a judgment is about, see
@@ -77,6 +78,16 @@ func attributes(resource map[string]any, record []*commonpb.KeyValue) store.Attr
 			attrs.Eval = &b
 		}
 		delete(merged, AttrEval)
+	}
+	// kitbash.internal decides who may read the record at all, so it is
+	// lifted the same way and a value of the wrong type is dropped rather
+	// than kept: a record carrying the string "true" under this name would
+	// be answered to every member as an ordinary record.
+	if raw, sent := merged[AttrInternal]; sent {
+		if b, ok := raw.(bool); ok {
+			attrs.Internal = &b
+		}
+		delete(merged, AttrInternal)
 	}
 	if len(merged) > 0 {
 		attrs.Other = merged

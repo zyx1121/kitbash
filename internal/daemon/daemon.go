@@ -187,6 +187,16 @@ type Server struct {
 	// starts serving and read by every health request.
 	boundMu sync.Mutex
 	bound   listeners
+
+	// backups is what health reports about the nightly copy of the store,
+	// written by the backup loop, see PLAN.md section 4.7.
+	backups backups
+
+	// internalCauses is the queue of causes waiting to be written, and
+	// internalRate what bounds how many one peer may record, see
+	// PLAN.md section 2.4.
+	internalCauses chan internalCause
+	internalRate   *rateLimiter
 }
 
 // New builds the server. The store is not owned by it: whoever opened the file
@@ -209,6 +219,9 @@ func New(st *store.Store, opts Options) *Server {
 		mcpIdle:     opts.MCPIdle,
 		callerGrace: opts.MCPCallerGrace,
 		stopped:     make(chan struct{}),
+
+		internalCauses: make(chan internalCause, InternalQueue),
+		internalRate:   newRateLimiter(InternalRate, InternalRateWindow),
 
 		noRestore: opts.NoRestore,
 	}
@@ -242,6 +255,7 @@ func New(st *store.Store, opts Options) *Server {
 	s.started = s.now()
 	s.routes()
 	go s.mcpSweepLoop()
+	go s.internalWriter()
 	return s
 }
 
@@ -265,6 +279,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc(approvalsPath, s.approvalsFamily)
 	s.mux.HandleFunc(approvalsPath+"/", s.approval)
 	s.mux.HandleFunc(healthPath, s.method(http.MethodGet, s.health))
+	s.mux.HandleFunc(internalPath, s.method(http.MethodPost, s.internal))
 	s.mux.HandleFunc("/", s.notFound)
 
 	s.otlpMux = http.NewServeMux()
@@ -281,6 +296,7 @@ const (
 	usersPath     = "/kitbash/v1/users"
 	approvalsPath = "/kitbash/v1/approvals"
 	healthPath    = "/kitbash/v1/health"
+	internalPath  = "/kitbash/v1/internal"
 )
 
 // otlpPaths registers the three OTLP paths on one mux, with the identity that

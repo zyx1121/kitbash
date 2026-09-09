@@ -395,7 +395,7 @@ func (b *Bridge) call(ctx context.Context, p *proc.Process, tool manifest.Tool, 
 			return nil, passed
 		}
 		return nil, problem.BadRequest(surface, remoteText(res),
-			"The Package refused the call; read the detail.")
+			fmt.Sprintf("The Package %s refused the call; its message is the detail above.", p.Name))
 	}
 	if res.StructuredContent == nil {
 		// A tool that answers in prose is answering, not misbehaving. There is

@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sync"
 )
 
 // Base is the prefix of every error type URI.
@@ -187,7 +188,15 @@ func TooManySessions(instance, detail, fix string) *Problem {
 	if fix == "" {
 		fix = "End a session with DELETE /mcp before opening another one."
 	}
-	return newProblem(SlugConflict, "Too many sessions", http.StatusTooManyRequests, instance, detail, fix)
+	return TooMany("Too many sessions", instance, detail, fix)
+}
+
+// TooMany reports a caller asking for more of something than kitbash accepts
+// in a window, whatever that something is. The slug stays conflict, so a
+// client matches one class of refusal however it was refused, and the status
+// is 429 because the same request works later.
+func TooMany(title, instance, detail, fix string) *Problem {
+	return newProblem(SlugConflict, title, http.StatusTooManyRequests, instance, detail, fix)
 }
 
 // Queued reports a call that was not run but put in the approval queue, which
@@ -202,22 +211,54 @@ func Queued(id, detail string) *Problem {
 // logger writes the causes of internal errors where the operator can read them.
 var logger = log.New(os.Stderr, "kitbash: ", log.LstdFlags)
 
+// hook receives every internal cause besides the server log, so an admin can
+// read it through Telemetry rather than on the host, see PLAN.md section 2.4.
+// It is set once at start up by whoever can record a cause: kitbash-mcp's
+// telemetry provider, which exports it, and kitbashd, which writes it to its
+// own store.
+var hook struct {
+	mu sync.RWMutex
+	fn func(instance, cause string)
+}
+
+// OnInternal sets that hook, replacing whatever was there. A nil argument
+// removes it, which is how a process that recorded causes stops before its
+// recorder is closed.
+func OnInternal(fn func(instance, cause string)) {
+	hook.mu.Lock()
+	defer hook.mu.Unlock()
+	hook.fn = fn
+}
+
+// record hands one cause to the hook, if there is one.
+func record(instance, cause string) {
+	hook.mu.RLock()
+	fn := hook.fn
+	hook.mu.RUnlock()
+	if fn != nil {
+		fn(instance, cause)
+	}
+}
+
 // Internal reports a failure inside kitbash itself. The cause goes to the
-// server log, never to the agent: it carries host paths, git output and other
-// detail the caller has no business seeing and cannot act on.
+// server log and to the hook, never to the agent: it carries host paths, git
+// output and other detail the caller has no business seeing and cannot act on.
+// The instance is what the agent is given, so a member quotes it to an admin
+// and the admin finds the cause with tel_query.
 func Internal(instance, cause, fix string) *Problem {
 	if fix == "" {
-		fix = "Retry the call. If it keeps failing, ask an administrator to read the server log."
+		fix = "Retry the call. If it keeps failing, ask an administrator to read the cause with tel_query."
 	}
 	logger.Printf("internal error at %s: %s", instance, cause)
+	record(instance, cause)
 	return newProblem(SlugInternal, "Internal error", http.StatusInternalServerError, instance,
-		"kitbash could not complete this call; the cause is in the server log", fix)
+		"kitbash could not complete this call; the cause is recorded for administrators", fix)
 }
 
 // InternalDetail is Internal with a detail the caller can act on. The failure
-// is still inside kitbash or inside a Package it ran, so the cause goes to the
-// server log, but saying which of the two broke helps the agent decide what to
-// do next.
+// is still inside kitbash or inside a Package it ran, so the cause goes where
+// only an admin reads it, but saying which of the two broke helps the agent
+// decide what to do next.
 func InternalDetail(instance, cause, detail, fix string) *Problem {
 	p := Internal(instance, cause, fix)
 	p.Detail = detail

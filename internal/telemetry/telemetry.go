@@ -14,6 +14,7 @@ package telemetry
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"sync"
@@ -29,6 +30,8 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 
 	"go.opentelemetry.io/otel/codes"
+
+	"github.com/zyx1121/kitbash/internal/problem"
 )
 
 // ServiceName is the OpenTelemetry service every record from this process
@@ -74,6 +77,29 @@ const (
 	AttrDigest = "kitbash.digest"
 	AttrError  = "kitbash.error"
 )
+
+// InternalCauseLimit bounds one reported cause, the same budget kitbashd
+// applies when it stores one. A cause is an error message, and one that
+// arrived from a command's standard error can be as long as that command felt
+// like being.
+const InternalCauseLimit = 8 << 10
+
+// InternalQueue is how many causes wait to be reported, and
+// InternalReportTimeout how long one report may take. Reporting a cause never
+// holds up the call that failed: the call is already answering with its
+// problem, so a report is queued, and a queue that is full drops.
+const (
+	InternalQueue         = 64
+	InternalReportTimeout = 5 * time.Second
+)
+
+// internalCause is one queued report: the problem instance the agent was
+// given, the cause, and the tool of the call it happened in.
+type internalCause struct {
+	instance string
+	cause    string
+	tool     string
+}
 
 // AttrCaller carries the caller credential of this session, which kitbashd
 // rewrites to the Process id of the session it minted the credential for. A
@@ -126,6 +152,22 @@ type Provider struct {
 	traces *sdktrace.TracerProvider
 	logs   *sdklog.LoggerProvider
 	client *Client
+
+	// calls are the tools/call spans open right now, which a reported
+	// internal cause reads its tool from, see tool.
+	mu    sync.Mutex
+	calls map[*call]struct{}
+
+	// The internal causes of this session on their way to kitbashd: the
+	// queue, the signal that ends the reporter, and the channel it closes on
+	// its way out. sessionLog carries the one line a session that cannot
+	// report is worth.
+	causes     chan internalCause
+	stopping   chan struct{}
+	causesDone chan struct{}
+	stopOnce   sync.Once
+	sessionLog *log.Logger
+	causeOnce  sync.Once
 }
 
 // New builds the provider for one session. It opens no connection: the socket
@@ -180,14 +222,26 @@ func New(opts Options) (*Provider, error) {
 	if caller == "" {
 		caller = Caller()
 	}
-	return &Provider{
-		caller: caller,
-		tracer: traces.Tracer(scopeName),
-		logger: logs.Logger(scopeName),
-		traces: traces,
-		logs:   logs,
-		client: NewClient(socket),
-	}, nil
+	p := &Provider{
+		caller:     caller,
+		tracer:     traces.Tracer(scopeName),
+		logger:     logs.Logger(scopeName),
+		traces:     traces,
+		logs:       logs,
+		client:     NewClient(socket),
+		calls:      map[*call]struct{}{},
+		causes:     make(chan internalCause, InternalQueue),
+		stopping:   make(chan struct{}),
+		causesDone: make(chan struct{}),
+		sessionLog: logger,
+	}
+	go p.reportCauses()
+	// The cause of an internal problem is not for the agent, but it is for
+	// the admin of this host, so it is reported to kitbashd rather than left
+	// as a line in a log file nobody can read through MCP, see PLAN.md
+	// section 2.4.
+	problem.OnInternal(p.RecordInternal)
+	return p, nil
 }
 
 // NewFromEnv is New with the socket the environment names. A provider that
@@ -234,6 +288,8 @@ func (p *Provider) Shutdown(ctx context.Context) error {
 	if p == nil {
 		return nil
 	}
+	// Nothing may reach a closed exporter, so the hook goes first.
+	problem.OnInternal(nil)
 	ctx, cancel := context.WithTimeout(ctx, ShutdownTimeout)
 	defer cancel()
 	var logErr error
@@ -247,6 +303,7 @@ func (p *Provider) Shutdown(ctx context.Context) error {
 	if err == nil {
 		err = logErr
 	}
+	p.stopCauses(ctx)
 	return err
 }
 
@@ -259,7 +316,10 @@ func (p *Provider) StartTool(ctx context.Context, tool, user string) (context.Co
 	}
 	ctx, span := p.tracer.Start(ctx, tool)
 	s := &Span{span: span, provider: p}
-	ctx = context.WithValue(ctx, callKey{}, &call{provider: p, tool: tool, user: user, span: s})
+	c := &call{provider: p, tool: tool, user: user, span: s}
+	s.call = c
+	p.began(c)
+	ctx = context.WithValue(ctx, callKey{}, c)
 	s.ctx = ctx
 	s.Set(AttrUser, user)
 	s.Set(AttrTool, tool)
@@ -340,6 +400,9 @@ type Span struct {
 	ctx      context.Context
 	span     trace.Span
 	provider *Provider
+	// call is set on the span of a whole tools/call and nil on a child, so
+	// ending one tells the provider the call is over.
+	call *call
 
 	mu    sync.Mutex
 	attrs []attribute.KeyValue
@@ -392,7 +455,121 @@ func (s *Span) End() {
 	if s == nil {
 		return
 	}
+	if s.call != nil {
+		s.provider.ended(s.call)
+	}
 	s.span.End()
+}
+
+// began and ended keep the set of tools/call spans this session has open.
+func (p *Provider) began(c *call) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls[c] = struct{}{}
+}
+
+func (p *Provider) ended(c *call) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.calls, c)
+}
+
+// tool is the tools/call this session is serving. An internal cause reaches
+// the provider through a package level hook, which carries the instance and
+// the cause and no context, so the tool is read from the calls in flight:
+// with exactly one open there is no doubt which call failed, and with none or
+// several the record carries no tool rather than a guessed one.
+func (p *Provider) tool() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.calls) != 1 {
+		return ""
+	}
+	for c := range p.calls {
+		return c.tool
+	}
+	return ""
+}
+
+// RecordInternal reports one internal cause to kitbashd, which stores it as a
+// record only an admin reads. No export may claim kitbash.internal, so this
+// goes to POST /kitbash/v1/internal and not through the exporter; kitbashd
+// stamps the record from the peer credentials of the socket, so the session
+// says who it is by connecting and not by what it sends.
+//
+// It is what problem.Internal hands its cause to for the life of this
+// provider, and it is called on the goroutine of the call that failed, so it
+// only queues. A provider that is nil, which is a session running untraced,
+// reports nothing.
+func (p *Provider) RecordInternal(instance, cause string) {
+	if p == nil {
+		return
+	}
+	report := internalCause{
+		instance: instance,
+		cause:    clip(cause, InternalCauseLimit),
+		tool:     p.tool(),
+	}
+	select {
+	case p.causes <- report:
+	default:
+		// A session failing faster than kitbashd accepts causes is a session
+		// in a loop. The queue is what bounds this one, the rate limit on the
+		// daemon is what bounds every session together.
+		p.causeDropped(fmt.Errorf("the queue of %d is full", InternalQueue))
+	}
+}
+
+// reportCauses is the one goroutine that posts causes, started with the
+// provider. Shutdown gives whatever is queued a last chance to go.
+func (p *Provider) reportCauses() {
+	defer close(p.causesDone)
+	for {
+		select {
+		case report := <-p.causes:
+			p.report(report)
+		case <-p.stopping:
+			for {
+				select {
+				case report := <-p.causes:
+					p.report(report)
+				default:
+					return
+				}
+			}
+		}
+	}
+}
+
+// report sends one cause. A daemon that is not there costs the session one
+// line, the same courtesy a dropping exporter gets.
+func (p *Provider) report(c internalCause) {
+	ctx, cancel := context.WithTimeout(context.Background(), InternalReportTimeout)
+	defer cancel()
+	if err := p.client.Internal(ctx, c.instance, c.cause, c.tool); err != nil {
+		p.causeDropped(err)
+	}
+}
+
+// causeDropped says once per session that the causes of this session are not
+// reaching an administrator.
+func (p *Provider) causeDropped(err error) {
+	p.causeOnce.Do(func() {
+		if p.sessionLog == nil {
+			return
+		}
+		p.sessionLog.Printf("this session is not recording the causes of its internal problems: %v", err)
+	})
+}
+
+// stopCauses ends the reporter and waits for what is queued, within whatever
+// budget the caller has left.
+func (p *Provider) stopCauses(ctx context.Context) {
+	p.stopOnce.Do(func() { close(p.stopping) })
+	select {
+	case <-p.causesDone:
+	case <-ctx.Done():
+	}
 }
 
 // Info emits a log record under this span with the span's own attributes.

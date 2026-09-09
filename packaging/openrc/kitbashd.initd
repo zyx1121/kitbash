@@ -15,6 +15,20 @@ output_log="/var/log/kitbashd.log"
 error_log="/var/log/kitbashd.log"
 respawn_delay=5
 respawn_max=0
+# The window respawn_max would count in. With respawn_max at 0 nothing is ever
+# given up on, and this is what keeps a daemon that fails in a loop from being
+# restarted as fast as it can exit: five minutes of failures are counted
+# together rather than each one starting the count again.
+respawn_period=300
+
+# supervise-daemon runs healthcheck() every healthcheck_timer seconds and
+# restarts kitbashd when it fails, which respawn_max=0 then keeps doing for as
+# long as the host is up. A daemon that is running but no longer answering is
+# the outage that matters: Processes start untraced, members cannot write /org
+# and /mcp is gone, see PLAN.md section 4.5 and issue #67. The first check
+# waits for the store to open and the listeners to bind.
+healthcheck_timer=60
+healthcheck_delay=60
 
 # One connection per member session, plus room for the exports in flight. The
 # daemon caps itself at 256 connections; this is the kernel's matching bound.
@@ -33,11 +47,25 @@ depend() {
 	after local
 }
 
+healthcheck() {
+	# GET /kitbash/v1/health over the unix socket, which is the surface every
+	# member reaches the daemon through, so this asks the same question a
+	# session asks. curl is on the host, deploy/install.sh installs it. root
+	# is a peer credential like any other, so the daemon answers it.
+	curl --silent --show-error --fail --max-time 5 \
+		--unix-socket /run/kitbash/kitbashd.sock \
+		http://localhost/kitbash/v1/health >/dev/null
+}
+
 start_pre() {
 	# The socket directory is world traversable; the socket itself is
 	# root:kitbash-users 0660 and kitbashd sets that after it binds.
 	checkpath --directory --mode 0755 --owner root:root /run/kitbash
 	# The store holds every member's Telemetry, so only root reads it.
 	checkpath --directory --mode 0700 --owner root:root /var/lib/kitbash
+	# A backup is a copy of that store, so it is kept the same way. kitbashd
+	# creates this directory too; doing it here also narrows one that an
+	# earlier layout left looser, see PLAN.md section 4.7.
+	checkpath --directory --mode 0700 --owner root:root /var/lib/kitbash/backup
 	checkpath --file --mode 0640 --owner root:root /var/log/kitbashd.log
 }

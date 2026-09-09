@@ -320,7 +320,7 @@ var (
 
 const telAttributesDef = `{
   "type": "object",
-  "description": "The four attributes plus tool and eval, in short form. Absent when the record did not carry them.",
+  "description": "The four attributes plus tool, eval and internal, in short form. Absent when the record did not carry them.",
   "properties": {
     "user": { "type": "string" },
     "package": { "type": "string" },
@@ -330,6 +330,7 @@ const telAttributesDef = `{
     "eval": { "type": "boolean" },
     "producer": { "type": "string", "description": "Member name or Process id that wrote the record" },
     "caller": { "type": "string", "description": "Process id whose MCP session recorded this span, when a Process acted for its owner" },
+    "internal": { "type": "boolean", "description": "true when the record is the cause of an internal problem; admins alone are answered these" },
     "subject": { "type": "object", "description": "For evaluation records: traceId and spanId of the judged span", "properties": { "traceId": { "type": "string" }, "spanId": { "type": "string" } } }
   }
 }`
@@ -394,6 +395,7 @@ var (
     "eval": { "type": "boolean", "description": "Only evaluation results written back by kits" },
     "producer": { "type": "string", "description": "Member name or Process id that wrote the record" },
     "caller": { "type": "string", "description": "Process id whose MCP session recorded the span, as kitbash.caller" },
+    "internal": { "type": "boolean", "description": "Only the causes of internal problems, which admins alone read; a member's query never returns them" },
     "since": { "type": "string", "format": "date-time" },
     "until": { "type": "string", "format": "date-time" },
     "limit": { "type": "integer", "minimum": 1, "default": 100, "maximum": 1000 }

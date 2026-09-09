@@ -351,6 +351,13 @@ func migrate(db *sql.DB) error {
 		if err := addTextColumn(db, table, "caller"); err != nil {
 			return err
 		}
+		// kitbash.internal arrives with the admin readable causes: the record
+		// is the cause of an internal problem. It is nullable like eval,
+		// because a record that is not one carries no value at all rather
+		// than a false.
+		if err := addColumn(db, table, "internal", "INTEGER"); err != nil {
+			return err
+		}
 	}
 	// The container name and the image digest arrive with M5, the fan out
 	// secret with the authenticated fan out. A registration written before any
@@ -369,6 +376,12 @@ func migrate(db *sql.DB) error {
 // already has it. A table that does not exist yet has no columns, which is the
 // answer a fresh store gives before the schema runs.
 func addTextColumn(db *sql.DB, table, column string) error {
+	return addColumn(db, table, column, "TEXT NOT NULL DEFAULT ''")
+}
+
+// addColumn adds one column with the declaration given unless the table
+// already has it.
+func addColumn(db *sql.DB, table, column, declaration string) error {
 	has, err := hasColumn(db, table, column)
 	if err != nil {
 		return err
@@ -376,7 +389,7 @@ func addTextColumn(db *sql.DB, table, column string) error {
 	if has {
 		return nil
 	}
-	if _, err := db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s TEXT NOT NULL DEFAULT ''", table, column)); err != nil {
+	if _, err := db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, declaration)); err != nil {
 		return fmt.Errorf("store: add the %s column to %s: %w", column, table, err)
 	}
 	return nil

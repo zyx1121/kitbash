@@ -20,6 +20,7 @@ import (
 const (
 	QueryPath     = "/kitbash/v1/query"
 	RetentionPath = "/kitbash/v1/retention"
+	InternalPath  = "/kitbash/v1/internal"
 )
 
 // NotRunningFix is what an agent is told when the socket is not there. It is
@@ -69,6 +70,42 @@ func (c *Client) Retention(ctx context.Context, set json.RawMessage) (json.RawMe
 		return c.do(ctx, http.MethodGet, RetentionPath, nil, "tel_retention")
 	}
 	return c.do(ctx, http.MethodPut, RetentionPath, set, "tel_retention")
+}
+
+// Internal reports the cause of one internal problem to kitbashd, which
+// stores it as a record only an admin reads, see PLAN.md section 2.4. No
+// producer may assert kitbash.internal on an export, so this path is the only
+// way a cause becomes Telemetry.
+//
+// It answers with a plain error and never with a problem: this is what
+// problem.Internal calls, and a problem here would call it again.
+func (c *Client) Internal(ctx context.Context, instance, cause, tool string) error {
+	if c == nil {
+		return errors.New("telemetry: no client for this session")
+	}
+	body, err := json.Marshal(struct {
+		Instance string `json:"instance,omitempty"`
+		Cause    string `json:"cause"`
+		Tool     string `json:"tool,omitempty"`
+	}{Instance: instance, Cause: cause, Tool: tool})
+	if err != nil {
+		return fmt.Errorf("telemetry: encode the internal cause: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://kitbashd"+InternalPath, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("telemetry: record the internal cause: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	res, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("telemetry: record the internal cause over %s: %w", c.socket, err)
+	}
+	defer res.Body.Close()
+	io.Copy(io.Discard, io.LimitReader(res.Body, maxDetailBytes))
+	if res.StatusCode >= 300 {
+		return fmt.Errorf("telemetry: kitbashd answered %s to the internal cause", statusText(res.StatusCode))
+	}
+	return nil
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body json.RawMessage, instance string) (json.RawMessage, *problem.Problem) {

@@ -160,6 +160,15 @@ func KeyValues(a store.Attributes) []*commonpb.KeyValue {
 			Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_BoolValue{BoolValue: *a.Eval}},
 		})
 	}
+	// A record that is the cause of an internal problem says so on the way
+	// out too, so a subscriber that receives one, which only an admin's
+	// subscriber does, can tell it from an ordinary record.
+	if a.Internal != nil {
+		out = append(out, &commonpb.KeyValue{
+			Key:   AttrInternal,
+			Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_BoolValue{BoolValue: *a.Internal}},
+		})
+	}
 	for key, value := range a.Other {
 		converted := anyValue(value)
 		if converted == nil {

@@ -161,6 +161,7 @@ type queryRequest struct {
 	Path     string `json:"path,omitempty"`
 	Tool     string `json:"tool,omitempty"`
 	Eval     *bool  `json:"eval,omitempty"`
+	Internal *bool  `json:"internal,omitempty"`
 	Producer string `json:"producer,omitempty"`
 	Caller   string `json:"caller,omitempty"`
 	Since    string `json:"since,omitempty"`
@@ -215,11 +216,28 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request) {
 		Path:     req.Path,
 		Tool:     req.Tool,
 		Eval:     req.Eval,
+		Internal: req.Internal,
 		Producer: req.Producer,
 		Caller:   req.Caller,
 		Since:    now.Add(-QueryWindow),
 		Until:    now,
 		Limit:    req.Limit,
+	}
+	if !caller.Admin {
+		// The cause of an internal problem carries host paths and the output
+		// of whatever kitbash ran, so only an admin reads one. A member's
+		// query excludes them rather than being refused: what the member has
+		// instead is the problem's instance to quote to an admin, see PLAN.md
+		// section 2.4.
+		if req.Internal != nil && *req.Internal {
+			// Asking for exactly the records this member never reads is
+			// answered with the empty page. Excluding them silently here
+			// would answer with the ordinary records the filter did not ask
+			// for, which reads as if those were the causes.
+			writeJSON(w, r.URL.Path, queryResponse{Signal: req.Signal, Records: []any{}})
+			return
+		}
+		filter.Internal = &notInternal
 	}
 	if req.Since != "" {
 		since, err := time.Parse(time.RFC3339, req.Since)
@@ -307,13 +325,20 @@ func (s *Server) retention(w http.ResponseWriter, r *http.Request) {
 // healthResponse is what /kitbash/v1/health answers. The listeners say which
 // of the two receivers is bound, subscribers how many Processes the fan out is
 // delivering to, and mcpSessions how many MCP sessions Processes hold open.
+//
+// lastBackup is when the nightly store backup last succeeded and backups how
+// many copies are kept; lastBackupError is the reason the last attempt failed
+// and is absent while backups are working, see PLAN.md section 4.7.
 type healthResponse struct {
-	Version       string    `json:"version"`
-	Store         string    `json:"store"`
-	UptimeSeconds int64     `json:"uptimeSeconds"`
-	Listeners     listeners `json:"listeners"`
-	Subscribers   int       `json:"subscribers"`
-	MCPSessions   int       `json:"mcpSessions"`
+	Version         string    `json:"version"`
+	Store           string    `json:"store"`
+	UptimeSeconds   int64     `json:"uptimeSeconds"`
+	Listeners       listeners `json:"listeners"`
+	Subscribers     int       `json:"subscribers"`
+	MCPSessions     int       `json:"mcpSessions"`
+	LastBackup      string    `json:"lastBackup,omitempty"`
+	Backups         int       `json:"backups"`
+	LastBackupError string    `json:"lastBackupError,omitempty"`
 }
 
 // listeners are the addresses kitbashd is serving on, empty for one that is
@@ -328,13 +353,17 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, prob)
 		return
 	}
+	backup := s.backupState()
 	writeJSON(w, r.URL.Path, healthResponse{
-		Version:       s.version,
-		Store:         s.store.Path(),
-		UptimeSeconds: int64(s.now().Sub(s.started) / time.Second),
-		Listeners:     s.listeners(),
-		Subscribers:   s.fanout.count(),
-		MCPSessions:   s.mcpSessions.count(),
+		Version:         s.version,
+		Store:           s.store.Path(),
+		UptimeSeconds:   int64(s.now().Sub(s.started) / time.Second),
+		Listeners:       s.listeners(),
+		Subscribers:     s.fanout.count(),
+		MCPSessions:     s.mcpSessions.count(),
+		LastBackup:      backup.LastBackup,
+		Backups:         backup.Backups,
+		LastBackupError: backup.LastBackupError,
 	})
 }
 

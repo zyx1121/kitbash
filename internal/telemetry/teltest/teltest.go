@@ -59,6 +59,16 @@ type Call struct {
 	Body   string
 }
 
+// InternalCause is one cause reported to POST /kitbash/v1/internal, the path
+// kitbash-mcp reports the cause of an internal problem to. The real daemon
+// stamps the record from the peer credentials; a test asserts on what the
+// session sent.
+type InternalCause struct {
+	Instance string `json:"instance,omitempty"`
+	Cause    string `json:"cause"`
+	Tool     string `json:"tool,omitempty"`
+}
+
 // Registration is one Process the fake has registered, as the request body of
 // processes_register carries it.
 type Registration struct {
@@ -131,6 +141,9 @@ type Daemon struct {
 	approvalIDs     int
 	approvalsAnswer Response
 	resultAnswer    Response
+
+	// The causes reported to POST /kitbash/v1/internal, in arrival order.
+	internalCauses []InternalCause
 }
 
 // Start listens on a unix socket in a temporary directory of its own. The
@@ -175,6 +188,7 @@ func StartAt(socket string) (*Daemon, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/traces", d.traces)
 	mux.HandleFunc("POST /v1/logs", d.logRecords)
+	mux.HandleFunc("POST /kitbash/v1/internal", d.internalCause)
 	mux.HandleFunc("/kitbash/v1/query", d.jsonAPI)
 	mux.HandleFunc("/kitbash/v1/retention", d.jsonAPI)
 	mux.HandleFunc("POST /kitbash/v1/processes", d.register)
@@ -373,6 +387,35 @@ func (d *Daemon) decode(w http.ResponseWriter, r *http.Request, into proto.Messa
 		return false
 	}
 	return true
+}
+
+// internalCause records one reported cause and answers as the daemon does,
+// with 204 and no body.
+func (d *Daemon) internalCause(w http.ResponseWriter, r *http.Request) {
+	d.wait()
+	body, err := readAll(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var cause InternalCause
+	if err := json.Unmarshal(body, &cause); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	d.mu.Lock()
+	d.internalCauses = append(d.internalCauses, cause)
+	d.mu.Unlock()
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// InternalCauses are the causes this daemon was told about, in order.
+func (d *Daemon) InternalCauses() []InternalCause {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	out := make([]InternalCause, len(d.internalCauses))
+	copy(out, d.internalCauses)
+	return out
 }
 
 func (d *Daemon) jsonAPI(w http.ResponseWriter, r *http.Request) {

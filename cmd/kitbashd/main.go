@@ -145,6 +145,14 @@ func run() error {
 		logger.Printf("retention sweep on start failed: %v", err)
 	}
 	go srv.SweepLoop(ctx, daemon.SweepEvery)
+	// From here every internal cause is stored as a log record only an admin
+	// reads, see PLAN.md section 2.4. Recording stops before the store is
+	// closed, which is why this defer comes after the store's.
+	stopRecording := srv.RecordInternalCauses()
+	defer stopRecording()
+	// One file is the whole store, so one copy of it is the whole backup,
+	// see PLAN.md section 4.7.
+	go srv.BackupLoop(ctx, "", 0)
 	// The Processes that survived a restart are still registered, so the fan
 	// out starts delivering to them again without waiting for a session.
 	if err := srv.LoadSubscribers(ctx); err != nil {
