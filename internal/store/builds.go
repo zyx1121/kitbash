@@ -59,24 +59,28 @@ type BuildLimits struct {
 	PerBuilder int
 }
 
-// RecordBuild writes one build record and prunes the oldest rows beyond the
-// limits.
+// RecordBuild writes one build record, prunes the oldest rows beyond the
+// limits, and answers the row as it now stands.
 //
 // The builder of an existing row is never replaced. Recording a triple that is
 // already there refreshes the time and the size for the member who recorded
 // it, and does nothing at all for anybody else: the row names the member
 // kitbashd asks for a copy of this image, so a member who could take it over
 // could point every other member's fetch at themselves.
-func (s *Store) RecordBuild(ctx context.Context, b Build, limits BuildLimits) error {
+//
+// The row is read back inside the same transaction and returned, so a caller
+// that answers with it never tells one member they are the builder while the
+// table says another.
+func (s *Store) RecordBuild(ctx context.Context, b Build, limits BuildLimits) (Build, error) {
 	if b.Path == "" || b.Commit == "" || b.Digest == "" || b.Builder == "" {
-		return errors.New("store: a build record needs a path, a commit, a digest and a builder")
+		return Build{}, errors.New("store: a build record needs a path, a commit, a digest and a builder")
 	}
 	if b.BuiltAt.IsZero() {
 		b.BuiltAt = time.Now()
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("store: begin: %w", err)
+		return Build{}, fmt.Errorf("store: begin: %w", err)
 	}
 	defer tx.Rollback()
 
@@ -91,7 +95,7 @@ func (s *Store) RecordBuild(ctx context.Context, b Build, limits BuildLimits) er
 			built_at = excluded.built_at, size = excluded.size
 		WHERE builds.builder = excluded.builder`,
 		b.Path, b.Commit, b.Digest, b.Builder, b.BuiltAt.UnixNano(), b.Size); err != nil {
-		return fmt.Errorf("store: record the build of %s: %w", b.Path, err)
+		return Build{}, fmt.Errorf("store: record the build of %s: %w", b.Path, err)
 	}
 	// Both prunes run in the same transaction as the insert, so the caps hold
 	// however many sessions record a build of one path at the same moment.
@@ -105,20 +109,39 @@ func (s *Store) RecordBuild(ctx context.Context, b Build, limits BuildLimits) er
 			(SELECT id FROM builds WHERE path = ? AND builder = ?
 			 ORDER BY built_at DESC, id DESC LIMIT ?)`,
 			b.Path, b.Builder, b.Path, b.Builder, limits.PerBuilder); err != nil {
-			return fmt.Errorf("store: prune the builds of %s by %s: %w", b.Path, b.Builder, err)
+			return Build{}, fmt.Errorf("store: prune the builds of %s by %s: %w", b.Path, b.Builder, err)
 		}
 	}
 	if limits.PerPath > 0 {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM builds WHERE path = ? AND id NOT IN
 			(SELECT id FROM builds WHERE path = ? ORDER BY built_at DESC, id DESC LIMIT ?)`,
 			b.Path, b.Path, limits.PerPath); err != nil {
-			return fmt.Errorf("store: prune the builds of %s: %w", b.Path, err)
+			return Build{}, fmt.Errorf("store: prune the builds of %s: %w", b.Path, err)
 		}
 	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("store: commit: %w", err)
+	// The row as it now stands, which for a triple another member recorded
+	// first is their row and not the one just sent.
+	stored, err := scanBuild(tx.QueryRowContext(ctx,
+		`SELECT path, commit_sha, digest, builder, built_at, size FROM builds
+		 WHERE path = ? AND commit_sha = ? AND digest = ?`, b.Path, b.Commit, b.Digest))
+	if err != nil {
+		return Build{}, fmt.Errorf("store: read back the build of %s: %w", b.Path, err)
 	}
-	return nil
+	if err := tx.Commit(); err != nil {
+		return Build{}, fmt.Errorf("store: commit: %w", err)
+	}
+	return stored, nil
+}
+
+// scanBuild reads one build row.
+func scanBuild(row scanner) (Build, error) {
+	var b Build
+	var built int64
+	if err := row.Scan(&b.Path, &b.Commit, &b.Digest, &b.Builder, &built, &b.Size); err != nil {
+		return Build{}, err
+	}
+	b.BuiltAt = time.Unix(0, built).UTC()
+	return b, nil
 }
 
 // Builds lists the build records that match the filter, newest first.
@@ -155,12 +178,10 @@ func (s *Store) Builds(ctx context.Context, f BuildFilter) ([]Build, error) {
 	defer rows.Close()
 	out := []Build{}
 	for rows.Next() {
-		var b Build
-		var built int64
-		if err := rows.Scan(&b.Path, &b.Commit, &b.Digest, &b.Builder, &built, &b.Size); err != nil {
+		b, err := scanBuild(rows)
+		if err != nil {
 			return nil, fmt.Errorf("store: read a build: %w", err)
 		}
-		b.BuiltAt = time.Unix(0, built).UTC()
 		out = append(out, b)
 	}
 	if err := rows.Err(); err != nil {

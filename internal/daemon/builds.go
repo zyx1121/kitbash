@@ -121,20 +121,23 @@ func (s *Server) recordBuild(w http.ResponseWriter, r *http.Request, caller Call
 	if size == 0 {
 		size = info.Size
 	}
-	record := store.Build{
+	stored, err := s.store.RecordBuild(r.Context(), store.Build{
 		Path:    folder,
 		Commit:  req.Commit,
 		Digest:  req.Digest,
 		Builder: caller.User,
 		BuiltAt: s.now().UTC(),
 		Size:    size,
-	}
-	if err := s.store.RecordBuild(r.Context(), record,
-		store.BuildLimits{PerPath: MaxBuildsPerPath, PerBuilder: MaxBuildsPerBuilder}); err != nil {
+	}, store.BuildLimits{PerPath: MaxBuildsPerPath, PerBuilder: MaxBuildsPerBuilder})
+	if err != nil {
 		writeProblem(w, problem.Internal(r.URL.Path, err.Error(), ""))
 		return
 	}
-	writeJSON(w, r.URL.Path, record)
+	// The row as it stands is the answer, not the row that was sent. A triple
+	// another member recorded first keeps their builder, and a caller told
+	// they are the builder while the table says otherwise would go on to fetch
+	// from themselves.
+	writeJSON(w, r.URL.Path, stored)
 }
 
 // listBuilds answers the builds of one Package path, newest first. A path

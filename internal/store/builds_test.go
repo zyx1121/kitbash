@@ -47,7 +47,7 @@ func TestBuildsAreListedNewestFirst(t *testing.T) {
 		build("/org/ffmpeg", sha(1), imageID(2), "kim", now.Add(-time.Hour)),
 		build("/org/other", sha(3), imageID(3), "loki", now),
 	} {
-		if err := st.RecordBuild(ctx, b, store.BuildLimits{}); err != nil {
+		if _, err := st.RecordBuild(ctx, b, store.BuildLimits{}); err != nil {
 			t.Fatalf("RecordBuild %d: %v", i, err)
 		}
 	}
@@ -81,23 +81,29 @@ func TestBuildsAreListedNewestFirst(t *testing.T) {
 	}
 }
 
-// TestRecordingOneBuildTwiceReplacesTheRow is the unique index doing its work:
-// two members who built the same commit to the same image are one build, and
-// the row names the one most recently known to hold it.
-func TestRecordingOneBuildTwiceReplacesTheRow(t *testing.T) {
+// TestARowBelongsToItsFirstBuilder is the unique index doing its work: two
+// members who built the same commit to the same image are one build, and the
+// row keeps the member who recorded it first until it is pruned.
+func TestARowBelongsToItsFirstBuilder(t *testing.T) {
 	st := openBuildStore(t)
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Millisecond)
 
-	if err := st.RecordBuild(ctx, build("/org/ffmpeg", sha(1), imageID(1), "loki", now), store.BuildLimits{}); err != nil {
+	if _, err := st.RecordBuild(ctx, build("/org/ffmpeg", sha(1), imageID(1), "loki", now), store.BuildLimits{}); err != nil {
 		t.Fatalf("RecordBuild: %v", err)
 	}
 	// Another member recording the same build changes nothing. The row names
 	// the member kitbashd asks for a copy of this image, so a member who could
 	// take it over could point every other member's fetch at themselves.
-	if err := st.RecordBuild(ctx,
-		build("/org/ffmpeg", sha(1), imageID(1), "kim", now.Add(time.Hour)), store.BuildLimits{}); err != nil {
+	stored, err := st.RecordBuild(ctx,
+		build("/org/ffmpeg", sha(1), imageID(1), "kim", now.Add(time.Hour)), store.BuildLimits{})
+	if err != nil {
 		t.Fatalf("RecordBuild again: %v", err)
+	}
+	// What comes back is the row as it stands, so a caller answering with it
+	// never tells one member they are the builder while the table says another.
+	if stored.Builder != "loki" || !stored.BuiltAt.Equal(now) {
+		t.Errorf("RecordBuild answered %+v, want the row that was kept", stored)
 	}
 
 	builds, err := st.Builds(ctx, store.BuildFilter{Path: "/org/ffmpeg"})
@@ -115,7 +121,7 @@ func TestRecordingOneBuildTwiceReplacesTheRow(t *testing.T) {
 	// size, which is what a second build of one commit does.
 	refreshed := build("/org/ffmpeg", sha(1), imageID(1), "loki", now.Add(2*time.Hour))
 	refreshed.Size = 8192
-	if err := st.RecordBuild(ctx, refreshed, store.BuildLimits{}); err != nil {
+	if _, err := st.RecordBuild(ctx, refreshed, store.BuildLimits{}); err != nil {
 		t.Fatalf("RecordBuild by the owner: %v", err)
 	}
 	builds, err = st.Builds(ctx, store.BuildFilter{Path: "/org/ffmpeg"})
@@ -137,14 +143,14 @@ func TestOneMembersRecordsCannotPruneAnothers(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Millisecond)
 
-	if err := st.RecordBuild(ctx, build("/org/ffmpeg", sha(1), imageID(1), "kim", now),
+	if _, err := st.RecordBuild(ctx, build("/org/ffmpeg", sha(1), imageID(1), "kim", now),
 		store.BuildLimits{PerPath: 4, PerBuilder: 2}); err != nil {
 		t.Fatalf("RecordBuild: %v", err)
 	}
 	for i := range 6 {
 		at := now.Add(time.Duration(i+1) * time.Second)
 		digest := fmt.Sprintf("sha256:%064x", i)
-		if err := st.RecordBuild(ctx,
+		if _, err := st.RecordBuild(ctx,
 			store.Build{Path: "/org/ffmpeg", Commit: sha(2), Digest: digest, Builder: "loki", BuiltAt: at},
 			store.BuildLimits{PerPath: 4, PerBuilder: 2}); err != nil {
 			t.Fatalf("RecordBuild %d: %v", i, err)
@@ -183,7 +189,7 @@ func TestBuildsArePrunedBeyondTheCap(t *testing.T) {
 	for i := range total {
 		at := now.Add(time.Duration(i) * time.Second)
 		digest := fmt.Sprintf("sha256:%064x", i)
-		if err := st.RecordBuild(ctx,
+		if _, err := st.RecordBuild(ctx,
 			store.Build{Path: "/org/ffmpeg", Commit: sha(1), Digest: digest, Builder: "loki", BuiltAt: at},
 			store.BuildLimits{PerPath: keep}); err != nil {
 			t.Fatalf("RecordBuild %d: %v", i, err)
@@ -217,7 +223,7 @@ func TestABuildNeedsEveryField(t *testing.T) {
 		{Path: "/org/ffmpeg", Commit: sha(1), Builder: "loki"},
 		{Path: "/org/ffmpeg", Commit: sha(1), Digest: imageID(1)},
 	} {
-		if err := st.RecordBuild(ctx, b, store.BuildLimits{}); err == nil {
+		if _, err := st.RecordBuild(ctx, b, store.BuildLimits{}); err == nil {
 			t.Errorf("RecordBuild(%+v) was accepted, want a refusal", b)
 		}
 	}
@@ -230,10 +236,10 @@ func TestBuildsGoWithTheirBuilder(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Millisecond)
 
-	if err := st.RecordBuild(ctx, build("/org/ffmpeg", sha(1), imageID(1), "loki", now), store.BuildLimits{}); err != nil {
+	if _, err := st.RecordBuild(ctx, build("/org/ffmpeg", sha(1), imageID(1), "loki", now), store.BuildLimits{}); err != nil {
 		t.Fatalf("RecordBuild: %v", err)
 	}
-	if err := st.RecordBuild(ctx, build("/org/ffmpeg", sha(2), imageID(2), "kim", now), store.BuildLimits{}); err != nil {
+	if _, err := st.RecordBuild(ctx, build("/org/ffmpeg", sha(2), imageID(2), "kim", now), store.BuildLimits{}); err != nil {
 		t.Fatalf("RecordBuild: %v", err)
 	}
 	n, err := st.DeleteBuildsByBuilder(ctx, "loki")

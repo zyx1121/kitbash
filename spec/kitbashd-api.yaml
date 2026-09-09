@@ -381,10 +381,20 @@ api:
       never replaced: recording a triple that is there refreshes the time and
       the size for the member who recorded it and does nothing at all for
       anybody else, because the row names the member kitbashd asks for a copy.
-      At most 64 rows per path per member, and 4096 per path, the oldest pruned
-      beyond each. The per member cap is the one that matters: a member's
-      records can prune only their own, so nobody can push another member's
-      build out of the table.
+      The response is the row as it stands rather than the record that was
+      sent, so a caller is never told they are the builder while the table says
+      another member is. At most 64 rows per path per member, and 4096 per
+      path, the oldest pruned beyond each. The per member cap is the one that
+      matters: a member's records can prune only their own, so nobody can push
+      another member's build out of the table.
+    row_ownership: >
+      A row belongs to its first builder until it is pruned. If that member
+      removes the image, images_fetch of it is 404 not-found and every other
+      member builds the commit locally rather than being sent to a store that
+      no longer has it; the second member to record the same triple does not
+      become the one kitbashd asks. This is the safe end of the trade: the cost
+      is a build somebody could have copied, and the alternative is a row whose
+      builder any member can take over.
     errors: [bad-request, not-permitted, internal]
   builds_list:
     method: GET

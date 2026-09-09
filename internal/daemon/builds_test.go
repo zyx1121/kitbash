@@ -46,7 +46,7 @@ const builderName = "kim"
 // member would have recorded it.
 func (h *harness) recordFor(builder, path, commit, digest string) {
 	h.t.Helper()
-	if err := h.store.RecordBuild(context.Background(), store.Build{
+	if _, err := h.store.RecordBuild(context.Background(), store.Build{
 		Path: path, Commit: commit, Digest: digest, Builder: builder,
 		BuiltAt: time.Now().UTC(), Size: 4096,
 	}, store.BuildLimits{PerPath: MaxBuildsPerPath, PerBuilder: MaxBuildsPerBuilder}); err != nil {
@@ -285,12 +285,24 @@ func TestOneMemberCannotTakeOverAnothersRecord(t *testing.T) {
 	if res.StatusCode != http.StatusOK {
 		t.Fatalf("record = %d %s, want 200: recording an image you hold is not an error", res.StatusCode, body)
 	}
+	// The answer is the row as it stands. A caller told they are the builder
+	// while the table says otherwise would go on to fetch from themselves.
+	var answered store.Build
+	if err := json.Unmarshal(body, &answered); err != nil {
+		t.Fatalf("body %q: %v", body, err)
+	}
+	if answered.Builder != builderName {
+		t.Errorf("the answer names the builder %q, want the stored %q", answered.Builder, builderName)
+	}
 	held, err := h.store.Builds(context.Background(), store.BuildFilter{Path: "/org/ffmpeg"})
 	if err != nil {
 		t.Fatalf("Builds: %v", err)
 	}
 	if len(held) != 1 || held[0].Builder != builderName {
 		t.Errorf("the record is %+v, want the member who recorded it first", held)
+	}
+	if !answered.BuiltAt.Equal(held[0].BuiltAt) || answered.Digest != held[0].Digest {
+		t.Errorf("the answer is %+v and the row is %+v; they must not disagree", answered, held[0])
 	}
 }
 
