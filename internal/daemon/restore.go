@@ -7,7 +7,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/zyx1121/kitbash/internal/cgroups"
 	"github.com/zyx1121/kitbash/internal/store"
 	"github.com/zyx1121/kitbash/internal/sysusers"
 )
@@ -122,15 +121,21 @@ func (s *Server) restoreOwner(ctx context.Context, owner string, processes []sto
 
 	s.memberCgroup(ctx, m)
 	for _, p := range processes {
-		// The Process's cgroup is created again before its container starts:
-		// the cgroup filesystem does not survive a reboot, and the container
-		// was created under a cgroup parent that has to be there for it to
-		// start at all. The ceiling is not written here, because a
-		// registration does not carry the manifest's limits; the container
-		// keeps the limits its own configuration holds, and the ceiling comes
-		// back the next time the Process is run, see restore.cgroups in
-		// spec/kitbashd-api.yaml.
-		leaf := s.processCgroup(ctx, m, p, cgroups.Limits{})
+		// The Process's cgroup is created again, with its ceiling, before the
+		// container starts: the cgroup filesystem does not survive a reboot,
+		// and a container whose cgroup parent is gone does not start at all.
+		// The limits come from the registration, which is the only thing that
+		// remembers them once the filesystem is empty.
+		limits := limitsOf(p.Limits.Memory, p.Limits.CPU, p.Limits.Pids)
+		if p.Limits.Empty() {
+			// A registration written before the limits were recorded names no
+			// ceiling and no later boot will change that. The container keeps
+			// whatever its own configuration holds, and the ceiling arrives
+			// the next time the Process is run.
+			logger.Printf("restore: the Process %s of %s was registered without limits, so it comes back without a ceiling; run it again to write one",
+				p.ID, owner)
+		}
+		leaf := s.processCgroup(ctx, m, p, limits)
 		start, cancel := context.WithTimeout(ctx, RestoreTimeout)
 		err := s.runner.Start(start, m, p.Container, leaf)
 		cancel()

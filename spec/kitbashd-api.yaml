@@ -279,7 +279,9 @@ api:
       (SysProcAttr.UseCgroupFD) with --cgroups=enabled,
       --cgroup-parent=/kitbash/<owner>/<id> and the --memory, --cpus and
       --pids-limit of the unit. The environment file is removed
-      before the response is written. The Telemetry token is minted here rather
+      before the response is written. The limits are recorded with the
+      registration as the request carried them, so restore can write the same
+      ceiling after a reboot. The Telemetry token is minted here rather
       than read back: the store keeps only its hash, so a start revokes the
       token the registration answered and puts the new one in the container.
       A host whose cgroup filesystem is not version 2 or not writable runs the
@@ -333,6 +335,7 @@ api:
     path: /kitbash/v1/processes
     response: >
       { processes: [ { id, owner, admin, package, name, expose, endpoint,
+      limits: { memory, cpu, pids },
       subscriptions, registeredAt } ] }. The caller's registered Processes,
       every key present even when its value is empty, and no token anywhere.
       An admin sees every member's.
@@ -448,16 +451,22 @@ restore:
     once per daemon start and is also what makes "all Processes come back
     after a reboot" true; the OpenRC script orders kitbashd after localmount
     and the local runlevel scripts.
-  registration_fields: the registration carries the container name and the digest from M5 on, so restore needs no manifest, and the permits block of the Package's manifest, see mcp_for_processes.permits.
+  registration_fields: >
+    The registration carries the container name and the digest from M5 on, so
+    restore needs no manifest; the permits block of the Package's manifest, see
+    mcp_for_processes.permits; and the limits the Process was started with, so
+    restore writes its ceiling again.
   cgroups: >
-    The cgroup of each Process is created again before its container starts:
-    the cgroup filesystem does not survive a reboot, and a container whose
-    cgroup parent is gone does not start at all. The ceiling is not written
-    there, because a registration does not carry the manifest's limits; the
-    container keeps the limits its own configuration holds, and the ceiling
-    comes back the next time the Process is run. A container created before
-    this release has no cgroup parent at all and restores without limits until
-    it is run again, which creates it anew.
+    The cgroup of each Process is created again, with its ceiling, before its
+    container starts: the cgroup filesystem does not survive a reboot, and a
+    container whose cgroup parent is gone does not start at all. The limits
+    come from the registration, which is the only thing that remembers them
+    once the filesystem is empty, so the ceiling a Process was started with is
+    the ceiling it comes back under. A registration written before limits were
+    recorded carries none: that Process comes back without a ceiling, which is
+    logged once for it, and gains one the next time it is run. A container
+    created before this release has no cgroup parent at all either, and gains
+    one the same way.
 
 backup:
   description: >

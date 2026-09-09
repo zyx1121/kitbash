@@ -233,7 +233,7 @@ func (s *Server) startProcess(w http.ResponseWriter, r *http.Request, p store.Pr
 	// and the container is created under it. A host that cannot place it runs
 	// the Process anyway: the limits are recorded, not enforced, and that is
 	// said on this start rather than once for the life of the daemon.
-	leaf := s.processCgroup(r.Context(), m, p, limitsOf(opts))
+	leaf := s.processCgroup(r.Context(), m, p, limitsOf(opts.Memory, opts.CPUs, opts.PidsLimit))
 	if leaf != "" {
 		opts.CgroupParent = cgroups.Parent(m.Name, p.ID)
 	}
@@ -241,7 +241,10 @@ func (s *Server) startProcess(w http.ResponseWriter, r *http.Request, p store.Pr
 	// The token is minted here and not at registration: the store keeps only
 	// the hash of a token, so the one the registration answered cannot be
 	// read back, and the container is the only thing that needs this one.
-	// Minting again revokes the previous one, which nothing holds.
+	// Minting again revokes the previous one, which nothing holds. The
+	// ceiling is written with it: after a reboot the cgroup filesystem is
+	// empty and the registration is the only thing that remembers.
+	p.Limits = store.Limits{Memory: req.Memory, CPU: req.CPU, Pids: opts.PidsLimit}
 	token, err := s.mintToken(r.Context(), p)
 	if err != nil {
 		writeProblem(w, problem.Internal(r.URL.Path, err.Error(), ""))
@@ -684,19 +687,22 @@ func (s *Server) processCgroup(ctx context.Context, m sysusers.Member, p store.P
 	return leaf
 }
 
-// limitsOf is the ceiling of one Process, read off the command line that was
-// built for it, so what root writes into the cgroup and what the runtime is
-// asked for cannot drift apart. A limit that has no cgroup spelling is left
-// out rather than guessed at; the runtime still gets it.
-func limitsOf(opts podman.RunOptions) cgroups.Limits {
+// limitsOf is the ceiling of one Process in the spelling the cgroup files
+// take. It is the one conversion: a start reads it off the command line that
+// was built for the container, and restore reads it off the registration, so
+// the ceiling after a reboot is the ceiling the Process was started with.
+//
+// A limit that has no cgroup spelling is left out rather than guessed at; the
+// runtime still gets what the unit declared.
+func limitsOf(memory, cpu string, pids int) cgroups.Limits {
 	var limits cgroups.Limits
-	if memory, ok := cgroups.MemoryMax(opts.Memory); ok {
-		limits.Memory = memory
+	if value, ok := cgroups.MemoryMax(memory); ok {
+		limits.Memory = value
 	}
-	if cpu, ok := cgroups.CPUMax(opts.CPUs); ok {
-		limits.CPU = cpu
+	if value, ok := cgroups.CPUMax(cpu); ok {
+		limits.CPU = value
 	}
-	limits.Pids = opts.PidsLimit
+	limits.Pids = pids
 	return limits
 }
 

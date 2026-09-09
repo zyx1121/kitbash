@@ -248,6 +248,32 @@ func TestStartKeepsTheRestOfTheRegistration(t *testing.T) {
 	}
 }
 
+// The ceiling a start wrote into the cgroup is recorded with the registration,
+// because after a reboot the cgroup filesystem is empty and nothing else
+// remembers what the Process was limited to.
+func TestStartRecordsTheCeilingItWrote(t *testing.T) {
+	h, _ := supervised(t)
+	id := h.supervise(h.user, "kitbash-echo-echo")
+
+	res, body := h.start(id, startRequest{Image: testDigest, Memory: "512Mi", CPU: "0.5"})
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("start = %d %s, want 200", res.StatusCode, body)
+	}
+	p, found, err := h.store.Process(context.Background(), id)
+	if err != nil || !found {
+		t.Fatalf("Process: found %t, err %v", found, err)
+	}
+	want := store.Limits{Memory: "512Mi", CPU: "0.5", Pids: DefaultPidsLimit}
+	if p.Limits != want {
+		t.Errorf("the recorded limits are %+v, want %+v as the request carried them", p.Limits, want)
+	}
+	// And they are what the cgroup was given, in the spelling its files take.
+	placed := h.cgroups.Placed()
+	if len(placed) != 1 || placed[0].Limits.Memory != "536870912" || placed[0].Limits.CPU != "50000 100000" {
+		t.Errorf("the ceiling written is %+v, want the converted limits", placed)
+	}
+}
+
 // A host that cannot delegate cgroups still runs Processes: the limits are
 // passed to the runtime and recorded, and nothing is placed.
 func TestStartWithoutCgroupsRecordsTheLimits(t *testing.T) {

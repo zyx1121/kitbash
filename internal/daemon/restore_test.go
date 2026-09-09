@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zyx1121/kitbash/internal/cgroups"
 	"github.com/zyx1121/kitbash/internal/store"
 	"github.com/zyx1121/kitbash/internal/sysusers"
 	"github.com/zyx1121/kitbash/internal/uuid"
@@ -16,6 +17,12 @@ import (
 // registered writes one registration straight to the store, which is what a
 // daemon that has just started finds there.
 func (h *harness) registered(owner, container string) string {
+	return h.registeredWith(owner, container, store.Limits{})
+}
+
+// registeredWith is registered with the ceiling that Process was started
+// under, which is what restore writes into its cgroup again.
+func (h *harness) registeredWith(owner, container string, limits store.Limits) string {
 	h.t.Helper()
 	_, hash, err := store.NewToken()
 	if err != nil {
@@ -30,6 +37,7 @@ func (h *harness) registered(owner, container string) string {
 		Container:    container,
 		Digest:       "sha256:" + "ab12cd34" + "00000000000000000000000000000000000000000000000000000000",
 		Expose:       ExposeNone,
+		Limits:       limits,
 		RegisteredAt: time.Now().UTC(),
 	}, hash, 0); err != nil {
 		h.t.Fatalf("RegisterProcess: %v", err)
@@ -85,6 +93,39 @@ func TestRestoreStartsEveryProcessAsItsOwner(t *testing.T) {
 	// One member cgroup per owner, not one per Process.
 	if len(h.cgroups.Calls()) != 2 {
 		t.Errorf("the member cgroups prepared are %+v, want one per owner", h.cgroups.Calls())
+	}
+}
+
+// The ceiling survives a reboot: the cgroup filesystem is empty by then, so
+// restore writes the limits of the registration back into each Process's
+// cgroup before its container starts. A registration written before limits
+// were recorded has none to write, and comes back without a ceiling.
+func TestRestoreWritesTheCeilingAgain(t *testing.T) {
+	h, fake := serveUsers(t, true)
+	fake.Add(sysusers.Member{Name: "alice", UID: 1005})
+
+	limited := h.registeredWith("alice", "kitbash-echo-limited",
+		store.Limits{Memory: "512Mi", CPU: "0.5", Pids: 512})
+	legacy := h.registered("alice", "kitbash-echo-legacy")
+
+	if counts := h.server.Restore(context.Background()); counts.Started != 2 {
+		t.Fatalf("counts = %+v, want two started", counts)
+	}
+	placed := map[string]cgroups.Limits{}
+	for _, call := range h.cgroups.Placed() {
+		placed[call.ID] = call.Limits
+	}
+	want := cgroups.Limits{Memory: "536870912", CPU: "50000 100000", Pids: 512}
+	if placed[limited] != want {
+		t.Errorf("the ceiling of the limited Process is %+v, want %+v", placed[limited], want)
+	}
+	if (placed[legacy] != cgroups.Limits{}) {
+		t.Errorf("the ceiling of the legacy Process is %+v, want none to write", placed[legacy])
+	}
+	// Both containers still come back: a Process with no ceiling runs
+	// unlimited rather than not at all.
+	if len(fake.Calls()) != 2 {
+		t.Errorf("the containers started are %+v, want both", fake.Calls())
 	}
 }
 
