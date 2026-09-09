@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -27,20 +28,16 @@ func causes(t *testing.T, h *harness, want int) []store.Log {
 	yes := true
 	filter := window()
 	filter.Internal = &yes
-	deadline := time.Now().Add(5 * time.Second)
-	for {
+	var logs []store.Log
+	waitFor(t, fmt.Sprintf("%d causes to be recorded", want), func() bool {
 		page, err := h.store.Query(context.Background(), store.SignalLogs, filter)
 		if err != nil {
 			t.Fatalf("Query: %v", err)
 		}
-		if len(page.Logs) >= want {
-			return page.Logs
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("the store holds %d causes after five seconds, want %d", len(page.Logs), want)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+		logs = page.Logs
+		return len(logs) >= want
+	})
+	return logs
 }
 
 // seedCause writes one cause the way the daemon records its own, and one

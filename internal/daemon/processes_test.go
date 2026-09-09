@@ -39,14 +39,17 @@ func (h *harness) serveTCP() string {
 	done := make(chan error, 1)
 	go func() { done <- h.server.ServeTCP(ctx, ln) }()
 	h.t.Cleanup(func() {
+		// The callers of this listener are done, so they hang up before the
+		// daemon stops: a keep alive connection left open is one shutdown
+		// waits out, and on a loaded host that wait is what expires.
+		http.DefaultTransport.(*http.Transport).CloseIdleConnections()
 		cancel()
-		select {
-		case err := <-done:
-			if err != nil {
-				h.t.Errorf("ServeTCP: %v", err)
-			}
-		case <-time.After(5 * time.Second):
-			h.t.Error("ServeTCP did not return after the context was cancelled")
+		err, returned := recvWithin(done)
+		switch {
+		case !returned:
+			h.t.Errorf("waited %s for ServeTCP to return after the context was cancelled", waitBudget)
+		case err != nil:
+			h.t.Errorf("ServeTCP: %v", err)
 		}
 	})
 	return "http://" + ln.Addr().String()
@@ -64,7 +67,7 @@ func (h *harness) exportTCP(base, path, token string, body []byte) (*http.Respon
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	res, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	res, err := (&http.Client{Timeout: waitBudget}).Do(req)
 	if err != nil {
 		h.t.Fatalf("POST %s: %v", path, err)
 	}
@@ -631,13 +634,7 @@ func newSubscriberStub(t *testing.T, slow bool) *subscriberStub {
 // await reads the next delivery, or fails the test if none arrives.
 func (s *subscriberStub) await(t *testing.T) fanoutRequest {
 	t.Helper()
-	select {
-	case req := <-s.requests:
-		return req
-	case <-time.After(5 * time.Second):
-		t.Fatal("the subscriber received nothing")
-		return fanoutRequest{}
-	}
+	return waitRecv(t, "the subscriber to receive a delivery", s.requests)
 }
 
 // silent fails the test if anything arrives within the window.
@@ -895,10 +892,8 @@ func TestQueueDropsTheOldest(t *testing.T) {
 			sub.enqueue(delivery{path: pathTraces, body: []byte(strings.Repeat("x", i%8))})
 		}
 	}()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("enqueue blocked on a full queue")
+	if _, finished := recvWithin(done); !finished {
+		t.Fatalf("waited %s for enqueue to fill the queue: it blocked on a full one", waitBudget)
 	}
 	if len(sub.queue) != QueueDepth {
 		t.Errorf("queue holds %d, want it full at %d", len(sub.queue), QueueDepth)

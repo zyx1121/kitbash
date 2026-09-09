@@ -235,7 +235,7 @@ func serveMCPDaemonWith(t *testing.T, idle, grace time.Duration) *mcpHarness {
 func (m *mcpHarness) client(token string) *http.Client {
 	return &http.Client{
 		Transport: bearerHeader{token: token, next: m.transport},
-		Timeout:   10 * time.Second,
+		Timeout:   waitBudget,
 	}
 }
 
@@ -314,20 +314,6 @@ func (m *mcpHarness) live(t *testing.T) int {
 		t.Fatalf("health body %q: %v", body, err)
 	}
 	return got.MCPSessions
-}
-
-// waitFor polls until the condition holds or the test gives up, which is how
-// the tests wait for a child to exit or a session to be swept.
-func waitFor(t *testing.T, what string, condition func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		if condition() {
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	t.Fatalf("timed out waiting for %s", what)
 }
 
 // exited reports whether the child of one session has exited.
@@ -420,10 +406,8 @@ func TestMCPSessionPublishesTheChildTools(t *testing.T) {
 	waitFor(t, "the new tool to reach the session", func() bool {
 		return slices.Contains(toolNames(t, session), "ffmpeg_transcode")
 	})
-	select {
-	case <-changed:
-	case <-time.After(5 * time.Second):
-		t.Error("the session sent no tools/list_changed of its own")
+	if _, notified := recvWithin(changed); !notified {
+		t.Errorf("waited %s for the session's own tools/list_changed", waitBudget)
 	}
 	res, err = session.CallTool(context.Background(), &mcp.CallToolParams{Name: "ffmpeg_transcode"})
 	if err != nil {

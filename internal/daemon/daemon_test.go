@@ -90,26 +90,28 @@ func serveWith(t *testing.T, opts Options) *harness {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- srv.Serve(ctx, ln) }()
-	t.Cleanup(func() {
-		cancel()
-		select {
-		case err := <-done:
-			if err != nil {
-				t.Errorf("Serve: %v", err)
-			}
-		case <-time.After(5 * time.Second):
-			t.Error("Serve did not return after the context was cancelled")
-		}
-	})
-
 	client := &http.Client{
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 				return (&net.Dialer{}).DialContext(ctx, "unix", socket)
 			},
 		},
-		Timeout: 10 * time.Second,
+		Timeout: waitBudget,
 	}
+	t.Cleanup(func() {
+		// The test is over, so its client hangs up first: a keep alive
+		// connection left open is one the daemon's shutdown waits out, and on
+		// a loaded host that wait is what expires.
+		client.CloseIdleConnections()
+		cancel()
+		err, returned := recvWithin(done)
+		switch {
+		case !returned:
+			t.Errorf("waited %s for Serve to return after the context was cancelled", waitBudget)
+		case err != nil:
+			t.Errorf("Serve: %v", err)
+		}
+	})
 	h := &harness{t: t, client: client, store: st, server: srv, user: me.Username, socket: socket,
 		envDir: opts.EnvDir}
 	h.cgroups, _ = opts.Cgroups.(*cgroups.Fake)
@@ -541,18 +543,36 @@ func TestSweepDeletesOldRecords(t *testing.T) {
 
 func TestSweepLoopStops(t *testing.T) {
 	h := serve(t, false)
+	// One record past the retention window, so a sweep of the loop's own is
+	// visible: the test cancels a loop that is known to have run, not one it
+	// hopes had time to start.
+	res, body := h.do(http.MethodPost, "/v1/traces", otlp.ContentTypeProtobuf,
+		exportRequest("fs_list", "", time.Now().Add(-48*time.Hour)))
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("export status = %d, body %s", res.StatusCode, body)
+	}
+	window := "24h"
+	if _, err := h.store.SetRetention(context.Background(), store.RetentionSet{Traces: &window}); err != nil {
+		t.Fatalf("SetRetention: %v", err)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
 		h.server.SweepLoop(ctx, 10*time.Millisecond)
 		close(done)
 	}()
-	time.Sleep(30 * time.Millisecond)
+	waitFor(t, "the sweep loop to delete the record past its window", func() bool {
+		page, err := h.store.Query(context.Background(), store.SignalTraces, store.Filter{})
+		if err != nil {
+			t.Fatalf("Query: %v", err)
+		}
+		return len(page.Spans) == 0
+	})
+
 	cancel()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("SweepLoop did not stop with its context")
+	if _, stopped := recvWithin(done); !stopped {
+		t.Fatalf("waited %s for SweepLoop to stop with its context", waitBudget)
 	}
 }
 
