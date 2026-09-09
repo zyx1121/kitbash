@@ -27,6 +27,7 @@ import (
 	commonpb "github.com/zyx1121/kitbash/internal/otlpproto/common/v1"
 	tracepb "github.com/zyx1121/kitbash/internal/otlpproto/trace/v1"
 
+	"github.com/zyx1121/kitbash/internal/manifest"
 	"github.com/zyx1121/kitbash/internal/otlp"
 	"github.com/zyx1121/kitbash/internal/problem"
 	"github.com/zyx1121/kitbash/internal/store"
@@ -471,12 +472,15 @@ func TestMCPSessionRunsAsTheOwnerWithNothingOfTheDaemons(t *testing.T) {
 		}
 	}
 	want := map[string]string{
-		"HOME":             call.Member.Home,
-		"USER":             m.user,
-		"LOGNAME":          m.user,
-		"PATH":             sysusers.RunnerPath,
-		"XDG_RUNTIME_DIR":  filepath.Join(sysusers.DefaultRunUser, strconv.Itoa(call.Member.UID)),
-		sysusers.EnvCaller: call.Credential,
+		"HOME":            call.Member.Home,
+		"USER":            m.user,
+		"LOGNAME":         m.user,
+		"PATH":            sysusers.RunnerPath,
+		"XDG_RUNTIME_DIR": filepath.Join(sysusers.DefaultRunUser, strconv.Itoa(call.Member.UID)),
+		// This Process registered no permits block, so its session is
+		// permitted nothing and is told so rather than left to guess.
+		sysusers.EnvCaller:  call.Credential,
+		manifest.EnvPermits: string(manifest.Permits{}.JSON()),
 	}
 	for key, value := range want {
 		if got[key] != value {

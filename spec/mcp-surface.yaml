@@ -77,6 +77,15 @@ $package_tools:
     The set is read from the caller's running Processes when a session starts
     and kept current within the session; other sessions see changes when they
     reconnect.
+  permits: >
+    A Package's manifest may declare provides.permits, the tool name globs and
+    absolute path prefixes a Process of that Package may call over /mcp.
+    pkg_inspect returns the manifest as it is written, so the block is visible
+    there; proc_run registers it with the Process, and kitbashd narrows that
+    Process's own MCP sessions to it, see mcp_for_processes.permits in
+    spec/kitbashd-api.yaml and PLAN.md section 2.3. A session a member opens
+    over SSH is narrowed by nothing, so every tool below is described as that
+    member reads it.
   errors: [bad-request, not-found, internal, and any problem the Package itself returns]
   package_errors: >
     When a Package tool answers isError with a single text block that parses

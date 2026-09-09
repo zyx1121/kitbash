@@ -180,6 +180,19 @@ output:
   graph is loaded when the step that runs it is reached, so its tools are
   resolved then, after the steps before it have run.
 
+## What this engine may call
+
+This Process reaches your surface through `/mcp`, and what it may reach is what
+this kit's `kitbash.yaml` declares in `provides.permits`. It declares the tools
+`fs_read`, `fs_list` and the glob `*_*`, which is every tool whose name carries
+an underscore: the built in families and the `<package>_<tool>` of your running
+Processes alike. It declares the paths `/org` and `/home/*`, and that is the
+narrowing that bites: every step that names a path, a Package or a graph outside
+those two prefixes is refused with `not-permitted` before the tool runs, and the
+fix is a line in this kit's manifest rather than a change to your graph. A kit
+that should reach less declares less; the block is the whole of what its
+Processes may call.
+
 ## Telemetry
 
 Every call this engine makes is a span kitbashd already records, carrying

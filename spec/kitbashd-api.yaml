@@ -64,7 +64,21 @@ mcp_for_processes:
     owner starts later joins an open session. The child talks to
     kitbashd over the unix socket like any member session, so identity,
     Telemetry and the approval queue all behave as for the owner. The surface
-    is exactly the owner's; there is no narrowing in version 1.
+    is the owner's, narrowed to what the Process registered as its permits.
+  permits: >
+    A registration carries permits: { tools: [glob], paths: [prefix] }, the
+    provides.permits block of the Package's manifest, and kitbashd stores it
+    with the Process and lists it on processes_list. Every session of that
+    Process is started with KITBASH_PERMITS set to that block as JSON, an
+    empty object when the Package declared none and for a registration written
+    before this field existed. kitbash-mcp publishes only the tools a glob
+    names, built in and Package tools alike, and answers not-permitted at 403
+    to a call the block does not name and to one whose path or package
+    argument is outside every prefix. A Process with no permits therefore
+    reaches nothing over /mcp. A block whose globs kitbashd cannot honour is
+    refused at registration with bad-request; the variable is read by a child
+    only beside KITBASH_CALLER, so a member's own SSH session is narrowed by
+    nothing. See PLAN.md section 2.3.
   limits: >
     At most 8 live sessions per Process; the ninth is refused with the
     conflict problem at status 429, titled "Too many sessions" and carrying
@@ -315,7 +329,7 @@ restore:
     once per daemon start and is also what makes "all Processes come back
     after a reboot" true; the OpenRC script orders kitbashd after localmount
     and the local runlevel scripts.
-  registration_fields: the registration carries the container name and the digest from M5 on, so restore needs no manifest.
+  registration_fields: the registration carries the container name and the digest from M5 on, so restore needs no manifest, and the permits block of the Package's manifest, see mcp_for_processes.permits.
 
 retention:
   defaults: { traces: 30d, logs: 14d, metrics: 30d }

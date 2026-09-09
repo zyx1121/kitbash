@@ -259,6 +259,10 @@ func (s *Service) run(ctx context.Context, span *telemetry.Span, path, digest, n
 		Expose:        unit.Expose,
 		Endpoint:      endpoint,
 		Subscriptions: m.Subscriptions(),
+		// What this Process may call back over /mcp. The manifest is the
+		// declaration, so a Package that asks for nothing gets an empty
+		// surface rather than its owner's whole one, see PLAN.md section 2.3.
+		Permits: m.Permits(),
 	})
 	opts.Env = env
 	// A registration whose container never started is worse than no
@@ -386,6 +390,9 @@ func (s *Service) Reconcile(ctx context.Context, running []Process) (registered,
 		if m, folder, prob := s.files.Manifest(ctx, p.Package); prob == nil {
 			reg.Package = folder
 			reg.Subscriptions = m.Subscriptions()
+			// A Process re-registered here is one this host is running
+			// already, so it keeps what its manifest declares it may call.
+			reg.Permits = m.Permits()
 		}
 		if _, _, prob := s.registry.RegisterProcess(ctx, reg); prob != nil {
 			s.logger.Printf("proc: registering Process %s at %s: %s", p.ID, p.Package, prob.Detail)

@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/zyx1121/kitbash/internal/manifest"
 	"github.com/zyx1121/kitbash/internal/otlp"
 	"github.com/zyx1121/kitbash/internal/problem"
 	"github.com/zyx1121/kitbash/internal/store"
@@ -33,6 +34,10 @@ type identity struct {
 	// their subject's identity. Only a Process an admin runs may, see
 	// PLAN.md section 2.4 Evaluation.
 	EvalClaims bool
+	// Permits is what this Process may call over /mcp, as its Package's
+	// manifest declared it at registration. It is read only by the MCP
+	// endpoint, which hands it to the session child; a record carries none.
+	Permits manifest.Permits
 	// Callers resolves the caller credential a record carries to the Process
 	// whose MCP session recorded it. It is nil for a producer that may not
 	// carry one at all, which is every Process on the TCP receiver: only a
@@ -150,6 +155,7 @@ func (s *Server) tokenIdentity(r *http.Request) (identity, *problem.Problem) {
 		Process:    p.ID,
 		Producer:   p.ID,
 		EvalClaims: p.Admin,
+		Permits:    p.Permits,
 	}, nil
 }
 

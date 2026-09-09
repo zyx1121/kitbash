@@ -17,6 +17,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/zyx1121/kitbash/internal/manifest"
 	"github.com/zyx1121/kitbash/internal/otlp"
 	"github.com/zyx1121/kitbash/internal/problem"
 	"github.com/zyx1121/kitbash/internal/sysusers"
@@ -527,6 +528,15 @@ func (s *Server) openMCPSession(ctx context.Context, id identity) (*mcpSession, 
 		s.endMCPSession(sess)
 		return nil, problem.Internal(MCPPath, fmt.Sprintf("building the session command: %v", err), "")
 	}
+	// What this Process may call, as its Package declared it at registration.
+	// It is appended rather than built into the environment the runner makes,
+	// because the runner speaks for a member's session and this narrows one
+	// Process's: a session opened without a registration behind it is not a
+	// thing that reaches here. The block is always set, so a child that finds
+	// the variable empty is a child of a Process that may call nothing, not a
+	// child of a daemon that forgot, see mcp_for_processes in
+	// spec/kitbashd-api.yaml.
+	cmd.Env = append(cmd.Env, manifest.EnvPermits+"="+string(id.Permits.JSON()))
 
 	client := mcp.NewClient(&mcp.Implementation{Name: "kitbashd", Version: s.version}, &mcp.ClientOptions{
 		// The owner may start another Process while this session is open, and

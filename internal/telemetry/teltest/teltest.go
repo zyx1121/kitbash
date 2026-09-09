@@ -26,6 +26,8 @@ import (
 	coltracepb "github.com/zyx1121/kitbash/internal/otlpproto/collector/trace/v1"
 	commonpb "github.com/zyx1121/kitbash/internal/otlpproto/common/v1"
 	tracepb "github.com/zyx1121/kitbash/internal/otlpproto/trace/v1"
+
+	"github.com/zyx1121/kitbash/internal/manifest"
 )
 
 // maxBodyBytes is the request limit of spec/kitbashd-api.yaml.
@@ -70,6 +72,9 @@ type Registration struct {
 	Expose        string   `json:"expose,omitempty"`
 	Endpoint      string   `json:"endpoint,omitempty"`
 	Subscriptions []string `json:"subscriptions,omitempty"`
+	// Permits is what the Package declared its Process may call over /mcp. A
+	// test reads it to see what the session child would be given.
+	Permits manifest.Permits `json:"permits,omitempty"`
 	// Owner is the member kitbashd recorded from the socket's peer
 	// credentials, and Admin whether they were an admin at registration. A
 	// client sends neither; a test seeds Owner to stand in for another
