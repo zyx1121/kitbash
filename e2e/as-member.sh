@@ -43,6 +43,11 @@ home=$(getent passwd "$name" | cut -d: -f6)
 uid=$(id -u "$name")
 gid=$(id -g "$name")
 
+# The command runs where every member can stand. podman's children chdir to
+# the working directory they inherit, and the job's own is under a home no
+# member may enter.
+cd /
+
 # setpriv rather than another sudo: it execs the command in this process, so
 # the cgroup joined above is the one the command runs in.
 exec setpriv --reuid "$uid" --regid "$gid" --init-groups \

@@ -107,7 +107,14 @@ func asUser(t *testing.T, name string, argv ...string) *exec.Cmd {
 		"TMPDIR=/tmp",
 	}
 	args := append([]string{"-n", "-u", name, "env", "-i"}, env...)
-	return exec.Command("sudo", append(args, argv...)...)
+	cmd := exec.Command("sudo", append(args, argv...)...)
+	// The session inherits its working directory, and podman's children chdir
+	// to it: the job's own directory is under a home the member cannot reach,
+	// so the session starts where every member can stand. The home itself is
+	// not it: this process is still the job's user when it changes directory,
+	// and a member's home is theirs alone.
+	cmd.Dir = "/"
+	return cmd
 }
 
 // runAs runs one command to completion as a member and returns its output. It

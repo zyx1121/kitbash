@@ -28,6 +28,7 @@ jobs:
       # The upgrade half: one store, opened by the previous release and then by
       # this one. The surface half gets a store of its own.
       KITBASH_E2E_STORE: /var/tmp/kitbash-e2e/upgrade.db
+      KITBASH_E2E_CLIENT: /var/tmp/kitbash-e2e/client
       MAIN_STORE: /var/tmp/kitbash-e2e/surface.db
       PREVIOUS: v0.6.2
       PREVIOUS_TREE: /var/tmp/kitbash-previous
@@ -54,9 +55,15 @@ jobs:
         run: sudo KITBASH_BIN=bin KITBASH_E2E_ADMIN="$KITBASH_E2E_ADMIN" KITBASH_E2E_MEMBER="$KITBASH_E2E_MEMBER" KITBASH_E2E_SSH_KEY="$KITBASH_E2E_SSH_KEY" sh e2e/setup-host.sh
 
       - name: Install the second MCP client
+        # It is staged outside the checkout because a member has to read it:
+        # podman copies it into the container as the admin, and the runner's
+        # home is not somewhere a member may go.
         run: |
           npm install --prefix e2e/client --no-audit --no-fund --loglevel error
-          chmod -R a+rX e2e/client
+          rm -rf "$KITBASH_E2E_CLIENT"
+          mkdir -p "$(dirname "$KITBASH_E2E_CLIENT")"
+          cp -R e2e/client "$KITBASH_E2E_CLIENT"
+          chmod -R a+rX "$KITBASH_E2E_CLIENT"
 
       - name: Start kitbashd
         run: sudo sh e2e/daemon.sh start /usr/bin/kitbashd "$MAIN_STORE" "$KITBASH_E2E_LOGS/kitbashd.log"

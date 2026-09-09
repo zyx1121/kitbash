@@ -23,10 +23,11 @@ const (
 	echoTool    = "echo_echo"
 )
 
-// clientDir holds the second MCP client and the node_modules the job installed
-// beside it; clientMount is where podman cp puts them in the container.
+// clientMount is where podman cp puts the second MCP client in the container.
+// Where it comes from is the job's to say: a member has to be able to read it,
+// and the checkout is under a home that is not theirs.
 const (
-	clientDir   = "client"
+	clientEnv   = "KITBASH_E2E_CLIENT"
 	clientMount = "/e2e-client"
 )
 
@@ -197,9 +198,9 @@ func runThePackage(t *testing.T, s *state) {
 // own container. The Process token lives only there, so the client that bears
 // it has to run there too.
 func secondClient(t *testing.T, s *state) {
-	local, err := filepath.Abs(clientDir)
+	local, err := filepath.Abs(envOr(clientEnv, "client"))
 	if err != nil {
-		t.Fatalf("resolving %s: %v", clientDir, err)
+		t.Fatalf("resolving the second client: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(local, "node_modules")); err != nil {
 		t.Fatalf("the second client has no node_modules: %v", err)
