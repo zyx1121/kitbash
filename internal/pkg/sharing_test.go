@@ -246,9 +246,11 @@ func TestBuildOfAHomePackageIsNeitherFetchedNorRecorded(t *testing.T) {
 	}
 }
 
-// TestBuildDoesNotCopyAnImageThisMemberAlreadyHas: there is nothing to copy,
-// and a fetch would be a request for what is already in the store.
-func TestBuildDoesNotCopyAnImageThisMemberAlreadyHas(t *testing.T) {
+// TestBuildReturnsTheImageOfThisCommitItAlreadyHas: one commit is one digest,
+// so a commit whose image is in this member's store is neither copied nor
+// built again. Building it again would answer a second digest for a commit
+// that already has one.
+func TestBuildReturnsTheImageOfThisCommitItAlreadyHas(t *testing.T) {
 	f, builds := shared(t)
 	folder, commit := pack(t, f)
 	f.runner.AddImage(podman.Image{ID: otherDigest, Labels: map[string]string{
@@ -258,31 +260,77 @@ func TestBuildDoesNotCopyAnImageThisMemberAlreadyHas(t *testing.T) {
 		{Path: folder, Commit: commit, Digest: otherDigest, Builder: "kim"},
 	}
 
-	if _, prob := f.packages.Build(context.Background(), folder); prob != nil {
+	out, prob := f.packages.Build(context.Background(), folder)
+	if prob != nil {
 		t.Fatalf("Build: %s", prob.Detail)
+	}
+	if out.Digest != otherDigest || out.Commit != commit {
+		t.Errorf("the build is %+v, want the image of this commit that is already here", out)
+	}
+	if out.Log != "already built at "+otherDigest {
+		t.Errorf("the log is %q, want it to say the image was already built", out.Log)
 	}
 	if len(builds.fetched) != 0 {
 		t.Errorf("the session fetched %v, want nothing for an image it has", builds.fetched)
 	}
+	if len(f.runner.Builds) != 0 {
+		t.Errorf("the runtime built %+v, want the image that was already here", f.runner.Builds)
+	}
+	// Nothing was built, so there is nothing new to record: the row that named
+	// this digest still names the member who made it.
+	if len(builds.recorded) != 0 {
+		t.Errorf("the build was recorded as %+v, want the record left alone", builds.recorded)
+	}
 }
 
-// TestBuildDoesNotCopyItsOwnBuild: a member who removed their own image is
-// building it again on purpose.
-func TestBuildDoesNotCopyItsOwnBuild(t *testing.T) {
+// TestBuildReturnsItsOwnImageOfThisCommit is the same rule for the member who
+// made it: a second pkg_build of one commit answers the digest of the first.
+func TestBuildReturnsItsOwnImageOfThisCommit(t *testing.T) {
+	f, builds := shared(t)
+	folder, commit := pack(t, f)
+
+	first, prob := f.packages.Build(context.Background(), folder)
+	if prob != nil {
+		t.Fatalf("Build: %s", prob.Detail)
+	}
+	// The first build recorded itself, which is what the second one reads.
+	builds.known[0].Builder = "tester"
+
+	second, prob := f.packages.Build(context.Background(), folder)
+	if prob != nil {
+		t.Fatalf("Build again: %s", prob.Detail)
+	}
+	if second.Digest != first.Digest || second.Commit != commit {
+		t.Errorf("the second build is %+v, want the digest of the first", second)
+	}
+	if second.Log != "already built at "+first.Digest {
+		t.Errorf("the log is %q, want it to say the image was already built", second.Log)
+	}
+	if len(f.runner.Builds) != 1 {
+		t.Errorf("the runtime made %d builds, want the one the first call asked for", len(f.runner.Builds))
+	}
+}
+
+// TestBuildRebuildsAnImageThisMemberRemoved: the record names this member and
+// the image is not in their store, so they are building it again on purpose
+// and nothing is copied from themselves.
+func TestBuildRebuildsAnImageThisMemberRemoved(t *testing.T) {
 	f, builds := shared(t)
 	folder, commit := pack(t, f)
 	builds.known = []telemetry.Build{
 		{Path: folder, Commit: commit, Digest: otherDigest, Builder: "tester"},
 	}
 
-	if _, prob := f.packages.Build(context.Background(), folder); prob != nil {
+	out, prob := f.packages.Build(context.Background(), folder)
+	if prob != nil {
 		t.Fatalf("Build: %s", prob.Detail)
+	}
+	if len(f.runner.Builds) != 1 || out.Digest == otherDigest {
+		t.Errorf("the build is %+v after %d local builds, want a build that ran here",
+			out, len(f.runner.Builds))
 	}
 	if len(builds.fetched) != 0 {
 		t.Errorf("the session fetched %v, want nothing of its own", builds.fetched)
-	}
-	if len(f.runner.Builds) != 1 {
-		t.Errorf("the runtime made %d builds, want the one this member asked for", len(f.runner.Builds))
 	}
 }
 

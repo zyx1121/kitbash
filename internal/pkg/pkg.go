@@ -205,9 +205,10 @@ func (s *Service) build(ctx context.Context, span *telemetry.Span, path string) 
 
 	tag := TagPrefix + m.Name + ":" + shortSha(head.Sha)
 	// A Package under /org is one Package for the whole organization, so a
-	// build of this commit that another member already made is copied rather
-	// than made again: one commit is then one digest for everybody, see
-	// PLAN.md section 2.2.
+	// build of this commit that exists already is answered rather than made
+	// again: the image in this member's store as it is, another member's
+	// copied here. One commit is then one digest for everybody, see PLAN.md
+	// section 2.2.
 	if result := s.copied(ctx, span, folder, head.Sha, tag); result != nil {
 		return result, nil
 	}
@@ -246,9 +247,14 @@ func (s *Service) build(ctx context.Context, span *telemetry.Span, path string) 
 	}, nil
 }
 
-// copied is the build another member already made, copied into this member's
-// store instead of made again. It answers nil when there is nothing to copy
-// and when the copy failed, which are the same thing to the caller: build it.
+// copied is the image of this commit that already exists: the one in this
+// member's own store, or the one another member has, copied here instead of
+// made again. It answers nil when there is neither and when the copy failed,
+// which are the same thing to the caller: build it.
+//
+// One commit is one digest. A commit kitbashd has a record of is never built
+// twice by the same member either, because a second build would answer a
+// second digest for a commit that already has one.
 //
 // Only /org Packages take part. A Package in a home is that member's alone,
 // so nothing about it is recorded and nothing about it is fetched.
@@ -272,10 +278,24 @@ func (s *Service) copied(ctx context.Context, span *telemetry.Span, folder, comm
 	for _, image := range local {
 		held[image.ID] = true
 	}
+	// The digest of this commit may already be in this member's store, from a
+	// build of their own or from a copy they took earlier. Returning it is the
+	// whole invariant: one commit is one digest, and building it again would
+	// produce a second digest for a commit that already has one.
 	for _, build := range builds {
-		// A build of this member's own is not fetched: either they have the
-		// image, or they removed it and are building it again on purpose.
-		if build.Builder == "" || build.Builder == s.files.User() || held[build.Digest] {
+		if !held[build.Digest] {
+			continue
+		}
+		span.SetDigest(build.Digest)
+		log := "already built at " + build.Digest
+		span.Info(log)
+		return &BuildResult{Path: folder, Digest: build.Digest, Commit: commit, Log: log}
+	}
+	for _, build := range builds {
+		// A build of this member's own is not fetched: they removed the image
+		// and are building it again on purpose, which the loop above let them
+		// past because nothing of that digest is in their store.
+		if build.Builder == "" || build.Builder == s.files.User() {
 			continue
 		}
 		result, prob := s.builds.FetchImage(ctx, build.Digest, folder, build.Builder)

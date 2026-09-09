@@ -334,6 +334,16 @@ families:
           with image is pulled by digest and relabelled through a one line
           Containerfile so the result carries the same labels and its own
           image ID.
+
+          For a Package under /org the builds kitbashd recorded for this commit
+          are read first, so one commit is one digest for every member: an
+          image of that commit already in the caller's store is returned as it
+          is with the log line "already built at <digest>", one another member
+          has is copied into the caller's store with the log line "copied from
+          <builder>", and only a commit nobody has built is built. A build that
+          did run is recorded, and any failure of the record or the copy falls
+          back to building. Packages in a home are neither recorded nor
+          copied. See PLAN.md section 2.2.
         input: { type: object, additionalProperties: false, required: [path], properties: { path: { type: string } } }
         output:
           type: object
