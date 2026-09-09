@@ -87,6 +87,21 @@ sh deploy/kitbash-adduser "$member" "$key"
 #    cleared here too rather than only between these two.
 unlock_subids
 
+# 6b. /run/user/<uid> is where rootless podman keeps its state. On a systemd
+#     host that directory belongs to logind, which removes the one
+#     kitbash-adduser made as soon as the last session of that account ends,
+#     and a member here has no session at all. Lingering is what keeps it for
+#     an account nobody logs into. install.sh writes no equivalent: Alpine runs
+#     no logind, and /etc/local.d/kitbash-rootless.start makes the directory at
+#     every boot instead.
+for m in "$admin" "$member"; do
+  if command -v loginctl >/dev/null 2>&1; then loginctl enable-linger "$m" || true; fi
+  uid=$(id -u "$m")
+  mkdir -p "/run/user/$uid"
+  chown "$m" "/run/user/$uid"
+  chmod 700 "/run/user/$uid"
+done
+
 # 7. /org, seeded and owned as install.sh leaves it.
 mkdir -p /org
 for src in deploy/org/*/; do
