@@ -73,9 +73,6 @@ type mcpSession struct {
 	// arrives, so nothing a producer sends names a Process, see the caller
 	// rules in mcp_for_processes.
 	credential string
-	server     *mcp.Server
-	client     *mcp.ClientSession
-	cancel     context.CancelFunc
 	// done is closed when the session ends. Every request being served for
 	// this session watches it, so an event stream held open by a client whose
 	// session is over does not keep a listener from stopping.
@@ -86,12 +83,20 @@ type mcpSession struct {
 	// without it one sync could publish what the other has just removed.
 	syncMu sync.Mutex
 
-	mu    sync.Mutex
-	id    string
-	last  time.Time
-	holds int               // requests in flight, an open event stream among them
-	tools map[string]string // tool name to the JSON of the tool as published
-	ended bool
+	mu sync.Mutex
+	// server, client and cancel are written while the session is being
+	// opened, which is after the registry already holds it: a shutdown or an
+	// unregistering can end a session that is still opening, and end reads
+	// exactly these three. They are written and read under the lock so that
+	// ordering is the mutex's rather than the scheduler's.
+	server *mcp.Server
+	client *mcp.ClientSession
+	cancel context.CancelFunc
+	id     string
+	last   time.Time
+	holds  int               // requests in flight, an open event stream among them
+	tools  map[string]string // tool name to the JSON of the tool as published
+	ended  bool
 }
 
 // mcpRegistry holds the live sessions of every Process. It is indexed twice:
@@ -295,23 +300,27 @@ func (sess *mcpSession) end(graceUntil time.Time) (closeChild func()) {
 	}
 	sess.ended = true
 	id := sess.id
+	// Read what the opening wrote while still holding the lock: a session can
+	// be ended while it is still being opened, and these three are the fields
+	// the two sides share.
+	server, client, cancel := sess.server, sess.client, sess.cancel
 	sess.mu.Unlock()
 
 	close(sess.done)
 	sess.registry.drop(sess, id, graceUntil)
-	if sess.server != nil {
-		for open := range sess.server.Sessions() {
+	if server != nil {
+		for open := range server.Sessions() {
 			open.Close()
 		}
 	}
 	return func() {
-		if sess.client != nil {
+		if client != nil {
 			// Closing the client closes the child's stdin, waits for it, and
 			// then signals it.
-			sess.client.Close()
+			client.Close()
 		}
-		if sess.cancel != nil {
-			sess.cancel()
+		if cancel != nil {
+			cancel()
 		}
 	}
 }
@@ -522,7 +531,9 @@ func (s *Server) openMCPSession(ctx context.Context, id identity) (*mcpSession, 
 	}
 
 	own, cancel := context.WithCancel(context.Background())
+	sess.mu.Lock()
 	sess.cancel = cancel
+	sess.mu.Unlock()
 	cmd, err := s.sessions.MCPCommand(own, member, s.mcpBinary, sess.credential)
 	if err != nil {
 		s.endMCPSession(sess)
@@ -552,8 +563,7 @@ func (s *Server) openMCPSession(ctx context.Context, id identity) (*mcpSession, 
 		s.endMCPSession(sess)
 		return nil, problem.Internal(MCPPath, fmt.Sprintf("starting %s as %s: %v", s.mcpBinary, id.User, err), "")
 	}
-	sess.client = child
-	sess.server = mcp.NewServer(&mcp.Implementation{Name: "kitbash", Version: s.version}, &mcp.ServerOptions{
+	server := mcp.NewServer(&mcp.Implementation{Name: "kitbash", Version: s.version}, &mcp.ServerOptions{
 		// The transport asks for the session id right after it asks for the
 		// server, which is where a session becomes addressable.
 		GetSessionID: func() string {
@@ -565,6 +575,10 @@ func (s *Server) openMCPSession(ctx context.Context, id identity) (*mcpSession, 
 			return name
 		},
 	})
+	sess.mu.Lock()
+	sess.client = child
+	sess.server = server
+	sess.mu.Unlock()
 	if err := sess.sync(own); err != nil {
 		s.endMCPSession(sess)
 		return nil, problem.Internal(MCPPath, fmt.Sprintf("reading the tools of %s: %v", s.mcpBinary, err), "")

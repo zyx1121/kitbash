@@ -188,18 +188,11 @@ func TestBackupLoopTakesOneCopyPerInterval(t *testing.T) {
 
 	// health is what says a run finished; a file in the directory may still be
 	// the copy in flight.
-	deadline := time.Now().Add(10 * time.Second)
 	var got healthResponse
-	for {
+	waitFor(t, "the backup loop to finish two runs", func() bool {
 		got = h.health(t)
-		if got.Backups >= 2 && got.LastBackup != "" {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("the backup loop finished %d runs in ten seconds, want two", got.Backups)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+		return got.Backups >= 2 && got.LastBackup != ""
+	})
 	cancel()
 	if got.LastBackupError != "" {
 		t.Errorf("lastBackupError = %q, want none", got.LastBackupError)

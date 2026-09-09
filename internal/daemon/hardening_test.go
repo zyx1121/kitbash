@@ -182,7 +182,7 @@ func TestIdleConnectionIsClosed(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 	reply := make([]byte, 4096)
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	conn.SetReadDeadline(time.Now().Add(waitBudget))
 	n, err := conn.Read(reply)
 	if err != nil {
 		t.Fatalf("read the response: %v", err)
@@ -192,7 +192,7 @@ func TestIdleConnectionIsClosed(t *testing.T) {
 	}
 
 	// The connection is now idle and keep alive. The daemon must hang up.
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	conn.SetReadDeadline(time.Now().Add(waitBudget))
 	if _, err := conn.Read(reply); err == nil {
 		t.Error("the daemon kept an idle connection open")
 	} else if !isClosed(err) {
@@ -218,7 +218,7 @@ func TestSlowBodyIsCut(t *testing.T) {
 
 	// Within a few times the read timeout the daemon has either answered or
 	// hung up. What it must not do is wait for the rest of the body.
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	conn.SetReadDeadline(time.Now().Add(waitBudget))
 	reply := make([]byte, 4096)
 	n, err := conn.Read(reply)
 	if err != nil {
@@ -396,7 +396,7 @@ func TestConnectionsAreCapped(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 	reply := make([]byte, 4096)
-	held.SetReadDeadline(time.Now().Add(5 * time.Second))
+	held.SetReadDeadline(time.Now().Add(waitBudget))
 	if _, err := held.Read(reply); err != nil {
 		t.Fatalf("read: %v", err)
 	}
