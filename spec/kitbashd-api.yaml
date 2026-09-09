@@ -123,7 +123,9 @@ fan_out:
     matching standard path (/v1/traces, /v1/logs, /v1/metrics). Eligible: a
     registered Process with subscriptions containing telemetry and an
     endpoint, run by an admin (receives everything) or by the record's
-    kitbash.user (receives that member's records).
+    kitbash.user (receives that member's records). A record with
+    kitbash.internal = true goes to an admin's subscriber alone, the rule
+    tel_query follows, see internal_records.
   authentication: >
     Every fan out request carries Authorization: Bearer <fan out secret>. The
     secret is minted with the Process token at registration and returned once
@@ -183,6 +185,8 @@ api:
     authorization: >
       A regular user's query is forced to user = caller; a request naming
       another user is 403 not-permitted. An admin may name any user or none.
+      The causes of internal problems are answered to admins alone, see
+      internal_records.
     errors: [bad-request, not-permitted, internal]
   retention_get:
     method: GET
@@ -298,10 +302,23 @@ api:
     response: >
       { version: "v0.4.0", store: "/var/lib/kitbash/kitbashd.db",
       uptimeSeconds: 12, listeners: { socket: "/run/kitbash/kitbashd.sock",
-      tcp: "0.0.0.0:4318" }, subscribers: 1, mcpSessions: 2 }. A listener that
+      tcp: "0.0.0.0:4318" }, subscribers: 1, mcpSessions: 2,
+      lastBackup: "2026-09-06T03:00:00Z", backups: 7 }. A listener that
       is not bound is absent; subscribers is how many registered Processes the
       fan out is delivering to, and mcpSessions how many MCP sessions
-      Processes hold open on the receiver, see mcp_for_processes.
+      Processes hold open on the receiver, see mcp_for_processes. lastBackup
+      and backups are the store backup, see backup; lastBackup is absent until
+      the first one and a run that failed adds lastBackupError with the reason
+      while lastBackup stays at the last good copy.
+    authorization: any member; the answer is about the daemon, not about the caller.
+    supervision: >
+      The OpenRC service script runs this path every 60 s as supervise-daemon's
+      healthcheck, over the unix socket with curl, and restarts kitbashd when
+      it fails: a daemon that is up but no longer answering costs every member
+      the same as one that is down, because Processes may not start untraced,
+      members cannot write /org and /mcp is gone, see PLAN.md section 4.5.
+      respawn_delay is 5 s and respawn_max 0, so restarts continue for as long
+      as the host is up.
 
 restore:
   description: >
@@ -316,6 +333,51 @@ restore:
     after a reboot" true; the OpenRC script orders kitbashd after localmount
     and the local runlevel scripts.
   registration_fields: the registration carries the container name and the digest from M5 on, so restore needs no manifest.
+
+backup:
+  description: >
+    kitbashd copies its store with SQLite's VACUUM INTO once a day: the first
+    copy 5 minutes after start, then every 24 hours. The copy is a whole
+    database an operator can open, taken through the same connection every
+    other statement uses, so nothing is locked out while it runs.
+  path: /var/lib/kitbash/backup/kitbashd-<YYYYMMDD-HHMMSS>.db, the timestamp in UTC
+  modes: the directory is 0700 root:root and each copy 0600, the same as the store itself
+  retention: >
+    The newest 7 copies are kept and the older ones deleted after every
+    successful run. Nothing else in the directory is touched: only files named
+    kitbashd-<stamp>.db are ever removed.
+  logging: one line per run, naming the copy and how many are kept, or the reason it failed
+  health: lastBackup, backups and lastBackupError, see the health path
+  environment:
+    KITBASH_BACKUP_EVERY: >
+      Shortens the interval, for tests and for running outside a kitbash host.
+      A value that is not a positive Go duration leaves the daily interval in
+      place and is logged. The first copy is taken after 5 minutes or after
+      one interval, whichever is shorter.
+  not_covered: >
+    Files are git repositories, which the host snapshot covers, and the copies
+    live on the same host: this is the store's backup, not the host's.
+
+internal_records:
+  description: >
+    Every internal problem records its cause as a log record with
+    kitbash.internal = true, severity ERROR, the cause as the body, the
+    problem's instance as kitbash.path and kitbash.error = internal.
+    kitbash-mcp exports them through its own exporter, carrying kitbash.tool of
+    the call in flight when there is exactly one; kitbashd has no exporter and
+    writes its own into the store directly, stamped kitbash.producer = kitbashd
+    and kitbash.user = kitbashd.
+  authorization: >
+    A query returns these records to admins alone. A member's query excludes
+    them, and a member asking for internal = true is answered with an empty
+    page rather than a refusal: what the member has is the problem's instance,
+    to quote to an admin who then queries by it. The fan out follows the same
+    rule, so only an admin's subscriber receives one.
+  why: >
+    The detail an agent reads carries no host paths, git output or third party
+    messages. Those are what an operator needs and what a member may not have,
+    so they go where an admin can read them through MCP instead of into a log
+    file on the host that no tool reaches.
 
 retention:
   defaults: { traces: 30d, logs: 14d, metrics: 30d }

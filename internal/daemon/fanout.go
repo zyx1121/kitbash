@@ -82,6 +82,17 @@ func (s *subscriber) eligible(user string) bool {
 	return s.admin || s.owner == user
 }
 
+// sees reports whether this subscriber receives one stored record. It is the
+// rule above plus the one tel_query follows: the cause of an internal problem
+// carries host paths and third party output, so it goes to an admin's
+// subscriber and to nobody else, see PLAN.md section 2.4.
+func (s *subscriber) sees(a store.Attributes) bool {
+	if !s.eligible(a.User) {
+		return false
+	}
+	return s.admin || a.Internal == nil || !*a.Internal
+}
+
 // bearer is the secret this subscriber's deliveries carry. It is empty for a
 // registration written before the fan out was authenticated, which is
 // delivered to without a bearer until the Process is registered again.
@@ -424,7 +435,7 @@ func parts(e store.Export, sub *subscriber) []part {
 
 	spans := make([]store.Span, 0, len(e.Spans))
 	for _, sp := range e.Spans {
-		if sub.eligible(sp.User) {
+		if sub.sees(sp.Attributes) {
 			spans = append(spans, sp)
 		}
 	}
@@ -438,7 +449,7 @@ func parts(e store.Export, sub *subscriber) []part {
 
 	logs := make([]store.Log, 0, len(e.Logs))
 	for _, l := range e.Logs {
-		if sub.eligible(l.User) {
+		if sub.sees(l.Attributes) {
 			logs = append(logs, l)
 		}
 	}
@@ -452,7 +463,7 @@ func parts(e store.Export, sub *subscriber) []part {
 
 	metrics := make([]store.Metric, 0, len(e.Metrics))
 	for _, m := range e.Metrics {
-		if sub.eligible(m.User) {
+		if sub.sees(m.Attributes) {
 			metrics = append(metrics, m)
 		}
 	}

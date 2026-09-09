@@ -29,6 +29,8 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 
 	"go.opentelemetry.io/otel/codes"
+
+	"github.com/zyx1121/kitbash/internal/problem"
 )
 
 // ServiceName is the OpenTelemetry service every record from this process
@@ -74,6 +76,16 @@ const (
 	AttrDigest = "kitbash.digest"
 	AttrError  = "kitbash.error"
 )
+
+// AttrInternal marks a record as the cause of an internal problem: the host
+// paths and third party output that never reach the agent. kitbashd answers
+// such a record to admins alone, see PLAN.md section 2.4.
+const AttrInternal = "kitbash.internal"
+
+// InternalCauseLimit bounds the body of one recorded cause. A cause is an
+// error message, and one that arrived from a command's standard error can be
+// as long as that command felt like being.
+const InternalCauseLimit = 8 << 10
 
 // AttrCaller carries the caller credential of this session, which kitbashd
 // rewrites to the Process id of the session it minted the credential for. A
@@ -126,6 +138,11 @@ type Provider struct {
 	traces *sdktrace.TracerProvider
 	logs   *sdklog.LoggerProvider
 	client *Client
+
+	// calls are the tools/call spans open right now, which a recorded
+	// internal cause reads its tool from, see tool.
+	mu    sync.Mutex
+	calls map[*call]struct{}
 }
 
 // New builds the provider for one session. It opens no connection: the socket
@@ -180,14 +197,20 @@ func New(opts Options) (*Provider, error) {
 	if caller == "" {
 		caller = Caller()
 	}
-	return &Provider{
+	p := &Provider{
 		caller: caller,
 		tracer: traces.Tracer(scopeName),
 		logger: logs.Logger(scopeName),
 		traces: traces,
 		logs:   logs,
 		client: NewClient(socket),
-	}, nil
+		calls:  map[*call]struct{}{},
+	}
+	// The cause of an internal problem is not for the agent, but it is for
+	// the admin of this host, so it leaves as a log record rather than only
+	// as a line in the server log, see PLAN.md section 2.4.
+	problem.OnInternal(p.RecordInternal)
+	return p, nil
 }
 
 // NewFromEnv is New with the socket the environment names. A provider that
@@ -234,6 +257,8 @@ func (p *Provider) Shutdown(ctx context.Context) error {
 	if p == nil {
 		return nil
 	}
+	// Nothing may reach a closed exporter, so the hook goes first.
+	problem.OnInternal(nil)
 	ctx, cancel := context.WithTimeout(ctx, ShutdownTimeout)
 	defer cancel()
 	var logErr error
@@ -259,7 +284,10 @@ func (p *Provider) StartTool(ctx context.Context, tool, user string) (context.Co
 	}
 	ctx, span := p.tracer.Start(ctx, tool)
 	s := &Span{span: span, provider: p}
-	ctx = context.WithValue(ctx, callKey{}, &call{provider: p, tool: tool, user: user, span: s})
+	c := &call{provider: p, tool: tool, user: user, span: s}
+	s.call = c
+	p.began(c)
+	ctx = context.WithValue(ctx, callKey{}, c)
 	s.ctx = ctx
 	s.Set(AttrUser, user)
 	s.Set(AttrTool, tool)
@@ -340,6 +368,9 @@ type Span struct {
 	ctx      context.Context
 	span     trace.Span
 	provider *Provider
+	// call is set on the span of a whole tools/call and nil on a child, so
+	// ending one tells the provider the call is over.
+	call *call
 
 	mu    sync.Mutex
 	attrs []attribute.KeyValue
@@ -392,7 +423,76 @@ func (s *Span) End() {
 	if s == nil {
 		return
 	}
+	if s.call != nil {
+		s.provider.ended(s.call)
+	}
 	s.span.End()
+}
+
+// began and ended keep the set of tools/call spans this session has open.
+func (p *Provider) began(c *call) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls[c] = struct{}{}
+}
+
+func (p *Provider) ended(c *call) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.calls, c)
+}
+
+// tool is the tools/call this session is serving. An internal cause reaches
+// the provider through a package level hook, which carries the instance and
+// the cause and no context, so the tool is read from the calls in flight:
+// with exactly one open there is no doubt which call failed, and with none or
+// several the record carries no tool rather than a guessed one.
+func (p *Provider) tool() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.calls) != 1 {
+		return ""
+	}
+	for c := range p.calls {
+		return c.tool
+	}
+	return ""
+}
+
+// RecordInternal exports one internal cause as a log record: severity ERROR,
+// the cause as the body, and the attributes that make it an admin's to read.
+// The instance is kept as kitbash.path, because that is what the agent was
+// given and what an admin queries by to find the cause behind it.
+//
+// It is what problem.Internal hands its cause to for the life of this
+// provider. A provider that is nil, which is a session running untraced,
+// records nothing.
+func (p *Provider) RecordInternal(instance, cause string) {
+	if p == nil {
+		return
+	}
+	var record otellog.Record
+	record.SetTimestamp(time.Now())
+	record.SetSeverity(otellog.SeverityError)
+	record.SetSeverityText("ERROR")
+	record.SetBody(attribute.StringValue(clip(cause, InternalCauseLimit)))
+	attrs := []attribute.KeyValue{
+		attribute.Bool(AttrInternal, true),
+		attribute.String(AttrError, problem.SlugInternal),
+	}
+	if instance != "" {
+		attrs = append(attrs, attribute.String(AttrPath, instance))
+	}
+	if tool := p.tool(); tool != "" {
+		attrs = append(attrs, attribute.String(AttrTool, tool))
+	}
+	if p.caller != "" {
+		attrs = append(attrs, attribute.String(AttrCaller, p.caller))
+	}
+	record.AddAttributes(attrs...)
+	// kitbashd stamps kitbash.user from the peer credentials of the socket,
+	// so the record is the caller's without this process saying so.
+	p.logger.Emit(context.Background(), record)
 }
 
 // Info emits a log record under this span with the span's own attributes.

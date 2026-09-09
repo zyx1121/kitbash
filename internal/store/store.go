@@ -57,6 +57,10 @@ const (
 // sends the credential of its session and the daemon rewrites it to the
 // Process id, so this column is never what a producer claimed, see PLAN.md
 // section 2.3. It is empty for a record a member's own session wrote.
+//
+// Internal marks a record as the cause of an internal problem, which only an
+// admin reads: it carries host paths and third party output, and a member is
+// given the problem's instance to quote instead, see PLAN.md section 2.4.
 type Attributes struct {
 	User     string         `json:"user,omitempty"`
 	Package  string         `json:"package,omitempty"`
@@ -66,6 +70,7 @@ type Attributes struct {
 	Eval     *bool          `json:"eval,omitempty"`
 	Producer string         `json:"producer,omitempty"`
 	Caller   string         `json:"caller,omitempty"`
+	Internal *bool          `json:"internal,omitempty"`
 	Other    map[string]any `json:"-"`
 }
 
@@ -118,6 +123,10 @@ func (e Export) Empty() bool {
 // Filter selects records of one signal. The zero value matches everything
 // within the time range, which is what an admin querying the whole machine
 // sends. Path is a prefix match, every other string is exact.
+//
+// Internal selects the causes of internal problems: true returns only them,
+// false only the records that are not one, and nil both. The daemon sends
+// false for every caller who is not an admin, see PLAN.md section 2.4.
 type Filter struct {
 	User     string
 	Package  string
@@ -127,6 +136,7 @@ type Filter struct {
 	Eval     *bool
 	Producer string
 	Caller   string
+	Internal *bool
 	Since    time.Time
 	Until    time.Time
 	Limit    int
@@ -264,6 +274,7 @@ CREATE TABLE IF NOT EXISTS spans (
   eval           INTEGER,
   producer       TEXT    NOT NULL DEFAULT '',
   caller         TEXT    NOT NULL DEFAULT '',
+  internal       INTEGER,
   other          TEXT    NOT NULL DEFAULT ''
 );
 
@@ -282,6 +293,7 @@ CREATE TABLE IF NOT EXISTS logs (
   eval      INTEGER,
   producer  TEXT    NOT NULL DEFAULT '',
   caller    TEXT    NOT NULL DEFAULT '',
+  internal  INTEGER,
   other     TEXT    NOT NULL DEFAULT ''
 );
 
@@ -299,6 +311,7 @@ CREATE TABLE IF NOT EXISTS metrics (
   eval    INTEGER,
   producer TEXT    NOT NULL DEFAULT '',
   caller  TEXT    NOT NULL DEFAULT '',
+  internal INTEGER,
   other   TEXT    NOT NULL DEFAULT ''
 );
 
@@ -346,18 +359,21 @@ CREATE INDEX IF NOT EXISTS spans_user     ON spans(user, start_ns);
 CREATE INDEX IF NOT EXISTS spans_package  ON spans(package, start_ns);
 CREATE INDEX IF NOT EXISTS spans_producer ON spans(producer, start_ns);
 CREATE INDEX IF NOT EXISTS spans_caller   ON spans(caller, start_ns);
+CREATE INDEX IF NOT EXISTS spans_internal ON spans(internal, start_ns);
 
 CREATE INDEX IF NOT EXISTS logs_time     ON logs(time_ns);
 CREATE INDEX IF NOT EXISTS logs_user     ON logs(user, time_ns);
 CREATE INDEX IF NOT EXISTS logs_package  ON logs(package, time_ns);
 CREATE INDEX IF NOT EXISTS logs_producer ON logs(producer, time_ns);
 CREATE INDEX IF NOT EXISTS logs_caller   ON logs(caller, time_ns);
+CREATE INDEX IF NOT EXISTS logs_internal ON logs(internal, time_ns);
 
 CREATE INDEX IF NOT EXISTS metrics_time     ON metrics(time_ns);
 CREATE INDEX IF NOT EXISTS metrics_user     ON metrics(user, time_ns);
 CREATE INDEX IF NOT EXISTS metrics_package  ON metrics(package, time_ns);
 CREATE INDEX IF NOT EXISTS metrics_producer ON metrics(producer, time_ns);
 CREATE INDEX IF NOT EXISTS metrics_caller   ON metrics(caller, time_ns);
+CREATE INDEX IF NOT EXISTS metrics_internal ON metrics(internal, time_ns);
 
 CREATE INDEX IF NOT EXISTS processes_owner ON processes(owner);
 CREATE UNIQUE INDEX IF NOT EXISTS processes_token ON processes(token_hash);
@@ -381,8 +397,8 @@ func (s *Store) Insert(ctx context.Context, e Export) error {
 	if len(e.Spans) > 0 {
 		stmt, err := tx.PrepareContext(ctx, `INSERT INTO spans
 			(trace_id, span_id, parent_span_id, name, start_ns, end_ns, status, status_message,
-			 user, package, process, path, tool, eval, producer, caller, other)
-			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+			 user, package, process, path, tool, eval, producer, caller, internal, other)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 		if err != nil {
 			return fmt.Errorf("store: prepare spans: %w", err)
 		}
@@ -394,15 +410,17 @@ func (s *Store) Insert(ctx context.Context, e Export) error {
 			}
 			if _, err := stmt.ExecContext(ctx, sp.TraceID, sp.SpanID, sp.ParentSpanID, sp.Name,
 				sp.StartNS, sp.EndNS, status(sp.Status), sp.StatusMessage,
-				sp.User, sp.Package, sp.Process, sp.Path, sp.Tool, boolArg(sp.Eval), sp.Producer, sp.Caller, other); err != nil {
+				sp.User, sp.Package, sp.Process, sp.Path, sp.Tool, boolArg(sp.Eval), sp.Producer, sp.Caller,
+				boolArg(sp.Internal), other); err != nil {
 				return fmt.Errorf("store: insert span: %w", err)
 			}
 		}
 	}
 	if len(e.Logs) > 0 {
 		stmt, err := tx.PrepareContext(ctx, `INSERT INTO logs
-			(time_ns, severity, body, trace_id, span_id, user, package, process, path, tool, eval, producer, caller, other)
-			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+			(time_ns, severity, body, trace_id, span_id, user, package, process, path, tool, eval, producer, caller,
+			 internal, other)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 		if err != nil {
 			return fmt.Errorf("store: prepare logs: %w", err)
 		}
@@ -413,15 +431,16 @@ func (s *Store) Insert(ctx context.Context, e Export) error {
 				return err
 			}
 			if _, err := stmt.ExecContext(ctx, l.TimeNS, l.Severity, l.Body, l.TraceID, l.SpanID,
-				l.User, l.Package, l.Process, l.Path, l.Tool, boolArg(l.Eval), l.Producer, l.Caller, other); err != nil {
+				l.User, l.Package, l.Process, l.Path, l.Tool, boolArg(l.Eval), l.Producer, l.Caller,
+				boolArg(l.Internal), other); err != nil {
 				return fmt.Errorf("store: insert log: %w", err)
 			}
 		}
 	}
 	if len(e.Metrics) > 0 {
 		stmt, err := tx.PrepareContext(ctx, `INSERT INTO metrics
-			(time_ns, name, value, unit, user, package, process, path, tool, eval, producer, caller, other)
-			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+			(time_ns, name, value, unit, user, package, process, path, tool, eval, producer, caller, internal, other)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 		if err != nil {
 			return fmt.Errorf("store: prepare metrics: %w", err)
 		}
@@ -439,7 +458,8 @@ func (s *Store) Insert(ctx context.Context, e Export) error {
 				return err
 			}
 			if _, err := stmt.ExecContext(ctx, m.TimeNS, m.Name, m.Value, m.Unit,
-				m.User, m.Package, m.Process, m.Path, m.Tool, boolArg(m.Eval), m.Producer, m.Caller, other); err != nil {
+				m.User, m.Package, m.Process, m.Path, m.Tool, boolArg(m.Eval), m.Producer, m.Caller,
+				boolArg(m.Internal), other); err != nil {
 				return fmt.Errorf("store: insert metric: %w", err)
 			}
 		}
@@ -477,9 +497,9 @@ func (s *Store) Query(ctx context.Context, signal string, f Filter) (Page, error
 	}
 
 	columns := map[string]string{
-		"spans":   "trace_id, span_id, parent_span_id, name, start_ns, end_ns, status, status_message, user, package, process, path, tool, eval, producer, caller, other",
-		"logs":    "time_ns, severity, body, trace_id, span_id, user, package, process, path, tool, eval, producer, caller, other",
-		"metrics": "time_ns, name, value, unit, user, package, process, path, tool, eval, producer, caller, other",
+		"spans":   "trace_id, span_id, parent_span_id, name, start_ns, end_ns, status, status_message, user, package, process, path, tool, eval, producer, caller, internal, other",
+		"logs":    "time_ns, severity, body, trace_id, span_id, user, package, process, path, tool, eval, producer, caller, internal, other",
+		"metrics": "time_ns, name, value, unit, user, package, process, path, tool, eval, producer, caller, internal, other",
 	}[table]
 
 	where, args := conditions(timeColumn, f)
@@ -503,40 +523,45 @@ func (s *Store) Query(ctx context.Context, signal string, f Filter) (Page, error
 		switch signal {
 		case SignalTraces:
 			var sp Span
-			var eval sql.NullBool
+			var eval, internal sql.NullBool
 			var other string
 			if err := rows.Scan(&sp.TraceID, &sp.SpanID, &sp.ParentSpanID, &sp.Name, &sp.StartNS, &sp.EndNS,
 				&sp.Status, &sp.StatusMessage, &sp.User, &sp.Package, &sp.Process, &sp.Path, &sp.Tool,
-				&eval, &sp.Producer, &sp.Caller, &other); err != nil {
+				&eval, &sp.Producer, &sp.Caller, &internal, &other); err != nil {
 				return page, fmt.Errorf("store: scan span: %w", err)
 			}
 			sp.Eval = nullBool(eval)
+			sp.Internal = nullBool(internal)
 			if sp.Other, err = decodeOther(other); err != nil {
 				return page, err
 			}
 			page.Spans = append(page.Spans, sp)
 		case SignalLogs:
 			var l Log
-			var eval sql.NullBool
+			var eval, internal sql.NullBool
 			var other string
 			if err := rows.Scan(&l.TimeNS, &l.Severity, &l.Body, &l.TraceID, &l.SpanID,
-				&l.User, &l.Package, &l.Process, &l.Path, &l.Tool, &eval, &l.Producer, &l.Caller, &other); err != nil {
+				&l.User, &l.Package, &l.Process, &l.Path, &l.Tool, &eval, &l.Producer, &l.Caller,
+				&internal, &other); err != nil {
 				return page, fmt.Errorf("store: scan log: %w", err)
 			}
 			l.Eval = nullBool(eval)
+			l.Internal = nullBool(internal)
 			if l.Other, err = decodeOther(other); err != nil {
 				return page, err
 			}
 			page.Logs = append(page.Logs, l)
 		case SignalMetrics:
 			var m Metric
-			var eval sql.NullBool
+			var eval, internal sql.NullBool
 			var other string
 			if err := rows.Scan(&m.TimeNS, &m.Name, &m.Value, &m.Unit,
-				&m.User, &m.Package, &m.Process, &m.Path, &m.Tool, &eval, &m.Producer, &m.Caller, &other); err != nil {
+				&m.User, &m.Package, &m.Process, &m.Path, &m.Tool, &eval, &m.Producer, &m.Caller,
+				&internal, &other); err != nil {
 				return page, fmt.Errorf("store: scan metric: %w", err)
 			}
 			m.Eval = nullBool(eval)
+			m.Internal = nullBool(internal)
 			if m.Other, err = decodeOther(other); err != nil {
 				return page, err
 			}
@@ -587,6 +612,16 @@ func conditions(timeColumn string, f Filter) (string, []any) {
 	}
 	if f.Caller != "" {
 		add("caller = ?", f.Caller)
+	}
+	// A record that is not an internal cause carries no internal at all, so
+	// excluding them is a test for NULL as well as for false: "internal = 0"
+	// alone would return nothing and every member's query would be empty.
+	if f.Internal != nil {
+		if *f.Internal {
+			add("internal = ?", true)
+		} else {
+			clauses = append(clauses, "(internal IS NULL OR internal = 0)")
+		}
 	}
 	if len(clauses) == 0 {
 		return "1", nil

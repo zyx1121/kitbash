@@ -301,8 +301,8 @@ func TestRemoteErrorBecomesABadRequest(t *testing.T) {
 	if !strings.Contains(p.Detail, "no such file") {
 		t.Errorf("detail is %q, want the Package's own message", p.Detail)
 	}
-	if p.Fix != "The Package refused the call; read the detail." {
-		t.Errorf("fix is %q, want it to point at the Package's own message", p.Fix)
+	if p.Fix != "The Package ffmpeg refused the call; its message is the detail above." {
+		t.Errorf("fix is %q, want it to name the Package and point at its own message", p.Fix)
 	}
 }
 

@@ -187,6 +187,10 @@ type Server struct {
 	// starts serving and read by every health request.
 	boundMu sync.Mutex
 	bound   listeners
+
+	// backups is what health reports about the nightly copy of the store,
+	// written by the backup loop, see PLAN.md section 4.7.
+	backups backups
 }
 
 // New builds the server. The store is not owned by it: whoever opened the file
