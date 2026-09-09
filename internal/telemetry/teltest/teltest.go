@@ -157,6 +157,15 @@ type Daemon struct {
 
 	// The causes reported to POST /kitbash/v1/internal, in arrival order.
 	internalCauses []InternalCause
+
+	// The build registry: what has been built, what a fetch was asked for,
+	// the answers that replace the registry's own, and the counter that gives
+	// a seeded build a time, see builds.go.
+	builds       []Build
+	fetches      []Fetch
+	buildsAnswer Response
+	fetchAnswer  Response
+	buildSeq     int
 }
 
 // Start listens on a unix socket in a temporary directory of its own. The
@@ -210,6 +219,9 @@ func StartAt(socket string) (*Daemon, error) {
 	mux.HandleFunc("POST /kitbash/v1/processes/{id}/start", d.start)
 	mux.HandleFunc("POST /kitbash/v1/processes/{id}/stop", d.stop)
 	mux.HandleFunc("POST /kitbash/v1/processes/{id}/remove", d.remove)
+	mux.HandleFunc("POST /kitbash/v1/builds", d.recordBuild)
+	mux.HandleFunc("GET /kitbash/v1/builds", d.listBuilds)
+	mux.HandleFunc("POST /kitbash/v1/images/{digest}/fetch", d.fetchImage)
 	mux.HandleFunc("GET /kitbash/v1/users/me", d.me)
 	mux.HandleFunc("POST /kitbash/v1/users", d.createUser)
 	mux.HandleFunc("GET /kitbash/v1/users", d.listUsers)

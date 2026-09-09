@@ -184,6 +184,13 @@ func (c *CLI) ImageEntrypoint(ctx context.Context, ref string) ([]string, []stri
 	return got.Config.Entrypoint, got.Config.Cmd, nil
 }
 
+// Tag names an image the caller has. The digest stays the version; the tag is
+// for a human reading podman images, the same one a build writes.
+func (c *CLI) Tag(ctx context.Context, image, tag string) error {
+	_, err := c.run(ctx, "tag", image, tag)
+	return err
+}
+
 // Run starts one container. The environment goes into a file of its own,
 // which is removed before this returns.
 func (c *CLI) Run(ctx context.Context, opts RunOptions) (string, error) {

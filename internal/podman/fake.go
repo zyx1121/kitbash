@@ -25,18 +25,20 @@ type Fake struct {
 
 	// Log is the build log every Build returns.
 	Log string
-	// BuildErr, RunErr and StopErr make the runtime fail on demand.
+	// BuildErr, RunErr, StopErr and TagErr make the runtime fail on demand.
 	BuildErr error
 	RunErr   error
 	StopErr  error
+	TagErr   error
 	// Entrypoints answers ImageEntrypoint per image reference.
 	Entrypoints map[string][]string
 	// LogLines answers Logs per container name.
 	LogLines map[string][]string
 
-	// Builds and Runs record what the caller asked for, newest last.
+	// Builds, Runs and Tags record what the caller asked for, newest last.
 	Builds []BuildCall
 	Runs   []RunOptions
+	Tags   []TagCall
 	// Stopped and Removed record container names.
 	Stopped []string
 	Removed []string
@@ -56,6 +58,12 @@ type BuildCall struct {
 	Content       string
 	Tag           string
 	Labels        map[string]string
+}
+
+// TagCall is one recorded tag: which image was named and what it was named.
+type TagCall struct {
+	Image string
+	Tag   string
 }
 
 // NewFake returns a runtime with an empty image store.
@@ -149,6 +157,24 @@ func (f *Fake) ImageEntrypoint(_ context.Context, ref string) ([]string, []strin
 		return argv, nil, nil
 	}
 	return []string{"/usr/local/bin/server"}, nil, nil
+}
+
+// Tag records the tag against the image, so a test sees what a copied image
+// was named locally. An image the fake does not have is a failure, the way
+// podman refuses to tag one it cannot find.
+func (f *Fake) Tag(_ context.Context, image, tag string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Tags = append(f.Tags, TagCall{Image: image, Tag: tag})
+	if f.TagErr != nil {
+		return f.TagErr
+	}
+	for i := range f.images {
+		if f.images[i].ID == image {
+			return nil
+		}
+	}
+	return fmt.Errorf("podman: no image %s to tag", image)
 }
 
 // Run adds a running container, publishing every requested port.

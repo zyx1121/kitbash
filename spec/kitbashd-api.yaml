@@ -339,6 +339,133 @@ api:
       subscriptions, registeredAt } ] }. The caller's registered Processes,
       every key present even when its value is empty, and no token anywhere.
       An admin sees every member's.
+  builds_record:
+    method: POST
+    path: /kitbash/v1/builds
+    request: { path: "/org/ffmpeg", commit: "40 hex characters", digest: "sha256:...", size: 41943040 }
+    response: { path, commit, digest, builder, builtAt, size }
+    description: >
+      The build record of one Package. A member's images live in that member's
+      rootless store, which no other member can read, so this is what says an
+      image exists and who has it: pkg_build of an /org path records what it
+      built, and the next member's pkg_build of the same commit copies that
+      image instead of building it again, see images_fetch and PLAN.md section
+      2.2.
+    authorization: >
+      Any member; the builder is the peer and is never in the body. The path
+      must be under /org or under the caller's own home, and a path under
+      another member's home is 403 not-permitted. A home path is recorded and
+      never fetched: the client records what it builds, and the rule about who
+      may fetch is images_fetch's.
+    validation: >
+      path is absolute, at most 4096 bytes and carries no .. segment; commit is
+      40 lower case hexadecimal characters; digest is sha256: followed by 64;
+      size is a non negative number of bytes and may be left out, in which case
+      the size the runtime reports is recorded.
+    provenance: >
+      The record is checked against the caller's own image store before it is
+      written, with podman image inspect as the caller: they must hold the
+      digest, and the image's own kitbash.path and kitbash.commit labels must
+      be the path and the commit being recorded. A digest the caller does not
+      hold is 400 bad-request, "you do not hold the image", and labels that do
+      not match are 400 "the image you recorded is not a build of this commit";
+      a runtime that could not answer at all is internal, because that is the
+      host's failure and not the caller's. A digest is a
+      number the caller chose and the labels are what the build stamped inside
+      the image, so this is the whole of what kitbashd knows about provenance.
+      Without it a member could record any digest against any /org path and
+      commit, and every other member's pkg_build of that commit would answer
+      the image they named instead of building.
+    limits: >
+      One row per path, commit and digest. The builder of an existing row is
+      never replaced: recording a triple that is there refreshes the time and
+      the size for the member who recorded it and does nothing at all for
+      anybody else, because the row names the member kitbashd asks for a copy.
+      The response is the row as it stands rather than the record that was
+      sent, so a caller is never told they are the builder while the table says
+      another member is. At most 64 rows per path per member, and 4096 per
+      path, the oldest pruned beyond each. The per member cap is the one that
+      matters: a member's records can prune only their own, so nobody can push
+      another member's build out of the table.
+    row_ownership: >
+      A row belongs to its first builder until it is pruned. If that member
+      removes the image, images_fetch of it is 404 not-found and every other
+      member builds the commit locally rather than being sent to a store that
+      no longer has it; the second member to record the same triple does not
+      become the one kitbashd asks. This is the safe end of the trade: the cost
+      is a build somebody could have copied, and the alternative is a row whose
+      builder any member can take over.
+    errors: [bad-request, not-permitted, internal]
+  builds_list:
+    method: GET
+    path: /kitbash/v1/builds?path=&commit=&digest=
+    response: { builds: [{ path, commit, digest, builder, builtAt, size }] }
+    description: >
+      The builds of one Package, newest first, at most 100. path is required;
+      commit and digest narrow it, which is what pkg_build (by commit) and
+      proc_run (by digest) ask with.
+    authorization: >
+      A path under /org is read by every member, because every member may run
+      what it names. A path under a home is read by that member and by an
+      admin; another member's home is 403 not-permitted.
+    errors: [bad-request, not-permitted, internal]
+  images_fetch:
+    method: POST
+    path: /kitbash/v1/images/{digest}/fetch
+    request: { path: "/org/ffmpeg", from: "the member the build record names, optional" }
+    response: { digest: "sha256:...", bytes: 41943040, from: "kim" }
+    description: >
+      Copies one image into the caller's own store from the member who built
+      it. kitbashd runs podman save --format oci-archive <digest> as the
+      builder piped into podman load as the requester: two setuid children
+      joined by a pipe the kernel holds, each placed in its own member's run
+      leaf, with 300 s for the pair. Nothing of the archive passes through the
+      daemon and nothing touches the disk.
+    authorization: >
+      The requester is the peer. A copy is served when kitbashd has a build
+      record for that path and digest, the builder named by that record is
+      still a member of this host, and the path is under /org. A path under the
+      requester's own home is answered without copying anything, because the
+      builder is then the requester; a path under another member's home is 403
+      not-permitted, since kitbashd is root and must not read a private image
+      store on behalf of somebody the kernel keeps out of it.
+    behaviour: >
+      The builder's store is checked first with podman image inspect as the
+      builder: they must still have the image, and its own kitbash.path and
+      kitbash.commit labels must be the ones the build record names, or it is
+      404 not-found naming pkg_build. An image whose labels say it is a build
+      of something else is a record that was never true of it, and copying it
+      would hand the requester somebody else's image under a name they trust.
+      The requester's store is checked after the copy the same way: a save and
+      a load that both exited zero and moved nothing is a failure only this
+      call can see. bytes is the size of the image in the requester's store,
+      absent when the runtime did not say.
+    concurrency: >
+      One copy per requester and digest, and 2 per member at a time. Beyond
+      either it is 409 conflict carrying Retry-After: 60, because the caller is
+      not wrong and there is a copy of theirs running. Every copy is two setuid
+      podman children moving an image through a pipe, so the per member cap is
+      what bounds what one member can ask the host to carry.
+
+      An archive of one image saved by digest carries no name, so podman load
+      invents one of the form localhost/sha256:<hex>. It is untagged as the
+      requester once the load has finished, so the copied image carries the tag
+      pkg_build gives it and nothing else, and podman images shows one row for
+      it rather than two. Only that name is dropped; every other name on the
+      image is one the member put there. A name that could not be dropped is
+      logged and nothing more: the image is in the store, which is what the
+      copy was for.
+    timeouts: >
+      The two children share a 300 s budget and the response deadline is
+      extended to 360 s, so the answer arrives rather than the deadline. A
+      caller that hangs up does not cancel the children: a load that has begun
+      is writing into a member's store.
+    errors: >
+      [bad-request, not-permitted, not-found, conflict, internal]. A digest
+      that is not sha256: and 64 hexadecimal characters is bad-request; no
+      build record, or a builder who no longer has the image or is no longer a
+      member, is not-found naming pkg_build; anything the runtime said is
+      internal, with its own output kept in the daemon log.
   users_create:
     method: POST
     path: /kitbash/v1/users
@@ -366,7 +493,7 @@ api:
     method: DELETE
     path: /kitbash/v1/users/{name}
     response: { user, archived: "/org/.archive/<name>" }
-    authorization: admin only; an admin cannot remove themselves or the last admin. Stops and removes the member's kitbash containers as the member, deletes their registrations and approvals, kills their processes, moves the home to /org/.archive/<name> owned by root 0700, deletes the account and its subordinate ranges.
+    authorization: admin only; an admin cannot remove themselves or the last admin. Stops and removes the member's kitbash containers as the member, deletes their registrations, approvals and build records, kills their processes, moves the home to /org/.archive/<name> owned by root 0700, deletes the account and its subordinate ranges.
     errors: [not-permitted, not-found, conflict, internal]
   approvals_create:
     method: POST

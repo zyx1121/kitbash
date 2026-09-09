@@ -32,13 +32,21 @@ type Fake struct {
 	AddKeyErr error
 	RemoveErr error
 	ListErr   error
-	// StartErr, RunErr, StopErr, RemoveContainerErr and RemoveAllErr make the
-	// runtime fail on demand.
+	// StartErr, RunErr, StopErr, RemoveContainerErr, RemoveAllErr and
+	// CopyErr make the runtime fail on demand.
 	StartErr           error
 	RunErr             error
 	StopErr            error
 	RemoveContainerErr error
 	RemoveAllErr       error
+	CopyErr            error
+	// ImageInfoErr makes reading an image fail for a reason that is not a
+	// missing image, which is the host's failure and not the caller's.
+	ImageInfoErr error
+	// LoseCopies makes a copy succeed without the image arriving, which is
+	// the one failure a caller cannot see from the exit status of the two
+	// children: a save and a load that both said nothing and moved nothing.
+	LoseCopies bool
 	// RunID is the container id Run answers. Empty means a fixed one.
 	RunID string
 
@@ -50,8 +58,8 @@ type Fake struct {
 	Running map[string]bool
 
 	// Created, AddedKeys and Removed record what the caller asked for, and
-	// Started, Ran, Stopped, RemovedContainers and RemovedFor what the
-	// runtime was asked to do.
+	// Started, Ran, Stopped, RemovedContainers, RemovedFor and Copied what
+	// the runtime was asked to do.
 	Created           []Spec
 	AddedKeys         []KeyCall
 	Removed           []string
@@ -60,9 +68,26 @@ type Fake struct {
 	Stopped           []StopCall
 	RemovedContainers []StopCall
 	RemovedFor        []string
+	Copied            []CopyCall
 
 	members map[string]*fakeMember
 	nextUID int
+	// images is the image store of the fake host, one per member: which
+	// digests they hold, how big each one is and what its labels say it is a
+	// build of. A copy reads one member's and writes the other's, the way a
+	// save into a load does, and the labels travel with the image because
+	// they are inside it.
+	images map[string]map[string]ImageInfo
+}
+
+// CopyCall is one recorded image copy, with the two members it ran as and the
+// cgroup leaf each child was placed in.
+type CopyCall struct {
+	From       string
+	To         string
+	Digest     string
+	FromCgroup string
+	ToCgroup   string
 }
 
 // KeyCall is one recorded AddKey.
@@ -375,6 +400,89 @@ func (f *Fake) RemoveContainer(_ context.Context, m Member, container string, fo
 		Member: m.Name, Container: container, Force: force,
 	})
 	return nil
+}
+
+// AddImage puts one image in a member's store, which is what a build of
+// theirs would have left there. The labels are given rather than derived: they
+// are the provenance every caller checks, so a test that wants an image whose
+// labels lie says so.
+func (f *Fake) AddImage(member, digest string, size int64, labels map[string]string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.addImage(member, digest, ImageInfo{Size: size, Labels: labels})
+}
+
+// addImage is AddImage without the lock.
+func (f *Fake) addImage(member, digest string, info ImageInfo) {
+	if f.images == nil {
+		f.images = map[string]map[string]ImageInfo{}
+	}
+	if f.images[member] == nil {
+		f.images[member] = map[string]ImageInfo{}
+	}
+	if info.Labels == nil {
+		info.Labels = map[string]string{}
+	}
+	f.images[member][digest] = info
+}
+
+// HasImage reports whether a member's store holds one image, which is how a
+// test sees that a copy arrived.
+func (f *Fake) HasImage(member, digest string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, held := f.images[member][digest]
+	return held
+}
+
+// CopyImage records the copy and moves the image into the second member's
+// store. An image the first member does not have is ErrNoImage, the same
+// answer a save of an image that is not there gives.
+func (f *Fake) CopyImage(_ context.Context, from, to Member, digest, fromCgroup, toCgroup string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Copied = append(f.Copied, CopyCall{
+		From: from.Name, To: to.Name, Digest: digest,
+		FromCgroup: fromCgroup, ToCgroup: toCgroup,
+	})
+	if f.CopyErr != nil {
+		return f.CopyErr
+	}
+	info, held := f.images[from.Name][digest]
+	if !held {
+		return fmt.Errorf("%w: %s", ErrNoImage, digest)
+	}
+	if f.LoseCopies {
+		return nil
+	}
+	// The labels are inside the image, so they arrive with it: a copy cannot
+	// change what an image says it is a build of.
+	f.addImage(to.Name, digest, info)
+	return nil
+}
+
+// ImageInfo answers what a member's store holds, and ErrNoImage for a digest
+// it does not.
+func (f *Fake) ImageInfo(_ context.Context, m Member, digest string) (ImageInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.ImageInfoErr != nil {
+		return ImageInfo{}, f.ImageInfoErr
+	}
+	info, held := f.images[m.Name][digest]
+	if !held {
+		return ImageInfo{}, fmt.Errorf("%w: %s", ErrNoImage, digest)
+	}
+	return info, nil
+}
+
+// Copies answers the recorded image copies, newest last.
+func (f *Fake) Copies() []CopyCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]CopyCall, len(f.Copied))
+	copy(out, f.Copied)
+	return out
 }
 
 // RemoveAll records that one member's containers were removed.

@@ -336,6 +336,16 @@ CREATE TABLE IF NOT EXISTS processes (
   registered_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS builds (
+  id         INTEGER PRIMARY KEY,
+  path       TEXT    NOT NULL,
+  commit_sha TEXT    NOT NULL,
+  digest     TEXT    NOT NULL,
+  builder    TEXT    NOT NULL,
+  built_at   INTEGER NOT NULL,
+  size       INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS approvals (
   id           TEXT    PRIMARY KEY,
   requester    TEXT    NOT NULL,
@@ -377,6 +387,11 @@ CREATE INDEX IF NOT EXISTS metrics_internal ON metrics(internal, time_ns);
 
 CREATE INDEX IF NOT EXISTS processes_owner ON processes(owner);
 CREATE UNIQUE INDEX IF NOT EXISTS processes_token ON processes(token_hash);
+
+CREATE UNIQUE INDEX IF NOT EXISTS builds_unique ON builds(path, commit_sha, digest);
+CREATE INDEX IF NOT EXISTS builds_path        ON builds(path, commit_sha);
+CREATE INDEX IF NOT EXISTS builds_builder     ON builds(builder);
+CREATE INDEX IF NOT EXISTS builds_by_builder  ON builds(path, builder);
 
 CREATE INDEX IF NOT EXISTS approvals_requester ON approvals(requester, state);
 CREATE INDEX IF NOT EXISTS approvals_state     ON approvals(state);

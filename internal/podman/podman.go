@@ -133,6 +133,10 @@ type Runner interface {
 	// ImageEntrypoint reads the entrypoint and command of an image, which is
 	// what the bridge execs to open one more MCP session.
 	ImageEntrypoint(ctx context.Context, ref string) ([]string, []string, error)
+	// Tag names an image the caller already has. A build tags what it builds;
+	// this is for an image that arrived some other way, which is one kitbashd
+	// copied out of another member's store, see PLAN.md section 2.2.
+	Tag(ctx context.Context, image, tag string) error
 	// Run starts one container and returns its ID.
 	Run(ctx context.Context, opts RunOptions) (string, error)
 	// Containers lists containers whose labels match the filter. With all set,

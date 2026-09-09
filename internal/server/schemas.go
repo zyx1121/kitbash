@@ -132,7 +132,8 @@ const buildEntryDef = `{
   "properties": {
     "digest": { "type": "string" },
     "commit": { "type": "string" },
-    "builtAt": { "type": "string", "format": "date-time" }
+    "builtAt": { "type": "string", "format": "date-time" },
+    "builder": { "type": "string", "description": "The member who built it, for a Package under /org" }
   }
 }`
 

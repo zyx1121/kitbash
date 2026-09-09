@@ -158,6 +158,17 @@ type Runner interface {
 	// best effort: a runtime that will not answer must not stop an admin from
 	// deleting the account.
 	RemoveAll(ctx context.Context, m Member) error
+	// CopyImage copies one image out of the store of from into the store of
+	// to, as a save by the first piped into a load by the second. Each child
+	// runs in its own member's cgroup leaf. It is how an /org Package built
+	// by one member becomes runnable by the next, see PLAN.md section 2.2.
+	CopyImage(ctx context.Context, from, to Member, digest, fromCgroup, toCgroup string) error
+	// ImageInfo answers the size and the labels of one image in a member's
+	// store, and ErrNoImage when they do not have it. The labels are the
+	// provenance of the image, which is what says it is a build of one
+	// Package at one commit: a copy asks it of both members, and a build
+	// record is only accepted from a member whose image says so.
+	ImageInfo(ctx context.Context, m Member, digest string) (ImageInfo, error)
 }
 
 // Sessions starts one kitbash-mcp as a member, which is how a Process reaches

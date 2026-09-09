@@ -104,6 +104,14 @@ type Registry interface {
 	// RemoveProcess removes it, which is what a replacement does to the
 	// Process it takes the place of.
 	RemoveProcess(ctx context.Context, id string) *problem.Problem
+	// Builds is what kitbashd knows about the builds of one Package path,
+	// newest first. A digest this member does not have may be one another
+	// member built, and the record is what says so.
+	Builds(ctx context.Context, path, commit, digest string) ([]telemetry.Build, *problem.Problem)
+	// FetchImage asks kitbashd to copy one image into this member's store
+	// from the member who built it, which is what makes a digest another
+	// member built runnable here, see PLAN.md section 2.2.
+	FetchImage(ctx context.Context, digest, path, from string) (*telemetry.FetchResult, *problem.Problem)
 }
 
 // Service answers the proc family for one caller.
@@ -603,16 +611,20 @@ func (s *Service) labels(folder, name, digest, expose string) map[string]string 
 
 // image resolves the digest to run: the one the caller asked for, or the
 // newest build of this Package.
+//
+// A digest the caller named and this member's store does not have may be one
+// another member built, which kitbashd copies over rather than leaving the
+// member to build the same commit again, see PLAN.md section 2.2.
 func (s *Service) image(ctx context.Context, folder, digest string) (*podman.Image, *problem.Problem) {
 	images, err := s.runner.Images(ctx, podman.Filter{podman.LabelPath: folder})
 	if err != nil {
 		return nil, problem.Internal(folder, err.Error(), "")
 	}
-	if len(images) == 0 {
-		return nil, problem.NotFoundFix(folder, "this Package has not been built yet",
-			"Call pkg_build first, then run the digest it returns.")
-	}
 	if digest == "" {
+		if len(images) == 0 {
+			return nil, problem.NotFoundFix(folder, "this Package has not been built yet",
+				"Call pkg_build first, then run the digest it returns.")
+		}
 		return &images[0], nil
 	}
 	for i := range images {
@@ -620,9 +632,53 @@ func (s *Service) image(ctx context.Context, folder, digest string) (*podman.Ima
 			return &images[i], nil
 		}
 	}
+	if image := s.fetch(ctx, folder, digest); image != nil {
+		return image, nil
+	}
+	if len(images) == 0 {
+		return nil, problem.NotFoundFix(folder, "this Package has not been built yet",
+			"Call pkg_build first, then run the digest it returns.")
+	}
 	return nil, problem.NotFoundFix(folder,
 		fmt.Sprintf("no build of this Package has the digest %s", digest),
 		"Call pkg_inspect to see the digests this Package has been built to.")
+}
+
+// fetch asks kitbashd for an image another member built. It answers nil for
+// everything that is not a copy this member may have, which the caller reports
+// as the not-found it would have reported anyway: a digest nobody recorded, a
+// builder who no longer has it, and a daemon that is not answering are all
+// "this member cannot run that digest".
+func (s *Service) fetch(ctx context.Context, folder, digest string) *podman.Image {
+	if s.registry == nil {
+		return nil
+	}
+	builds, prob := s.registry.Builds(ctx, folder, "", digest)
+	if prob != nil || len(builds) == 0 {
+		return nil
+	}
+	build := builds[0]
+	if build.Builder == "" || build.Builder == s.files.User() {
+		// The record names this member, so the image was theirs and is gone.
+		// Copying it from themselves would answer the same nothing.
+		return nil
+	}
+	if _, prob := s.registry.FetchImage(ctx, digest, folder, build.Builder); prob != nil {
+		s.logger.Printf("proc: %s could not be copied from %s: %s", digest, build.Builder, prob.Detail)
+		return nil
+	}
+	// The copy is not believed until this member's own store answers for it,
+	// which is also where the labels of the image come from.
+	images, err := s.runner.Images(ctx, podman.Filter{podman.LabelPath: folder})
+	if err != nil {
+		return nil
+	}
+	for i := range images {
+		if images[i].ID == digest {
+			return &images[i]
+		}
+	}
+	return nil
 }
 
 // describe turns a container into the Process the surface publishes. The unit

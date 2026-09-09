@@ -188,6 +188,9 @@ type Server struct {
 	// run.go. Two of them at once on one id race on its environment file and
 	// on its cgroup.
 	actions *actionLock
+	// fetches holds one image copy per member and digest, see images.go. The
+	// second caller is refused rather than queued: a copy takes minutes.
+	fetches *fetchLock
 
 	// The MCP endpoint of the Process receiver: the handler of the SDK, the
 	// live sessions, the binary each one runs and how long one may sit idle,
@@ -242,6 +245,7 @@ func New(st *store.Store, opts Options) *Server {
 		envDir:   opts.EnvDir,
 		endpoint: opts.ProcessEndpoint,
 		actions:  newActionLock(),
+		fetches:  newFetchLock(),
 
 		mcpSessions: newMCPRegistry(),
 		mcpBinary:   mcpBinaryPath(opts.MCPBinary),
@@ -309,6 +313,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc(retentionPath, s.retention)
 	s.mux.HandleFunc(processesPath, s.processes)
 	s.mux.HandleFunc(processesPath+"/", s.process)
+	s.mux.HandleFunc(buildsPath, s.builds)
+	s.mux.HandleFunc(imagesPath+"/", s.image)
 	s.mux.HandleFunc(usersPath, s.usersFamily)
 	s.mux.HandleFunc(usersPath+"/", s.user)
 	s.mux.HandleFunc(approvalsPath, s.approvalsFamily)
@@ -329,6 +335,11 @@ const (
 	queryPath     = "/kitbash/v1/query"
 	retentionPath = "/kitbash/v1/retention"
 	processesPath = "/kitbash/v1/processes"
+	// buildsPath is the build record of every Package, and imagesPath the
+	// copy of one image between two members' stores, see builds.go and
+	// images.go.
+	buildsPath    = "/kitbash/v1/builds"
+	imagesPath    = "/kitbash/v1/images"
 	usersPath     = "/kitbash/v1/users"
 	approvalsPath = "/kitbash/v1/approvals"
 	// sessionsJoinPath is where a session asks to be placed in its member's

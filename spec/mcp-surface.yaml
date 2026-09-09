@@ -334,6 +334,22 @@ families:
           with image is pulled by digest and relabelled through a one line
           Containerfile so the result carries the same labels and its own
           image ID.
+
+          For a Package under /org the builds kitbashd recorded for this commit
+          are read first, so one commit is one digest for every member: an
+          image of that commit already in the caller's store is returned as it
+          is with the log line "already built at <digest>", one another member
+          has is copied into the caller's store with the log line "copied from
+          <builder>", and only a commit nobody has built is built. When several
+          digests are recorded for one commit the earliest record wins, so
+          every member picks the same one. An image is accepted, held or
+          copied, only when its own kitbash.path and kitbash.commit labels are
+          this Package at this commit: a record is a claim another member
+          wrote, and the labels are what the build stamped inside the image.
+          Anything else, an image whose labels do not match included, falls
+          back to building. A build that did run is recorded, and a record
+          kitbashd refuses costs nothing but the record. Packages in a home are
+          neither recorded nor copied. See PLAN.md section 2.2.
         input: { type: object, additionalProperties: false, required: [path], properties: { path: { type: string } } }
         output:
           type: object
@@ -382,7 +398,12 @@ families:
                   builtAt: { type: string, format: date-time }
                   running: { type: integer, description: "Number of Processes of this Package" }
       pkg_inspect:
-        description: Manifest, build history and provenance of one Package. Builds are newest first.
+        description: >
+          Manifest, build history and provenance of one Package. Builds are
+          newest first. For a Package under /org the local image store is
+          merged with the builds kitbashd recorded, so a build carries the
+          member who made it and a build another member has is listed even
+          though this member's store does not hold it, see PLAN.md section 2.2.
         input: { type: object, additionalProperties: false, required: [path], properties: { path: { type: string } } }
         output:
           type: object
@@ -392,7 +413,7 @@ families:
             manifest: { type: object }
             builds:
               type: array
-              items: { type: object, required: [digest, commit, builtAt], properties: { digest: { type: string }, commit: { type: string }, builtAt: { type: string, format: date-time } } }
+              items: { type: object, required: [digest, commit, builtAt], properties: { digest: { type: string }, commit: { type: string }, builtAt: { type: string, format: date-time }, builder: { type: string, description: "The member who built it, for a Package under /org" } } }
         errors: [not-found, not-visible, not-permitted, invalid-path, invalid-manifest, internal]
 
   # ---------------------------------------------------------------- proc (M2)

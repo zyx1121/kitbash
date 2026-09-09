@@ -92,9 +92,14 @@ func run() error {
 	processes := proc.New(files, runner, telem.Client())
 	tools := bridge.New(files, processes, runner)
 	defer tools.Close()
+	// The same client again is the build registry: a build of an /org Package
+	// is recorded with kitbashd, and one another member already made is copied
+	// instead of made again, see PLAN.md section 2.2.
+	packages := pkg.New(files, runner, tools)
+	packages.SetBuilds(telem.Client())
 	srv := server.New(version, server.Deps{
 		Files:     files,
-		Packages:  pkg.New(files, runner, tools),
+		Packages:  packages,
 		Processes: processes,
 		Bridge:    tools,
 		Telemetry: telem,
