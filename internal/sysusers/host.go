@@ -69,9 +69,12 @@ type Host struct {
 	// Passwd and Group are read to answer List.
 	Passwd string
 	Group  string
-	// SubUID and SubGID hold the subordinate id blocks rootless podman needs.
-	SubUID string
-	SubGID string
+	// SubUID and SubGID hold the subordinate id blocks rootless podman needs,
+	// and SubIDLock is the file the allocation locks. That file is kitbash's
+	// own and is never shadow's /etc/subuid.lock, see issue #83.
+	SubUID    string
+	SubGID    string
+	SubIDLock string
 	// RunUser is where a member's XDG runtime directory goes.
 	RunUser string
 	// Archive is where a removed member's home is moved to.
@@ -82,22 +85,23 @@ type Host struct {
 	// Runner removes a member's containers as that member.
 	Runner Runner
 
-	// subIDs serialises this daemon's own allocations; the lock file beside
-	// SubUID serialises them against kitbash-adduser on the console.
+	// subIDs serialises this daemon's own allocations; SubIDLock serialises
+	// them against kitbash-adduser on the console.
 	subIDs sync.Mutex
 }
 
 // NewHost returns the System kitbashd uses on a kitbash host.
 func NewHost(runner Runner) *Host {
 	return &Host{
-		Passwd:  DefaultPasswdFile,
-		Group:   DefaultGroupFile,
-		SubUID:  DefaultSubUIDFile,
-		SubGID:  DefaultSubGIDFile,
-		RunUser: DefaultRunUser,
-		Archive: DefaultArchive,
-		Proc:    DefaultProc,
-		Runner:  runner,
+		Passwd:    DefaultPasswdFile,
+		Group:     DefaultGroupFile,
+		SubUID:    DefaultSubUIDFile,
+		SubGID:    DefaultSubGIDFile,
+		SubIDLock: DefaultSubIDLock,
+		RunUser:   DefaultRunUser,
+		Archive:   DefaultArchive,
+		Proc:      DefaultProc,
+		Runner:    runner,
 	}
 }
 
@@ -395,7 +399,7 @@ func (h *Host) ensureSubIDs(name string) error {
 	h.subIDs.Lock()
 	defer h.subIDs.Unlock()
 
-	unlock, err := lockSubIDs(h.SubUID)
+	unlock, err := lockSubIDs(h.SubIDLock)
 	if err != nil {
 		return err
 	}

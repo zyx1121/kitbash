@@ -37,13 +37,14 @@ func hostFor(t *testing.T) (*Host, Member) {
 		t.Fatalf("mkdir: %v", err)
 	}
 	h := &Host{
-		Passwd:  filepath.Join(dir, "passwd"),
-		Group:   filepath.Join(dir, "group"),
-		SubUID:  filepath.Join(dir, "subuid"),
-		SubGID:  filepath.Join(dir, "subgid"),
-		RunUser: filepath.Join(dir, "run"),
-		Archive: filepath.Join(dir, "archive"),
-		Proc:    filepath.Join(dir, "proc"),
+		Passwd:    filepath.Join(dir, "passwd"),
+		Group:     filepath.Join(dir, "group"),
+		SubUID:    filepath.Join(dir, "subuid"),
+		SubGID:    filepath.Join(dir, "subgid"),
+		SubIDLock: filepath.Join(dir, "lock", "subids.lock"),
+		RunUser:   filepath.Join(dir, "run"),
+		Archive:   filepath.Join(dir, "archive"),
+		Proc:      filepath.Join(dir, "proc"),
 	}
 	m := Member{
 		Name:   "alice",

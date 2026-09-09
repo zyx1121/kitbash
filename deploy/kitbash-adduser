@@ -60,14 +60,37 @@ home=$(getent passwd "$name" | cut -d: -f6)
 #
 #    Reading the highest block and appending the next are two steps, and
 #    kitbashd allocates from the same two files, so both take the same lock:
-#    /etc/subuid.lock, flock where there is one and a directory where there is
-#    not. The lock is on a file of its own because an allocation renames a new
-#    file over /etc/subuid, and a lock on the old inode would guard nothing.
-lockfile=/etc/subuid.lock
-lockdir=/etc/subuid.lock.d
+#    /run/kitbash/subids.lock, flock where there is one and a directory where
+#    there is not. The lock is on a file of its own because an allocation
+#    renames a new file over /etc/subuid, and a lock on the old inode would
+#    guard nothing.
+#
+#    The name is kitbash's own and is never /etc/subuid.lock: that name belongs
+#    to shadow-utils, which writes a PID into it and refuses to run when it
+#    finds one without, so a lock file kitbash left there stops useradd on the
+#    whole host, see issue #83. An empty one an older kitbash left behind is
+#    cleared here once, and one with anything in it belongs to a shadow tool
+#    that is running now and is left alone. /run is a tmpfs, so the directory
+#    is created if nothing has made it yet this boot.
+#
+#    Both names can be pointed somewhere else, which is what lets this lock
+#    step be run against a temporary directory in a test, the same rule the
+#    overrides in install.sh follow.
+legacy=${KITBASH_LEGACY_SUBID_LOCK:-/etc/subuid.lock}
+if [ ! -L "$legacy" ] && [ -f "$legacy" ] && [ ! -s "$legacy" ]; then
+  echo "removing the stale $legacy an older kitbash left behind; that name belongs to shadow-utils" >&2
+  rm -f "$legacy"
+fi
+
+lockroot=${KITBASH_SUBID_LOCK_DIR:-/run/kitbash}
+lockfile=$lockroot/subids.lock
+lockdir=$lockfile.d
+mkdir -p "$lockroot"
+chmod 755 "$lockroot"
 unlock() { :; }
 if command -v flock >/dev/null 2>&1; then
-  exec 9>"$lockfile"
+  exec 9>>"$lockfile"
+  chmod 600 "$lockfile"
   flock 9
   unlock() { flock -u 9 2>/dev/null || true; }
 else
