@@ -28,7 +28,9 @@ jobs:
       # The upgrade half: one store, opened by the previous release and then by
       # this one. The surface half gets a store of its own.
       KITBASH_E2E_STORE: /var/tmp/kitbash-e2e/upgrade.db
-      KITBASH_E2E_CLIENT: /var/tmp/kitbash-e2e/client
+      # Beside the stores rather than under them: the store directory is
+      # kitbashd's alone, and the daemon narrows it to itself at every start.
+      KITBASH_E2E_CLIENT: /var/tmp/kitbash-e2e-client
       MAIN_STORE: /var/tmp/kitbash-e2e/surface.db
       PREVIOUS: v0.6.2
       PREVIOUS_TREE: /var/tmp/kitbash-previous
