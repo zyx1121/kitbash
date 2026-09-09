@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/zyx1121/kitbash/internal/cgroups"
+	"github.com/zyx1121/kitbash/internal/manifest"
 	"github.com/zyx1121/kitbash/internal/podman"
 	"github.com/zyx1121/kitbash/internal/problem"
 	"github.com/zyx1121/kitbash/internal/store"
@@ -61,6 +63,9 @@ func (h *harness) supervise(owner, container string) string {
 		Digest:       testDigest,
 		Expose:       ExposeNone,
 		FanoutSecret: "the-secret",
+		// A kit that reaches back over /mcp carries its permits block in the
+		// registration, and a start must not drop it, see #76.
+		Permits:      manifest.Permits{Tools: []string{"fs_read"}, Paths: []string{"/org"}},
 		RegisteredAt: time.Now().UTC(),
 	}, hash, 0); err != nil {
 		h.t.Fatalf("RegisterProcess: %v", err)
@@ -206,6 +211,40 @@ func TestStartWritesTheEnvironmentFileForTheMemberAndRemovesIt(t *testing.T) {
 	}
 	if _, err := os.Stat(run.EnvFile); !os.IsNotExist(err) {
 		t.Errorf("the environment file is still there after the run: %v", err)
+	}
+}
+
+// A start mints a new token, which writes the registration again. Everything
+// else about it has to survive that: a Process that lost its permits block on
+// the way to being started would reach back over /mcp with nothing allowed.
+func TestStartKeepsTheRestOfTheRegistration(t *testing.T) {
+	h, _ := supervised(t)
+	id := h.supervise(h.user, "kitbash-echo-echo")
+	ctx := context.Background()
+	before, _, err := h.store.Process(ctx, id)
+	if err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+
+	res, body := h.start(id, startRequest{Image: testDigest})
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("start = %d %s, want 200", res.StatusCode, body)
+	}
+	after, found, err := h.store.Process(ctx, id)
+	if err != nil || !found {
+		t.Fatalf("Process after the start: found %t, err %v", found, err)
+	}
+	if !reflect.DeepEqual(after.Permits, before.Permits) {
+		t.Errorf("the permits are %+v, want the registration's %+v", after.Permits, before.Permits)
+	}
+	if after.Package != before.Package || after.Container != before.Container ||
+		after.Digest != before.Digest || after.Expose != before.Expose ||
+		after.Endpoint != before.Endpoint || after.Admin != before.Admin ||
+		!after.RegisteredAt.Equal(before.RegisteredAt) {
+		t.Errorf("the registration is %+v, want %+v with only the token replaced", after, before)
+	}
+	if after.FanoutSecret != before.FanoutSecret {
+		t.Errorf("the fan out secret changed on a start; the container holds the one it was given")
 	}
 }
 
