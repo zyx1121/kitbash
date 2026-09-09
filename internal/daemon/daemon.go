@@ -184,6 +184,10 @@ type Server struct {
 	cgroups  cgroups.Cgroups
 	envDir   string
 	endpoint string
+	// actions serialises the start, stop and remove of one Process, see
+	// run.go. Two of them at once on one id race on its environment file and
+	// on its cgroup.
+	actions *actionLock
 
 	// The MCP endpoint of the Process receiver: the handler of the SDK, the
 	// live sessions, the binary each one runs and how long one may sit idle,
@@ -237,6 +241,7 @@ func New(st *store.Store, opts Options) *Server {
 		cgroups:  opts.Cgroups,
 		envDir:   opts.EnvDir,
 		endpoint: opts.ProcessEndpoint,
+		actions:  newActionLock(),
 
 		mcpSessions: newMCPRegistry(),
 		mcpBinary:   mcpBinaryPath(opts.MCPBinary),

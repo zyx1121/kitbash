@@ -272,18 +272,19 @@ api:
       The owner of the registration and nobody else, admins included: this runs
       a program as that member.
     behaviour: >
-      kitbashd ensures /sys/fs/cgroup/kitbash/<owner> and its run leaf, writes
-      /run/kitbash/env/<id> (0600, owned by the member) with the manifest's
-      environment plus the seven kitbashd speaks for, and runs podman run as
-      the owner from inside the leaf (SysProcAttr.UseCgroupFD) with
-      --cgroups=enabled, --cgroup-parent=/kitbash/<owner> and the --memory,
-      --cpus and --pids-limit of the unit. The environment file is removed
+      kitbashd creates /sys/fs/cgroup/kitbash/<owner>/<id>, writes the unit's
+      limits into it as root, writes /run/kitbash/env/<id> (0600, owned by the
+      member) with the manifest's environment plus the seven kitbashd speaks
+      for, and runs podman run as the owner from inside that cgroup's run leaf
+      (SysProcAttr.UseCgroupFD) with --cgroups=enabled,
+      --cgroup-parent=/kitbash/<owner>/<id> and the --memory, --cpus and
+      --pids-limit of the unit. The environment file is removed
       before the response is written. The Telemetry token is minted here rather
       than read back: the store keeps only its hash, so a start revokes the
       token the registration answered and puts the new one in the container.
       A host whose cgroup filesystem is not version 2 or not writable runs the
-      Process without placing it, records the limits, and says so once in the
-      daemon log.
+      Process without placing it, records the limits, and says so on that
+      start. One action at a time is served per Process id.
     timeouts: >
       The runtime gets 120 s for a run and 40 s for a stop or a forced removal,
       which is the ten second grace the container is given plus room to kill it
@@ -298,7 +299,9 @@ api:
       environment variables of at most 4096 bytes each and no line breaks in
       them, 32 labels. The identity labels (kitbash.id, kitbash.user,
       kitbash.package, kitbash.name, kitbash.expose, kitbash.digest) are
-      written from the registration, whatever the request carries.
+      written from the registration, whatever the request carries, the endpoint
+      among them. An image that is not the registration's digest is refused
+      rather than run.
     errors: >
       [bad-request, not-permitted, not-found, internal]. A unit the runtime
       will not parse (exit 125) is bad-request naming deploy.units[0]; an image
@@ -320,7 +323,9 @@ api:
     response: { id: "UUIDv7", container: "kitbash-echo-echo" }
     behaviour: >
       podman rm --force as the owner, which is what a run that replaces a
-      Process does to the one it takes the place of.
+      Process does to the one it takes the place of. The Process's cgroup goes
+      with the container; one that is still busy is left for the next removal
+      or the next boot.
     authorization: the owner, as processes_start.
     errors: [not-permitted, not-found, internal]
   processes_list:
@@ -445,12 +450,14 @@ restore:
     and the local runlevel scripts.
   registration_fields: the registration carries the container name and the digest from M5 on, so restore needs no manifest, and the permits block of the Package's manifest, see mcp_for_processes.permits.
   cgroups: >
-    The child that runs podman start is placed in the owner's leaf, the same
-    way processes_start places one. A container keeps the cgroup parent it was
-    created with, so a restored Process holds the limits it was started with,
-    and one created before kitbashd supervised Processes keeps its empty parent
-    however often it is restored: it gains limits when the Process is run
-    again, which creates the container.
+    The cgroup of each Process is created again before its container starts:
+    the cgroup filesystem does not survive a reboot, and a container whose
+    cgroup parent is gone does not start at all. The ceiling is not written
+    there, because a registration does not carry the manifest's limits; the
+    container keeps the limits its own configuration holds, and the ceiling
+    comes back the next time the Process is run. A container created before
+    this release has no cgroup parent at all and restores without limits until
+    it is run again, which creates it anew.
 
 backup:
   description: >
@@ -527,16 +534,31 @@ cgroups:
     container for them, see PLAN.md section 2.3.
   layout: >
     /sys/fs/cgroup/kitbash is root's, with memory, cpu and pids in its
-    cgroup.subtree_control; /sys/fs/cgroup/kitbash/<member> has the same
-    delegation and belongs to the member; /sys/fs/cgroup/kitbash/<member>/run
-    is the leaf every podman child of that member is started in. Processes live
-    in a leaf because a cgroup that holds processes may not enable controllers
-    for its children, and the containers are children of <member>.
-  when: at daemon start, at users_create, and again at every start and restore.
+    cgroup.subtree_control; /sys/fs/cgroup/kitbash/<member> is root's in full,
+    with the same delegation; /sys/fs/cgroup/kitbash/<member>/<process id> is
+    the cgroup of one Process, and
+    /sys/fs/cgroup/kitbash/<member>/<process id>/run the leaf its podman child
+    is started in. Processes live in a leaf because a cgroup that holds
+    processes may not enable controllers for its children, and the container is
+    a child of the Process's cgroup.
+  ceiling: >
+    memory.max, cpu.max and pids.max of the Process's cgroup are written by
+    root and stay root's. The member is given the directory of that cgroup and
+    its cgroup.procs, cgroup.threads and cgroup.subtree_control, which is what
+    the kernel's delegation convention names and exactly enough for a rootless
+    podman to create the container's cgroup under the ceiling and move the
+    container into it. Nothing above it is theirs, so a member can neither
+    raise their own limit nor create a Process cgroup without one.
+  when: >
+    The root and one cgroup per member at daemon start and at users_create; the
+    cgroup of a Process at every start and at every restore. The cgroup of a
+    Process goes at processes_remove, and a member's whole cgroup at
+    users_remove.
   without_it: >
-    A host whose cgroup filesystem is not version 2 or not writable runs every
-    Process unplaced. The limits are still passed to the runtime and recorded,
-    and the daemon log says so once.
+    A host whose cgroup filesystem is not version 2 or not writable runs that
+    Process unplaced: the limits are still passed to the runtime and recorded,
+    and the daemon log says so on that start. The fail open is per member and
+    per attempt; the daemon never turns placement off for itself.
 
 client_behaviour:
   processes: >

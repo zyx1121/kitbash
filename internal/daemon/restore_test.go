@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/zyx1121/kitbash/internal/cgroups"
 	"github.com/zyx1121/kitbash/internal/store"
 	"github.com/zyx1121/kitbash/internal/sysusers"
 	"github.com/zyx1121/kitbash/internal/uuid"
@@ -68,19 +67,24 @@ func TestRestoreStartsEveryProcessAsItsOwner(t *testing.T) {
 	if got := started["kitbash-observe-count"]; got.Member != "bob" || got.UID != 1006 {
 		t.Errorf("kitbash-observe-count ran as %+v, want bob with his uid", got)
 	}
-	// A container keeps the cgroup parent it was created with, so a restored
-	// Process holds the limits it was started with as long as the child that
-	// starts it is placed in the owner's leaf, see internal/cgroups.
-	if got := started["kitbash-echo-one"]; got.Cgroup != cgroups.LeafDir(h.cgroups.Base, "alice") {
-		t.Errorf("the child was placed in %q, want alice's leaf", got.Cgroup)
+	// The cgroup filesystem does not survive a reboot, so the cgroup of every
+	// Process is created again and the child is placed in its leaf: a
+	// container whose cgroup parent is gone does not start at all.
+	placed := map[string]string{}
+	for _, call := range h.cgroups.Placed() {
+		placed[call.ID] = call.Leaf
 	}
-	if got := started["kitbash-observe-count"]; got.Cgroup != cgroups.LeafDir(h.cgroups.Base, "bob") {
-		t.Errorf("the child was placed in %q, want bob's leaf", got.Cgroup)
+	if len(placed) != 3 {
+		t.Fatalf("the cgroups prepared are %+v, want one per Process", h.cgroups.Placed())
 	}
-	// One subtree per owner, not one per container: the leaf is the same for
-	// every Process of a member.
+	for _, call := range fake.Calls() {
+		if call.Cgroup == "" {
+			t.Errorf("%s was started outside a cgroup of its own", call.Container)
+		}
+	}
+	// One member cgroup per owner, not one per Process.
 	if len(h.cgroups.Calls()) != 2 {
-		t.Errorf("the subtrees prepared are %+v, want one per owner", h.cgroups.Calls())
+		t.Errorf("the member cgroups prepared are %+v, want one per owner", h.cgroups.Calls())
 	}
 }
 

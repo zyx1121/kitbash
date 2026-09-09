@@ -326,6 +326,12 @@ func (s *Server) removeUser(w http.ResponseWriter, r *http.Request, caller Calle
 		writeProblem(w, problem.Internal(r.URL.Path, err.Error(), ""))
 		return
 	}
+	// Their containers are gone, so the cgroups those containers ran in go
+	// too. One that is still busy is left for the next boot rather than
+	// holding up an account that is already deleted.
+	if err := s.cgroups.RemoveMember(r.Context(), name); err != nil {
+		logger.Printf("cgroups: the cgroup of %s could not be removed: %v", name, err)
+	}
 	logger.Printf("%s removed the member %s, home archived at %s", caller.User, name, archived)
 	writeJSON(w, r.URL.Path, removeResponse{User: name, Archived: archived})
 }

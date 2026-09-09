@@ -25,7 +25,10 @@ apk add -q --no-progress podman crun passt fuse-overlayfs shadow shadow-subids g
 sed -i 's/^#\?rc_cgroup_mode=.*/rc_cgroup_mode="unified"/' /etc/rc.conf
 grep -q '^rc_cgroup_mode="unified"' /etc/rc.conf || echo 'rc_cgroup_mode="unified"' >> /etc/rc.conf
 for m in tun fuse; do grep -qx "$m" /etc/modules || echo "$m" >> /etc/modules; modprobe "$m" 2>/dev/null || true; done
-rc-update -q add cgroups boot 2>/dev/null || true
+# sysinit, not boot: kitbashd depends on the cgroups service, and a service in
+# the default runlevel can only need one that is already up by then.
+rc-update -q add cgroups sysinit 2>/dev/null || true
+rc-update -q del cgroups boot 2>/dev/null || true
 rc-service -q cgroups start 2>/dev/null || true
 rc-update -q add qemu-guest-agent default 2>/dev/null || true
 rc-service -q qemu-guest-agent start 2>/dev/null || true

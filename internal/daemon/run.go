@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/zyx1121/kitbash/internal/cgroups"
@@ -164,6 +165,11 @@ func (s *Server) processAction(w http.ResponseWriter, r *http.Request, id, actio
 		deadline = StartDeadline
 	}
 	extendResponse(w, deadline)
+	// One action at a time per Process. Two starts of one id would race on
+	// its environment file and on its cgroup, and a start racing a remove
+	// would leave a container the registry does not describe.
+	unlock := s.actions.lock(id)
+	defer unlock()
 	switch action {
 	case actionStart:
 		s.startProcess(w, r, p, m)
@@ -223,12 +229,13 @@ func (s *Server) startProcess(w http.ResponseWriter, r *http.Request, p store.Pr
 		return
 	}
 
-	// The leaf is ensured on every start rather than at boot alone: a member
-	// created since the daemon started has none yet, and a cgroup filesystem
-	// that took this tree once takes it again for nothing.
-	leaf := s.memberCgroup(r.Context(), m)
+	// The Process gets a cgroup of its own, with its ceiling written by root,
+	// and the container is created under it. A host that cannot place it runs
+	// the Process anyway: the limits are recorded, not enforced, and that is
+	// said on this start rather than once for the life of the daemon.
+	leaf := s.processCgroup(r.Context(), m, p, limitsOf(opts))
 	if leaf != "" {
-		opts.CgroupParent = cgroups.Parent(m.Name)
+		opts.CgroupParent = cgroups.Parent(m.Name, p.ID)
 	}
 
 	// The token is minted here and not at registration: the store keeps only
@@ -281,6 +288,12 @@ func (s *Server) removeProcess(w http.ResponseWriter, r *http.Request, p store.P
 	if err := s.runner.RemoveContainer(r.Context(), m, p.Container, true); err != nil {
 		writeProblem(w, s.runProblem(r, err, p, podman.RunOptions{}))
 		return
+	}
+	// The cgroup goes with the container. One that is still busy is a
+	// container the runtime has not finished tearing down; it is left for the
+	// next removal or the next boot rather than waited on here.
+	if err := s.cgroups.RemoveProcess(r.Context(), m.Name, p.ID); err != nil {
+		logger.Printf("cgroups: the cgroup of %s could not be removed: %v", p.ID, err)
 	}
 	writeJSON(w, r.URL.Path, startResponse{ID: p.ID, Container: p.Container})
 }
@@ -357,12 +370,12 @@ func runOptions(instance string, p store.Process, req startRequest) (podman.RunO
 			"Send the container name the Process was registered with, or none at all.")
 	}
 	image := p.Digest
-	if req.Image != "" {
-		if !imageDigest.MatchString(req.Image) {
-			return refuse(fmt.Sprintf("%q is not an image digest", req.Image),
-				"Send the image as sha256: followed by 64 hexadecimal characters.")
-		}
-		image = req.Image
+	if req.Image != "" && req.Image != image {
+		// The registration names the image this Process runs. A request that
+		// named another one would start something the registry does not
+		// describe, and the registry is what an admin reads.
+		return refuse(fmt.Sprintf("this Process is registered to run %s, not %s", image, req.Image),
+			"Register the Process with the digest you want to run, then start it.")
 	}
 	if image == "" {
 		return refuse("this Process is registered without an image digest",
@@ -461,6 +474,9 @@ func labelsOf(instance string, p store.Process, given map[string]string) (map[st
 	labels[podman.LabelName] = p.Name
 	labels[podman.LabelExpose] = p.Expose
 	labels[podman.LabelDigest] = p.Digest
+	// The endpoint is the registration's too: it is what the fan out delivers
+	// to, so a container may not claim one of its own.
+	delete(labels, podman.LabelEndpoint)
 	if p.Endpoint != "" {
 		labels[podman.LabelEndpoint] = p.Endpoint
 	}
@@ -595,16 +611,13 @@ func (s *Server) processEndpoint() string {
 	return DefaultProcessEndpoint
 }
 
-// PrepareCgroups creates the kitbash cgroup and one subtree per member, so the
-// first Process of a member that was created before this daemon started is
-// placed without waiting for anything. It is called once at start; every later
-// caller ensures the member it is about.
-func (s *Server) PrepareCgroups(ctx context.Context) {
+// Prepare is what the daemon runs at start: the cgroup tree, one subtree per
+// member of the host, and the environment directory swept of whatever a daemon
+// that stopped mid start left behind.
+func (s *Server) Prepare(ctx context.Context) {
+	s.sweepEnvDir()
 	if err := s.cgroups.EnsureRoot(ctx); err != nil {
-		logger.Printf("cgroups: the kitbash cgroup could not be prepared: %v", err)
-		return
-	}
-	if !s.cgroups.Enabled() {
+		logger.Printf("cgroups: the kitbash cgroup could not be prepared, so the limits of every Process are recorded and not enforced: %v", err)
 		return
 	}
 	members, err := s.users.List(ctx)
@@ -613,23 +626,117 @@ func (s *Server) PrepareCgroups(ctx context.Context) {
 		return
 	}
 	for _, m := range members {
-		if _, err := s.cgroups.EnsureMember(ctx, m.Name, m.UID, m.GID); err != nil {
-			logger.Printf("cgroups: the subtree of %s could not be prepared: %v", m.Name, err)
+		if err := s.cgroups.EnsureMember(ctx, m.Name, m.UID, m.GID); err != nil {
+			logger.Printf("cgroups: the cgroup of %s could not be prepared: %v", m.Name, err)
 		}
 	}
 }
 
-// memberCgroup is the leaf one member's children are placed in, or the empty
-// string on a host that enforces no limits. A failure is logged and answered
-// the same way: a Process that runs unplaced is better than one that does not
-// run, and the log says which happened.
-func (s *Server) memberCgroup(ctx context.Context, m sysusers.Member) string {
-	leaf, err := s.cgroups.EnsureMember(ctx, m.Name, m.UID, m.GID)
+// sweepEnvDir removes the environment files of starts that did not finish. A
+// file there holds a Telemetry token and is removed by the start that wrote
+// it; one that survived a daemon that was killed mid start would otherwise sit
+// on the host until that Process is run again.
+func (s *Server) sweepEnvDir() {
+	entries, err := os.ReadDir(s.envDir)
 	if err != nil {
-		logger.Printf("cgroups: the subtree of %s could not be prepared: %v", m.Name, err)
+		if !errors.Is(err, os.ErrNotExist) {
+			logger.Printf("processes: the environment directory %s could not be read: %v", s.envDir, err)
+		}
+		return
+	}
+	swept := 0
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if err := os.Remove(filepath.Join(s.envDir, entry.Name())); err != nil {
+			logger.Printf("processes: %s could not be removed: %v", entry.Name(), err)
+			continue
+		}
+		swept++
+	}
+	if swept > 0 {
+		logger.Printf("processes: swept %d environment file(s) of starts that did not finish", swept)
+	}
+}
+
+// memberCgroup creates one member's cgroup, which is what an account gains
+// when it is created and loses when it goes.
+func (s *Server) memberCgroup(ctx context.Context, m sysusers.Member) {
+	if err := s.cgroups.EnsureMember(ctx, m.Name, m.UID, m.GID); err != nil {
+		logger.Printf("cgroups: the cgroup of %s could not be prepared: %v", m.Name, err)
+	}
+}
+
+// processCgroup creates the cgroup one Process runs under and answers the leaf
+// its podman child is started in. An empty leaf is a host that could not place
+// it: the Process still runs, its limits are recorded rather than enforced,
+// and this says so on every start rather than once, because the next start may
+// be on a host that has since been fixed, or for a member whose cgroup is
+// fine.
+func (s *Server) processCgroup(ctx context.Context, m sysusers.Member, p store.Process, limits cgroups.Limits) string {
+	leaf, err := s.cgroups.EnsureProcess(ctx, m.Name, p.ID, m.UID, m.GID, limits)
+	if err != nil {
+		logger.Printf("cgroups: %s runs without a cgroup of its own, so its limits are recorded and not enforced: %v",
+			p.ID, err)
 		return ""
 	}
 	return leaf
+}
+
+// limitsOf is the ceiling of one Process, read off the command line that was
+// built for it, so what root writes into the cgroup and what the runtime is
+// asked for cannot drift apart. A limit that has no cgroup spelling is left
+// out rather than guessed at; the runtime still gets it.
+func limitsOf(opts podman.RunOptions) cgroups.Limits {
+	var limits cgroups.Limits
+	if memory, ok := cgroups.MemoryMax(opts.Memory); ok {
+		limits.Memory = memory
+	}
+	if cpu, ok := cgroups.CPUMax(opts.CPUs); ok {
+		limits.CPU = cpu
+	}
+	limits.Pids = opts.PidsLimit
+	return limits
+}
+
+// actionLock serialises the actions of one Process. It is a lock per id rather
+// than one for the daemon: two members starting two Processes have nothing to
+// wait for from each other.
+type actionLock struct {
+	mu    sync.Mutex
+	held  map[string]*sync.Mutex
+	waits map[string]int
+}
+
+func newActionLock() *actionLock {
+	return &actionLock{held: map[string]*sync.Mutex{}, waits: map[string]int{}}
+}
+
+// lock takes the lock of one id and answers what releases it. The entry is
+// dropped once nobody is waiting for it, so a daemon that has served a million
+// Processes holds a map of the ones running now.
+func (a *actionLock) lock(id string) func() {
+	a.mu.Lock()
+	lock, held := a.held[id]
+	if !held {
+		lock = &sync.Mutex{}
+		a.held[id] = lock
+	}
+	a.waits[id]++
+	a.mu.Unlock()
+
+	lock.Lock()
+	return func() {
+		lock.Unlock()
+		a.mu.Lock()
+		a.waits[id]--
+		if a.waits[id] <= 0 {
+			delete(a.waits, id)
+			delete(a.held, id)
+		}
+		a.mu.Unlock()
+	}
 }
 
 // cgroupOrNone renders a leaf for the log.

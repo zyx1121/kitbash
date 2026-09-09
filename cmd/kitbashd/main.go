@@ -186,11 +186,12 @@ func run() error {
 	// podman. It logs one line when it is done, see PLAN.md section 2.3, and
 	// it does nothing at all when the daemon was started with restore off.
 	//
-	// The cgroup tree comes first: every Process is started inside its owner's
-	// leaf, so the tree exists before the first container does, see
-	// internal/cgroups.
+	// The cgroup tree comes first: every Process is started inside a cgroup of
+	// its own under its owner's, so the tree exists before the first container
+	// does. It also sweeps the environment files a daemon that stopped mid
+	// start left behind, see internal/cgroups and internal/daemon/run.go.
 	go func() {
-		srv.PrepareCgroups(serve)
+		srv.Prepare(serve)
 		srv.Restore(serve)
 	}()
 

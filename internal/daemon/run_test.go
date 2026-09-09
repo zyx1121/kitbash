@@ -9,7 +9,9 @@ import (
 	"os/user"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -108,11 +110,24 @@ func TestStartRunsTheContainerAsTheOwnerInTheirCgroup(t *testing.T) {
 	if run.Member != h.user {
 		t.Errorf("the container ran as %s, want %s", run.Member, h.user)
 	}
-	if run.Cgroup != cgroups.LeafDir(h.cgroups.Base, h.user) {
-		t.Errorf("the child was placed in %q, want the member's leaf", run.Cgroup)
+	if run.Cgroup != cgroups.LeafDir(h.cgroups.Base, h.user, id) {
+		t.Errorf("the child was placed in %q, want the leaf of the Process's own cgroup", run.Cgroup)
 	}
-	want := [][2]string{
-		{"--cgroup-parent=" + cgroups.Parent(h.user), ""},
+	// The ceiling is the Process's own cgroup and it is written by root, in
+	// the spelling the cgroup files take.
+	placed := h.cgroups.Placed()
+	if len(placed) != 1 {
+		t.Fatalf("the cgroups prepared are %+v, want one for this Process", placed)
+	}
+	if placed[0].ID != id || placed[0].Name != h.user {
+		t.Errorf("the cgroup is %+v, want this Process under its owner", placed[0])
+	}
+	want := cgroups.Limits{Memory: "536870912", CPU: "100000 100000", Pids: DefaultPidsLimit}
+	if placed[0].Limits != want {
+		t.Errorf("the ceiling is %+v, want %+v", placed[0].Limits, want)
+	}
+	wantArgs := [][2]string{
+		{"--cgroup-parent=" + cgroups.Parent(h.user, id), ""},
 		{"--memory", "512m"},
 		{"--cpus", "1"},
 		{"--pids-limit", "512"},
@@ -120,7 +135,7 @@ func TestStartRunsTheContainerAsTheOwnerInTheirCgroup(t *testing.T) {
 		{"--publish", "127.0.0.1:40275:8080"},
 		{"--env-file", run.EnvFile},
 	}
-	for _, pair := range want {
+	for _, pair := range wantArgs {
 		if !hasArg(run.Args, pair[0], pair[1]) {
 			t.Errorf("the command line is %v, want %s %s", run.Args, pair[0], pair[1])
 		}
@@ -198,12 +213,11 @@ func TestStartWritesTheEnvironmentFileForTheMemberAndRemovesIt(t *testing.T) {
 // passed to the runtime and recorded, and nothing is placed.
 func TestStartWithoutCgroupsRecordsTheLimits(t *testing.T) {
 	fake := sysusers.NewFake()
-	off := &cgroups.Fake{Off: true}
 	h := serveWith(t, Options{
 		Admin:   func(*user.User) (bool, error) { return false, nil },
 		Users:   fake,
 		Runner:  fake,
-		Cgroups: off,
+		Cgroups: &cgroups.Fake{Off: true},
 	})
 	fake.Add(sysusers.Member{Name: h.user, UID: os.Getuid(), GID: os.Getgid()})
 	id := h.supervise(h.user, "kitbash-echo-echo")
@@ -360,8 +374,12 @@ func TestStartWritesTheIdentityLabelsItself(t *testing.T) {
 	id := h.supervise(h.user, "kitbash-echo-echo")
 
 	res, body := h.start(id, startRequest{
-		Image:  testDigest,
-		Labels: map[string]string{podman.LabelID: "forged", podman.LabelUser: "root"},
+		Image: testDigest,
+		Labels: map[string]string{
+			podman.LabelID:       "forged",
+			podman.LabelUser:     "root",
+			podman.LabelEndpoint: "http://127.0.0.1:1",
+		},
 	})
 	if res.StatusCode != http.StatusOK {
 		t.Fatalf("start = %d %s, want 200", res.StatusCode, body)
@@ -369,6 +387,11 @@ func TestStartWritesTheIdentityLabelsItself(t *testing.T) {
 	labels := fake.Runs()[0].Options.Labels
 	if labels[podman.LabelID] != id || labels[podman.LabelUser] != h.user {
 		t.Errorf("labels are %v, want the Process id and its owner from the registration", labels)
+	}
+	// The endpoint is the registration's as well: it is where the fan out
+	// delivers, so a container may not claim one of its own.
+	if _, claimed := labels[podman.LabelEndpoint]; claimed {
+		t.Errorf("labels are %v, want no endpoint on a Process registered without one", labels)
 	}
 }
 
@@ -389,6 +412,17 @@ func TestStartRefusesLimitsTheRuntimeWouldNotTake(t *testing.T) {
 		{name: "port", req: startRequest{Image: testDigest, Publish: []portMapping{{ContainerPort: 0}}}},
 		{name: "environment name", req: startRequest{Image: testDigest, Env: map[string]string{"not a name": "x"}}},
 		{name: "environment line break", req: startRequest{Image: testDigest, Env: map[string]string{"KEY": "a\nb"}}},
+		{name: "environment count", req: startRequest{Image: testDigest, Env: manyEntries(MaxEnvEntries + 1)}},
+		{name: "environment value size", req: startRequest{Image: testDigest,
+			Env: map[string]string{"KEY": strings.Repeat("x", MaxEnvBytes+1)}}},
+		{name: "label count", req: startRequest{Image: testDigest, Labels: manyEntries(MaxLabels + 1)}},
+		{name: "label size", req: startRequest{Image: testDigest,
+			Labels: map[string]string{"kitbash.note": strings.Repeat("x", MaxLabelBytes+1)}}},
+		{name: "label name", req: startRequest{Image: testDigest, Labels: map[string]string{"not a name": "x"}}},
+		{name: "port count", req: startRequest{Image: testDigest, Publish: tooManyPorts()}},
+		{name: "host port", req: startRequest{Image: testDigest,
+			Publish: []portMapping{{HostPort: 70000, ContainerPort: 8080}}}},
+		{name: "another image", req: startRequest{Image: "sha256:" + strings.Repeat("b", 64)}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -425,6 +459,11 @@ func TestStopAndRemoveRunAsTheOwner(t *testing.T) {
 	removals := fake.Removals()
 	if len(removals) != 1 || !removals[0].Force || removals[0].Member != h.user {
 		t.Errorf("removals = %+v, want one forced removal as the owner", removals)
+	}
+	// The cgroup goes with the container it was made for.
+	cgroupRemovals := h.cgroups.Removals()
+	if len(cgroupRemovals) != 1 || cgroupRemovals[0].ID != id || cgroupRemovals[0].Name != h.user {
+		t.Errorf("the cgroups removed are %+v, want the one of this Process", cgroupRemovals)
 	}
 	// Neither touches the registration: proc_stop unregisters, which is what
 	// revokes the token.
@@ -478,8 +517,30 @@ func TestCreatingAMemberPreparesTheirCgroup(t *testing.T) {
 	if len(calls) != 1 || calls[0].Name != "alice" {
 		t.Fatalf("the cgroups prepared are %+v, want alice's", calls)
 	}
-	if calls[0].UID == 0 || calls[0].Leaf == "" {
-		t.Errorf("alice's subtree is %+v, want her uid and a leaf", calls[0])
+	if calls[0].UID == 0 {
+		t.Errorf("alice's cgroup is %+v, want her uid", calls[0])
+	}
+}
+
+// A member who goes takes their cgroup with them, Processes of theirs that
+// were left in it included.
+func TestRemovingAMemberRemovesTheirCgroup(t *testing.T) {
+	fake := sysusers.NewFake()
+	h := serveWith(t, Options{
+		Admin:  func(*user.User) (bool, error) { return true, nil },
+		Users:  fake,
+		Runner: fake,
+	})
+	fake.Add(sysusers.Member{Name: h.user, Admin: true})
+	fake.Add(sysusers.Member{Name: "alice", UID: 1005})
+
+	res, body := h.do(http.MethodDelete, usersPath+"/alice", "", nil)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("users_remove = %d %s, want 200", res.StatusCode, body)
+	}
+	removals := h.cgroups.Removals()
+	if len(removals) != 1 || removals[0].Name != "alice" || removals[0].ID != "" {
+		t.Errorf("the removals are %+v, want alice's whole cgroup", removals)
 	}
 }
 
@@ -491,7 +552,7 @@ func TestPrepareCgroupsCoversEveryMember(t *testing.T) {
 	fake.Add(sysusers.Member{Name: "alice", UID: 1005})
 	fake.Add(sysusers.Member{Name: "bob", UID: 1006})
 
-	h.server.PrepareCgroups(context.Background())
+	h.server.Prepare(context.Background())
 	if h.cgroups.Roots != 1 {
 		t.Errorf("the root was prepared %d times, want once", h.cgroups.Roots)
 	}
@@ -501,6 +562,78 @@ func TestPrepareCgroupsCoversEveryMember(t *testing.T) {
 	}
 	if !slices.Contains(names, "alice") || !slices.Contains(names, "bob") {
 		t.Errorf("the subtrees prepared are %v, want one per member", names)
+	}
+}
+
+// manyEntries is a map of n entries, for the bounds a request is held to.
+func manyEntries(n int) map[string]string {
+	entries := make(map[string]string, n)
+	for i := range n {
+		entries["KEY_"+strconv.Itoa(i)] = "value"
+	}
+	return entries
+}
+
+// tooManyPorts is one port mapping more than a Process may publish.
+func tooManyPorts() []portMapping {
+	ports := make([]portMapping, 0, MaxPublishPorts+1)
+	for i := range MaxPublishPorts + 1 {
+		ports = append(ports, portMapping{ContainerPort: 8080 + i})
+	}
+	return ports
+}
+
+// Two starts of one Process at once would race on its environment file, which
+// is opened exclusively, and on its cgroup. They are serialised, so the second
+// waits rather than failing.
+func TestStartsOfOneProcessAreSerialised(t *testing.T) {
+	h, fake := supervised(t)
+	id := h.supervise(h.user, "kitbash-echo-echo")
+
+	var wg sync.WaitGroup
+	codes := make([]int, 4)
+	for i := range codes {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			res, _ := h.start(id, startRequest{Image: testDigest})
+			codes[i] = res.StatusCode
+		}()
+	}
+	wg.Wait()
+	for i, code := range codes {
+		if code != http.StatusOK {
+			t.Errorf("start %d = %d, want 200: they are serialised, not refused", i, code)
+		}
+	}
+	if runs := fake.Runs(); len(runs) != len(codes) {
+		t.Errorf("the runtime was asked for %d runs, want %d", len(runs), len(codes))
+	}
+	// Every one of them left the host as it found it.
+	entries, err := os.ReadDir(h.envDir)
+	if err != nil {
+		t.Fatalf("read the environment directory: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("the environment directory holds %d files, want none", len(entries))
+	}
+}
+
+// A daemon that was killed mid start left an environment file behind, and that
+// file holds a Telemetry token. The next start of the daemon sweeps them.
+func TestPrepareSweepsTheEnvironmentDirectory(t *testing.T) {
+	h, _ := supervised(t)
+	if err := os.MkdirAll(h.envDir, 0o711); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	stale := filepath.Join(h.envDir, "01a08654-1c5b-7828-9b6b-37044de254d4")
+	if err := os.WriteFile(stale, []byte("KITBASH_TELEMETRY_TOKEN=leaked\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	h.server.Prepare(context.Background())
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Errorf("the stale environment file is still there: %v", err)
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/zyx1121/kitbash/internal/cgroups"
 	"github.com/zyx1121/kitbash/internal/store"
 	"github.com/zyx1121/kitbash/internal/sysusers"
 )
@@ -119,11 +120,17 @@ func (s *Server) restoreOwner(ctx context.Context, owner string, processes []sto
 		return counts
 	}
 
-	// The leaf is ensured once per owner: every container of theirs is placed
-	// in the same one, and a container keeps the cgroup parent it was created
-	// with, so a restored Process holds the limits it was started with.
-	leaf := s.memberCgroup(ctx, m)
+	s.memberCgroup(ctx, m)
 	for _, p := range processes {
+		// The Process's cgroup is created again before its container starts:
+		// the cgroup filesystem does not survive a reboot, and the container
+		// was created under a cgroup parent that has to be there for it to
+		// start at all. The ceiling is not written here, because a
+		// registration does not carry the manifest's limits; the container
+		// keeps the limits its own configuration holds, and the ceiling comes
+		// back the next time the Process is run, see restore.cgroups in
+		// spec/kitbashd-api.yaml.
+		leaf := s.processCgroup(ctx, m, p, cgroups.Limits{})
 		start, cancel := context.WithTimeout(ctx, RestoreTimeout)
 		err := s.runner.Start(start, m, p.Container, leaf)
 		cancel()
