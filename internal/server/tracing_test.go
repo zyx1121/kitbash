@@ -62,7 +62,9 @@ func newTracedPermits(t *testing.T, socket string, permitsFor func(w *whole) *ma
 	}
 
 	ctx := context.Background()
-	processes := proc.New(w.files, w.runner, nil)
+	// kitbashd is the one that runs a Process, so the registry is the same
+	// client the tel family forwards through, see PLAN.md section 2.3.
+	processes := proc.New(w.files, w.runner, provider.Client())
 	tools := bridge.New(w.files, processes, w.runner)
 	// The Package runs in this process instead of in a container, the way
 	// internal/bridge tests reach one.
@@ -123,6 +125,9 @@ func newTracedWithDaemonPermits(t *testing.T, permitsFor func(w *whole) *manifes
 	t.Cleanup(daemon.Close)
 	tr := newTracedPermits(t, daemon.Socket, permitsFor)
 	tr.daemon = daemon
+	// A container the fake daemon starts shows up in the member's own runtime,
+	// which is where the session reads a Process back from.
+	daemon.MirrorRuns(tr.runner)
 	return tr
 }
 

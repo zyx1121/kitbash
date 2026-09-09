@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zyx1121/kitbash/internal/cgroups"
 	"github.com/zyx1121/kitbash/internal/store"
 	"github.com/zyx1121/kitbash/internal/sysusers"
 	"github.com/zyx1121/kitbash/internal/uuid"
@@ -16,6 +17,12 @@ import (
 // registered writes one registration straight to the store, which is what a
 // daemon that has just started finds there.
 func (h *harness) registered(owner, container string) string {
+	return h.registeredWith(owner, container, store.Limits{})
+}
+
+// registeredWith is registered with the ceiling that Process was started
+// under, which is what restore writes into its cgroup again.
+func (h *harness) registeredWith(owner, container string, limits store.Limits) string {
 	h.t.Helper()
 	_, hash, err := store.NewToken()
 	if err != nil {
@@ -30,6 +37,7 @@ func (h *harness) registered(owner, container string) string {
 		Container:    container,
 		Digest:       "sha256:" + "ab12cd34" + "00000000000000000000000000000000000000000000000000000000",
 		Expose:       ExposeNone,
+		Limits:       limits,
 		RegisteredAt: time.Now().UTC(),
 	}, hash, 0); err != nil {
 		h.t.Fatalf("RegisterProcess: %v", err)
@@ -66,6 +74,81 @@ func TestRestoreStartsEveryProcessAsItsOwner(t *testing.T) {
 	}
 	if got := started["kitbash-observe-count"]; got.Member != "bob" || got.UID != 1006 {
 		t.Errorf("kitbash-observe-count ran as %+v, want bob with his uid", got)
+	}
+	// The cgroup filesystem does not survive a reboot, so the ceiling of every
+	// Process is created again and the child is placed in the member's leaf: a
+	// container whose cgroup parent is gone does not start at all.
+	placed := map[string]string{}
+	for _, call := range h.cgroups.Placed() {
+		placed[call.ID] = call.Leaf
+	}
+	if len(placed) != 3 {
+		t.Fatalf("the cgroups prepared are %+v, want one per Process", h.cgroups.Placed())
+	}
+	for _, call := range fake.Calls() {
+		if call.Cgroup == "" {
+			t.Errorf("%s was started outside a cgroup of its own", call.Container)
+		}
+	}
+	// One member cgroup per owner, not one per Process.
+	if len(h.cgroups.Calls()) != 2 {
+		t.Errorf("the member cgroups prepared are %+v, want one per owner", h.cgroups.Calls())
+	}
+}
+
+// The ceiling survives a reboot: the cgroup filesystem is empty by then, so
+// restore writes the limits of the registration back into each Process's
+// cgroup before its container starts. A registration written before limits
+// were recorded has none to write, and comes back without a ceiling.
+func TestRestoreWritesTheCeilingAgain(t *testing.T) {
+	h, fake := serveUsers(t, true)
+	fake.Add(sysusers.Member{Name: "alice", UID: 1005})
+
+	limited := h.registeredWith("alice", "kitbash-echo-limited",
+		store.Limits{Memory: "512Mi", CPU: "0.5", Pids: 512})
+	legacy := h.registered("alice", "kitbash-echo-legacy")
+
+	if counts := h.server.Restore(context.Background()); counts.Started != 2 {
+		t.Fatalf("counts = %+v, want two started", counts)
+	}
+	placed := map[string]cgroups.Limits{}
+	for _, call := range h.cgroups.Placed() {
+		placed[call.ID] = call.Limits
+	}
+	want := cgroups.Limits{Memory: "536870912", CPU: "50000 100000", Pids: 512}
+	if placed[limited] != want {
+		t.Errorf("the ceiling of the limited Process is %+v, want %+v", placed[limited], want)
+	}
+	if (placed[legacy] != cgroups.Limits{}) {
+		t.Errorf("the ceiling of the legacy Process is %+v, want none to write", placed[legacy])
+	}
+	// Both containers still come back: a Process with no ceiling runs
+	// unlimited rather than not at all.
+	if len(fake.Calls()) != 2 {
+		t.Errorf("the containers started are %+v, want both", fake.Calls())
+	}
+}
+
+// A daemon that restarts without the host finds its Processes still running.
+// Restore promises that every registered Process is running afterwards, not
+// that it started each one, so a container that was up already is counted with
+// the rest and named only in the line at the end.
+func TestRestoreCountsAContainerThatIsAlreadyRunning(t *testing.T) {
+	h, fake := serveUsers(t, true)
+	fake.Add(sysusers.Member{Name: "alice", UID: 1005})
+	fake.Running = map[string]bool{"kitbash-echo-up": true}
+
+	kept := h.registered("alice", "kitbash-echo-up")
+	h.registered("alice", "kitbash-echo-down")
+
+	counts := h.server.Restore(context.Background())
+	if counts.Started != 2 || counts.Running != 1 || counts.Failed != 0 {
+		t.Fatalf("counts = %+v, want two started of which one was already running", counts)
+	}
+	// The registration of a Process that never stopped is left alone: it is
+	// running, and its token is the one its container holds.
+	if _, found, err := h.store.Process(context.Background(), kept); err != nil || !found {
+		t.Errorf("the registration of a running Process went (found %t, err %v)", found, err)
 	}
 }
 

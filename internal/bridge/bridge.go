@@ -62,19 +62,55 @@ type Bridge struct {
 	owners    map[string]string             // surface tool name to the Process id that answers it
 	packages  map[string]string             // Process id to the Package path it runs
 	sessions  map[string]*mcp.ClientSession // Process id to its open session
+	// execErrors is what the container runtime wrote while a session was
+	// opening, per Process id. It is read once, by the failure that followed.
+	execErrors map[string]*boundedSink
+}
+
+// boundedSink keeps the first ExecErrorBytes of what a command wrote and drops
+// the rest. A runtime that will not stop talking is not a reason for one
+// session to hold a growing buffer.
+type boundedSink struct {
+	mu   sync.Mutex
+	text []byte
+}
+
+// ExecErrorBytes is how much of the runtime's error output is kept. A refusal
+// is one line; this is room for the handful a broken image writes before it
+// gives up.
+const ExecErrorBytes = 4 << 10
+
+func (s *boundedSink) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if room := ExecErrorBytes - len(s.text); room > 0 {
+		if len(p) > room {
+			s.text = append(s.text, p[:room]...)
+		} else {
+			s.text = append(s.text, p...)
+		}
+	}
+	return len(p), nil
+}
+
+func (s *boundedSink) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return string(s.text)
 }
 
 // New builds a bridge over one caller's Processes.
 func New(files *fs.Service, processes *proc.Service, runner podman.Runner) *Bridge {
 	b := &Bridge{
-		files:     files,
-		processes: processes,
-		runner:    runner,
-		logger:    log.New(os.Stderr, "kitbash: ", log.LstdFlags),
-		published: map[string][]string{},
-		owners:    map[string]string{},
-		packages:  map[string]string{},
-		sessions:  map[string]*mcp.ClientSession{},
+		files:      files,
+		processes:  processes,
+		runner:     runner,
+		logger:     log.New(os.Stderr, "kitbash: ", log.LstdFlags),
+		published:  map[string][]string{},
+		owners:     map[string]string{},
+		packages:   map[string]string{},
+		sessions:   map[string]*mcp.ClientSession{},
+		execErrors: map[string]*boundedSink{},
 	}
 	b.transport = b.execTransport
 	return b
@@ -442,8 +478,7 @@ func (b *Bridge) session(ctx context.Context, p *proc.Process) (*mcp.ClientSessi
 	client := mcp.NewClient(&mcp.Implementation{Name: "kitbash", Version: "1"}, nil)
 	session, err := client.Connect(own, t, nil)
 	if err != nil {
-		return nil, problem.Internal(p.Package, err.Error(),
-			"Check the Process is running with proc_list and read proc_logs.")
+		return nil, connectProblem(p, err, b.execOutput(p.ID))
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -454,6 +489,49 @@ func (b *Bridge) session(ctx context.Context, p *proc.Process) (*mcp.ClientSessi
 	}
 	b.sessions[p.ID] = session
 	return session, nil
+}
+
+// connectProblem turns a session that would not open into the answer the agent
+// reads. What the runtime wrote is the only thing that tells the two apart: a
+// Package that is not running, and a session the kernel would not let into the
+// container's cgroup.
+func connectProblem(p *proc.Process, err error, output string) *problem.Problem {
+	if outsideCgroup(output) {
+		return problem.InternalDetail(p.Package,
+			fmt.Sprintf("exec into %s: %s", p.Container, strings.TrimSpace(output)),
+			"this session is outside the member's cgroup; kitbashd could not place it",
+			"Open a new session. If it keeps happening, ask an administrator whether kitbashd is running.")
+	}
+	detail := err.Error()
+	if output != "" {
+		detail += ": " + strings.TrimSpace(output)
+	}
+	return problem.Internal(p.Package, detail,
+		"Check the Process is running with proc_list and read proc_logs.")
+}
+
+// outsideCgroup reports whether the container runtime refused because it could
+// not move the new process into the container's cgroup. That is one thing and
+// one only: this session is not in its member's cgroup, so the kernel's
+// common ancestor is the root cgroup, see internal/cgroups and sessions_join
+// in spec/kitbashd-api.yaml.
+func outsideCgroup(output string) bool {
+	lower := strings.ToLower(output)
+	return strings.Contains(lower, "cgroup.procs") &&
+		(strings.Contains(lower, "permission denied") || strings.Contains(lower, "operation not permitted"))
+}
+
+// execOutput is what the runtime wrote while one Process's session was opening,
+// and empties it: a later failure is a later message.
+func (b *Bridge) execOutput(id string) string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	sink, ok := b.execErrors[id]
+	if !ok {
+		return ""
+	}
+	delete(b.execErrors, id)
+	return sink.String()
 }
 
 // execTransport runs the image's own entrypoint inside the Process's
@@ -468,7 +546,19 @@ func (b *Bridge) execTransport(ctx context.Context, p *proc.Process) (mcp.Transp
 		return nil, fmt.Errorf("the image of %s declares no entrypoint to exec", p.Package)
 	}
 	full := b.runner.ExecArgv(p.Container, argv)
-	return &mcp.CommandTransport{Command: exec.CommandContext(ctx, full[0], full[1:]...)}, nil
+	command := exec.CommandContext(ctx, full[0], full[1:]...)
+	// The runtime's own error output is kept, bounded, rather than sent to the
+	// session's stderr where nothing reads it. It is the only place a refusal
+	// by the kernel says which refusal it was.
+	sink := &boundedSink{}
+	command.Stderr = sink
+	b.mu.Lock()
+	if b.execErrors == nil {
+		b.execErrors = map[string]*boundedSink{}
+	}
+	b.execErrors[p.ID] = sink
+	b.mu.Unlock()
+	return &mcp.CommandTransport{Command: command}, nil
 }
 
 // Kits are the caller's running import kits: Processes whose manifest declares

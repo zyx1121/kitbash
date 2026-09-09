@@ -13,6 +13,8 @@ import (
 	"errors"
 	"os/exec"
 	"regexp"
+
+	"github.com/zyx1121/kitbash/internal/podman"
 )
 
 // Groups every member and every admin belongs to, see PLAN.md section 4.5.
@@ -39,6 +41,23 @@ var (
 	// ErrNoContainer reports a container the runtime does not have, which is
 	// what restore unregisters rather than retries.
 	ErrNoContainer = errors.New("sysusers: no such container")
+	// ErrNoImage reports an image the member's store does not have, which is
+	// a Process whose Package was never built here or whose build is gone.
+	ErrNoImage = errors.New("sysusers: no such image")
+	// ErrAlreadyRunning reports a container that is up already, which is what
+	// restore finds when the daemon restarts rather than the host: the
+	// Processes never stopped. It is a Process that is running, not a start
+	// that failed.
+	ErrAlreadyRunning = errors.New("sysusers: the container is already running")
+	// ErrUsage reports a run the container runtime refused to parse, which is
+	// exit 125: the options of the unit are wrong, and the member is the one
+	// who can change them.
+	ErrUsage = errors.New("sysusers: the container runtime refused the options")
+	// ErrTimeout reports a runtime that was still working when its budget ran
+	// out. It is not a failure of the Package: stopping a container that
+	// ignores SIGTERM takes the whole grace, and a host under load takes
+	// longer still.
+	ErrTimeout = errors.New("sysusers: the container runtime did not answer in time")
 	// ErrHomeShape reports a home that is not the shape kitbashd writes into:
 	// a .ssh that is a link or belongs to somebody else, an authorized_keys
 	// that is not a regular file the member owns. kitbashd is root and a
@@ -106,14 +125,35 @@ type System interface {
 	Lookup(ctx context.Context, name string) (Member, bool, error)
 }
 
-// Runner runs the container runtime as a member. It is the one part of
-// restore and of removing a member that has to change uid, see
-// spec/kitbashd-api.yaml.
+// Runner runs the container runtime as a member. It is the part of kitbashd
+// that changes uid: restore, removing a member, and every Process start,
+// because a member cannot place their own container in a delegated cgroup and
+// kitbashd can, see PLAN.md section 2.3.
+//
+// cgroup is the leaf directory the child is started in, which internal/cgroups
+// answers per member. An empty one runs the child where the daemon is, which
+// is a host that records limits rather than enforcing them.
 type Runner interface {
+	// Run starts one container as the member and returns its runtime id. The
+	// options carry the whole command line, env file included; nothing here
+	// reads a manifest. An image the member does not have is ErrNoImage, and
+	// a command the runtime refused to parse is ErrUsage.
+	Run(ctx context.Context, m Member, opts podman.RunOptions, cgroup string) (string, error)
 	// Start creates the member's runtime directory and starts one container
 	// as them. A container the runtime does not have is ErrNoContainer, which
-	// restore answers by unregistering the Process.
-	Start(ctx context.Context, m Member, container string) error
+	// restore answers by unregistering the Process, and one that is up
+	// already is ErrAlreadyRunning, which is a Process that came through a
+	// daemon restart. A container keeps the cgroup parent it was created
+	// with, so restoring one only has to place the child again.
+	Start(ctx context.Context, m Member, container, cgroup string) error
+	// Stop stops one container as the member, giving it timeout seconds to
+	// exit on its own. A container the runtime does not have is
+	// ErrNoContainer.
+	Stop(ctx context.Context, m Member, container string, timeout int) error
+	// RemoveContainer removes one container as the member. A container the
+	// runtime does not have is ErrNoContainer. The name says container
+	// because Remove on the System of this package is a member.
+	RemoveContainer(ctx context.Context, m Member, container string, force bool) error
 	// RemoveAll force removes every kitbash container of one member. It is
 	// best effort: a runtime that will not answer must not stop an admin from
 	// deleting the account.

@@ -71,6 +71,14 @@ type Process struct {
 	// pkg_inspect already shows the same block. A registration written before
 	// permits existed carries none, which permits nothing.
 	Permits manifest.Permits `json:"permits"`
+	// Limits is the ceiling this Process runs under, as the start that created
+	// its container received it: the manifest's own spelling of memory and
+	// cpu, and the number of processes kitbashd bounded it to. It is listed
+	// like the rest of the record, and it is what restore writes into the
+	// Process's cgroup again after a reboot, when the cgroup filesystem is
+	// empty and nothing else remembers. A registration written before this
+	// carries none and restores without a ceiling until it is run again.
+	Limits Limits `json:"limits"`
 	// FanoutSecret is the bearer kitbashd puts on every fan out request to
 	// this Process. It is minted with the token at registration and handed to
 	// the container once. The tag keeps it out of processes_list, which is the
@@ -78,6 +86,34 @@ type Process struct {
 	// secret any more than it carries a token. A registration written before
 	// the fan out was authenticated carries none.
 	FanoutSecret string `json:"-"`
+}
+
+// Limits is one Process's ceiling, in the spelling the start request carried:
+// memory and cpu as the manifest declares them, pids as kitbashd bounded it.
+// Converting them is the caller's, so what is stored is what was asked for
+// rather than one host's reading of it.
+type Limits struct {
+	Memory string `json:"memory,omitempty"`
+	CPU    string `json:"cpu,omitempty"`
+	Pids   int    `json:"pids,omitempty"`
+}
+
+// Empty reports whether this ceiling limits nothing, which is what a
+// registration written before limits were recorded carries.
+func (l Limits) Empty() bool { return l.Memory == "" && l.CPU == "" && l.Pids <= 0 }
+
+// JSON renders the limits for the column. An empty ceiling is an empty string
+// rather than an object of nulls, so a legacy row and a Process with no limits
+// read back the same.
+func (l Limits) JSON() string {
+	if l.Empty() {
+		return ""
+	}
+	body, err := json.Marshal(l)
+	if err != nil {
+		return ""
+	}
+	return string(body)
 }
 
 // Subscribes reports whether this Process asked for the Telemetry fan out.
@@ -167,21 +203,26 @@ func (s *Store) RegisterProcess(ctx context.Context, p Process, tokenHash string
 	// child of an MCP session is given is what the Process was registered
 	// with and not what its Package says today.
 	permits := p.Permits.JSON()
+	// The ceiling is written with the rest of the record: after a reboot the
+	// cgroup filesystem is empty, and this is the only thing that remembers
+	// what the Process was limited to.
+	limits := p.Limits.JSON()
 	// The fan out secret is replaced with the token, because the two are minted
 	// together: a container holding the old token holds the old secret.
 	if _, err := tx.ExecContext(ctx, `INSERT INTO processes
 		(id, owner, admin, package, name, container, digest, expose, endpoint,
-		 subscriptions, permits, token_hash, fanout_secret, registered_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		 subscriptions, permits, limits, token_hash, fanout_secret, registered_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 			owner = excluded.owner, admin = excluded.admin, package = excluded.package,
 			name = excluded.name, container = excluded.container, digest = excluded.digest,
 			expose = excluded.expose, endpoint = excluded.endpoint,
 			subscriptions = excluded.subscriptions, permits = excluded.permits,
+			limits = excluded.limits,
 			token_hash = excluded.token_hash,
 			fanout_secret = excluded.fanout_secret, registered_at = excluded.registered_at`,
 		p.ID, p.Owner, p.Admin, p.Package, p.Name, p.Container, p.Digest, p.Expose, p.Endpoint,
-		string(subscriptions), string(permits), tokenHash, p.FanoutSecret,
+		string(subscriptions), string(permits), limits, tokenHash, p.FanoutSecret,
 		p.RegisteredAt.UnixNano()); err != nil {
 		return fmt.Errorf("store: register the Process %s: %w", p.ID, err)
 	}
@@ -315,7 +356,7 @@ func (s *Store) Processes(ctx context.Context, owner string) ([]Process, error) 
 
 // processColumns is the one select every read of this table shares.
 const processColumns = `SELECT id, owner, admin, package, name, container, digest,
-	expose, endpoint, subscriptions, permits, fanout_secret, registered_at`
+	expose, endpoint, subscriptions, permits, limits, fanout_secret, registered_at`
 
 // scanner is what both a single row and a row of a result set satisfy.
 type scanner interface {
@@ -324,10 +365,10 @@ type scanner interface {
 
 func scanProcess(row scanner) (Process, error) {
 	var p Process
-	var subscriptions, permits string
+	var subscriptions, permits, limits string
 	var registered int64
 	if err := row.Scan(&p.ID, &p.Owner, &p.Admin, &p.Package, &p.Name, &p.Container, &p.Digest,
-		&p.Expose, &p.Endpoint, &subscriptions, &permits, &p.FanoutSecret, &registered); err != nil {
+		&p.Expose, &p.Endpoint, &subscriptions, &permits, &limits, &p.FanoutSecret, &registered); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Process{}, err
 		}
@@ -343,6 +384,11 @@ func scanProcess(row scanner) (Process, error) {
 	// A record written before the column existed carries an empty string,
 	// which is the empty block: that Process is permitted nothing until it is
 	// registered again, which is the safe end of the two.
+	if limits != "" {
+		if err := json.Unmarshal([]byte(limits), &p.Limits); err != nil {
+			return Process{}, fmt.Errorf("store: read the limits of %s: %w", p.ID, err)
+		}
+	}
 	if permits != "" {
 		block, err := manifest.ParsePermits([]byte(permits))
 		if err != nil {
@@ -392,7 +438,11 @@ func migrate(db *sql.DB) error {
 	// registration written before it carries none, so that Process reaches
 	// nothing over /mcp until it is run again, which is the end of the two
 	// that cannot surprise a member.
-	for _, column := range []string{"container", "digest", "fanout_secret", "permits"} {
+	// The limits arrive with the Process cgroup: kitbashd writes the ceiling
+	// into it, and after a reboot the registration is the only thing that
+	// remembers what the ceiling was. A registration written before this
+	// restores without one until the Process is run again.
+	for _, column := range []string{"container", "digest", "fanout_secret", "permits", "limits"} {
 		if err := addTextColumn(db, "processes", column); err != nil {
 			return err
 		}

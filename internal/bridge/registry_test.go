@@ -57,6 +57,7 @@ func TestSyncReRegistersProcessesKitbashdForgot(t *testing.T) {
 	writeFile(t, filepath.Join(folder, manifest.FileName), subscriberManifest)
 
 	runner := podman.NewFake()
+	daemon.MirrorRuns(runner)
 	client := telemetry.NewClient(daemon.Socket)
 	processes := proc.New(files, runner, client)
 	if _, _, err := runner.Build(ctx, folder, folder+"/Containerfile", "localhost/kitbash/observer:test",

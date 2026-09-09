@@ -184,18 +184,9 @@ func (c *CLI) ImageEntrypoint(ctx context.Context, ref string) ([]string, []stri
 	return got.Config.Entrypoint, got.Config.Cmd, nil
 }
 
-// Run starts one container.
+// Run starts one container. The environment goes into a file of its own,
+// which is removed before this returns.
 func (c *CLI) Run(ctx context.Context, opts RunOptions) (string, error) {
-	args := []string{"run", "--name", opts.Name}
-	if opts.Detach {
-		args = append(args, "--detach")
-	}
-	if opts.Interactive {
-		args = append(args, "--interactive")
-	}
-	for _, k := range sortedKeys(opts.Labels) {
-		args = append(args, "--label", k+"="+opts.Labels[k])
-	}
 	// The environment goes through a file rather than the command line: one of
 	// its entries is the Process's Telemetry token, and a command line is
 	// readable in /proc/<pid>/cmdline by anyone on the host.
@@ -207,7 +198,37 @@ func (c *CLI) Run(ctx context.Context, opts RunOptions) (string, error) {
 		return "", err
 	}
 	if envFile != "" {
-		args = append(args, "--env-file", envFile)
+		opts.EnvFile = envFile
+	}
+	out, err := c.run(ctx, RunArgs(opts, inline)...)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
+// RunArgs is the podman run command line for one container start, without the
+// binary. It is shared: a session builds it for its own runtime and kitbashd
+// builds it to run the Process as the member, so a Process started by a
+// session and one restored by the daemon are the same command.
+//
+// inline are the environment keys that cannot go into an env file, which is
+// the ones whose value carries a line break. They land on the command line,
+// where they are visible; they can only come from a manifest, and the
+// variables kitbash sets itself carry no line breaks.
+func RunArgs(opts RunOptions, inline []string) []string {
+	args := []string{"run", "--name", opts.Name}
+	if opts.Detach {
+		args = append(args, "--detach")
+	}
+	if opts.Interactive {
+		args = append(args, "--interactive")
+	}
+	for _, k := range sortedKeys(opts.Labels) {
+		args = append(args, "--label", k+"="+opts.Labels[k])
+	}
+	if opts.EnvFile != "" {
+		args = append(args, "--env-file", opts.EnvFile)
 	}
 	for _, k := range inline {
 		args = append(args, "--env", k+"="+opts.Env[k])
@@ -221,6 +242,16 @@ func (c *CLI) Run(ctx context.Context, opts RunOptions) (string, error) {
 	if opts.Memory != "" {
 		args = append(args, "--memory", opts.Memory)
 	}
+	if opts.PidsLimit > 0 {
+		args = append(args, "--pids-limit", strconv.Itoa(opts.PidsLimit))
+	}
+	// The container gets a cgroup of its own under the member's delegated
+	// subtree, which is where the limits above are enforced. Without a parent
+	// there is nothing to enforce them in, so the flags are still passed and
+	// the runtime records them, see internal/cgroups.
+	if opts.CgroupParent != "" {
+		args = append(args, "--cgroups=enabled", "--cgroup-parent="+opts.CgroupParent)
+	}
 	for _, port := range opts.Publish {
 		// The loopback address only: a Process is reachable from this host,
 		// never from the network, until a reverse proxy fronts it. An empty
@@ -231,12 +262,7 @@ func (c *CLI) Run(ctx context.Context, opts RunOptions) (string, error) {
 		}
 		args = append(args, "--publish", "127.0.0.1:"+host+":"+strconv.Itoa(port.ContainerPort))
 	}
-	args = append(args, opts.Image)
-	out, err := c.run(ctx, args...)
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(out), nil
+	return append(args, opts.Image)
 }
 
 // writeEnvFile writes the environment of one container into a file only the
@@ -253,15 +279,8 @@ func writeEnvFile(env map[string]string) (path string, inline []string, cleanup 
 	if len(env) == 0 {
 		return "", nil, nil, nil
 	}
-	var body strings.Builder
-	for _, k := range sortedKeys(env) {
-		if strings.ContainsAny(env[k], "\n\r") {
-			inline = append(inline, k)
-			continue
-		}
-		body.WriteString(k + "=" + env[k] + "\n")
-	}
-	if body.Len() == 0 {
+	content, inline := EnvFileBody(env)
+	if content == "" {
 		return "", inline, nil, nil
 	}
 	dir, err := os.MkdirTemp("", "kitbash-env-")
@@ -270,10 +289,30 @@ func writeEnvFile(env map[string]string) (path string, inline []string, cleanup 
 	}
 	remove := func() { os.RemoveAll(dir) }
 	file := filepath.Join(dir, "env")
-	if err := os.WriteFile(file, []byte(body.String()), 0o600); err != nil {
+	if err := os.WriteFile(file, []byte(content), 0o600); err != nil {
 		return "", nil, remove, fmt.Errorf("writing the environment file: %w", err)
 	}
 	return file, inline, remove, nil
+}
+
+// EnvFileBody renders one container's environment as the KEY=value lines
+// podman reads out of an env file, and answers the keys that have no spelling
+// in one, which is the values that carry a line break. Those go on the command
+// line instead, where they are visible.
+//
+// It is exported because kitbashd writes the env file of a Process itself: the
+// file has to be readable by the member the container is started as, and a
+// file the daemon wrote into its own temporary directory is not.
+func EnvFileBody(env map[string]string) (body string, inline []string) {
+	var lines strings.Builder
+	for _, k := range sortedKeys(env) {
+		if strings.ContainsAny(env[k], "\n\r") {
+			inline = append(inline, k)
+			continue
+		}
+		lines.WriteString(k + "=" + env[k] + "\n")
+	}
+	return lines.String(), inline
 }
 
 // containerJSON is the part of podman ps --format json kitbash reads.

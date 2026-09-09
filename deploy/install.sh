@@ -18,11 +18,18 @@ fi
 log "installing host packages"
 apk add -q --no-progress podman crun passt fuse-overlayfs shadow shadow-subids git openssh qemu-guest-agent curl
 
-# 3. cgroups v2 and kernel modules for rootless podman.
+# 3. cgroups v2 and kernel modules for rootless podman. kitbashd owns
+#    /sys/fs/cgroup/kitbash: it creates one root owned ceiling cgroup per
+#    Process under the member's cgroup, writes the manifest's limits into it,
+#    and starts the container beneath it, which is what makes those limits an
+#    enforcement rather than a record. Nothing here creates any of it.
 sed -i 's/^#\?rc_cgroup_mode=.*/rc_cgroup_mode="unified"/' /etc/rc.conf
 grep -q '^rc_cgroup_mode="unified"' /etc/rc.conf || echo 'rc_cgroup_mode="unified"' >> /etc/rc.conf
 for m in tun fuse; do grep -qx "$m" /etc/modules || echo "$m" >> /etc/modules; modprobe "$m" 2>/dev/null || true; done
-rc-update -q add cgroups boot 2>/dev/null || true
+# sysinit, not boot: kitbashd depends on the cgroups service, and a service in
+# the default runlevel can only need one that is already up by then.
+rc-update -q add cgroups sysinit 2>/dev/null || true
+rc-update -q del cgroups boot 2>/dev/null || true
 rc-service -q cgroups start 2>/dev/null || true
 rc-update -q add qemu-guest-agent default 2>/dev/null || true
 rc-service -q qemu-guest-agent start 2>/dev/null || true

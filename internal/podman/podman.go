@@ -95,6 +95,10 @@ type Container struct {
 // RunOptions is one container start. Detach and Interactive together are what
 // keeps a stdio MCP server alive as PID 1: the container runs detached with
 // stdin held open, and every session execs another instance beside it.
+//
+// The last four fields are kitbashd's, not a session's: a member cannot place
+// their own container in a delegated cgroup, so the daemon runs podman for
+// them, see internal/cgroups and PLAN.md section 2.3.
 type RunOptions struct {
 	Name        string
 	Image       string
@@ -103,9 +107,19 @@ type RunOptions struct {
 	Restart     string
 	CPUs        string
 	Memory      string
+	PidsLimit   int
 	Publish     []PortMapping
 	Detach      bool
 	Interactive bool
+	// CgroupParent is the cgroup the container's own one is created under,
+	// as an absolute path below the mount point. Empty leaves the runtime's
+	// default in place, which is a host that enforces no limits.
+	CgroupParent string
+	// EnvFile is a file of KEY=value lines podman reads the environment out
+	// of. A caller that sets it has written the file itself, so Run passes it
+	// through and removes nothing; one that leaves it empty gets a file
+	// written and removed around the call.
+	EnvFile string
 }
 
 // Runner is the container runtime kitbash drives. The CLI implementation talks

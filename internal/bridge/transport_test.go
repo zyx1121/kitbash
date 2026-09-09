@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -63,5 +64,53 @@ func TestExecTransportRefusesAnImageWithNoEntrypoint(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "entrypoint") {
 		t.Errorf("error is %q, want it to name the missing entrypoint", err)
+	}
+}
+
+// A session that will not open is one of two things, and only what the runtime
+// wrote tells them apart. The kernel refuses to move the new process into the
+// container's cgroup when this session is outside its member's, which is a
+// session kitbashd did not place rather than a Package that is down, see
+// sessions_join in spec/kitbashd-api.yaml.
+func TestAnExecOutsideTheMemberCgroupIsNamed(t *testing.T) {
+	p := &proc.Process{
+		Package:   "/home/tester/import-mcp",
+		Container: "kitbash-import-mcp-import-mcp",
+	}
+	refused := "crun: write to /sys/fs/cgroup/kitbash/loki/0192f000-0000-7000-8000-000000000000/" +
+		"libpod-abc/cgroup.procs: Permission denied"
+
+	prob := connectProblem(p, errors.New("EOF"), refused)
+	if prob.Detail != "this session is outside the member's cgroup; kitbashd could not place it" {
+		t.Errorf("detail is %q, want the placement named", prob.Detail)
+	}
+	if !strings.Contains(prob.Fix, "new session") {
+		t.Errorf("fix is %q, want it to say what to do", prob.Fix)
+	}
+
+	// Anything else is the Package, and the runtime's words go with it.
+	other := connectProblem(p, errors.New("EOF"), "Error: container is not running")
+	if other.Detail == "this session is outside the member's cgroup; kitbashd could not place it" {
+		t.Error("a Package that is down was reported as a cgroup problem")
+	}
+	if !strings.Contains(other.Fix, "proc_list") {
+		t.Errorf("fix is %q, want the Package's own next step", other.Fix)
+	}
+}
+
+// The runtime's error output is kept for the failure that follows it, and no
+// more of it than one line of trouble.
+func TestTheExecOutputIsKeptOnceAndBounded(t *testing.T) {
+	b := &Bridge{execErrors: map[string]*boundedSink{}}
+	sink := &boundedSink{}
+	b.execErrors["one"] = sink
+	sink.Write([]byte(strings.Repeat("x", ExecErrorBytes+100)))
+
+	got := b.execOutput("one")
+	if len(got) != ExecErrorBytes {
+		t.Errorf("kept %d bytes, want at most %d", len(got), ExecErrorBytes)
+	}
+	if b.execOutput("one") != "" {
+		t.Error("the output was read twice; a later failure is a later message")
 	}
 }

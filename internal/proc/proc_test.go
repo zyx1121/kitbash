@@ -2,7 +2,7 @@ package proc_test
 
 import (
 	"context"
-	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -55,7 +55,8 @@ type fixture struct {
 
 // newFixture runs the proc family against a fake kitbashd on a socket of its
 // own, which is what a kitbash host looks like: every Process is registered
-// before it starts.
+// with the daemon and started by it, and the container it started shows up in
+// the member's own runtime, which is what the session reads back.
 func newFixture(t *testing.T) *fixture {
 	t.Helper()
 	daemon, err := teltest.Start()
@@ -65,6 +66,7 @@ func newFixture(t *testing.T) *fixture {
 	t.Cleanup(daemon.Close)
 	f := newFixtureWithSocket(t, daemon.Socket)
 	f.daemon = daemon
+	daemon.MirrorRuns(f.runner)
 	return f
 }
 
@@ -237,36 +239,76 @@ func TestRunKeepsTheOldContainerWhenTheNewOneCannotStart(t *testing.T) {
 	}
 }
 
-// A run the runtime refuses is not the caller's to fix: podman reports the
-// same exit status for an image that is gone, a name taken since the lookup
-// and an option it will not take, and the manifest's own options were checked
-// before anything was removed. The runtime's words stay in the server log.
-func TestRunRuntimeFailureIsInternal(t *testing.T) {
+// kitbashd runs the container, so a run it refuses is reported as it answered
+// it: the daemon knows whether the image is missing, the options are wrong or
+// the runtime is not there, and the runtime's own words stay in its log.
+func TestRunFailureIsWhatKitbashdAnswered(t *testing.T) {
 	cases := []struct {
-		name string
-		err  error
+		name   string
+		answer teltest.Response
+		slug   string
 	}{
-		{name: "refused the command", err: errors.New("podman run: exit status 125: Error: no such image")},
-		{name: "no runtime", err: errors.New(`exec: "podman": executable file not found in $PATH`)},
+		{
+			name: "the unit options are wrong",
+			answer: teltest.Problem(http.StatusBadRequest, problem.SlugBadRequest, "Bad request",
+				"the container runtime refused the options of this unit",
+				"Check deploy.units[0]: its limits, restart policy, ports and environment are what this command line is made of."),
+			slug: problem.SlugBadRequest,
+		},
+		{
+			name: "the image is gone",
+			answer: teltest.Problem(http.StatusNotFound, problem.SlugNotFound, "Not found",
+				"tester has no image sha256:1", "Call pkg_build for this Package."),
+			slug: problem.SlugNotFound,
+		},
+		{
+			name: "the runtime could not be run at all",
+			answer: teltest.Problem(http.StatusInternalServerError, problem.SlugInternal, "Internal error",
+				"the container runtime could not run kitbash-ffmpeg-ffmpeg", ""),
+			slug: problem.SlugInternal,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFixture(t)
 			folder := f.pack(t, "ffmpeg", mcpManifest)
 			f.build(folder, "ffmpeg")
-			f.runner.RunErr = tc.err
+			f.daemon.AnswerStart(tc.answer)
 
 			_, prob := f.processes.Run(context.Background(), folder, "", "")
 			if prob == nil {
 				t.Fatal("a failed run was reported as a success")
 			}
-			if prob.Slug() != problem.SlugInternal {
-				t.Fatalf("problem is %s, want internal", prob.Slug())
+			if prob.Slug() != tc.slug {
+				t.Fatalf("problem is %s, want %s", prob.Slug(), tc.slug)
 			}
 			if strings.Contains(prob.Detail, "podman") {
 				t.Errorf("detail is %q, want the runtime's own words kept out of it", prob.Detail)
 			}
 		})
+	}
+}
+
+// Without kitbashd there is no Process: the daemon is the one that starts the
+// container, holds its cgroup and mints its credentials, so a session refuses
+// rather than starting something nobody supervises, see PLAN.md 2.6.
+func TestRunWithoutKitbashdIsRefused(t *testing.T) {
+	f := newFixtureWithSocket(t, filepath.Join(t.TempDir(), "absent.sock"))
+	folder := f.pack(t, "ffmpeg", mcpManifest)
+	f.build(folder, "ffmpeg")
+
+	_, prob := f.processes.Run(context.Background(), folder, "", "")
+	if prob == nil {
+		t.Fatal("a Process was started on a host without kitbashd")
+	}
+	if prob.Slug() != problem.SlugInternal {
+		t.Errorf("problem is %s, want internal", prob.Slug())
+	}
+	if prob.Fix != telemetry.NotRunningFix {
+		t.Errorf("fix is %q, want %q", prob.Fix, telemetry.NotRunningFix)
+	}
+	if len(f.runner.Runs) != 0 {
+		t.Errorf("the runtime was asked to run %d containers, want none", len(f.runner.Runs))
 	}
 }
 

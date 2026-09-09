@@ -40,6 +40,10 @@ depend() {
 	# not a requirement: a host whose network is down still stores the
 	# Telemetry of the sessions on it.
 	need localmount
+	# The unified hierarchy has to be mounted before kitbashd can create
+	# /sys/fs/cgroup/kitbash and delegate memory, cpu and pids to one cgroup
+	# per member, which is where a Process's limits are enforced.
+	need cgroups
 	use net
 	# local runs /etc/local.d/kitbash-rootless.start, which makes / rshared
 	# and creates every member's /run/user directory. Boot restore starts each

@@ -20,6 +20,7 @@ import (
 	commonpb "github.com/zyx1121/kitbash/internal/otlpproto/common/v1"
 	tracepb "github.com/zyx1121/kitbash/internal/otlpproto/trace/v1"
 
+	"github.com/zyx1121/kitbash/internal/cgroups"
 	"github.com/zyx1121/kitbash/internal/otlp"
 	"github.com/zyx1121/kitbash/internal/problem"
 	"github.com/zyx1121/kitbash/internal/store"
@@ -35,6 +36,11 @@ type harness struct {
 	server *Server
 	user   string
 	socket string
+	// cgroups is the placement this daemon was given, and envDir where it
+	// writes the environment file of a Process. Both are the test's own: a
+	// unit test writes no cgroup filesystem and nothing under /run.
+	cgroups *cgroups.Fake
+	envDir  string
 }
 
 // serve starts a daemon whose admin answer is fixed, which is how a test gets
@@ -64,6 +70,14 @@ func serveWith(t *testing.T, opts Options) *harness {
 	}
 	if opts.Admin == nil {
 		opts.Admin = func(*user.User) (bool, error) { return false, nil }
+	}
+	// No test touches the real cgroup filesystem or /run/kitbash: placement is
+	// a fake and the environment files go into the test's own directory.
+	if opts.Cgroups == nil {
+		opts.Cgroups = &cgroups.Fake{Base: filepath.Join(dir, "cgroup")}
+	}
+	if opts.EnvDir == "" {
+		opts.EnvDir = filepath.Join(dir, "env")
 	}
 	srv := New(st, opts)
 	t.Cleanup(srv.Close)
@@ -96,7 +110,10 @@ func serveWith(t *testing.T, opts Options) *harness {
 		},
 		Timeout: 10 * time.Second,
 	}
-	return &harness{t: t, client: client, store: st, server: srv, user: me.Username, socket: socket}
+	h := &harness{t: t, client: client, store: st, server: srv, user: me.Username, socket: socket,
+		envDir: opts.EnvDir}
+	h.cgroups, _ = opts.Cgroups.(*cgroups.Fake)
+	return h
 }
 
 // do sends one request to the daemon. The host name is ignored: the transport

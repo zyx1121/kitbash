@@ -192,10 +192,29 @@ func (s *Server) listProcesses(w http.ResponseWriter, r *http.Request, caller Ca
 	writeJSON(w, r.URL.Path, processList{Processes: list})
 }
 
+// process answers everything under /kitbash/v1/processes/{id}: the DELETE that
+// unregisters one, and the three actions that run the container runtime as its
+// owner, see run.go.
+func (s *Server) process(w http.ResponseWriter, r *http.Request) {
+	rest := strings.TrimPrefix(r.URL.Path, processesPath+"/")
+	id, action, _ := strings.Cut(rest, "/")
+	switch action {
+	case actionStart, actionStop, actionRemove:
+		s.processAction(w, r, id, action)
+		return
+	case "":
+		s.unregisterProcess(w, r, id)
+		return
+	}
+	writeProblem(w, problem.NotFoundFix(r.URL.Path,
+		fmt.Sprintf("%s is not part of the kitbashd API", r.URL.Path),
+		"Call DELETE on the Process id to unregister it, or POST start, stop or remove on it."))
+}
+
 // unregisterProcess answers DELETE /kitbash/v1/processes/{id}. Removing the
 // record revokes the token, so a container that keeps exporting after its
 // Process is gone is answered 401 rather than writing records nobody owns.
-func (s *Server) unregisterProcess(w http.ResponseWriter, r *http.Request) {
+func (s *Server) unregisterProcess(w http.ResponseWriter, r *http.Request, id string) {
 	caller, prob := s.caller(r)
 	if prob != nil {
 		writeProblem(w, prob)
@@ -207,8 +226,7 @@ func (s *Server) unregisterProcess(w http.ResponseWriter, r *http.Request) {
 			"Call DELETE to unregister a Process."))
 		return
 	}
-	id := strings.TrimPrefix(r.URL.Path, processesPath+"/")
-	if id == "" || strings.Contains(id, "/") {
+	if id == "" {
 		writeProblem(w, problem.NotFoundFix(r.URL.Path,
 			fmt.Sprintf("%s is not part of the kitbashd API", r.URL.Path),
 			"Call DELETE on the Process id, without a further path."))

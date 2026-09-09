@@ -180,6 +180,10 @@ func (s *Server) createUser(w http.ResponseWriter, r *http.Request, caller Calle
 		writeProblem(w, s.userProblem(r, err, req.Name))
 		return
 	}
+	// The member's cgroup subtree is created with the account, so their first
+	// Process is placed without waiting for the next daemon start, see
+	// internal/cgroups.
+	s.memberCgroup(r.Context(), m)
 	logger.Printf("%s created the member %s (uid %d, admin %t)", caller.User, m.Name, m.UID, m.Admin)
 	writeJSON(w, r.URL.Path, userResponse{User: m.Name, UID: m.UID, Admin: m.Admin})
 }
@@ -321,6 +325,12 @@ func (s *Server) removeUser(w http.ResponseWriter, r *http.Request, caller Calle
 	if _, err := s.store.DeleteApprovals(r.Context(), name); err != nil {
 		writeProblem(w, problem.Internal(r.URL.Path, err.Error(), ""))
 		return
+	}
+	// Their containers are gone, so the cgroups those containers ran in go
+	// too. One that is still busy is left for the next boot rather than
+	// holding up an account that is already deleted.
+	if err := s.cgroups.RemoveMember(r.Context(), name); err != nil {
+		logger.Printf("cgroups: the cgroup of %s could not be removed: %v", name, err)
 	}
 	logger.Printf("%s removed the member %s, home archived at %s", caller.User, name, archived)
 	writeJSON(w, r.URL.Path, removeResponse{User: name, Archived: archived})

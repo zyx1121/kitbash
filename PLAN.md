@@ -73,7 +73,13 @@ Packages can also be imported rather than built: an existing OCI image, an exist
 
 ### 2.3 Processes
 
-A Process is a Package running as a rootless container under the user who started it. kitbashd supervises Processes directly: restart policy, boot restore, health, resource limits. There is no dependency on systemd user sessions. Boot restore works from the registrations kitbashd holds: at start it creates each owner's runtime directory and starts each registered container as its owner, so every Process that was running before a reboot is running after it, with the token it already had.
+A Process is a Package running as a rootless container under the user who started it. kitbashd supervises Processes directly: restart policy, boot restore, health, resource limits. There is no dependency on systemd user sessions. Boot restore works from the registrations kitbashd holds: at start it creates each owner's runtime directory and starts each registered container as its owner, so every Process that was running before a reboot is running after it.
+
+**kitbashd runs the container, not the session.** A member cannot move their own process into a delegated cgroup, so limits declared in a manifest would be a record and nothing more. kitbashd owns the tree: `/sys/fs/cgroup/kitbash`, one cgroup per member below it, and one cgroup per Process below that, `/sys/fs/cgroup/kitbash/<member>/<process id>`. The Process's cgroup is the ceiling: root writes `memory.max`, `cpu.max` and `pids.max` there and those files stay root's. What the member is given is the directory of that cgroup and its three delegation files, which is exactly enough for their rootless podman to create the container's cgroup beneath the ceiling and move the container into it. The member's own cgroup stays root's in full, so nobody can make a Process cgroup beside the ones kitbashd made, and a member cannot raise what their own Process may spend.
+
+Every `podman run`, `stop` and `rm` of a Process runs as its owner from inside the member's own leaf, `/sys/fs/cgroup/kitbash/<member>/run`, with `--cgroup-parent=/kitbash/<member>/<process id>`, so `memory.max` inside the container is what the manifest asked for while the podman child that started it spends none of that memory. A member's MCP session is placed in the same leaf, which it asks for once at startup: moving a process between cgroups needs write access to the common ancestor's, and a session sshd started shares only the root cgroup with anything of kitbash's, so without it `proc` tools that exec into a container are refused by the kernel. `proc_run` registers the Process and then asks kitbashd to start it; the daemon writes the environment file itself, so the Telemetry token and the fan out secret never cross a request body or a command line. The cgroup goes when the container does, and a member's whole cgroup goes with their account.
+
+A host whose cgroup filesystem is not version 2 or not writable runs that Process unplaced, records its limits and says so on that start: the fail open is per member and per attempt, never a daemon that has given up. Restore recreates each Process's cgroup with its ceiling, because the cgroup filesystem does not survive a reboot and a container whose parent is gone does not start at all: the limits travel with the registration, so what a Process was started under is what it comes back under. A registration written before limits were recorded, and a container created before any of this existed, come back without a ceiling and gain one the next time they are run.
 
 A Process declares how it is exposed:
 
@@ -268,6 +274,8 @@ Creating a member is root's work, so the `users` family is served by kitbashd: k
 
 kitbash-mcp talks to kitbashd over a unix socket, `/run/kitbash/kitbashd.sock`, owned by root with group `kitbash-users` and mode 0660. Processes talk to kitbashd over TCP on the host's address, port 4318, because rootless networking delivers `host.containers.internal` to that address and not to loopback; the host firewall scopes who else can reach it, and the token decides whose records they are. kitbashd learns who is calling from the socket's peer credentials, the same kernel fact sshd relied on, and reads group membership from the system. There is no token and no second identity. The socket carries OTLP/HTTP on the standard paths and a small JSON API for queries and settings; the machine readable definition is [`spec/kitbashd-api.yaml`](spec/kitbashd-api.yaml).
 
+**What needs kitbashd.** `proc_run`, `proc_stop`, the `tel` family, the `users` family, the `approvals` family and `/mcp` all go through the daemon; without it they answer internal with the fix "kitbashd is not running on this host; ask an administrator to start it." `proc_run` refuses rather than starting a Process nobody supervises, because a Process started without the daemon has no token, no fan out secret and no cgroup, and version 1 has no untraced path. What keeps working through the kernel alone: the `fs` family, `pkg_build`, `pkg_list`, `pkg_inspect`, `proc_list` and `proc_logs`, which read the member's own files and their own container runtime.
+
 One break glass path exists for the operator: a serial console or a dedicated `ops` user with a real shell, disabled by default and enabled only from the console. Without it the first stuck machine is a reinstall.
 
 ### 4.6 The three infrastructure layers
@@ -328,7 +336,6 @@ Each milestone is done when its acceptance sentence is true on a real machine, n
 The MCP tool surface is decided in `spec/mcp-surface.yaml`: six families, `fs` implemented in M1, the rest declared.
 
 - Whether `files` deploy units are needed in version 1 at all, or whether every Package is a container until a real case appears.
-- Resource limits: rootless podman on OpenRC has no cgroup delegation, so `limits` are passed to the runtime and recorded but not enforced until kitbashd places member sessions in delegated cgroups.
 - Health: `health` is recorded but not probed until kitbashd supervises Processes. Liveness in M2 is PID 1 of the container.
 - A Process started in one MCP session appears on another session's surface when that session reconnects, not live.
 - Import kits run under the member who imports. Whether an admin can run a kit once for every member is an M5 question.
