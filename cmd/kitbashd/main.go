@@ -21,6 +21,7 @@ import (
 
 	"github.com/zyx1121/kitbash/internal/daemon"
 	"github.com/zyx1121/kitbash/internal/store"
+	"github.com/zyx1121/kitbash/internal/sysusers"
 )
 
 // version is set at build time with -X main.version.
@@ -95,6 +96,11 @@ func run() error {
 	if !filepath.IsAbs(*mcpBinary) {
 		return fmt.Errorf("-mcp-binary %s is not an absolute path", *mcpBinary)
 	}
+
+	// A host upgraded from a kitbash that locked shadow's own /etc/subuid.lock
+	// still carries the empty file that makes useradd refuse to run, so it is
+	// cleared once here, see issue #83.
+	clearLegacySubIDLock()
 
 	// The store directory is the daemon's alone: it holds every member's
 	// Telemetry, and the socket is the only way in. A directory that already
@@ -206,6 +212,24 @@ func run() error {
 	}
 	logger.Printf("stopped")
 	return nil
+}
+
+// clearLegacySubIDLock removes the subordinate id lock file an older kitbash
+// left at shadow's own lock name. Only an empty file is removed, and a failure
+// is a log line rather than a refusal to start: the daemon takes its own lock
+// under /run and serves either way, while useradd on that host stays broken
+// until an operator deletes the file.
+func clearLegacySubIDLock() {
+	removed, err := sysusers.RemoveLegacySubIDLock(sysusers.LegacySubIDLock)
+	if err != nil {
+		logger.Printf("could not remove the stale lock %s an older kitbash left behind: %v",
+			sysusers.LegacySubIDLock, err)
+		return
+	}
+	if removed {
+		logger.Printf("removed the stale lock %s an older kitbash left behind; that name belongs to shadow-utils",
+			sysusers.LegacySubIDLock)
+	}
 }
 
 // truthy reads a switch from the environment. Only 1 and true turn one on: a

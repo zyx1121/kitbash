@@ -19,15 +19,29 @@ const (
 	SubIDMode  = 0o644
 )
 
-// SubIDLockSuffix names the lock file beside /etc/subuid. The lock is on a
-// file of its own rather than on /etc/subuid, because an allocation replaces
-// /etc/subuid by renaming a new file over it: a lock held on the old inode
-// would guard a file nobody reads any more.
+// The cross process lock of the allocation. The lock is on a file of its own
+// rather than on /etc/subuid, because an allocation replaces /etc/subuid by
+// renaming a new file over it: a lock held on the old inode would guard a file
+// nobody reads any more.
+//
+// The name is kitbash's own, under /run, and never /etc/subuid.lock: that name
+// belongs to shadow-utils, which writes a PID into it and refuses to run when
+// it finds one without, so a lock file kitbash left there stops useradd on the
+// whole host, see issue #83.
 //
 // kitbash-adduser takes the same lock, so an admin creating a member through
 // kitbashd and an operator running the console script cannot hand out the same
 // range.
-const SubIDLockSuffix = ".lock"
+const (
+	DefaultSubIDLock = "/run/kitbash/subids.lock"
+	SubIDLockDirMode = 0o755
+	SubIDLockMode    = 0o600
+)
+
+// LegacySubIDLock is where kitbash took that lock before issue #83, which is
+// shadow's own lock name. An empty file there is one an older kitbash left
+// behind and is removed once at start, see RemoveLegacySubIDLock.
+const LegacySubIDLock = "/etc/subuid.lock"
 
 // SubIDAttempts is how often an allocation is tried before it gives up. One
 // attempt is enough under the lock; the retry is what makes the allocation
@@ -38,21 +52,59 @@ const SubIDAttempts = 5
 
 // lockSubIDs takes the cross process lock and returns the release. The lock is
 // advisory, which is enough: the two writers of these files are kitbashd and
-// kitbash-adduser, and both take it.
+// kitbash-adduser, and both take it. The directory holding it is created
+// first, because /run is a tmpfs on a kitbash host and comes back empty at
+// every boot.
 func lockSubIDs(path string) (func(), error) {
-	name := path + SubIDLockSuffix
-	f, err := os.OpenFile(name, os.O_RDWR|os.O_CREATE, 0o600)
+	if path == "" {
+		return nil, fmt.Errorf("sysusers: no subordinate id lock file is configured")
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, SubIDLockDirMode); err != nil {
+		return nil, fmt.Errorf("sysusers: lock directory %s: %w", dir, err)
+	}
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, SubIDLockMode)
 	if err != nil {
-		return nil, fmt.Errorf("sysusers: open %s: %w", name, err)
+		return nil, fmt.Errorf("sysusers: open %s: %w", path, err)
 	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
 		f.Close()
-		return nil, fmt.Errorf("sysusers: lock %s: %w", name, err)
+		return nil, fmt.Errorf("sysusers: lock %s: %w", path, err)
 	}
 	return func() {
 		syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 		f.Close()
 	}, nil
+}
+
+// RemoveLegacySubIDLock clears the lock file an older kitbash left at shadow's
+// own lock name and reports whether it removed one. Only an empty regular file
+// is removed: shadow writes its PID into that file while useradd runs, so a
+// file with anything in it belongs to a tool that is running now and deleting
+// it would break the protocol this is fixing. A symbolic link there is not
+// kitbash's either and is left alone.
+//
+// kitbashd calls this at start and kitbash-adduser does the same on the
+// console, so a host upgraded from a version that took the wrong lock recovers
+// without an operator deleting the file by hand.
+func RemoveLegacySubIDLock(path string) (bool, error) {
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("sysusers: stat %s: %w", path, err)
+	}
+	if !info.Mode().IsRegular() || info.Size() != 0 {
+		return false, nil
+	}
+	if err := os.Remove(path); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("sysusers: remove the stale lock %s: %w", path, err)
+	}
+	return true, nil
 }
 
 // nextSubID reads a subordinate id file and answers the first free block above
