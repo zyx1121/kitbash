@@ -3,3 +3,4 @@ node_modules/
 bun.lock
 .claude/
 oc.stdout
+oc.stderr
