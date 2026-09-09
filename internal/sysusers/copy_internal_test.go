@@ -108,6 +108,25 @@ func TestImageSizeReadsAnInspect(t *testing.T) {
 	}
 }
 
+// TestLoadedNamesPicksOnlyTheNameTheLoadInvented. An archive of one image
+// saved by digest carries no name, so podman load invents one and the copied
+// image would show up twice in podman images and in pkg_list. The tag its new
+// owner writes, and every other name that member put there, are theirs.
+func TestLoadedNamesPicksOnlyTheNameTheLoadInvented(t *testing.T) {
+	out := `["localhost/sha256:d503eb2f7a0d","localhost/kitbash/observe-count:cb3e14906035","localhost/mine:v1"]`
+	names := loadedNames(out)
+	if len(names) != 1 || names[0] != "localhost/sha256:d503eb2f7a0d" {
+		t.Errorf("the names to drop are %v, want the one the load invented", names)
+	}
+	// An image with no names at all, and output that is not a list, are both
+	// nothing to untag rather than a reason to fail a copy that worked.
+	for _, empty := range []string{"null", "[]", "", "<no value>"} {
+		if names := loadedNames(empty); len(names) != 0 {
+			t.Errorf("loadedNames(%q) = %v, want nothing to untag", empty, names)
+		}
+	}
+}
+
 // exitError is a real command that exited with one status, because the mapping
 // under test reads the exit status of an *exec.ExitError and nothing else.
 func exitError(t *testing.T, status int) error {

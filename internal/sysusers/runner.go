@@ -3,6 +3,7 @@ package sysusers
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -235,7 +236,53 @@ func (p *Podman) CopyImage(ctx context.Context, from, to Member, digest, fromCgr
 		return fmt.Errorf("sysusers: podman load as %s: %w: %s",
 			to.Name, loadWait, clipOutput(loadErr.String()))
 	}
+	p.dropLoadedName(ctx, to, digest)
 	return nil
+}
+
+// LoadedPrefix is the repository podman load invents for an archive that
+// carries no name of its own, which is every archive of one image saved by
+// digest. The result is a name like localhost/sha256:d503eb... beside the tag
+// the caller writes, and two names for one image is what pkg_list and podman
+// images then show.
+const LoadedPrefix = "localhost/sha256:"
+
+// dropLoadedName removes the name the load invented, so the copied image
+// carries the tag its new owner gives it and nothing else. Only a name of
+// LoadedPrefix is dropped: every other name on that image is one the member
+// put there, and this is not the call that decides about those.
+//
+// It is best effort. The image is in the member's store, which is what the
+// copy was for; a name left behind is untidy and nothing more, so it is
+// logged rather than turned into a failed copy.
+func (p *Podman) dropLoadedName(ctx context.Context, m Member, digest string) {
+	out, err := p.run(ctx, m, "image", "inspect", "--format", "{{json .RepoTags}}", digest)
+	if err != nil {
+		logger.Printf("images: the names of %s in %s's store could not be read: %v", digest, m.Name, err)
+		return
+	}
+	for _, name := range loadedNames(out) {
+		if _, err := p.run(ctx, m, "untag", digest, name); err != nil {
+			logger.Printf("images: %s of %s could not be untagged from %s: %v", name, m.Name, digest, err)
+		}
+	}
+}
+
+// loadedNames picks the names a load invented out of one image's RepoTags.
+// It is a function of its own because it is the part worth testing without a
+// container runtime.
+func loadedNames(out string) []string {
+	var names []string
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &names); err != nil {
+		return nil
+	}
+	var invented []string
+	for _, name := range names {
+		if strings.HasPrefix(name, LoadedPrefix) {
+			invented = append(invented, name)
+		}
+	}
+	return invented
 }
 
 // pipeline runs the output of one child into the input of another and answers

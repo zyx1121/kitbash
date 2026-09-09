@@ -407,6 +407,15 @@ api:
       this call can see. bytes is the size of the image in the requester's
       store. One fetch per requester and digest at a time; a second while one
       is in flight is 409 conflict rather than a second load into one store.
+
+      An archive of one image saved by digest carries no name, so podman load
+      invents one of the form localhost/sha256:<hex>. It is untagged as the
+      requester once the load has finished, so the copied image carries the tag
+      pkg_build gives it and nothing else, and podman images shows one row for
+      it rather than two. Only that name is dropped; every other name on the
+      image is one the member put there. A name that could not be dropped is
+      logged and nothing more: the image is in the store, which is what the
+      copy was for.
     timeouts: >
       The two children share a 300 s budget and the response deadline is
       extended to 360 s, so the answer arrives rather than the deadline. A
