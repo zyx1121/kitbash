@@ -12,6 +12,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/zyx1121/kitbash/internal/manifest"
 )
 
 // SubscriptionTelemetry is the one subscription a manifest can declare, see
@@ -63,6 +65,12 @@ type Process struct {
 	Endpoint      string    `json:"endpoint"`
 	Subscriptions []string  `json:"subscriptions"`
 	RegisteredAt  time.Time `json:"registeredAt"`
+	// Permits is what this Process may call back over /mcp, as its Package's
+	// manifest declared it at registration. It is listed like the rest of the
+	// record: what a Process may do is not a secret from its owner, and
+	// pkg_inspect already shows the same block. A registration written before
+	// permits existed carries none, which permits nothing.
+	Permits manifest.Permits `json:"permits"`
 	// FanoutSecret is the bearer kitbashd puts on every fan out request to
 	// this Process. It is minted with the token at registration and handed to
 	// the container once. The tag keeps it out of processes_list, which is the
@@ -155,20 +163,26 @@ func (s *Store) RegisterProcess(ctx context.Context, p Process, tokenHash string
 	if err != nil {
 		return fmt.Errorf("store: encode subscriptions: %w", err)
 	}
+	// The permits block is written as the manifest declared it, so what the
+	// child of an MCP session is given is what the Process was registered
+	// with and not what its Package says today.
+	permits := p.Permits.JSON()
 	// The fan out secret is replaced with the token, because the two are minted
 	// together: a container holding the old token holds the old secret.
 	if _, err := tx.ExecContext(ctx, `INSERT INTO processes
 		(id, owner, admin, package, name, container, digest, expose, endpoint,
-		 subscriptions, token_hash, fanout_secret, registered_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+		 subscriptions, permits, token_hash, fanout_secret, registered_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 			owner = excluded.owner, admin = excluded.admin, package = excluded.package,
 			name = excluded.name, container = excluded.container, digest = excluded.digest,
 			expose = excluded.expose, endpoint = excluded.endpoint,
-			subscriptions = excluded.subscriptions, token_hash = excluded.token_hash,
+			subscriptions = excluded.subscriptions, permits = excluded.permits,
+			token_hash = excluded.token_hash,
 			fanout_secret = excluded.fanout_secret, registered_at = excluded.registered_at`,
 		p.ID, p.Owner, p.Admin, p.Package, p.Name, p.Container, p.Digest, p.Expose, p.Endpoint,
-		string(subscriptions), tokenHash, p.FanoutSecret, p.RegisteredAt.UnixNano()); err != nil {
+		string(subscriptions), string(permits), tokenHash, p.FanoutSecret,
+		p.RegisteredAt.UnixNano()); err != nil {
 		return fmt.Errorf("store: register the Process %s: %w", p.ID, err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -301,7 +315,7 @@ func (s *Store) Processes(ctx context.Context, owner string) ([]Process, error) 
 
 // processColumns is the one select every read of this table shares.
 const processColumns = `SELECT id, owner, admin, package, name, container, digest,
-	expose, endpoint, subscriptions, fanout_secret, registered_at`
+	expose, endpoint, subscriptions, permits, fanout_secret, registered_at`
 
 // scanner is what both a single row and a row of a result set satisfy.
 type scanner interface {
@@ -310,10 +324,10 @@ type scanner interface {
 
 func scanProcess(row scanner) (Process, error) {
 	var p Process
-	var subscriptions string
+	var subscriptions, permits string
 	var registered int64
 	if err := row.Scan(&p.ID, &p.Owner, &p.Admin, &p.Package, &p.Name, &p.Container, &p.Digest,
-		&p.Expose, &p.Endpoint, &subscriptions, &p.FanoutSecret, &registered); err != nil {
+		&p.Expose, &p.Endpoint, &subscriptions, &permits, &p.FanoutSecret, &registered); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Process{}, err
 		}
@@ -325,6 +339,16 @@ func scanProcess(row scanner) (Process, error) {
 		if err := json.Unmarshal([]byte(subscriptions), &p.Subscriptions); err != nil {
 			return Process{}, fmt.Errorf("store: read the subscriptions of %s: %w", p.ID, err)
 		}
+	}
+	// A record written before the column existed carries an empty string,
+	// which is the empty block: that Process is permitted nothing until it is
+	// registered again, which is the safe end of the two.
+	if permits != "" {
+		block, err := manifest.ParsePermits([]byte(permits))
+		if err != nil {
+			return Process{}, fmt.Errorf("store: read the permits of %s: %w", p.ID, err)
+		}
+		p.Permits = block
 	}
 	return p, nil
 }
@@ -364,7 +388,11 @@ func migrate(db *sql.DB) error {
 	// of them carries none: restore skips a Process without a container, and
 	// the fan out delivers to a Process without a secret with no bearer on the
 	// request until it is registered again.
-	for _, column := range []string{"container", "digest", "fanout_secret"} {
+	// The permits block arrives with the narrowed /mcp surface. A
+	// registration written before it carries none, so that Process reaches
+	// nothing over /mcp until it is run again, which is the end of the two
+	// that cannot surprise a member.
+	for _, column := range []string{"container", "digest", "fanout_secret", "permits"} {
 		if err := addTextColumn(db, "processes", column); err != nil {
 			return err
 		}

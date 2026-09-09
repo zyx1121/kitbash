@@ -7,6 +7,15 @@ tags: [kit, workflow]
 
 provides:
   prompt: WORKFLOW.md
+  # What a Process of this kit may call back over /mcp. The engine reads the
+  # graph with fs_read and calls the tools of the owner's other Processes,
+  # which is what packages stands for: their tools and no built in, so this
+  # engine cannot write Files, build a Package or start a Process whatever a
+  # graph asks it to do. Graphs live under /org or in a member's home, so
+  # those are the two prefixes.
+  permits:
+    tools: [fs_read, packages]
+    paths: [/org, /home/*]
   tools:
     - name: run
       description: >-

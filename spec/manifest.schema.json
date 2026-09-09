@@ -52,6 +52,9 @@
           "description": "Lifecycle hooks this Package implements. Presence makes it a kit.",
           "items": { "type": "string", "enum": ["import", "build", "run", "observe", "evaluate"] },
           "uniqueItems": true
+        },
+        "permits": {
+          "$ref": "#/$defs/permits"
         }
       }
     },
@@ -70,6 +73,27 @@
     }
   },
   "$defs": {
+    "permits": {
+      "type": "object",
+      "description": "What a Process of this Package may call over /mcp. A Process with no permits block gets an empty surface: the block is the declaration, not a filter on top of one. It narrows nothing for a member's own SSH session.",
+      "additionalProperties": false,
+      "properties": {
+        "tools": {
+          "type": "array",
+          "description": "Surface tool names this Package may call, as globs, plus the reserved word packages. A * matches any run of characters within a name, so fs_* is the fs family; a glob matches whatever it matches, built in tools included, because writing one is declaring them. The word packages stands for every tool the owner's running Processes publish and for no built in, which is what a kit that composes other kits needs. A tool that matches nothing here is not published to the Process and calling it is not-permitted.",
+          "items": { "type": "string", "pattern": "^(packages|[A-Za-z0-9_*-]+)$", "maxLength": 63 },
+          "maxItems": 64,
+          "uniqueItems": true
+        },
+        "paths": {
+          "type": "array",
+          "description": "Absolute Files path prefixes this Package may name. A prefix covers the path itself and everything below it, and a * stands for exactly one whole component, so /home/*/flows is that folder in every member's home. A Process with tools but no paths may call nothing that takes a path.",
+          "items": { "type": "string", "pattern": "^(/(\\*|[A-Za-z0-9._-]+))+$", "maxLength": 4096 },
+          "maxItems": 32,
+          "uniqueItems": true
+        }
+      }
+    },
     "tool": {
       "type": "object",
       "additionalProperties": false,

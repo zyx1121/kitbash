@@ -14,6 +14,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/zyx1121/kitbash/internal/bridge"
+	"github.com/zyx1121/kitbash/internal/manifest"
 	"github.com/zyx1121/kitbash/internal/pkg"
 	"github.com/zyx1121/kitbash/internal/problem"
 	"github.com/zyx1121/kitbash/internal/proc"
@@ -37,7 +38,19 @@ type traced struct {
 // nothing is listening on is how the missing daemon is exercised.
 func newTraced(t *testing.T, socket string) *traced {
 	t.Helper()
+	return newTracedPermits(t, socket, nil)
+}
+
+// newTracedPermits is newTraced narrowed by a permits block, which is how the
+// session of a Process reaches the same surface. The block is built from the
+// fixture because a prefix is a real path.
+func newTracedPermits(t *testing.T, socket string, permitsFor func(w *whole) *manifest.Permits) *traced {
+	t.Helper()
 	w := newWhole(t)
+	var permits *manifest.Permits
+	if permitsFor != nil {
+		permits = permitsFor(w)
+	}
 	logs := &bytes.Buffer{}
 	provider, err := telemetry.New(telemetry.Options{
 		Version: "test",
@@ -72,6 +85,7 @@ func newTraced(t *testing.T, socket string) *traced {
 		Processes: processes,
 		Bridge:    tools,
 		Telemetry: provider,
+		Permits:   permits,
 	})
 	clientTransport, serverTransport := mcp.NewInMemoryTransports()
 	serverSession, err := srv.Connect(ctx, serverTransport, nil)
@@ -95,12 +109,19 @@ func newTraced(t *testing.T, socket string) *traced {
 // it receives.
 func newTracedWithDaemon(t *testing.T) *traced {
 	t.Helper()
+	return newTracedWithDaemonPermits(t, nil)
+}
+
+// newTracedWithDaemonPermits is newTracedWithDaemon for the session of a
+// Process: the same fake kitbashd, narrowed by a permits block.
+func newTracedWithDaemonPermits(t *testing.T, permitsFor func(w *whole) *manifest.Permits) *traced {
+	t.Helper()
 	daemon, err := teltest.Start()
 	if err != nil {
 		t.Fatalf("teltest.Start: %v", err)
 	}
 	t.Cleanup(daemon.Close)
-	tr := newTraced(t, daemon.Socket)
+	tr := newTracedPermits(t, daemon.Socket, permitsFor)
 	tr.daemon = daemon
 	return tr
 }

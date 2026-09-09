@@ -10,6 +10,7 @@ import (
 
 	"github.com/zyx1121/kitbash/internal/bridge"
 	"github.com/zyx1121/kitbash/internal/fs"
+	"github.com/zyx1121/kitbash/internal/manifest"
 	"github.com/zyx1121/kitbash/internal/pkg"
 	"github.com/zyx1121/kitbash/internal/problem"
 	"github.com/zyx1121/kitbash/internal/proc"
@@ -28,6 +29,11 @@ type Deps struct {
 	Processes *proc.Service
 	Bridge    *bridge.Bridge
 	Telemetry *telemetry.Provider
+	// Permits narrows this session to what a Package declared its Process may
+	// call, see PLAN.md section 2.3. It is nil for a member's own session,
+	// which is narrowed by nothing; PermitsFromEnv is what reads it for the
+	// session of a Process.
+	Permits *manifest.Permits
 }
 
 // New builds the MCP server for one caller.
@@ -42,6 +48,12 @@ func New(version string, deps Deps) *mcp.Server {
 		Description: "Files, Packages, Processes and Telemetry for agents. M3 serves the fs, pkg, proc and tel families.",
 	}, nil)
 	s.AddReceivingMiddleware(problemGuard)
+	if deps.Permits != nil {
+		// Between the two, so a refusal is still one span: tracing wraps it
+		// and problemGuard is behind it, which is where a call this Process
+		// may make goes on to fail on its own terms.
+		s.AddReceivingMiddleware(permitsGuard(*deps.Permits, packageTools(deps.Bridge)))
+	}
 	// Middleware added later wraps middleware added earlier, so tracing goes
 	// on last: the span is open before the arguments are validated and closes
 	// after problemGuard has turned every failure into problem details.
@@ -64,7 +76,10 @@ func New(version string, deps Deps) *mcp.Server {
 		// The users and approvals families live in kitbashd, so they are on
 		// the surface only when this session has a socket to reach it on.
 		RegisterUsers(s, client)
-		RegisterApprovals(s, client, deps.Files, deps.Packages)
+		// The approvals family takes the block as well: approving executes the
+		// queued tool inside its own handler, which the guard never sees, see
+		// permittedApproval.
+		RegisterApprovals(s, client, deps.Files, deps.Packages, deps.Permits)
 	}
 	return s
 }

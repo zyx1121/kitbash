@@ -66,6 +66,15 @@ func run() error {
 	// queued with kitbashd instead of being attempted, see PLAN.md 2.1.
 	files.SetApprovals(telem.Client())
 
+	// What this session may call. A member's own session is narrowed by
+	// nothing; the session of a Process is narrowed to what its Package
+	// declared, and a declaration this build cannot read ends the session
+	// here rather than serving the owner's whole surface, see PLAN.md 2.3.
+	permits, err := server.PermitsFromEnv()
+	if err != nil {
+		return err
+	}
+
 	runner := podman.NewCLI()
 	// The Process registry is the same client tel_query forwards through: a
 	// Process is registered with kitbashd before its container starts, which
@@ -79,6 +88,7 @@ func run() error {
 		Processes: processes,
 		Bridge:    tools,
 		Telemetry: telem,
+		Permits:   permits,
 	})
 	// The tools of the caller's already running Processes join the surface
 	// before the first request is served, see PLAN.md section 2.3.

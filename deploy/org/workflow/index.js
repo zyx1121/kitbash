@@ -609,7 +609,7 @@ function preflight(doc, tools, graphPath) {
     if (step.tool === undefined || tools.has(step.tool)) continue;
     throw notFound(
       `Step ${JSON.stringify(step.id)} of ${graphPath} calls ${step.tool}, which is not on this Process's surface.`,
-      "Run the Package that provides the tool, then run the graph again. Tool names are <package>_<tool>.",
+      "Run the Package that provides the tool, then run the graph again. Tool names are <package>_<tool>. A tool this kit is not permitted to call is not on the surface either: declare it in provides.permits.tools of this kit's kitbash.yaml.",
       `${graphPath}#${step.id}`,
       "Tool not found",
     );
@@ -793,7 +793,7 @@ async function run(args) {
     session = await openSession(endpoint, token);
     const tools = await listToolNames(session.client, deadline);
     if (!tools.has("fs_read")) {
-      throw internal("The surface this Process reaches has no fs_read, so no graph can be read.", "Report this: a Process session is the owner's whole surface.", graphPath);
+      throw internal("The surface this Process reaches has no fs_read, so no graph can be read.", "Declare fs_read in provides.permits.tools of this kit's kitbash.yaml: a Process reaches only the tools its Package permits.", graphPath);
     }
     const result = await runGraph({ client: session.client, tools, graphPath, input, chain: [], deadline, run: state });
     console.error(`[workflow] ${graphPath} ran ${state.steps} steps, keeping ${state.bytes} bytes, in ${Date.now() - startedAt} ms`);

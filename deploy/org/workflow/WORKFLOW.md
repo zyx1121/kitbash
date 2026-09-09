@@ -174,11 +174,31 @@ output:
 - A step whose tool fails stops the run. `run` answers that tool's own problem,
   with the step named in `detail` and `<graph path>#<step id>` in `instance`, so
   a missing file in a step is still a `not-found` and not an engine failure.
-- Every tool a graph names is resolved against your surface when that graph is
-  loaded, before any of its steps run. A name that is not there is a `not-found`
-  naming the step and the tool: run the Package that provides it first. A nested
-  graph is loaded when the step that runs it is reached, so its tools are
-  resolved then, after the steps before it have run.
+- Every tool a graph names is resolved against this engine's surface when that
+  graph is loaded, before any of its steps run. A name that is not there is a
+  `not-found` naming the step and the tool. There are two reasons it would not
+  be there: the Package that provides it is not running, so run it first, or
+  this kit is not permitted to call it, in which case it is not published to
+  this Process at all and the fix is a line in this kit's `kitbash.yaml`, see
+  the section above. A nested graph is loaded when the step that runs it is
+  reached, so its tools are resolved then, after the steps before it have run.
+
+## What this engine may call
+
+This Process reaches your surface through `/mcp`, and what it may reach is what
+this kit's `kitbash.yaml` declares in `provides.permits`: the tools `fs_read`
+and `packages`, and the paths `/org` and `/home/*`.
+
+`packages` is every tool your running Processes publish, the `<package>_<tool>`
+names, and never a built in. So a step may call any kit you are running, and
+this engine cannot write Files, build a Package, start or stop a Process, touch
+members or approve anything, whatever a graph asks it to do.
+
+A tool this kit may not call is not published to it, so a step that names one
+fails in the pre-flight below as `not-found`, before anything runs, with a fix
+that points at this kit's manifest. A path or a graph outside the two prefixes
+is refused with `not-permitted` naming the step. Either way the fix is a line in
+this kit's `kitbash.yaml` rather than a change to your graph.
 
 ## Telemetry
 

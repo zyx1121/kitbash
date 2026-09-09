@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/zyx1121/kitbash/internal/manifest"
 	"github.com/zyx1121/kitbash/internal/problem"
 	"github.com/zyx1121/kitbash/internal/store"
 )
@@ -61,15 +62,20 @@ var uuidV7 = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-
 // Container and Digest are optional: a kitbash-mcp of the previous release
 // registers without them, and a registration that carries no container is one
 // restore leaves alone.
+// Permits is what this Process may call back over /mcp, as the Package's
+// manifest declares it. A registration without one permits nothing: an older
+// kitbash-mcp sends no block, and the surface it would otherwise be given is
+// its owner's whole one.
 type processRequest struct {
-	ID            string   `json:"id"`
-	Package       string   `json:"package"`
-	Name          string   `json:"name,omitempty"`
-	Container     string   `json:"container,omitempty"`
-	Digest        string   `json:"digest,omitempty"`
-	Expose        string   `json:"expose"`
-	Endpoint      string   `json:"endpoint,omitempty"`
-	Subscriptions []string `json:"subscriptions,omitempty"`
+	ID            string           `json:"id"`
+	Package       string           `json:"package"`
+	Name          string           `json:"name,omitempty"`
+	Container     string           `json:"container,omitempty"`
+	Digest        string           `json:"digest,omitempty"`
+	Expose        string           `json:"expose"`
+	Endpoint      string           `json:"endpoint,omitempty"`
+	Subscriptions []string         `json:"subscriptions,omitempty"`
+	Permits       manifest.Permits `json:"permits,omitempty"`
 }
 
 // processResponse is what a registration answers. The token is returned once
@@ -147,6 +153,7 @@ func (s *Server) registerProcess(w http.ResponseWriter, r *http.Request, caller 
 		Expose:        req.Expose,
 		Endpoint:      req.Endpoint,
 		Subscriptions: req.Subscriptions,
+		Permits:       req.Permits,
 		FanoutSecret:  secret,
 		RegisteredAt:  s.now().UTC(),
 	}
@@ -307,6 +314,14 @@ func validateProcess(instance string, req processRequest) *problem.Problem {
 				fmt.Sprintf("%q is not a subscription kitbashd offers", s),
 				"Declare subscriptions: [telemetry], which is the only one that exists.")
 		}
+	}
+	// A permits block kitbashd cannot honour is refused here rather than
+	// stored: a glob nobody can read would otherwise sit in the registry
+	// permitting nothing, and the member would look for the mistake in the
+	// session instead of in the manifest.
+	if err := req.Permits.Validate(); err != nil {
+		return problem.BadRequest(instance, err.Error(),
+			"Declare provides.permits.tools as tool name globs and provides.permits.paths as absolute path prefixes in the Package's kitbash.yaml.")
 	}
 	return validateEndpoint(instance, req.Endpoint)
 }

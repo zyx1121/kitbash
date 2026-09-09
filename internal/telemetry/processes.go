@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/zyx1121/kitbash/internal/manifest"
 	"github.com/zyx1121/kitbash/internal/problem"
 )
 
@@ -91,15 +92,20 @@ func EndpointForProcesses() string {
 // and the image it was started from, so kitbashd restores a Process without
 // reading its manifest, see registration_fields in spec/kitbashd-api.yaml.
 // Both are omitted when the caller does not know them.
+// Permits is what the Package's manifest declares its Process may call over
+// /mcp. It is sent on every registration, empty block and all: a Process
+// registered without one is permitted nothing, so the difference between "no
+// permits" and "an older kitbash-mcp" is not one kitbashd has to guess at.
 type Registration struct {
-	ID            string   `json:"id"`
-	Package       string   `json:"package"`
-	Name          string   `json:"name"`
-	Container     string   `json:"container,omitempty"`
-	Digest        string   `json:"digest,omitempty"`
-	Expose        string   `json:"expose"`
-	Endpoint      string   `json:"endpoint,omitempty"`
-	Subscriptions []string `json:"subscriptions,omitempty"`
+	ID            string           `json:"id"`
+	Package       string           `json:"package"`
+	Name          string           `json:"name"`
+	Container     string           `json:"container,omitempty"`
+	Digest        string           `json:"digest,omitempty"`
+	Expose        string           `json:"expose"`
+	Endpoint      string           `json:"endpoint,omitempty"`
+	Subscriptions []string         `json:"subscriptions,omitempty"`
+	Permits       manifest.Permits `json:"permits"`
 }
 
 // The shapes the two restore fields must have. kitbashd starts what the

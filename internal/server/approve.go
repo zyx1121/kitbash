@@ -8,6 +8,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/zyx1121/kitbash/internal/fs"
+	"github.com/zyx1121/kitbash/internal/manifest"
 	"github.com/zyx1121/kitbash/internal/pkg"
 	"github.com/zyx1121/kitbash/internal/problem"
 	"github.com/zyx1121/kitbash/internal/telemetry"
@@ -31,7 +32,7 @@ type approveResult struct {
 // The requester's input is not privileged by having been approved. It goes
 // through the same fs.Write and pkg.Import as any other call, with the same
 // path, manifest and size rules; only the authorship of the commit differs.
-func approveHandler(client *telemetry.Client, files *fs.Service, packages *pkg.Service) mcp.ToolHandlerFor[approveInput, any] {
+func approveHandler(client *telemetry.Client, files *fs.Service, packages *pkg.Service, permits *manifest.Permits) mcp.ToolHandlerFor[approveInput, any] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, in approveInput) (*mcp.CallToolResult, any, error) {
 		approval, prob := client.ClaimApproval(ctx, in.ID, in.Note)
 		if prob != nil {
@@ -42,7 +43,7 @@ func approveHandler(client *telemetry.Client, files *fs.Service, packages *pkg.S
 		telemetry.SetApproval(ctx, approval.ID)
 		telemetry.SetRequester(ctx, approval.Requester)
 
-		result := execute(ctx, files, packages, approval)
+		result := execute(ctx, files, packages, permits, approval)
 		if prob := client.StoreApprovalResult(ctx, approval.ID, result); prob != nil {
 			// The tool has run. Saying so is the daemon's job and it refused,
 			// so the caller is told rather than left with a result the
@@ -59,8 +60,8 @@ func approveHandler(client *telemetry.Client, files *fs.Service, packages *pkg.S
 
 // execute runs one approved call and returns what is stored on the approval:
 // the tool's output, or the problem it failed with.
-func execute(ctx context.Context, files *fs.Service, packages *pkg.Service, approval *telemetry.Approval) json.RawMessage {
-	out, prob := run(ctx, files, packages, approval)
+func execute(ctx context.Context, files *fs.Service, packages *pkg.Service, permits *manifest.Permits, approval *telemetry.Approval) json.RawMessage {
+	out, prob := run(ctx, files, packages, permits, approval)
 	if prob != nil {
 		return json.RawMessage(prob.JSON())
 	}
@@ -79,7 +80,7 @@ func execute(ctx context.Context, files *fs.Service, packages *pkg.Service, appr
 // call this session executes: the tool would otherwise happily write the
 // admin's own home on a requester's behalf, because the admin's roots include
 // it and the kernel would allow it.
-func run(ctx context.Context, files *fs.Service, packages *pkg.Service, approval *telemetry.Approval) (any, *problem.Problem) {
+func run(ctx context.Context, files *fs.Service, packages *pkg.Service, permits *manifest.Permits, approval *telemetry.Approval) (any, *problem.Problem) {
 	admin := files.User()
 	switch approval.Tool {
 	case telemetry.ToolFSWrite:
@@ -88,6 +89,9 @@ func run(ctx context.Context, files *fs.Service, packages *pkg.Service, approval
 			return nil, prob
 		}
 		if prob := confined(files, approval, in.Path); prob != nil {
+			return nil, prob
+		}
+		if prob := permittedApproval(permits, in.Path); prob != nil {
 			return nil, prob
 		}
 		telemetry.SetPath(ctx, in.Path)
@@ -112,6 +116,9 @@ func run(ctx context.Context, files *fs.Service, packages *pkg.Service, approval
 		if prob := confined(files, approval, in.Path); prob != nil {
 			return nil, prob
 		}
+		if prob := permittedApproval(permits, in.Path); prob != nil {
+			return nil, prob
+		}
 		telemetry.SetPackage(ctx, in.Path)
 		return packages.Import(ctx, pkg.ImportRequest{
 			Path:       in.Path,
@@ -124,6 +131,25 @@ func run(ctx context.Context, files *fs.Service, packages *pkg.Service, approval
 			fmt.Sprintf("%q is not a tool this session can execute", approval.Tool),
 			"Only fs_write and pkg_import are queued, so only those can be approved.")
 	}
+}
+
+// permittedApproval refuses an approved call whose queued path is outside what
+// this session may name. Approving executes the queued tool inside this
+// handler rather than as a call of its own, so the permits guard never sees
+// that write: without this, a Process permitted approvals_approve could have
+// anything under the shared root written for it by claiming an approval, which
+// is every prefix rule undone by one tool.
+//
+// A member's or an admin's own session has no permits and is unchanged. The
+// problem is returned rather than raised, so it is stored on the approval the
+// way every other refusal of an approved call is and the admin reads why
+// nothing happened.
+func permittedApproval(permits *manifest.Permits, path string) *problem.Problem {
+	if permits == nil || permits.Allows(path) {
+		return nil
+	}
+	return problem.NotPermitted(path,
+		fmt.Sprintf("this Process may not approve a call that names %s", path), PermitsPathFix)
 }
 
 // confined refuses an approved call whose path is not under the shared root.

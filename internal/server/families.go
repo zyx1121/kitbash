@@ -8,6 +8,7 @@ import (
 
 	"github.com/zyx1121/kitbash/internal/bridge"
 	"github.com/zyx1121/kitbash/internal/fs"
+	"github.com/zyx1121/kitbash/internal/manifest"
 	"github.com/zyx1121/kitbash/internal/pkg"
 	"github.com/zyx1121/kitbash/internal/proc"
 	"github.com/zyx1121/kitbash/internal/telemetry"
@@ -178,7 +179,7 @@ func RegisterUsers(s *mcp.Server, client *telemetry.Client) {
 // Listing and rejecting are forwarded to kitbashd; approving claims the
 // approval there and then runs the tool in this session, which is what makes
 // the write land as the admin's Linux user, see approve.go.
-func RegisterApprovals(s *mcp.Server, client *telemetry.Client, files *fs.Service, packages *pkg.Service) {
+func RegisterApprovals(s *mcp.Server, client *telemetry.Client, files *fs.Service, packages *pkg.Service, permits *manifest.Permits) {
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "approvals_list",
 		Description: "Approvals by state. Members see their own, admins see all. An executed approval " +
@@ -195,7 +196,7 @@ func RegisterApprovals(s *mcp.Server, client *telemetry.Client, files *fs.Servic
 			"stored on the approval for the requester.",
 		InputSchema:  approvalsApproveInputSchema,
 		OutputSchema: approvalsApproveOutputSchema,
-	}, approveHandler(client, files, packages))
+	}, approveHandler(client, files, packages, permits))
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:         "approvals_reject",
