@@ -72,23 +72,11 @@ log "installed $(/usr/bin/kitbash-mcp --version) at /usr/bin/kitbash-mcp"
 getent group kitbash-users >/dev/null || groupadd -r kitbash-users
 getent group kitbash-admin >/dev/null || groupadd -r kitbash-admin
 
-# 6. The two members, through the operator's own script.
-#
-#    shadow locks /etc/subuid with a file of that name plus .lock, which is the
-#    same name kitbash's own allocation takes its lock on, and shadow refuses a
-#    lock file it did not write ("existing lock file without a PID"). The
-#    allocation leaves its file behind, so the next useradd would refuse to
-#    run. Clearing it between accounts is this job's workaround, not a rule of
-#    the platform: on the host the two never run this close together.
-unlock_subids() { rm -f /etc/subuid.lock /etc/subgid.lock; }
-
-unlock_subids
+# 6. The two members, through the operator's own script. kitbash takes the
+#    subordinate id lock on /run/kitbash/subids.lock, its own file, so nothing
+#    is left at the name shadow locks and the second useradd runs, see #84.
 sh deploy/kitbash-adduser "$admin" "$key" admin
-unlock_subids
 sh deploy/kitbash-adduser "$member" "$key"
-#    users_create runs the same useradd from inside kitbashd, so the files are
-#    cleared here too rather than only between these two.
-unlock_subids
 
 # 6b. /run/user/<uid> is where rootless podman keeps its state, and on this
 #     host nothing but this loop makes it. A kitbash host runs no logind:
