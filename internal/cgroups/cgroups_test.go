@@ -10,6 +10,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/zyx1121/kitbash/internal/cgroups"
 )
@@ -232,21 +233,23 @@ func TestTheRealTreeOnAWritableCgroupV2Mount(t *testing.T) {
 	// A session is placed in that leaf, which is what lets it exec into the
 	// container: from there the common ancestor with the container's cgroup is
 	// the member's own, whose cgroup.procs they have.
-	placed, err := c.JoinSession(ctx, name, uid, gid, os.Getpid())
+	session := sleeper(t, uid, gid)
+	placed, err := c.JoinSession(ctx, name, uid, gid, session.Process.Pid)
 	if err != nil {
 		t.Fatalf("JoinSession: %v", err)
 	}
 	if placed != leaf {
 		t.Errorf("the session went to %q, want the leaf %q", placed, leaf)
 	}
-	if !strings.Contains(read(t, filepath.Join(leaf, "cgroup.procs")), strconv.Itoa(os.Getpid())) {
-		t.Errorf("the leaf holds %q, want this process", read(t, filepath.Join(leaf, "cgroup.procs")))
+	if !strings.Contains(read(t, filepath.Join(leaf, "cgroup.procs")), strconv.Itoa(session.Process.Pid)) {
+		t.Errorf("the leaf holds %q, want the session", read(t, filepath.Join(leaf, "cgroup.procs")))
 	}
-	// Put it back where the test found it, or the cgroup cannot be removed.
-	if err := os.WriteFile(filepath.Join(cgroups.DefaultRoot, "cgroup.procs"),
-		[]byte(strconv.Itoa(os.Getpid())), 0); err != nil {
-		t.Fatalf("move this process back to the root cgroup: %v", err)
+	// A pid the kernel has recycled is somebody else's process by now, and a
+	// session is not placed on the strength of a number alone.
+	if _, err := c.JoinSession(ctx, name, uid, gid, os.Getpid()); !errors.Is(err, cgroups.ErrNotOwned) {
+		t.Errorf("joining a process of root's as the member = %v, want ErrNotOwned", err)
 	}
+	stop(t, session)
 
 	if err := c.RemoveProcess(ctx, name, process); err != nil {
 		t.Errorf("RemoveProcess: %v", err)
@@ -260,6 +263,80 @@ func TestTheRealTreeOnAWritableCgroupV2Mount(t *testing.T) {
 	if _, err := os.Stat(cgroups.MemberDir(root, name)); !os.IsNotExist(err) {
 		t.Errorf("the member cgroup is still there: %v", err)
 	}
+}
+
+// What the delegation is worth is what a member can do with it. A process
+// under a Process's ceiling belongs to that ceiling, and the member owning
+// cgroup.procs of their own cgroup and of the ceiling does not let them move
+// it anywhere that spends less: every destination is either root's or refused
+// by the kernel's rule that a cgroup delegating controllers holds no processes.
+func TestAMemberCannotMoveAProcessOutOfItsCeiling(t *testing.T) {
+	root := testRoot(t)
+	c := cgroups.New(root)
+	ctx := context.Background()
+	if err := c.EnsureRoot(ctx); err != nil {
+		t.Skipf("this host does not delegate the controllers kitbash needs: %v", err)
+	}
+	const name = "kitbash-test-member"
+	const neighbour = "kitbash-test-other"
+	uid, gid := nobody(t)
+	leaf, err := c.EnsureProcess(ctx, name, process, uid, gid, cgroups.Limits{Memory: "536870912"})
+	if err != nil {
+		t.Fatalf("EnsureProcess: %v", err)
+	}
+	if _, err := c.EnsureMember(ctx, neighbour, uid, gid); err != nil {
+		t.Fatalf("EnsureMember: %v", err)
+	}
+	t.Cleanup(func() {
+		c.RemoveMember(ctx, name)
+		c.RemoveMember(ctx, neighbour)
+	})
+
+	// The container's own cgroup, as the member's rootless podman makes it:
+	// under the ceiling, and theirs.
+	ceiling := cgroups.ProcessDir(root, name, process)
+	container := filepath.Join(ceiling, "libpod-abc")
+	if err := os.Mkdir(container, 0o755); err != nil {
+		t.Fatalf("create the container cgroup: %v", err)
+	}
+	for _, path := range []string{container, filepath.Join(container, "cgroup.procs")} {
+		if err := os.Chown(path, uid, gid); err != nil {
+			t.Fatalf("chown %s: %v", path, err)
+		}
+	}
+	held := sleeper(t, uid, gid)
+	pid := held.Process.Pid
+	if err := os.WriteFile(filepath.Join(container, "cgroup.procs"), []byte(strconv.Itoa(pid)), 0); err != nil {
+		t.Fatalf("put the process in the container cgroup: %v", err)
+	}
+
+	// Everywhere a member might try to put it, and why each one is refused:
+	// the first three delegate controllers and may hold nothing, the rest are
+	// root's.
+	for _, destination := range []string{
+		filepath.Join(ceiling, "cgroup.procs"),
+		cgroups.MemberDir(root, name) + "/cgroup.procs",
+		filepath.Join(root, cgroups.Dir, "cgroup.procs"),
+		filepath.Join(leaf, "cgroup.procs"),
+		cgroups.MemberDir(root, neighbour) + "/cgroup.procs",
+		filepath.Join(cgroups.DefaultRoot, "cgroup.procs"),
+	} {
+		out, err := asMember(t, uid, gid, "echo "+strconv.Itoa(pid)+" > "+destination)
+		if err == nil {
+			t.Errorf("the member moved their process to %s", destination)
+			continue
+		}
+		t.Logf("%s: %s", destination, strings.TrimSpace(out))
+	}
+	// And it is still where it was, under the ceiling that limits it.
+	if !strings.Contains(read(t, filepath.Join(container, "cgroup.procs")), strconv.Itoa(pid)) {
+		t.Errorf("the container cgroup holds %q, want the process still in it",
+			read(t, filepath.Join(container, "cgroup.procs")))
+	}
+	// The container cgroup is the member's to remove, not this test's, so it
+	// is emptied the way the kernel offers and then taken away.
+	empty(t, container, held)
+	os.Remove(container)
 }
 
 // An upgrade finds what an earlier release left: a member cgroup handed to the
@@ -377,29 +454,42 @@ func testRoot(t *testing.T) string {
 		t.Skipf("%s could not be created: %v", dir, err)
 	}
 	t.Cleanup(func() {
-		entries, _ := os.ReadDir(dir)
-		for _, entry := range entries {
-			if entry.IsDir() {
-				removeAll(filepath.Join(dir, entry.Name()))
+		// A cgroup is removable once it holds nothing, and a process the
+		// kernel is still reaping is a cgroup that is still busy for a
+		// moment. The tree is taken away as soon as it will go.
+		var err error
+		for range 500 {
+			if err = removeAll(dir); err == nil {
+				return
 			}
+			time.Sleep(20 * time.Millisecond)
 		}
-		if err := os.Remove(dir); err != nil && !os.IsNotExist(err) {
-			t.Errorf("the test cgroup %s was left behind: %v", dir, err)
-		}
+		t.Errorf("the test cgroup %s was left behind: %v", dir, err)
 	})
 	return dir
 }
 
 // removeAll takes one cgroup subtree away, deepest first, the way the kernel
 // allows: rmdir on empty cgroups and nothing recursive over its own files.
-func removeAll(dir string) {
-	entries, _ := os.ReadDir(dir)
+func removeAll(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
 	for _, entry := range entries {
 		if entry.IsDir() {
-			removeAll(filepath.Join(dir, entry.Name()))
+			if err := removeAll(filepath.Join(dir, entry.Name())); err != nil {
+				return err
+			}
 		}
 	}
-	os.Remove(dir)
+	if err := os.Remove(dir); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 // nobody is an unprivileged account to delegate to. It is never root: root
@@ -408,6 +498,73 @@ func nobody(t *testing.T) (uid, gid int) {
 	t.Helper()
 	const unprivileged = 65534
 	return unprivileged, unprivileged
+}
+
+// sleeper starts a process that belongs to one member, which is a process to
+// move between cgroups. It is stopped when the test ends, however it ends.
+func sleeper(t *testing.T, uid, gid int) *exec.Cmd {
+	t.Helper()
+	cmd := exec.Command("/bin/sh", "-c", "sleep 30")
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Credential: &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)},
+	}
+	if err := cmd.Start(); err != nil {
+		t.Skipf("a process could not be started as uid %d: %v", uid, err)
+	}
+	t.Cleanup(func() { stop(t, cmd) })
+	return cmd
+}
+
+// stop ends one process and reaps it, then waits for the kernel to be done
+// with it: a cgroup that holds even a process nobody has reaped yet cannot be
+// removed. It is safe to call twice, because a process that has gone is the
+// state this wants.
+func stop(t *testing.T, cmd *exec.Cmd) {
+	t.Helper()
+	if cmd.Process == nil {
+		return
+	}
+	pid := cmd.Process.Pid
+	cmd.Process.Kill()
+	// The command owns the child, so this is the wait that reaps it. A second
+	// call answers an error and changes nothing.
+	cmd.Wait()
+	for range 100 {
+		if _, err := os.Stat(filepath.Join("/proc", strconv.Itoa(pid))); os.IsNotExist(err) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// empty kills whatever a cgroup holds and waits until the kernel says it holds
+// nothing. cgroup.kill is what does it: a process that is being killed is
+// still a member of its cgroup for a moment, and a cgroup with a member in it
+// is one nothing can remove.
+func empty(t *testing.T, dir string, cmd *exec.Cmd) {
+	t.Helper()
+	os.WriteFile(filepath.Join(dir, "cgroup.kill"), []byte("1"), 0)
+	stop(t, cmd)
+	for range 500 {
+		held, err := os.ReadFile(filepath.Join(dir, "cgroup.procs"))
+		if err != nil || strings.TrimSpace(string(held)) == "" {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Errorf("%s still holds %q", dir, read(t, filepath.Join(dir, "cgroup.procs")))
+}
+
+// asMember runs one shell command as an unprivileged account and answers what
+// it wrote, which is how a refusal is read.
+func asMember(t *testing.T, uid, gid int, script string) (string, error) {
+	t.Helper()
+	cmd := exec.Command("/bin/sh", "-c", script)
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Credential: &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)},
+	}
+	out, err := cmd.CombinedOutput()
+	return string(out), err
 }
 
 // read is the trimmed content of one cgroup file.

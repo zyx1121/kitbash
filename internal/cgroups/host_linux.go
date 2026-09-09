@@ -76,6 +76,14 @@ func (h *host) EnsureRoot(context.Context) error {
 // cgroup.threads are handed over, because moving a process between two cgroups
 // under here needs write access to the common ancestor's, which this is:
 // without it a member's session cannot exec into their own container.
+//
+// Handing over that one file lets a member move a process between the cgroups
+// under here and nowhere else, and it does not let them park one outside a
+// ceiling. Writing a pid into this cgroup itself is refused by the kernel: it
+// has controllers in its cgroup.subtree_control, which only root may change,
+// and a cgroup that delegates controllers may hold no processes of its own.
+// Every other destination is either root's, which they cannot write, or under
+// a ceiling, which is where the process already was.
 func (h *host) EnsureMember(ctx context.Context, name string, uid, gid int) (string, error) {
 	if !member.MatchString(name) {
 		return "", errName(name)
@@ -166,6 +174,13 @@ func (h *host) JoinSession(ctx context.Context, name string, uid, gid, pid int) 
 	if pid <= 0 {
 		return "", errPID(pid)
 	}
+	// The pid is what SO_PEERCRED said when the socket was opened, and the
+	// kernel reuses pids: by now it may name a process of somebody else's,
+	// which this would move into a member's cgroup. What the process is now
+	// decides, and a process that has already gone is not there to move.
+	if err := ownedBy(pid, uid); err != nil {
+		return "", err
+	}
 	leaf, err := h.EnsureMember(ctx, name, uid, gid)
 	if err != nil {
 		return "", err
@@ -193,6 +208,25 @@ func (h *host) RemoveMember(_ context.Context, name string) error {
 		return errName(name)
 	}
 	return removeTree(MemberDir(h.root, name))
+}
+
+// ownedBy reports whether one process belongs to a uid. The kernel says so
+// through /proc/<pid>, which it owns by the process's effective user: a
+// process that has exited has no directory there, and one that was replaced by
+// a recycled pid has somebody else's.
+func ownedBy(pid, uid int) error {
+	info, err := os.Stat(filepath.Join("/proc", strconv.Itoa(pid)))
+	if err != nil {
+		return fmt.Errorf("%w: %d: %v", ErrNotOwned, pid, err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("%w: %d has no owner", ErrNotOwned, pid)
+	}
+	if int(stat.Uid) != uid {
+		return fmt.Errorf("%w: %d belongs to uid %d, not %d", ErrNotOwned, pid, stat.Uid, uid)
+	}
+	return nil
 }
 
 // isCgroup2 reports whether a path is on the unified hierarchy.

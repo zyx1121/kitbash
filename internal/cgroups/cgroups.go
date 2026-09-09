@@ -96,6 +96,11 @@ var (
 	// ErrPID reports a process id that is not one, which is nothing this
 	// package writes into a cgroup.
 	ErrPID = errors.New("cgroups: not a process id")
+	// ErrNotOwned reports a process that does not belong to the member whose
+	// cgroup it would be placed in. A pid is a number the kernel reuses, so
+	// what SO_PEERCRED said when the socket was opened is checked against
+	// what the process is now before anything is moved.
+	ErrNotOwned = errors.New("cgroups: the process does not belong to this member")
 	// ErrUnsupported reports a machine with no cgroup filesystem to place
 	// anything in, which is anything that is not Linux.
 	ErrUnsupported = errors.New("cgroups: placing a Process needs Linux")
@@ -142,7 +147,8 @@ type Cgroups interface {
 	// JoinSession puts one of the member's own processes, an MCP session, in
 	// their leaf and answers where it went. Only root can: the session starts
 	// in sshd's cgroup, and the only ancestor that has in common with anything
-	// of kitbash's is the root cgroup.
+	// of kitbash's is the root cgroup. A process that does not belong to the
+	// member is ErrNotOwned and is not moved.
 	JoinSession(ctx context.Context, name string, uid, gid, pid int) (cgroup string, err error)
 	// RemoveProcess removes the ceiling of one Process, which the daemon does
 	// once its container is gone.

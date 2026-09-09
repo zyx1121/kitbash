@@ -355,6 +355,15 @@ func (s *Server) joinSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cgroup, err := s.cgroups.JoinSession(r.Context(), m.Name, m.UID, m.GID, int(caller.Peer.PID))
+	if errors.Is(err, cgroups.ErrNotOwned) {
+		// The process that opened this connection is gone, or the pid names
+		// somebody else's by now. Either way it is not this member's to move.
+		logger.Printf("cgroups: the session %d of %s was not placed: %v", caller.Peer.PID, m.Name, err)
+		writeProblem(w, problem.NotPermitted(r.URL.Path,
+			fmt.Sprintf("the process %d is not %s's to place", caller.Peer.PID, m.Name),
+			"Open a new session."))
+		return
+	}
 	if err != nil {
 		// A session that was not placed still works: everything but exec into
 		// a container kitbashd started, which says so when it is tried.
