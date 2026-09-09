@@ -340,10 +340,16 @@ families:
           image of that commit already in the caller's store is returned as it
           is with the log line "already built at <digest>", one another member
           has is copied into the caller's store with the log line "copied from
-          <builder>", and only a commit nobody has built is built. A build that
-          did run is recorded, and any failure of the record or the copy falls
-          back to building. Packages in a home are neither recorded nor
-          copied. See PLAN.md section 2.2.
+          <builder>", and only a commit nobody has built is built. When several
+          digests are recorded for one commit the earliest record wins, so
+          every member picks the same one. An image is accepted, held or
+          copied, only when its own kitbash.path and kitbash.commit labels are
+          this Package at this commit: a record is a claim another member
+          wrote, and the labels are what the build stamped inside the image.
+          Anything else, an image whose labels do not match included, falls
+          back to building. A build that did run is recorded, and a record
+          kitbashd refuses costs nothing but the record. Packages in a home are
+          neither recorded nor copied. See PLAN.md section 2.2.
         input: { type: object, additionalProperties: false, required: [path], properties: { path: { type: string } } }
         output:
           type: object

@@ -1,12 +1,14 @@
 package daemon
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"path"
 	"regexp"
 	"strings"
 
+	"github.com/zyx1121/kitbash/internal/podman"
 	"github.com/zyx1121/kitbash/internal/problem"
 	"github.com/zyx1121/kitbash/internal/store"
 	"github.com/zyx1121/kitbash/internal/sysusers"
@@ -26,6 +28,13 @@ const OrgRoot = "/org"
 // now, not an archive, and a path built four thousand times has nothing useful
 // left in its oldest row.
 const MaxBuildsPerPath = 4096
+
+// MaxBuildsPerBuilder is how many records one member keeps for one path. It is
+// the bound that matters: without it a member could record enough rows of one
+// path to prune every other member's out of the table, and a fetch would then
+// find nothing where another member's build used to be. Sixty four builds of
+// one Package is far more than a member has images for.
+const MaxBuildsPerBuilder = 64
 
 // commitSha is the shape of a Files commit, which is what a build record names
 // as the version it was built from.
@@ -98,15 +107,30 @@ func (s *Server) recordBuild(w http.ResponseWriter, r *http.Request, caller Call
 			"Send the size of the image in bytes, or none at all."))
 		return
 	}
+	// A record is a claim about an image, and every other member's pkg_build
+	// acts on it, so it is checked against the caller's own store before it is
+	// written. Without this a member could record any digest against any /org
+	// path and commit, and the next member's build of that commit would answer
+	// the digest they named instead of building, see PLAN.md section 2.2.
+	info, prob := s.recordedImage(r, caller, folder, req)
+	if prob != nil {
+		writeProblem(w, prob)
+		return
+	}
+	size := req.Size
+	if size == 0 {
+		size = info.Size
+	}
 	record := store.Build{
 		Path:    folder,
 		Commit:  req.Commit,
 		Digest:  req.Digest,
 		Builder: caller.User,
 		BuiltAt: s.now().UTC(),
-		Size:    req.Size,
+		Size:    size,
 	}
-	if err := s.store.RecordBuild(r.Context(), record, MaxBuildsPerPath); err != nil {
+	if err := s.store.RecordBuild(r.Context(), record,
+		store.BuildLimits{PerPath: MaxBuildsPerPath, PerBuilder: MaxBuildsPerBuilder}); err != nil {
 		writeProblem(w, problem.Internal(r.URL.Path, err.Error(), ""))
 		return
 	}
@@ -146,6 +170,50 @@ func (s *Server) listBuilds(w http.ResponseWriter, r *http.Request, caller Calle
 		return
 	}
 	writeJSON(w, r.URL.Path, buildList{Builds: builds})
+}
+
+// recordedImage is the image a member says they built, read out of their own
+// store. A record is accepted only when they hold the digest and the image
+// itself says it is a build of that Package at that commit: the labels are
+// inside the image and were written by the build, so they are the one thing
+// here that a caller cannot simply assert.
+func (s *Server) recordedImage(r *http.Request, caller Caller, folder string, req buildRequest) (sysusers.ImageInfo, *problem.Problem) {
+	m, found, prob := s.memberOf(r, caller.User)
+	if prob != nil {
+		return sysusers.ImageInfo{}, prob
+	}
+	if !found || !m.IsMember() {
+		return sysusers.ImageInfo{}, problem.NotPermitted(r.URL.Path,
+			fmt.Sprintf("%s is not a member of this host", caller.User),
+			"Ask an administrator to create a member for this account.")
+	}
+	info, err := s.runner.ImageInfo(r.Context(), m, req.Digest)
+	if err != nil {
+		if errors.Is(err, sysusers.ErrNoImage) {
+			return sysusers.ImageInfo{}, problem.BadRequest(r.URL.Path,
+				fmt.Sprintf("you do not have the image %s", req.Digest),
+				"Record the digest pkg_build answered, in the session that built it.")
+		}
+		logger.Printf("builds: reading %s in %s's store: %v", req.Digest, caller.User, err)
+		return sysusers.ImageInfo{}, problem.Internal(r.URL.Path, err.Error(), "")
+	}
+	if prob := checkProvenance(r.URL.Path, info, folder, req.Commit,
+		"the image you recorded is not a build of this commit"); prob != nil {
+		return sysusers.ImageInfo{}, prob
+	}
+	return info, nil
+}
+
+// checkProvenance holds one image to what its labels say it is. A digest is a
+// number a caller chose; the labels are what the build stamped inside the
+// image, so this is the whole of what kitbashd knows about provenance, see
+// PLAN.md section 2.2.
+func checkProvenance(instance string, info sysusers.ImageInfo, folder, commit, detail string) *problem.Problem {
+	if info.Label(podman.LabelPath) == folder && info.Label(podman.LabelCommit) == commit {
+		return nil
+	}
+	return problem.BadRequest(instance, detail,
+		fmt.Sprintf("Build the Package at %s from the commit you are naming; the image's own kitbash.path and kitbash.commit are what kitbashd reads.", folder))
 }
 
 // buildPath is the path a member may record a build for: under /org, which is

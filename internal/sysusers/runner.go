@@ -326,35 +326,71 @@ func pipeline(first, second *exec.Cmd) (firstErr, secondErr error) {
 	return firstErr, secondErr
 }
 
-// ImageSize answers the size in bytes of one image in a member's store, and
-// ErrNoImage when they do not have it. It is the check on both ends of a copy:
-// that the member who is asked for an image still has it, and that the member
-// who asked for it has it once the copy is over.
-func (p *Podman) ImageSize(ctx context.Context, m Member, digest string) (int64, error) {
+// ImageInfo answers what one image in a member's store is: its size and the
+// labels a kitbash build stamped on it. ErrNoImage says the member does not
+// have it.
+//
+// The labels are the provenance. Nothing else on this host can say which
+// Package and which commit an image is a build of: a digest a caller names is
+// a number, and the labels inside the image are what the build put there. Both
+// ends of a copy are checked with this, and so is every build record kitbashd
+// accepts, see PLAN.md section 2.2.
+func (p *Podman) ImageInfo(ctx context.Context, m Member, digest string) (ImageInfo, error) {
 	if err := ensureRuntimeDir(p.runUser(), m); err != nil {
-		return 0, err
+		return ImageInfo{}, err
 	}
-	return imageSize(p.run(ctx, m, "image", "inspect", "--format", "{{.Size}}", digest))
+	return imageInfo(p.run(ctx, m, "image", "inspect", "--format", "json", digest))
 }
 
-// imageSize reads one podman image inspect. An image the member does not have
-// is the one failure this call is asked about, and podman has answered it with
-// both of these statuses across releases; neither means anything else for an
-// inspect of one image by digest.
-func imageSize(out string, err error) (int64, error) {
+// ImageInfo is one image as the member's own runtime describes it.
+type ImageInfo struct {
+	// Size is the image in bytes, zero when the runtime did not say.
+	Size int64
+	// Labels are the image's own labels, which for a kitbash build carry
+	// kitbash.path, kitbash.name, kitbash.commit and kitbash.user.
+	Labels map[string]string
+}
+
+// Label reads one label, empty when the image does not carry it.
+func (i ImageInfo) Label(name string) string { return i.Labels[name] }
+
+// inspectJSON is the part of podman image inspect this package reads. The
+// labels are given twice by the runtime, at the top level and under Config;
+// both are read because which one a release fills in has changed.
+type inspectJSON struct {
+	Size   int64             `json:"Size"`
+	Labels map[string]string `json:"Labels"`
+	Config struct {
+		Labels map[string]string `json:"Labels"`
+	} `json:"Config"`
+}
+
+// imageInfo reads one podman image inspect. Exit 1 is the image the member
+// does not have, which is the one failure a caller acts on; exit 125 is podman
+// refusing the command itself and is reported as it is, because turning it
+// into a missing image would send a member off to build something that is
+// already there.
+func imageInfo(out string, err error) (ImageInfo, error) {
 	if err != nil {
-		if exitCode(err, 1) || exitCode(err, usageExit) {
-			return 0, fmt.Errorf("%w: %s", ErrNoImage, strings.TrimSpace(out))
+		if exitCode(err, 1) {
+			return ImageInfo{}, fmt.Errorf("%w: %s", ErrNoImage, clipOutput(out))
 		}
-		return 0, err
+		return ImageInfo{}, err
 	}
-	size, parseErr := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
-	if parseErr != nil {
-		// The image is there; only its size is unreadable, which is not worth
-		// failing a copy over.
-		return 0, nil
+	var decoded []inspectJSON
+	if jsonErr := json.Unmarshal([]byte(strings.TrimSpace(out)), &decoded); jsonErr != nil || len(decoded) == 0 {
+		// The image is there and this process cannot read what the runtime
+		// said about it, which is not a missing image and not a size.
+		return ImageInfo{}, fmt.Errorf("sysusers: reading podman image inspect: %v", jsonErr)
 	}
-	return size, nil
+	info := ImageInfo{Size: decoded[0].Size, Labels: decoded[0].Labels}
+	if len(info.Labels) == 0 {
+		info.Labels = decoded[0].Config.Labels
+	}
+	if info.Labels == nil {
+		info.Labels = map[string]string{}
+	}
+	return info, nil
 }
 
 // clipOutput bounds one child's standard error for the daemon log.

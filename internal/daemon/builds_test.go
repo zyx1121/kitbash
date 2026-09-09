@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zyx1121/kitbash/internal/podman"
 	"github.com/zyx1121/kitbash/internal/store"
 	"github.com/zyx1121/kitbash/internal/sysusers"
 )
@@ -47,8 +48,20 @@ func (h *harness) recordFor(builder, path, commit, digest string) {
 	if err := h.store.RecordBuild(context.Background(), store.Build{
 		Path: path, Commit: commit, Digest: digest, Builder: builder,
 		BuiltAt: time.Now().UTC(), Size: 4096,
-	}, MaxBuildsPerPath); err != nil {
+	}, store.BuildLimits{PerPath: MaxBuildsPerPath, PerBuilder: MaxBuildsPerBuilder}); err != nil {
 		h.t.Fatalf("RecordBuild: %v", err)
+	}
+}
+
+// labelsOfBuild is what a build of one Package at one commit stamps inside the
+// image. Every test that stages an image states them, because they are the
+// provenance kitbashd checks a record and a copy against.
+func labelsOfBuild(path, commit, builder string) map[string]string {
+	return map[string]string{
+		podman.LabelPath:   path,
+		podman.LabelName:   "ffmpeg",
+		podman.LabelCommit: commit,
+		podman.LabelUser:   builder,
 	}
 }
 
@@ -61,7 +74,10 @@ func (h *harness) builds(query string) (*http.Response, []byte) {
 // TestABuildIsRecordedForThePeerAndReadBack is the record the whole feature
 // rests on: kitbashd knows who built which image of which commit.
 func TestABuildIsRecordedForThePeerAndReadBack(t *testing.T) {
-	h, _ := sharing(t, false)
+	h, fake := sharing(t, false)
+	// The record is a claim about an image, so it is only accepted from a
+	// member who holds it and whose image says it is that build.
+	fake.AddImage(h.user, testDigest, 4096, labelsOfBuild("/org/ffmpeg", testCommit, h.user))
 
 	res, body := h.postJSON(http.MethodPost, buildsPath, buildRequest{
 		Path: "/org/ffmpeg", Commit: testCommit, Digest: testDigest, Size: 2048,
@@ -147,7 +163,9 @@ func TestAnAdminReadsEveryMembersBuilds(t *testing.T) {
 // build in a place they cannot write, which is what a fetch would then be
 // pointed at.
 func TestABuildOfAnotherMembersHomeIsNotRecorded(t *testing.T) {
-	h, _ := sharing(t, false)
+	h, fake := sharing(t, false)
+	fake.AddImage(h.user, testDigest, 4096,
+		labelsOfBuild("/home/"+builderName+"/secret", testCommit, h.user))
 
 	res, body := h.postJSON(http.MethodPost, buildsPath, buildRequest{
 		Path: "/home/" + builderName + "/secret", Commit: testCommit, Digest: testDigest,
@@ -161,13 +179,93 @@ func TestABuildOfAnotherMembersHomeIsNotRecorded(t *testing.T) {
 // client that records every build it makes is simpler than one that decides,
 // and nothing ever fetches one of these.
 func TestAMemberRecordsBuildsOfTheirOwnHome(t *testing.T) {
-	h, _ := sharing(t, false)
+	h, fake := sharing(t, false)
+	home := "/home/" + h.user + "/echo"
+	fake.AddImage(h.user, testDigest, 4096, labelsOfBuild(home, testCommit, h.user))
 
 	res, body := h.postJSON(http.MethodPost, buildsPath, buildRequest{
-		Path: "/home/" + h.user + "/echo", Commit: testCommit, Digest: testDigest,
+		Path: home, Commit: testCommit, Digest: testDigest,
 	})
 	if res.StatusCode != http.StatusOK {
 		t.Fatalf("record = %d %s, want 200", res.StatusCode, body)
+	}
+}
+
+// TestRecordingADigestYouDoNotHoldIsRefused is the first half of what makes a
+// record worth reading: a member can only record an image out of their own
+// store, which is the store kitbashd would copy it from.
+func TestRecordingADigestYouDoNotHoldIsRefused(t *testing.T) {
+	h, fake := sharing(t, false)
+	// The other member has it; this member does not.
+	fake.AddImage(builderName, testDigest, 4096, labelsOfBuild("/org/ffmpeg", testCommit, builderName))
+
+	res, body := h.postJSON(http.MethodPost, buildsPath, buildRequest{
+		Path: "/org/ffmpeg", Commit: testCommit, Digest: testDigest,
+	})
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("record = %d %s, want 400", res.StatusCode, body)
+	}
+	held, err := h.store.Builds(context.Background(), store.BuildFilter{Path: "/org/ffmpeg"})
+	if err != nil || len(held) != 0 {
+		t.Errorf("the store holds %+v, %v, want nothing recorded", held, err)
+	}
+}
+
+// TestRecordingAnImageOfAnotherCommitIsRefused is the attack this check exists
+// for: recording an old image against the commit somebody else is about to
+// build would have their pkg_build answer that image and never build their
+// change. The labels are inside the image and the build wrote them.
+func TestRecordingAnImageOfAnotherCommitIsRefused(t *testing.T) {
+	h, fake := sharing(t, false)
+	fake.AddImage(h.user, testDigest, 4096,
+		labelsOfBuild("/org/ffmpeg", "1111111111111111111111111111111111111111", h.user))
+
+	res, body := h.postJSON(http.MethodPost, buildsPath, buildRequest{
+		Path: "/org/ffmpeg", Commit: testCommit, Digest: testDigest,
+	})
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("record = %d %s, want 400", res.StatusCode, body)
+	}
+	if p := h.problemOf(res, body); !strings.Contains(p.Detail, "not a build of this commit") {
+		t.Errorf("the detail is %q, want it to name the commit as the mismatch", p.Detail)
+	}
+}
+
+// TestRecordingAnImageOfAnotherPackageIsRefused, for the same reason: the
+// image's own kitbash.path is what says which Package it is a build of.
+func TestRecordingAnImageOfAnotherPackageIsRefused(t *testing.T) {
+	h, fake := sharing(t, false)
+	fake.AddImage(h.user, testDigest, 4096, labelsOfBuild("/org/elsewhere", testCommit, h.user))
+
+	res, body := h.postJSON(http.MethodPost, buildsPath, buildRequest{
+		Path: "/org/ffmpeg", Commit: testCommit, Digest: testDigest,
+	})
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("record = %d %s, want 400", res.StatusCode, body)
+	}
+}
+
+// TestOneMemberCannotTakeOverAnothersRecord: the row names who kitbashd asks
+// for a copy, so a member who could rewrite it could point every other
+// member's fetch at themselves.
+func TestOneMemberCannotTakeOverAnothersRecord(t *testing.T) {
+	h, fake := sharing(t, false)
+	h.recordFor(builderName, "/org/ffmpeg", testCommit, testDigest)
+	// This member holds the same image, correctly labelled, and records it.
+	fake.AddImage(h.user, testDigest, 4096, labelsOfBuild("/org/ffmpeg", testCommit, builderName))
+
+	res, body := h.postJSON(http.MethodPost, buildsPath, buildRequest{
+		Path: "/org/ffmpeg", Commit: testCommit, Digest: testDigest,
+	})
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("record = %d %s, want 200: recording an image you hold is not an error", res.StatusCode, body)
+	}
+	held, err := h.store.Builds(context.Background(), store.BuildFilter{Path: "/org/ffmpeg"})
+	if err != nil {
+		t.Fatalf("Builds: %v", err)
+	}
+	if len(held) != 1 || held[0].Builder != builderName {
+		t.Errorf("the record is %+v, want the member who recorded it first", held)
 	}
 }
 

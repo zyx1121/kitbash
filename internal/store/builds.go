@@ -46,17 +46,28 @@ type BuildFilter struct {
 	Limit   int
 }
 
-// RecordBuild writes one build record and prunes the oldest rows of that path
-// beyond maxPerPath; zero means no prune, which is what a caller not
-// exercising the cap passes. The bound is the caller's, see
-// daemon.MaxBuildsPerPath, and it is applied inside the transaction so two
-// sessions recording at once cannot both write past it.
+// BuildLimits bounds what the build table holds. Both are the caller's, see
+// daemon.MaxBuildsPerPath and daemon.MaxBuildsPerBuilder, and both are applied
+// inside the transaction that writes, so two sessions recording at once cannot
+// both write past them. A zero field is no bound, which is what a caller not
+// exercising that cap passes.
 //
-// Recording a triple that is already there replaces the builder, the time and
-// the size. The row answers one question, which member kitbashd asks for a
-// copy of this image, and the member who recorded it last is the one most
-// recently known to hold it.
-func (s *Store) RecordBuild(ctx context.Context, b Build, maxPerPath int) error {
+// PerBuilder is the one that matters for safety: without it a member could
+// record enough rows of one path to prune everybody else's out of the table.
+type BuildLimits struct {
+	PerPath    int
+	PerBuilder int
+}
+
+// RecordBuild writes one build record and prunes the oldest rows beyond the
+// limits.
+//
+// The builder of an existing row is never replaced. Recording a triple that is
+// already there refreshes the time and the size for the member who recorded
+// it, and does nothing at all for anybody else: the row names the member
+// kitbashd asks for a copy of this image, so a member who could take it over
+// could point every other member's fetch at themselves.
+func (s *Store) RecordBuild(ctx context.Context, b Build, limits BuildLimits) error {
 	if b.Path == "" || b.Commit == "" || b.Digest == "" || b.Builder == "" {
 		return errors.New("store: a build record needs a path, a commit, a digest and a builder")
 	}
@@ -69,20 +80,38 @@ func (s *Store) RecordBuild(ctx context.Context, b Build, maxPerPath int) error 
 	}
 	defer tx.Rollback()
 
+	// The WHERE on the update is what keeps the builder: a row of another
+	// member's is left exactly as it is, and the insert reports no error,
+	// because two members holding one image of one commit is the normal case
+	// and not something to refuse.
 	if _, err := tx.ExecContext(ctx, `INSERT INTO builds
 		(path, commit_sha, digest, builder, built_at, size)
 		VALUES (?,?,?,?,?,?)
 		ON CONFLICT(path, commit_sha, digest) DO UPDATE SET
-			builder = excluded.builder, built_at = excluded.built_at, size = excluded.size`,
+			built_at = excluded.built_at, size = excluded.size
+		WHERE builds.builder = excluded.builder`,
 		b.Path, b.Commit, b.Digest, b.Builder, b.BuiltAt.UnixNano(), b.Size); err != nil {
 		return fmt.Errorf("store: record the build of %s: %w", b.Path, err)
 	}
-	// The prune runs in the same transaction as the insert, so the cap holds
+	// Both prunes run in the same transaction as the insert, so the caps hold
 	// however many sessions record a build of one path at the same moment.
-	if maxPerPath > 0 {
+	//
+	// The per builder prune comes first and is the one that bounds what one
+	// member can do: it takes only their own rows, so no member can push
+	// another member's record out of the table.
+	if limits.PerBuilder > 0 {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM builds
+			WHERE path = ? AND builder = ? AND id NOT IN
+			(SELECT id FROM builds WHERE path = ? AND builder = ?
+			 ORDER BY built_at DESC, id DESC LIMIT ?)`,
+			b.Path, b.Builder, b.Path, b.Builder, limits.PerBuilder); err != nil {
+			return fmt.Errorf("store: prune the builds of %s by %s: %w", b.Path, b.Builder, err)
+		}
+	}
+	if limits.PerPath > 0 {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM builds WHERE path = ? AND id NOT IN
 			(SELECT id FROM builds WHERE path = ? ORDER BY built_at DESC, id DESC LIMIT ?)`,
-			b.Path, b.Path, maxPerPath); err != nil {
+			b.Path, b.Path, limits.PerPath); err != nil {
 			return fmt.Errorf("store: prune the builds of %s: %w", b.Path, err)
 		}
 	}

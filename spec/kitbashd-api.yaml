@@ -360,12 +360,28 @@ api:
     validation: >
       path is absolute, at most 4096 bytes and carries no .. segment; commit is
       40 lower case hexadecimal characters; digest is sha256: followed by 64;
-      size is a non negative number of bytes and may be left out.
+      size is a non negative number of bytes and may be left out, in which case
+      the size the runtime reports is recorded.
+    provenance: >
+      The record is checked against the caller's own image store before it is
+      written, with podman image inspect as the caller: they must hold the
+      digest, and the image's own kitbash.path and kitbash.commit labels must
+      be the path and the commit being recorded. Neither is 400 bad-request,
+      "the image you recorded is not a build of this commit". A digest is a
+      number the caller chose and the labels are what the build stamped inside
+      the image, so this is the whole of what kitbashd knows about provenance.
+      Without it a member could record any digest against any /org path and
+      commit, and every other member's pkg_build of that commit would answer
+      the image they named instead of building.
     limits: >
-      One row per path, commit and digest: the same three recorded again
-      replace the row, so a build two members made is one record naming the one
-      most recently known to hold the image. At most 4096 rows per path, the
-      oldest pruned beyond that.
+      One row per path, commit and digest. The builder of an existing row is
+      never replaced: recording a triple that is there refreshes the time and
+      the size for the member who recorded it and does nothing at all for
+      anybody else, because the row names the member kitbashd asks for a copy.
+      At most 64 rows per path per member, and 4096 per path, the oldest pruned
+      beyond each. The per member cap is the one that matters: a member's
+      records can prune only their own, so nobody can push another member's
+      build out of the table.
     errors: [bad-request, not-permitted, internal]
   builds_list:
     method: GET
@@ -402,11 +418,21 @@ api:
       store on behalf of somebody the kernel keeps out of it.
     behaviour: >
       The builder's store is checked first with podman image inspect as the
-      builder, and the requester's is checked after the copy the same way: a
-      save and a load that both exited zero and moved nothing is a failure only
-      this call can see. bytes is the size of the image in the requester's
-      store. One fetch per requester and digest at a time; a second while one
-      is in flight is 409 conflict rather than a second load into one store.
+      builder: they must still have the image, and its own kitbash.path and
+      kitbash.commit labels must be the ones the build record names, or it is
+      404 not-found naming pkg_build. An image whose labels say it is a build
+      of something else is a record that was never true of it, and copying it
+      would hand the requester somebody else's image under a name they trust.
+      The requester's store is checked after the copy the same way: a save and
+      a load that both exited zero and moved nothing is a failure only this
+      call can see. bytes is the size of the image in the requester's store,
+      absent when the runtime did not say.
+    concurrency: >
+      One copy per requester and digest, and 2 per member at a time. Beyond
+      either it is 409 conflict carrying Retry-After: 60, because the caller is
+      not wrong and there is a copy of theirs running. Every copy is two setuid
+      podman children moving an image through a pipe, so the per member cap is
+      what bounds what one member can ask the host to carry.
 
       An archive of one image saved by digest carries no name, so podman load
       invents one of the form localhost/sha256:<hex>. It is untagged as the

@@ -3,6 +3,7 @@ package pkg_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -33,16 +34,23 @@ type fakeBuilds struct {
 	// runtime is the image store a fetch loads into, so the session reads the
 	// copied image back the way it would from its own podman.
 	runtime *podman.Fake
+	// delivers is the image a fetch of one digest puts in that store, labels
+	// and all. It is stated by the test rather than derived from the record:
+	// the labels are the provenance the session checks, so a fake that wrote
+	// them from the record would prove nothing about the check.
+	delivers map[string]podman.Image
 
 	// The failures a test stages.
 	listErr   *problem.Problem
 	fetchErr  *problem.Problem
 	recordErr *problem.Problem
 
-	// What this registry was asked for.
+	// What this registry was asked for, and the counter that gives a record
+	// the time the daemon would have stamped on it.
 	asked    []string
 	fetched  []string
 	recorded []telemetry.Build
+	stamps   int
 }
 
 func (f *fakeBuilds) Builds(_ context.Context, path, commit, digest string) ([]telemetry.Build, *problem.Problem) {
@@ -71,6 +79,13 @@ func (f *fakeBuilds) RecordBuild(_ context.Context, b telemetry.Build) *problem.
 	if f.recordErr != nil {
 		return f.recordErr
 	}
+	// The daemon stamps the peer and the time, so the record a later call
+	// reads back carries both.
+	b.Builder = "tester"
+	if b.BuiltAt == "" {
+		f.stamps++
+		b.BuiltAt = fmt.Sprintf("2026-01-01T00:00:%02dZ", f.stamps)
+	}
 	f.known = append([]telemetry.Build{b}, f.known...)
 	return nil
 }
@@ -81,16 +96,20 @@ func (f *fakeBuilds) FetchImage(_ context.Context, digest, path, from string) (*
 		return nil, f.fetchErr
 	}
 	// kitbashd loads the image into this member's own store, which is where
-	// the session reads it back from.
-	if f.runtime != nil {
-		f.runtime.AddImage(podman.Image{ID: digest, Labels: map[string]string{
-			podman.LabelPath:   path,
-			podman.LabelName:   "ffmpeg",
-			podman.LabelCommit: otherCommit,
-			podman.LabelUser:   from,
-		}})
+	// the session reads it back from. What arrives is what the test staged,
+	// labels included: nothing here derives them from the record.
+	if image, staged := f.delivers[digest]; staged && f.runtime != nil {
+		f.runtime.AddImage(image)
 	}
 	return &telemetry.FetchResult{Digest: digest, Bytes: 4096, From: from}, nil
+}
+
+// deliver stages the image one fetch of a digest puts in the caller's store.
+func (f *fakeBuilds) deliver(image podman.Image) {
+	if f.delivers == nil {
+		f.delivers = map[string]podman.Image{}
+	}
+	f.delivers[image.ID] = image
 }
 
 // shared is a fixture whose root stands in for /org and whose service talks to
@@ -102,6 +121,18 @@ func shared(t *testing.T) (*fixture, *fakeBuilds) {
 	builds := &fakeBuilds{runtime: f.runner}
 	f.packages.SetBuilds(builds)
 	return f, builds
+}
+
+// buildOf is one image as a build of this Package at this commit would have
+// been labelled. Every test that stages an image states its labels this way,
+// or states different ones on purpose.
+func buildOf(digest, folder, commit, builder string) podman.Image {
+	return podman.Image{ID: digest, Labels: map[string]string{
+		podman.LabelPath:   folder,
+		podman.LabelName:   "ffmpeg",
+		podman.LabelCommit: commit,
+		podman.LabelUser:   builder,
+	}}
 }
 
 // pack writes one Package and answers its folder and its commit.
@@ -124,8 +155,11 @@ func TestBuildCopiesAnotherMembersImageInsteadOfBuilding(t *testing.T) {
 	f, builds := shared(t)
 	folder, commit := pack(t, f)
 	builds.known = []telemetry.Build{
-		{Path: folder, Commit: commit, Digest: otherDigest, Builder: "kim"},
+		{Path: folder, Commit: commit, Digest: otherDigest, Builder: "kim", BuiltAt: "2026-01-01T00:00:00Z"},
 	}
+	// What kitbashd copies in is an image whose own labels say it is a build
+	// of this Package at this commit, which is what the session checks.
+	builds.deliver(buildOf(otherDigest, folder, commit, "kim"))
 
 	out, prob := f.packages.Build(context.Background(), folder)
 	if prob != nil {
@@ -253,11 +287,9 @@ func TestBuildOfAHomePackageIsNeitherFetchedNorRecorded(t *testing.T) {
 func TestBuildReturnsTheImageOfThisCommitItAlreadyHas(t *testing.T) {
 	f, builds := shared(t)
 	folder, commit := pack(t, f)
-	f.runner.AddImage(podman.Image{ID: otherDigest, Labels: map[string]string{
-		podman.LabelPath: folder, podman.LabelCommit: commit,
-	}})
+	f.runner.AddImage(buildOf(otherDigest, folder, commit, "kim"))
 	builds.known = []telemetry.Build{
-		{Path: folder, Commit: commit, Digest: otherDigest, Builder: "kim"},
+		{Path: folder, Commit: commit, Digest: otherDigest, Builder: "kim", BuiltAt: "2026-01-01T00:00:00Z"},
 	}
 
 	out, prob := f.packages.Build(context.Background(), folder)
@@ -334,13 +366,127 @@ func TestBuildRebuildsAnImageThisMemberRemoved(t *testing.T) {
 	}
 }
 
+// TestAPoisonedRecordDoesNotSkipTheBuild is the attack the record makes
+// possible if nothing checks it: another member records the current commit
+// against an old image this member happens to hold, and this member's
+// pkg_build would answer that image and never build the change they just
+// wrote. The image's own labels say which commit it is a build of, and they
+// are what decides.
+func TestAPoisonedRecordDoesNotSkipTheBuild(t *testing.T) {
+	f, builds := shared(t)
+	folder, commit := pack(t, f)
+	// An image this member holds, which is a build of an older commit of the
+	// same Package.
+	f.runner.AddImage(buildOf(otherDigest, folder, otherCommit, "tester"))
+	// Another member records it against the commit that is being built now.
+	builds.known = []telemetry.Build{
+		{Path: folder, Commit: commit, Digest: otherDigest, Builder: "kim", BuiltAt: "2026-01-01T00:00:00Z"},
+	}
+
+	out, prob := f.packages.Build(context.Background(), folder)
+	if prob != nil {
+		t.Fatalf("Build: %s", prob.Detail)
+	}
+	if out.Digest == otherDigest {
+		t.Errorf("the build answered %s, which is a build of another commit", out.Digest)
+	}
+	if len(f.runner.Builds) != 1 {
+		t.Errorf("the runtime made %d builds, want the build this member asked for", len(f.runner.Builds))
+	}
+	if len(builds.fetched) != 0 {
+		t.Errorf("the session fetched %v for an image it holds and does not trust", builds.fetched)
+	}
+}
+
+// TestACopiedImageWithTheWrongLabelsIsNotAccepted: kitbashd checks the far
+// end, and this is the end that hands the digest to the caller as a build of
+// their commit.
+func TestACopiedImageWithTheWrongLabelsIsNotAccepted(t *testing.T) {
+	f, builds := shared(t)
+	folder, commit := pack(t, f)
+	builds.known = []telemetry.Build{
+		{Path: folder, Commit: commit, Digest: otherDigest, Builder: "kim", BuiltAt: "2026-01-01T00:00:00Z"},
+	}
+	// What arrives is a build of another Package altogether.
+	builds.deliver(buildOf(otherDigest, "/org/elsewhere", commit, "kim"))
+
+	out, prob := f.packages.Build(context.Background(), folder)
+	if prob != nil {
+		t.Fatalf("Build: %s", prob.Detail)
+	}
+	if out.Digest == otherDigest {
+		t.Errorf("the build answered %s, which is a build of another Package", out.Digest)
+	}
+	if len(builds.fetched) != 1 {
+		t.Errorf("the fetches are %v, want the one that was tried", builds.fetched)
+	}
+	if len(f.runner.Builds) != 1 {
+		t.Errorf("the runtime made %d builds, want the fallback build", len(f.runner.Builds))
+	}
+	if len(f.runner.Tags) != 0 {
+		t.Errorf("the runtime tagged %+v, want nothing tagged as this Package", f.runner.Tags)
+	}
+}
+
+// TestACopyThatDeliveredNothingIsNotAccepted: the answer is not the image, and
+// only this member's own store says whether it arrived.
+func TestACopyThatDeliveredNothingIsNotAccepted(t *testing.T) {
+	f, builds := shared(t)
+	folder, commit := pack(t, f)
+	builds.known = []telemetry.Build{
+		{Path: folder, Commit: commit, Digest: otherDigest, Builder: "kim", BuiltAt: "2026-01-01T00:00:00Z"},
+	}
+	// Nothing is staged, so the fetch answers and no image arrives.
+
+	out, prob := f.packages.Build(context.Background(), folder)
+	if prob != nil {
+		t.Fatalf("Build: %s", prob.Detail)
+	}
+	if out.Digest == otherDigest || len(f.runner.Builds) != 1 {
+		t.Errorf("the build answered %+v after %d builds, want a build that ran here",
+			out, len(f.runner.Builds))
+	}
+}
+
+// TestTheEarliestRecordOfACommitWins, so two members reading the same records
+// pick the same digest. Whoever recorded last deciding for everybody is how
+// one commit ends up with two digests.
+func TestTheEarliestRecordOfACommitWins(t *testing.T) {
+	f, builds := shared(t)
+	folder, commit := pack(t, f)
+	first := "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+	// The registry answers newest first, and the oldest record is the one
+	// that wins.
+	builds.known = []telemetry.Build{
+		{Path: folder, Commit: commit, Digest: otherDigest, Builder: "dana", BuiltAt: "2026-01-02T00:00:00Z"},
+		{Path: folder, Commit: commit, Digest: first, Builder: "kim", BuiltAt: "2026-01-01T00:00:00Z"},
+	}
+	builds.deliver(buildOf(first, folder, commit, "kim"))
+	builds.deliver(buildOf(otherDigest, folder, commit, "dana"))
+
+	out, prob := f.packages.Build(context.Background(), folder)
+	if prob != nil {
+		t.Fatalf("Build: %s", prob.Detail)
+	}
+	if out.Digest != first {
+		t.Errorf("the digest is %s, want the earliest record %s", out.Digest, first)
+	}
+	if out.Log != "copied from kim" {
+		t.Errorf("the log is %q, want the copy from the member who recorded it first", out.Log)
+	}
+	if len(builds.fetched) != 1 || !strings.HasPrefix(builds.fetched[0], first+" ") {
+		t.Errorf("the fetches are %v, want the one image every member converges on", builds.fetched)
+	}
+}
+
 // TestACopyThatCannotBeTaggedIsStillACopy: the tag is a name, not an image.
 func TestACopyThatCannotBeTaggedIsStillACopy(t *testing.T) {
 	f, builds := shared(t)
 	folder, commit := pack(t, f)
 	builds.known = []telemetry.Build{
-		{Path: folder, Commit: commit, Digest: otherDigest, Builder: "kim"},
+		{Path: folder, Commit: commit, Digest: otherDigest, Builder: "kim", BuiltAt: "2026-01-01T00:00:00Z"},
 	}
+	builds.deliver(buildOf(otherDigest, folder, commit, "kim"))
 	f.runner.TagErr = errors.New("podman tag: the store is busy")
 
 	out, prob := f.packages.Build(context.Background(), folder)

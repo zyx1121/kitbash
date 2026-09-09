@@ -269,53 +269,116 @@ func (s *Service) copied(ctx context.Context, span *telemetry.Span, folder, comm
 		span.Error("the builds of this Package could not be read from kitbashd: " + prob.Detail)
 		return nil
 	}
-	local, err := s.runner.Images(ctx, podman.Filter{podman.LabelPath: folder})
-	if err != nil {
-		span.Error("the local images of this Package could not be read: " + err.Error())
+	// One of the records is the one every member converges on, and which one
+	// it is cannot depend on who is asking or on when they ask: two members
+	// picking differently is two digests for one commit, which is the thing
+	// this is all for.
+	build, ok := winner(builds)
+	if !ok {
 		return nil
 	}
-	held := map[string]bool{}
-	for _, image := range local {
-		held[image.ID] = true
-	}
-	// The digest of this commit may already be in this member's store, from a
-	// build of their own or from a copy they took earlier. Returning it is the
-	// whole invariant: one commit is one digest, and building it again would
-	// produce a second digest for a commit that already has one.
-	for _, build := range builds {
-		if !held[build.Digest] {
-			continue
+
+	// The image may be here already, from a build of this member's own or
+	// from a copy they took earlier. It is accepted only when the image
+	// itself says it is a build of this Package at this commit: a record is a
+	// claim another member wrote, and the labels are what the build stamped
+	// inside the image.
+	if image, ok := s.localImage(ctx, folder, build.Digest); ok {
+		if !isBuildOf(image, folder, commit) {
+			span.Error("the recorded image " + build.Digest + " in this store is labelled " +
+				image.Labels[podman.LabelPath] + " at " + image.Labels[podman.LabelCommit] +
+				", not this Package at this commit; building instead")
+			return nil
 		}
 		span.SetDigest(build.Digest)
 		log := "already built at " + build.Digest
 		span.Info(log)
 		return &BuildResult{Path: folder, Digest: build.Digest, Commit: commit, Log: log}
 	}
+	// A record of this member's own that they no longer hold is a build they
+	// removed on purpose. There is nothing to copy from themselves.
+	if build.Builder == s.files.User() {
+		return nil
+	}
+
+	result, prob := s.builds.FetchImage(ctx, build.Digest, folder, build.Builder)
+	if prob != nil {
+		span.Error("the image " + build.Digest + " could not be copied from " +
+			build.Builder + ": " + prob.Detail)
+		return nil
+	}
+	// What arrived is read back out of this member's own store and held to
+	// the same labels. kitbashd checked the same thing at the other end, and
+	// this is the end that is about to hand the digest to the caller as a
+	// build of their commit.
+	image, ok := s.localImage(ctx, folder, result.Digest)
+	if !ok || !isBuildOf(image, folder, commit) {
+		span.Error("the image copied from " + build.Builder +
+			" is not a build of this Package at this commit; building instead")
+		return nil
+	}
+	// The tag is the one a local build would have written, so podman images
+	// reads the same whether this Package was built here or copied. A tag
+	// that fails is a name, not an image: the copy stands.
+	if err := s.runner.Tag(ctx, image.ID, tag); err != nil {
+		span.Error("the copied image could not be tagged " + tag + ": " + err.Error())
+	}
+	span.SetDigest(image.ID)
+	log := fmt.Sprintf("copied from %s", build.Builder)
+	span.Info(log)
+	return &BuildResult{Path: folder, Digest: image.ID, Commit: commit, Log: log}
+}
+
+// winner is the record every member of this host converges on for one commit:
+// the one recorded first, and the lowest digest when two were recorded in the
+// same nanosecond. Newest first would mean the answer changes under a member
+// who is mid build, and whoever recorded last would decide for everybody.
+func winner(builds []telemetry.Build) (telemetry.Build, bool) {
+	var best telemetry.Build
+	found := false
 	for _, build := range builds {
-		// A build of this member's own is not fetched: they removed the image
-		// and are building it again on purpose, which the loop above let them
-		// past because nothing of that digest is in their store.
-		if build.Builder == "" || build.Builder == s.files.User() {
+		if build.Digest == "" || build.Builder == "" {
 			continue
 		}
-		result, prob := s.builds.FetchImage(ctx, build.Digest, folder, build.Builder)
-		if prob != nil {
-			span.Error("the image " + build.Digest + " could not be copied from " +
-				build.Builder + ": " + prob.Detail)
-			return nil
+		if !found || earlier(build, best) {
+			best, found = build, true
 		}
-		// The tag is the one a local build would have written, so podman
-		// images reads the same whether this Package was built here or
-		// copied. A tag that fails is a name, not an image: the copy stands.
-		if err := s.runner.Tag(ctx, build.Digest, tag); err != nil {
-			span.Error("the copied image could not be tagged " + tag + ": " + err.Error())
-		}
-		span.SetDigest(build.Digest)
-		log := fmt.Sprintf("copied from %s", build.Builder)
-		span.Info(log)
-		return &BuildResult{Path: folder, Digest: result.Digest, Commit: commit, Log: log}
 	}
-	return nil
+	return best, found
+}
+
+// earlier orders two records. A record with no time sorts last rather than
+// first, so one cannot take the decision away from a record that has one.
+func earlier(a, b telemetry.Build) bool {
+	if a.BuiltAt != b.BuiltAt {
+		if a.BuiltAt == "" || b.BuiltAt == "" {
+			return b.BuiltAt == ""
+		}
+		return a.BuiltAt < b.BuiltAt
+	}
+	return a.Digest < b.Digest
+}
+
+// localImage is one image of this Package in the caller's own store.
+func (s *Service) localImage(ctx context.Context, folder, digest string) (podman.Image, bool) {
+	images, err := s.runner.Images(ctx, podman.Filter{podman.LabelPath: folder})
+	if err != nil {
+		return podman.Image{}, false
+	}
+	for _, image := range images {
+		if image.ID == digest {
+			return image, true
+		}
+	}
+	return podman.Image{}, false
+}
+
+// isBuildOf reports whether an image says it is a build of one Package at one
+// commit. The labels are written by the build and travel inside the image, so
+// they are the only provenance a copied image carries with it.
+func isBuildOf(image podman.Image, folder, commit string) bool {
+	return image.Labels[podman.LabelPath] == folder &&
+		image.Labels[podman.LabelCommit] == commit
 }
 
 // record tells kitbashd what this member built, so the next member copies it.

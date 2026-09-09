@@ -391,6 +391,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS processes_token ON processes(token_hash);
 CREATE UNIQUE INDEX IF NOT EXISTS builds_unique ON builds(path, commit_sha, digest);
 CREATE INDEX IF NOT EXISTS builds_path        ON builds(path, commit_sha);
 CREATE INDEX IF NOT EXISTS builds_builder     ON builds(builder);
+CREATE INDEX IF NOT EXISTS builds_by_builder  ON builds(path, builder);
 
 CREATE INDEX IF NOT EXISTS approvals_requester ON approvals(requester, state);
 CREATE INDEX IF NOT EXISTS approvals_state     ON approvals(state);

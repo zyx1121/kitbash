@@ -163,11 +163,12 @@ type Runner interface {
 	// runs in its own member's cgroup leaf. It is how an /org Package built
 	// by one member becomes runnable by the next, see PLAN.md section 2.2.
 	CopyImage(ctx context.Context, from, to Member, digest, fromCgroup, toCgroup string) error
-	// ImageSize answers the size in bytes of one image in a member's store,
-	// and ErrNoImage when they do not have it. A copy asks it twice: of the
-	// member who is asked for the image, and of the one who asked for it once
-	// the copy is over.
-	ImageSize(ctx context.Context, m Member, digest string) (int64, error)
+	// ImageInfo answers the size and the labels of one image in a member's
+	// store, and ErrNoImage when they do not have it. The labels are the
+	// provenance of the image, which is what says it is a build of one
+	// Package at one commit: a copy asks it of both members, and a build
+	// record is only accepted from a member whose image says so.
+	ImageInfo(ctx context.Context, m Member, digest string) (ImageInfo, error)
 }
 
 // Sessions starts one kitbash-mcp as a member, which is how a Process reaches

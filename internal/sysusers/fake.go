@@ -70,9 +70,11 @@ type Fake struct {
 	members map[string]*fakeMember
 	nextUID int
 	// images is the image store of the fake host, one per member: which
-	// digests they hold and how big each one is. A copy reads one member's
-	// and writes the other's, the way a save into a load does.
-	images map[string]map[string]int64
+	// digests they hold, how big each one is and what its labels say it is a
+	// build of. A copy reads one member's and writes the other's, the way a
+	// save into a load does, and the labels travel with the image because
+	// they are inside it.
+	images map[string]map[string]ImageInfo
 }
 
 // CopyCall is one recorded image copy, with the two members it ran as and the
@@ -398,22 +400,27 @@ func (f *Fake) RemoveContainer(_ context.Context, m Member, container string, fo
 }
 
 // AddImage puts one image in a member's store, which is what a build of
-// theirs would have left there.
-func (f *Fake) AddImage(member, digest string, size int64) {
+// theirs would have left there. The labels are given rather than derived: they
+// are the provenance every caller checks, so a test that wants an image whose
+// labels lie says so.
+func (f *Fake) AddImage(member, digest string, size int64, labels map[string]string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.addImage(member, digest, size)
+	f.addImage(member, digest, ImageInfo{Size: size, Labels: labels})
 }
 
 // addImage is AddImage without the lock.
-func (f *Fake) addImage(member, digest string, size int64) {
+func (f *Fake) addImage(member, digest string, info ImageInfo) {
 	if f.images == nil {
-		f.images = map[string]map[string]int64{}
+		f.images = map[string]map[string]ImageInfo{}
 	}
 	if f.images[member] == nil {
-		f.images[member] = map[string]int64{}
+		f.images[member] = map[string]ImageInfo{}
 	}
-	f.images[member][digest] = size
+	if info.Labels == nil {
+		info.Labels = map[string]string{}
+	}
+	f.images[member][digest] = info
 }
 
 // HasImage reports whether a member's store holds one image, which is how a
@@ -438,27 +445,29 @@ func (f *Fake) CopyImage(_ context.Context, from, to Member, digest, fromCgroup,
 	if f.CopyErr != nil {
 		return f.CopyErr
 	}
-	size, held := f.images[from.Name][digest]
+	info, held := f.images[from.Name][digest]
 	if !held {
 		return fmt.Errorf("%w: %s", ErrNoImage, digest)
 	}
 	if f.LoseCopies {
 		return nil
 	}
-	f.addImage(to.Name, digest, size)
+	// The labels are inside the image, so they arrive with it: a copy cannot
+	// change what an image says it is a build of.
+	f.addImage(to.Name, digest, info)
 	return nil
 }
 
-// ImageSize answers what a member's store holds, and ErrNoImage for a digest
+// ImageInfo answers what a member's store holds, and ErrNoImage for a digest
 // it does not.
-func (f *Fake) ImageSize(_ context.Context, m Member, digest string) (int64, error) {
+func (f *Fake) ImageInfo(_ context.Context, m Member, digest string) (ImageInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	size, held := f.images[m.Name][digest]
+	info, held := f.images[m.Name][digest]
 	if !held {
-		return 0, fmt.Errorf("%w: %s", ErrNoImage, digest)
+		return ImageInfo{}, fmt.Errorf("%w: %s", ErrNoImage, digest)
 	}
-	return size, nil
+	return info, nil
 }
 
 // Copies answers the recorded image copies, newest last.

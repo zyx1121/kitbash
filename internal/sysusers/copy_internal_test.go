@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+
+	"github.com/zyx1121/kitbash/internal/podman"
 )
 
 // The copy that shares an image between two members is two podman children
@@ -83,28 +85,50 @@ func TestPipelineEndsTheFirstChildWhenTheSecondCannotStart(t *testing.T) {
 	}
 }
 
-// TestImageSizeReadsAnInspect and answers ErrNoImage for a store that does not
-// have it, which is what both ends of a copy are checked with.
-func TestImageSizeReadsAnInspect(t *testing.T) {
-	size, err := imageSize("4096\n", nil)
-	if err != nil || size != 4096 {
-		t.Errorf("imageSize = %d, %v, want the size the inspect printed", size, err)
+// TestImageInfoReadsAnInspect: the size and the labels of one image, which are
+// what both ends of a copy and every build record are checked against.
+func TestImageInfoReadsAnInspect(t *testing.T) {
+	const out = `[{"Size":4096,"Labels":{"kitbash.path":"/org/ffmpeg","kitbash.commit":"abc"}}]`
+	info, err := imageInfo(out, nil)
+	if err != nil {
+		t.Fatalf("imageInfo: %v", err)
 	}
-	// An image that is there and whose size is unreadable is still there.
-	if size, err := imageSize("<nil>", nil); err != nil || size != 0 {
-		t.Errorf("imageSize of an unreadable size = %d, %v, want no size and no failure", size, err)
+	if info.Size != 4096 {
+		t.Errorf("the size is %d, want the one the inspect printed", info.Size)
 	}
-	for _, status := range []int{1, usageExit} {
-		_, err := imageSize("no such image", exitError(t, status))
-		if !errors.Is(err, ErrNoImage) {
-			t.Errorf("imageSize after exit %d = %v, want ErrNoImage", status, err)
-		}
+	if info.Label(podman.LabelPath) != "/org/ffmpeg" || info.Label(podman.LabelCommit) != "abc" {
+		t.Errorf("the labels are %v, want the provenance the build stamped", info.Labels)
 	}
-	// Anything else is the host's failure and is not turned into a missing
-	// image, which would send the caller to build something that is there.
+	// An older runtime answers the labels under Config and nothing at the top
+	// level, and an image with no labels at all is a map to read, not a nil.
+	nested := `[{"Size":1,"Config":{"Labels":{"kitbash.path":"/org/ffmpeg"}}}]`
+	if info, err := imageInfo(nested, nil); err != nil || info.Label(podman.LabelPath) != "/org/ffmpeg" {
+		t.Errorf("imageInfo of Config labels = %+v, %v, want the labels read", info, err)
+	}
+	if info, err := imageInfo(`[{"Size":1}]`, nil); err != nil || info.Labels == nil || len(info.Labels) != 0 {
+		t.Errorf("imageInfo of an image with no labels = %+v, %v, want an empty label set", info, err)
+	}
+
+	// Exit 1 is the image the member does not have, which is the one failure
+	// a caller acts on.
+	if _, err := imageInfo("no such image", exitError(t, 1)); !errors.Is(err, ErrNoImage) {
+		t.Errorf("imageInfo after exit 1 = %v, want ErrNoImage", err)
+	}
+	// Exit 125 is podman refusing the command itself. Reporting it as a
+	// missing image would send a member off to build something that is
+	// already there.
+	err125 := exitError(t, usageExit)
+	if _, err := imageInfo("unknown flag", err125); errors.Is(err, ErrNoImage) {
+		t.Errorf("imageInfo after exit %d = %v, want the failure as it is", usageExit, err)
+	}
+	// Anything else is the host's failure and is reported as it is.
 	other := errors.New("the runtime could not be started")
-	if _, err := imageSize("", other); !errors.Is(err, other) {
-		t.Errorf("imageSize after a host failure = %v, want it reported as it is", err)
+	if _, err := imageInfo("", other); !errors.Is(err, other) {
+		t.Errorf("imageInfo after a host failure = %v, want it reported as it is", err)
+	}
+	// Output this process cannot read is not a missing image either.
+	if _, err := imageInfo("<no value>", nil); err == nil || errors.Is(err, ErrNoImage) {
+		t.Errorf("imageInfo of output that is not JSON = %v, want a failure that is not ErrNoImage", err)
 	}
 }
 

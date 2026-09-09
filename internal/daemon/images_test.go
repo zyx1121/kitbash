@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"os/user"
@@ -26,7 +27,7 @@ func (h *harness) fetch(digest string, req fetchRequest) (*http.Response, []byte
 func TestFetchCopiesTheImageBetweenTwoMembers(t *testing.T) {
 	h, fake := sharing(t, false)
 	h.recordFor(builderName, "/org/ffmpeg", testCommit, testDigest)
-	fake.AddImage(builderName, testDigest, 4096)
+	fake.AddImage(builderName, testDigest, 4096, labelsOfBuild("/org/ffmpeg", testCommit, builderName))
 
 	res, body := h.fetch(testDigest, fetchRequest{Path: "/org/ffmpeg", From: builderName})
 	if res.StatusCode != http.StatusOK {
@@ -66,7 +67,7 @@ func TestFetchCopiesTheImageBetweenTwoMembers(t *testing.T) {
 // may be copied.
 func TestFetchWithoutABuildRecordIsNotFound(t *testing.T) {
 	h, fake := sharing(t, false)
-	fake.AddImage(builderName, testDigest, 4096)
+	fake.AddImage(builderName, testDigest, 4096, labelsOfBuild("/org/ffmpeg", testCommit, builderName))
 
 	res, body := h.fetch(testDigest, fetchRequest{Path: "/org/ffmpeg", From: builderName})
 	if res.StatusCode != http.StatusNotFound {
@@ -101,7 +102,8 @@ func TestFetchOfAnImageTheBuilderNoLongerHasIsNotFound(t *testing.T) {
 func TestFetchOfAnotherMembersHomeIsNotPermitted(t *testing.T) {
 	h, fake := sharing(t, false)
 	h.recordFor(builderName, "/home/"+builderName+"/secret", testCommit, testDigest)
-	fake.AddImage(builderName, testDigest, 4096)
+	fake.AddImage(builderName, testDigest, 4096,
+		labelsOfBuild("/home/"+builderName+"/secret", testCommit, builderName))
 
 	res, body := h.fetch(testDigest, fetchRequest{
 		Path: "/home/" + builderName + "/secret", From: builderName,
@@ -114,12 +116,42 @@ func TestFetchOfAnotherMembersHomeIsNotPermitted(t *testing.T) {
 	}
 }
 
+// TestFetchOfAnImageWhoseLabelsDoNotMatchTheRecordIsNotFound. The record is a
+// claim; the labels are inside the image and the build wrote them. Copying an
+// image that says it is a build of something else would hand this member
+// somebody else's image under a name they trust.
+func TestFetchOfAnImageWhoseLabelsDoNotMatchTheRecordIsNotFound(t *testing.T) {
+	h, fake := sharing(t, false)
+	h.recordFor(builderName, "/org/ffmpeg", testCommit, testDigest)
+	fake.AddImage(builderName, testDigest, 4096,
+		labelsOfBuild("/org/elsewhere", testCommit, builderName))
+
+	res, body := h.fetch(testDigest, fetchRequest{Path: "/org/ffmpeg", From: builderName})
+	if res.StatusCode != http.StatusNotFound {
+		t.Fatalf("fetch = %d %s, want 404", res.StatusCode, body)
+	}
+	if len(fake.Copies()) != 0 {
+		t.Errorf("the runtime was asked to copy %+v, want nothing", fake.Copies())
+	}
+
+	// The same for an image of another commit of the same Package.
+	fake.AddImage(builderName, testDigest, 4096,
+		labelsOfBuild("/org/ffmpeg", "1111111111111111111111111111111111111111", builderName))
+	res, body = h.fetch(testDigest, fetchRequest{Path: "/org/ffmpeg", From: builderName})
+	if res.StatusCode != http.StatusNotFound {
+		t.Fatalf("fetch of another commit = %d %s, want 404", res.StatusCode, body)
+	}
+	if len(fake.Copies()) != 0 {
+		t.Errorf("the runtime was asked to copy %+v, want nothing", fake.Copies())
+	}
+}
+
 // TestFetchOfTheCallersOwnBuildCopiesNothing is the no-op: a member asking for
 // an image they built is told what they have, and no child runs.
 func TestFetchOfTheCallersOwnBuildCopiesNothing(t *testing.T) {
 	h, fake := sharing(t, false)
 	h.recordFor(h.user, "/org/ffmpeg", testCommit, testDigest)
-	fake.AddImage(h.user, testDigest, 512)
+	fake.AddImage(h.user, testDigest, 512, labelsOfBuild("/org/ffmpeg", testCommit, h.user))
 
 	res, body := h.fetch(testDigest, fetchRequest{Path: "/org/ffmpeg", From: h.user})
 	if res.StatusCode != http.StatusOK {
@@ -141,7 +173,7 @@ func TestFetchOfTheCallersOwnBuildCopiesNothing(t *testing.T) {
 func TestFetchThatDeliversNothingIsInternal(t *testing.T) {
 	h, fake := sharing(t, false)
 	h.recordFor(builderName, "/org/ffmpeg", testCommit, testDigest)
-	fake.AddImage(builderName, testDigest, 4096)
+	fake.AddImage(builderName, testDigest, 4096, labelsOfBuild("/org/ffmpeg", testCommit, builderName))
 	fake.LoseCopies = true
 
 	res, body := h.fetch(testDigest, fetchRequest{Path: "/org/ffmpeg", From: builderName})
@@ -204,7 +236,7 @@ func TestOneFetchPerMemberAndImageAtATime(t *testing.T) {
 	fake.Add(sysusers.Member{Name: h.user, UID: os.Getuid(), GID: os.Getgid()})
 	fake.Add(sysusers.Member{Name: builderName})
 	h.recordFor(builderName, "/org/ffmpeg", testCommit, testDigest)
-	fake.AddImage(builderName, testDigest, 4096)
+	fake.AddImage(builderName, testDigest, 4096, labelsOfBuild("/org/ffmpeg", testCommit, builderName))
 
 	first := make(chan int, 1)
 	go func() {
@@ -217,6 +249,10 @@ func TestOneFetchPerMemberAndImageAtATime(t *testing.T) {
 	if res.StatusCode != http.StatusConflict {
 		t.Errorf("the second fetch = %d %s, want 409", res.StatusCode, body)
 	}
+	// A caller told to wait is told how long to wait for.
+	if retry := res.Header.Get("Retry-After"); retry != RetryAfterSeconds {
+		t.Errorf("Retry-After is %q, want %q", retry, RetryAfterSeconds)
+	}
 	close(runner.release)
 	if status := <-first; status != http.StatusOK {
 		t.Errorf("the first fetch = %d, want 200", status)
@@ -228,12 +264,68 @@ func TestOneFetchPerMemberAndImageAtATime(t *testing.T) {
 	}
 }
 
+// TestAMemberCopiesAtMostTwoImagesAtATime. Every copy is two setuid podman
+// children moving an image through a pipe, so this is what bounds what one
+// member can ask the host to carry.
+func TestAMemberCopiesAtMostTwoImagesAtATime(t *testing.T) {
+	fake := sysusers.NewFake()
+	runner := &blockingRunner{Fake: fake, started: make(chan struct{}, MaxFetchesPerMember+1), release: make(chan struct{})}
+	h := serveWith(t, Options{
+		Admin:  func(*user.User) (bool, error) { return false, nil },
+		Users:  fake,
+		Runner: runner,
+	})
+	fake.Add(sysusers.Member{Name: h.user, UID: os.Getuid(), GID: os.Getgid()})
+	fake.Add(sysusers.Member{Name: builderName})
+
+	// One record and one image per digest, so the copies differ in nothing
+	// but which image they are of.
+	digests := make([]string, MaxFetchesPerMember+1)
+	for i := range digests {
+		digests[i] = fmt.Sprintf("sha256:%064x", i+1)
+		h.recordFor(builderName, "/org/ffmpeg", testCommit, digests[i])
+		fake.AddImage(builderName, digests[i], 4096, labelsOfBuild("/org/ffmpeg", testCommit, builderName))
+	}
+
+	running := make(chan int, MaxFetchesPerMember)
+	for i := range MaxFetchesPerMember {
+		go func() {
+			res, _ := h.fetch(digests[i], fetchRequest{Path: "/org/ffmpeg", From: builderName})
+			running <- res.StatusCode
+		}()
+		<-runner.started
+	}
+
+	res, body := h.fetch(digests[MaxFetchesPerMember], fetchRequest{Path: "/org/ffmpeg", From: builderName})
+	if res.StatusCode != http.StatusConflict {
+		t.Errorf("the third copy = %d %s, want 409", res.StatusCode, body)
+	}
+	if retry := res.Header.Get("Retry-After"); retry != RetryAfterSeconds {
+		t.Errorf("Retry-After is %q, want %q", retry, RetryAfterSeconds)
+	}
+	if p := h.problemOf(res, body); !strings.Contains(p.Detail, "images being copied") {
+		t.Errorf("the detail is %q, want it to say the member is already copying", p.Detail)
+	}
+
+	close(runner.release)
+	for range MaxFetchesPerMember {
+		if status := <-running; status != http.StatusOK {
+			t.Errorf("a copy that was under the cap = %d, want 200", status)
+		}
+	}
+	// The count is released with the copies, so the member is served again.
+	res, body = h.fetch(digests[MaxFetchesPerMember], fetchRequest{Path: "/org/ffmpeg", From: builderName})
+	if res.StatusCode != http.StatusOK {
+		t.Errorf("the copy after = %d %s, want 200", res.StatusCode, body)
+	}
+}
+
 // TestFetchReportsARuntimeFailureAsInternal keeps the runtime's own output in
 // the daemon log: it names host paths and another member's store.
 func TestFetchReportsARuntimeFailureAsInternal(t *testing.T) {
 	h, fake := sharing(t, false)
 	h.recordFor(builderName, "/org/ffmpeg", testCommit, testDigest)
-	fake.AddImage(builderName, testDigest, 4096)
+	fake.AddImage(builderName, testDigest, 4096, labelsOfBuild("/org/ffmpeg", testCommit, builderName))
 	fake.CopyErr = errors.New("podman save: the store is locked by /var/lib/containers/lock")
 
 	res, body := h.fetch(testDigest, fetchRequest{Path: "/org/ffmpeg", From: builderName})

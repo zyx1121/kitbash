@@ -44,10 +44,11 @@ type fetchRequest struct {
 }
 
 // FetchResult is what a fetch answers: the image the caller now has, how big
-// it is and who it came from.
+// it is and who it came from. The size is absent when the runtime did not say,
+// which is not the same as an image of no bytes.
 type FetchResult struct {
 	Digest string `json:"digest"`
-	Bytes  int64  `json:"bytes"`
+	Bytes  int64  `json:"bytes,omitempty"`
 	From   string `json:"from"`
 }
 
@@ -113,7 +114,10 @@ func (c *Client) FetchImage(ctx context.Context, digest, path, from string) (*Fe
 	if err != nil {
 		return nil, problem.Internal(path, err.Error(), "")
 	}
-	fetch := ImagesPath + "/" + digest + "/fetch"
+	// The digest reaches the daemon as one path segment. It is escaped rather
+	// than trusted to be hexadecimal: this client is given the digest by a
+	// caller, and a segment with a slash in it would be another path.
+	fetch := ImagesPath + "/" + url.PathEscape(digest) + "/fetch"
 	status, payload, prob := c.sendWith(ctx, c.supervisor, http.MethodPost, fetch, body, path)
 	if prob != nil {
 		return nil, prob

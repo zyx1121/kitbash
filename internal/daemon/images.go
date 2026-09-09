@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/zyx1121/kitbash/internal/podman"
 	"github.com/zyx1121/kitbash/internal/problem"
 	"github.com/zyx1121/kitbash/internal/store"
 	"github.com/zyx1121/kitbash/internal/sysusers"
@@ -36,10 +37,11 @@ type fetchRequest struct {
 }
 
 // fetchResponse is what a fetch answers: the image the requester now has and
-// how big it is in their own store.
+// how big it is in their own store. The size is left out when the runtime did
+// not say, rather than answered as zero bytes, which is a size no image has.
 type fetchResponse struct {
 	Digest string `json:"digest"`
-	Bytes  int64  `json:"bytes"`
+	Bytes  int64  `json:"bytes,omitempty"`
 	From   string `json:"from"`
 }
 
@@ -121,14 +123,14 @@ func (s *Server) fetchImage(w http.ResponseWriter, r *http.Request, digest strin
 		return
 	}
 
-	// One fetch per requester and digest. Two at once would run two loads
-	// into one store for one image, which is work the runtime does twice and
-	// a lock it takes against itself.
-	release, taken := s.fetches.take(caller.User + " " + digest)
-	if !taken {
-		writeProblem(w, problem.ConflictFix(r.URL.Path,
-			fmt.Sprintf("%s is already being copied into %s's store", digest, caller.User),
-			"Wait for the copy that is running to finish, then read the answer of that one."))
+	// One fetch per requester and digest, and MaxFetchesPerMember at a time
+	// per member. Two of one image at once would run two loads into one store
+	// for one image, and a member with sixteen in flight would have kitbashd
+	// running thirty two podman children as them.
+	release, taken := s.fetches.take(caller.User, digest, MaxFetchesPerMember)
+	if taken != fetchTaken {
+		w.Header().Set("Retry-After", RetryAfterSeconds)
+		writeProblem(w, s.busyProblem(r, caller, digest, taken))
 		return
 	}
 	defer release()
@@ -157,10 +159,13 @@ func (s *Server) fetchImage(w http.ResponseWriter, r *http.Request, digest strin
 	}
 
 	extendResponse(w, FetchDeadline)
-	// The image the record names has to still be there. A member who removed
-	// it is a build record that is now only history, and the caller's answer
-	// is to build the Package themselves.
-	if _, err := s.runner.ImageSize(r.Context(), builder, digest); err != nil {
+	// The image the record names has to still be there, and it has to still be
+	// what the record says it is. A member who removed it is a build record
+	// that is now only history; an image whose labels name another Package or
+	// another commit is a record that was never true of it, and copying it
+	// would hand this member somebody else's image under a name they trust.
+	info, err := s.runner.ImageInfo(r.Context(), builder, digest)
+	if err != nil {
 		if errors.Is(err, sysusers.ErrNoImage) {
 			logger.Printf("images: %s no longer has %s", builder.Name, digest)
 			writeProblem(w, problem.NotFoundFix(r.URL.Path,
@@ -169,6 +174,16 @@ func (s *Server) fetchImage(w http.ResponseWriter, r *http.Request, digest strin
 			return
 		}
 		writeProblem(w, s.fetchProblem(r, err, digest, builder.Name))
+		return
+	}
+	if info.Label(podman.LabelPath) != build.Path || info.Label(podman.LabelCommit) != build.Commit {
+		logger.Printf("images: %s in %s's store is labelled %s at %s, and the record says %s at %s",
+			digest, builder.Name, info.Label(podman.LabelPath), info.Label(podman.LabelCommit),
+			build.Path, build.Commit)
+		writeProblem(w, problem.NotFoundFix(r.URL.Path,
+			fmt.Sprintf("the image %s in %s's store is not a build of %s at that commit",
+				digest, builder.Name, build.Path),
+			"Build this Package yourself with pkg_build."))
 		return
 	}
 
@@ -183,7 +198,7 @@ func (s *Server) fetchImage(w http.ResponseWriter, r *http.Request, digest strin
 	// The copy is not believed until the requester's own store answers for
 	// it: a save and a load that both exited zero and moved nothing is a
 	// failure only this call can see.
-	size, err := s.runner.ImageSize(r.Context(), requester, digest)
+	arrived, err := s.runner.ImageInfo(r.Context(), requester, digest)
 	if err != nil {
 		logger.Printf("images: %s was copied from %s to %s and is not in their store: %v",
 			digest, builder.Name, requester.Name, err)
@@ -193,8 +208,8 @@ func (s *Server) fetchImage(w http.ResponseWriter, r *http.Request, digest strin
 			"Call pkg_build for this Package instead."))
 		return
 	}
-	logger.Printf("images: %s copied %s from %s (%d bytes)", requester.Name, digest, builder.Name, size)
-	writeJSON(w, r.URL.Path, fetchResponse{Digest: digest, Bytes: size, From: builder.Name})
+	logger.Printf("images: %s copied %s from %s (%d bytes)", requester.Name, digest, builder.Name, arrived.Size)
+	writeJSON(w, r.URL.Path, fetchResponse{Digest: digest, Bytes: arrived.Size, From: builder.Name})
 }
 
 // answerLocal answers a fetch of an image the caller built themselves. There
@@ -212,7 +227,7 @@ func (s *Server) answerLocal(w http.ResponseWriter, r *http.Request, caller Call
 			"Ask an administrator to create a member for this account."))
 		return
 	}
-	size, err := s.runner.ImageSize(r.Context(), m, digest)
+	info, err := s.runner.ImageInfo(r.Context(), m, digest)
 	if err != nil {
 		if errors.Is(err, sysusers.ErrNoImage) {
 			writeProblem(w, problem.NotFoundFix(r.URL.Path,
@@ -223,7 +238,7 @@ func (s *Server) answerLocal(w http.ResponseWriter, r *http.Request, caller Call
 		writeProblem(w, s.fetchProblem(r, err, digest, caller.User))
 		return
 	}
-	writeJSON(w, r.URL.Path, fetchResponse{Digest: digest, Bytes: size, From: builder})
+	writeJSON(w, r.URL.Path, fetchResponse{Digest: digest, Bytes: info.Size, From: builder})
 }
 
 // buildRecord is the row that says this image may be copied at all. Without
@@ -276,29 +291,70 @@ func (s *Server) fetchProblem(r *http.Request, err error, digest, builder string
 		"Call pkg_build for this Package instead.")
 }
 
-// fetchLock serialises the fetches of one image into one member's store. It
-// refuses rather than waits: a caller holding an open request for the minutes
-// a copy takes has an answer coming, and a second one would only wait for the
-// first and then copy nothing.
+// MaxFetchesPerMember is how many copies one member may have running at once.
+// Every one of them is two setuid podman children moving an image through a
+// pipe, so this is what bounds what one member can ask the host to carry.
+const MaxFetchesPerMember = 2
+
+// What a claim on the fetch lock answered.
+const (
+	fetchTaken = iota
+	// fetchInFlight is the same member already copying the same image.
+	fetchInFlight
+	// fetchBusy is the member at MaxFetchesPerMember.
+	fetchBusy
+)
+
+// fetchLock bounds the copies running at once: one per member and digest, and
+// MaxFetchesPerMember per member. It refuses rather than waits: a caller
+// holding an open request for the minutes a copy takes has an answer coming,
+// and a second one would only wait for the first and then copy nothing.
 type fetchLock struct {
 	mu   sync.Mutex
 	held map[string]bool
+	per  map[string]int
 }
 
-func newFetchLock() *fetchLock { return &fetchLock{held: map[string]bool{}} }
+func newFetchLock() *fetchLock {
+	return &fetchLock{held: map[string]bool{}, per: map[string]int{}}
+}
 
-// take claims one key and answers what releases it. The second return is
-// false when somebody else holds it, which is the 409 of images_fetch.
-func (f *fetchLock) take(key string) (func(), bool) {
+// take claims one copy for one member and answers what releases it. The second
+// return says why it was not taken, which is the 409 of images_fetch.
+func (f *fetchLock) take(member, digest string, max int) (func(), int) {
+	key := member + " " + digest
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.held[key] {
-		return func() {}, false
+		return func() {}, fetchInFlight
+	}
+	if max > 0 && f.per[member] >= max {
+		return func() {}, fetchBusy
 	}
 	f.held[key] = true
+	f.per[member]++
 	return func() {
 		f.mu.Lock()
 		delete(f.held, key)
+		// The counter is dropped with the last copy, so a daemon that has
+		// served a million fetches holds the members copying now.
+		if f.per[member]--; f.per[member] <= 0 {
+			delete(f.per, member)
+		}
 		f.mu.Unlock()
-	}, true
+	}, fetchTaken
+}
+
+// busyProblem is the refusal of a member who is already copying. Both are
+// conflicts with a Retry-After: the caller is not wrong, there is just a copy
+// of theirs running.
+func (s *Server) busyProblem(r *http.Request, caller Caller, digest string, why int) *problem.Problem {
+	if why == fetchInFlight {
+		return problem.ConflictFix(r.URL.Path,
+			fmt.Sprintf("%s is already being copied into %s's store", digest, caller.User),
+			"Wait for the copy that is running to finish, then read the answer of that one.")
+	}
+	return problem.ConflictFix(r.URL.Path,
+		fmt.Sprintf("%s already has %d images being copied", caller.User, MaxFetchesPerMember),
+		fmt.Sprintf("Wait for one of them to finish; kitbashd copies %d images at a time per member.", MaxFetchesPerMember))
 }
