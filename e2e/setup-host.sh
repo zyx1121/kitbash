@@ -70,8 +70,22 @@ getent group kitbash-users >/dev/null || groupadd -r kitbash-users
 getent group kitbash-admin >/dev/null || groupadd -r kitbash-admin
 
 # 6. The two members, through the operator's own script.
+#
+#    shadow locks /etc/subuid with a file of that name plus .lock, which is the
+#    same name kitbash's own allocation takes its lock on, and shadow refuses a
+#    lock file it did not write ("existing lock file without a PID"). The
+#    allocation leaves its file behind, so the next useradd would refuse to
+#    run. Clearing it between accounts is this job's workaround, not a rule of
+#    the platform: on the host the two never run this close together.
+unlock_subids() { rm -f /etc/subuid.lock /etc/subgid.lock; }
+
+unlock_subids
 sh deploy/kitbash-adduser "$admin" "$key" admin
+unlock_subids
 sh deploy/kitbash-adduser "$member" "$key"
+#    users_create runs the same useradd from inside kitbashd, so the files are
+#    cleared here too rather than only between these two.
+unlock_subids
 
 # 7. /org, seeded and owned as install.sh leaves it.
 mkdir -p /org
