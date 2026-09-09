@@ -75,6 +75,16 @@ func run() error {
 		return err
 	}
 
+	// The session asks kitbashd to place it in its member's cgroup before it
+	// serves anything. Without it, exec into a container kitbashd started is
+	// refused by the kernel: a process moves between cgroups only with write
+	// access to the common ancestor's, and sshd started this one outside the
+	// member's subtree, see internal/cgroups. A host without kitbashd, or one
+	// that cannot place it, costs one line here and nothing else.
+	if prob := telem.Client().JoinSession(ctx); prob != nil {
+		fmt.Fprintf(os.Stderr, "kitbash-mcp: this session was not placed in its cgroup: %s\n", prob.Detail)
+	}
+
 	runner := podman.NewCLI()
 	// The Process registry is the same client tel_query forwards through: a
 	// Process is registered with kitbashd before its container starts, which

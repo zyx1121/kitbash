@@ -75,8 +75,8 @@ func TestRestoreStartsEveryProcessAsItsOwner(t *testing.T) {
 	if got := started["kitbash-observe-count"]; got.Member != "bob" || got.UID != 1006 {
 		t.Errorf("kitbash-observe-count ran as %+v, want bob with his uid", got)
 	}
-	// The cgroup filesystem does not survive a reboot, so the cgroup of every
-	// Process is created again and the child is placed in its leaf: a
+	// The cgroup filesystem does not survive a reboot, so the ceiling of every
+	// Process is created again and the child is placed in the member's leaf: a
 	// container whose cgroup parent is gone does not start at all.
 	placed := map[string]string{}
 	for _, call := range h.cgroups.Placed() {
@@ -126,6 +126,29 @@ func TestRestoreWritesTheCeilingAgain(t *testing.T) {
 	// unlimited rather than not at all.
 	if len(fake.Calls()) != 2 {
 		t.Errorf("the containers started are %+v, want both", fake.Calls())
+	}
+}
+
+// A daemon that restarts without the host finds its Processes still running.
+// Restore promises that every registered Process is running afterwards, not
+// that it started each one, so a container that was up already is counted with
+// the rest and named only in the line at the end.
+func TestRestoreCountsAContainerThatIsAlreadyRunning(t *testing.T) {
+	h, fake := serveUsers(t, true)
+	fake.Add(sysusers.Member{Name: "alice", UID: 1005})
+	fake.Running = map[string]bool{"kitbash-echo-up": true}
+
+	kept := h.registered("alice", "kitbash-echo-up")
+	h.registered("alice", "kitbash-echo-down")
+
+	counts := h.server.Restore(context.Background())
+	if counts.Started != 2 || counts.Running != 1 || counts.Failed != 0 {
+		t.Fatalf("counts = %+v, want two started of which one was already running", counts)
+	}
+	// The registration of a Process that never stopped is left alone: it is
+	// running, and its token is the one its container holds.
+	if _, found, err := h.store.Process(context.Background(), kept); err != nil || !found {
+		t.Errorf("the registration of a running Process went (found %t, err %v)", found, err)
 	}
 }
 

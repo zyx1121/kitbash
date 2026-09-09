@@ -415,6 +415,34 @@ api:
       Retry-After: 60. The write itself is queued, so this path answers without
       waiting for the store.
     errors: [bad-request, not-permitted, conflict, internal]
+  sessions_join:
+    method: POST
+    path: /kitbash/v1/sessions/join
+    request: no body
+    response: { user: "loki", pid: 4242, cgroup: "/sys/fs/cgroup/kitbash/loki/run" }
+    description: >
+      Places the calling session in its member's cgroup leaf. The process
+      placed is the peer of the connection, read from the kernel with
+      SO_PEERCRED: a caller cannot name another one, which here would mean
+      moving somebody else's process into a cgroup.
+    why: >
+      Moving a process between cgroups needs write access to cgroup.procs of
+      the common ancestor of where it is and where it is going. A session sshd
+      started lives in sshd's cgroup, whose only ancestor in common with a
+      container of kitbash's is the root cgroup, so podman exec into a
+      container kitbashd started is refused by the kernel. From the leaf the
+      ancestor is /kitbash/<member>, whose cgroup.procs the member has.
+    client_behaviour: >
+      kitbash-mcp calls it once at startup, before it publishes the tools of
+      running Processes, and logs one line if it fails. A session that was not
+      placed still serves everything else; an exec into a Process is then
+      internal with the detail "this session is outside the member's cgroup;
+      kitbashd could not place it". The kitbash-mcp kitbashd starts for a
+      Process over /mcp is already placed and calls nothing.
+    authorization: >
+      Any member. An account that is not a member of kitbash-users is
+      not-permitted: this is not the path that creates a cgroup for one.
+    errors: [not-permitted, internal]
   health:
     method: GET
     path: /kitbash/v1/health
@@ -444,10 +472,13 @@ restore:
     At start, after the store is open and before the listeners accept,
     kitbashd restores Processes: for every registered Process whose owner
     still exists it creates /run/user/<uid> (0700, owned by the member) and
-    runs podman start <container> as that member (setuid to the member's uid
+    runs podman start <container> as that member from inside the member's leaf
+    (setuid to the member's uid
     and gid with HOME, USER, LOGNAME, PATH and XDG_RUNTIME_DIR set), 60 s per
     container, in parallel per owner and serially within one owner. A
-    container that no longer exists is unregistered and logged. Restore runs
+    container that no longer exists is unregistered and logged, and one that is
+    already running, which is what a daemon that restarted without the host
+    finds, is counted as started and named only in the line at the end. Restore runs
     once per daemon start and is also what makes "all Processes come back
     after a reboot" true; the OpenRC script orders kitbashd after localmount
     and the local runlevel scripts.
@@ -543,26 +574,34 @@ cgroups:
     container for them, see PLAN.md section 2.3.
   layout: >
     /sys/fs/cgroup/kitbash is root's, with memory, cpu and pids in its
-    cgroup.subtree_control; /sys/fs/cgroup/kitbash/<member> is root's in full,
-    with the same delegation; /sys/fs/cgroup/kitbash/<member>/<process id> is
-    the cgroup of one Process, and
-    /sys/fs/cgroup/kitbash/<member>/<process id>/run the leaf its podman child
-    is started in. Processes live in a leaf because a cgroup that holds
-    processes may not enable controllers for its children, and the container is
-    a child of the Process's cgroup.
+    cgroup.subtree_control; /sys/fs/cgroup/kitbash/<member> is root's, with the
+    same delegation; /sys/fs/cgroup/kitbash/<member>/run is the member's leaf;
+    and /sys/fs/cgroup/kitbash/<member>/<process id> is the ceiling of one
+    Process, under which the container runtime creates the container's own
+    cgroup.
+  leaf: >
+    The leaf holds what belongs to the member rather than to one Process: their
+    MCP sessions, and the podman child that starts, stops or removes a
+    container. Neither is the workload, and a podman child under the Process's
+    ceiling would spend the memory the manifest meant for the container, so a
+    small limit would kill the starter instead of the thing being started.
   ceiling: >
     memory.max, cpu.max and pids.max of the Process's cgroup are written by
     root and stay root's. The member is given the directory of that cgroup and
     its cgroup.procs, cgroup.threads and cgroup.subtree_control, which is what
     the kernel's delegation convention names and exactly enough for a rootless
     podman to create the container's cgroup under the ceiling and move the
-    container into it. Nothing above it is theirs, so a member can neither
-    raise their own limit nor create a Process cgroup without one.
+    container into it. Of the member's own cgroup they are given cgroup.procs
+    and cgroup.threads and not the directory: moving a process between two
+    cgroups needs write access to the common ancestor's cgroup.procs, and that
+    cgroup is the ancestor of the leaf and of every container. Nothing else is
+    theirs, so a member can neither raise their own limit nor create a Process
+    cgroup without one.
   when: >
     The root and one cgroup per member at daemon start and at users_create; the
-    cgroup of a Process at every start and at every restore. The cgroup of a
-    Process goes at processes_remove, and a member's whole cgroup at
-    users_remove.
+    ceiling of a Process at every start and at every restore; a session at
+    sessions_join. The cgroup of a Process goes at processes_remove, and a
+    member's whole cgroup at users_remove.
   without_it: >
     A host whose cgroup filesystem is not version 2 or not writable runs that
     Process unplaced: the limits are still passed to the runtime and recorded,

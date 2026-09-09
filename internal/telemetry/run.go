@@ -33,6 +33,35 @@ const (
 	actionTimeout = 60 * time.Second
 )
 
+// SessionsJoinPath is where a session asks kitbashd to place it in its
+// member's cgroup, see sessions_join in spec/kitbashd-api.yaml. Without it a
+// session cannot exec into a container kitbashd started: moving a process
+// between cgroups needs write access to the common ancestor's cgroup.procs,
+// and a session sshd started shares only the root cgroup with anything of
+// kitbash's.
+const SessionsJoinPath = "/kitbash/v1/sessions/join"
+
+// JoinSession asks kitbashd to place this process in its member's cgroup. It
+// is called once, at startup, and carries no body: the process it places is
+// the peer of the socket, which the kernel says and a caller cannot claim.
+//
+// A session that is not placed still works. Everything but exec into a
+// container kitbashd started is unaffected, and that says so when it is tried,
+// so this is one line in the log rather than a session that will not start.
+func (c *Client) JoinSession(ctx context.Context) *problem.Problem {
+	if c == nil {
+		return problem.Internal("sessions_join", "telemetry is not configured for this session", NotRunningFix)
+	}
+	status, payload, prob := c.send(ctx, http.MethodPost, SessionsJoinPath, nil, "sessions_join")
+	if prob != nil {
+		return prob
+	}
+	if status >= 300 {
+		return c.failure("sessions_join", statusText(status), payload)
+	}
+	return nil
+}
+
 // StartOptions is the command line the session would have run, as
 // processes_start carries it. The environment here is the manifest's own:
 // kitbashd writes the Telemetry token, the fan out secret and the Process's

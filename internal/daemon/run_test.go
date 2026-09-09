@@ -115,8 +115,11 @@ func TestStartRunsTheContainerAsTheOwnerInTheirCgroup(t *testing.T) {
 	if run.Member != h.user {
 		t.Errorf("the container ran as %s, want %s", run.Member, h.user)
 	}
-	if run.Cgroup != cgroups.LeafDir(h.cgroups.Base, h.user, id) {
-		t.Errorf("the child was placed in %q, want the leaf of the Process's own cgroup", run.Cgroup)
+	// The podman child runs in the member's leaf, not under the ceiling: the
+	// child is not the workload, and a small limit would kill the starter
+	// instead of the thing being started.
+	if run.Cgroup != cgroups.LeafDir(h.cgroups.Base, h.user) {
+		t.Errorf("the child was placed in %q, want the member's leaf", run.Cgroup)
 	}
 	// The ceiling is the Process's own cgroup and it is written by root, in
 	// the spelling the cgroup files take.
@@ -584,6 +587,89 @@ func TestCreatingAMemberPreparesTheirCgroup(t *testing.T) {
 	}
 	if calls[0].UID == 0 {
 		t.Errorf("alice's cgroup is %+v, want her uid", calls[0])
+	}
+}
+
+// A session sshd started is outside the member's cgroup, so the kernel refuses
+// to let it move a process into a container's. It asks kitbashd to place it,
+// and the process it places is the peer of the connection, which the kernel
+// says and no caller can claim.
+func TestJoinPlacesTheCallingSessionInTheMemberLeaf(t *testing.T) {
+	h, _ := supervised(t)
+
+	res, body := h.postJSON(http.MethodPost, sessionsJoinPath, nil)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("sessions_join = %d %s, want 200", res.StatusCode, body)
+	}
+	var answer sessionResponse
+	if err := json.Unmarshal(body, &answer); err != nil {
+		t.Fatalf("body %q: %v", body, err)
+	}
+	if answer.User != h.user || answer.PID != os.Getpid() {
+		t.Errorf("the answer is %+v, want this process placed for %s", answer, h.user)
+	}
+	joined := h.cgroups.Sessions()
+	if len(joined) != 1 {
+		t.Fatalf("the sessions placed are %+v, want one", joined)
+	}
+	if joined[0].PID != os.Getpid() || joined[0].Name != h.user {
+		t.Errorf("the session placed is %+v, want this process as %s", joined[0], h.user)
+	}
+	if joined[0].Cgroup != cgroups.LeafDir(h.cgroups.Base, h.user) {
+		t.Errorf("the session went to %q, want the member's leaf", joined[0].Cgroup)
+	}
+	// The leaf is the one the podman children use, so exec has the common
+	// ancestor the kernel asks for.
+	if answer.Cgroup != joined[0].Cgroup {
+		t.Errorf("the answer names %q and the fake placed it in %q", answer.Cgroup, joined[0].Cgroup)
+	}
+}
+
+// A host that cannot place the session says so, and the session still works:
+// everything but exec into a container kitbashd started is unaffected.
+func TestJoinOnAHostThatCannotPlaceIsInternal(t *testing.T) {
+	fake := sysusers.NewFake()
+	h := serveWith(t, Options{Users: fake, Runner: fake, Cgroups: &cgroups.Fake{Off: true}})
+	fake.Add(sysusers.Member{Name: h.user, UID: os.Getuid(), GID: os.Getgid()})
+
+	res, body := h.postJSON(http.MethodPost, sessionsJoinPath, nil)
+	if res.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("sessions_join = %d %s, want 500", res.StatusCode, body)
+	}
+	if got := h.problemOf(res, body).Detail; got != "this host could not place the session in its member's cgroup" {
+		t.Errorf("detail is %q, want the placement named", got)
+	}
+}
+
+// An account that is not a member has no cgroup to be placed in, and this is
+// not the path that creates one.
+func TestJoinRefusesAnAccountThatIsNotAMember(t *testing.T) {
+	fake := sysusers.NewFake()
+	h := serveWith(t, Options{Users: fake, Runner: fake})
+
+	res, body := h.postJSON(http.MethodPost, sessionsJoinPath, nil)
+	if res.StatusCode != http.StatusForbidden {
+		t.Fatalf("sessions_join = %d %s, want 403", res.StatusCode, body)
+	}
+	if len(h.cgroups.Sessions()) != 0 {
+		t.Errorf("a session of a non member was placed: %+v", h.cgroups.Sessions())
+	}
+}
+
+// The identity of a socket connection carries the peer's process id, which is
+// what sessions_join places. It is the kernel's word, like the uid beside it.
+func TestTheCallerCarriesThePeerProcessID(t *testing.T) {
+	h, _ := supervised(t)
+	res, body := h.postJSON(http.MethodPost, sessionsJoinPath, nil)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("sessions_join = %d %s, want 200", res.StatusCode, body)
+	}
+	var answer sessionResponse
+	if err := json.Unmarshal(body, &answer); err != nil {
+		t.Fatalf("body %q: %v", body, err)
+	}
+	if answer.PID != os.Getpid() {
+		t.Errorf("the peer is %d, want this test's own pid %d", answer.PID, os.Getpid())
 	}
 }
 

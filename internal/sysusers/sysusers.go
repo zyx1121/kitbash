@@ -44,6 +44,11 @@ var (
 	// ErrNoImage reports an image the member's store does not have, which is
 	// a Process whose Package was never built here or whose build is gone.
 	ErrNoImage = errors.New("sysusers: no such image")
+	// ErrAlreadyRunning reports a container that is up already, which is what
+	// restore finds when the daemon restarts rather than the host: the
+	// Processes never stopped. It is a Process that is running, not a start
+	// that failed.
+	ErrAlreadyRunning = errors.New("sysusers: the container is already running")
 	// ErrUsage reports a run the container runtime refused to parse, which is
 	// exit 125: the options of the unit are wrong, and the member is the one
 	// who can change them.
@@ -136,9 +141,10 @@ type Runner interface {
 	Run(ctx context.Context, m Member, opts podman.RunOptions, cgroup string) (string, error)
 	// Start creates the member's runtime directory and starts one container
 	// as them. A container the runtime does not have is ErrNoContainer, which
-	// restore answers by unregistering the Process. A container keeps the
-	// cgroup parent it was created with, so restoring one only has to place
-	// the child again.
+	// restore answers by unregistering the Process, and one that is up
+	// already is ErrAlreadyRunning, which is a Process that came through a
+	// daemon restart. A container keeps the cgroup parent it was created
+	// with, so restoring one only has to place the child again.
 	Start(ctx context.Context, m Member, container, cgroup string) error
 	// Stop stops one container as the member, giving it timeout seconds to
 	// exit on its own. A container the runtime does not have is

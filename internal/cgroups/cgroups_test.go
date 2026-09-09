@@ -28,25 +28,44 @@ func TestFakeIsACgroups(t *testing.T) {
 	if err := f.EnsureRoot(ctx); err != nil {
 		t.Fatalf("EnsureRoot: %v", err)
 	}
-	if err := f.EnsureMember(ctx, "alice", 1005, 1005); err != nil {
+	leaf, err := f.EnsureMember(ctx, "alice", 1005, 1005)
+	if err != nil {
 		t.Fatalf("EnsureMember: %v", err)
 	}
+	if leaf != "/sys/fs/cgroup/kitbash/alice/run" {
+		t.Errorf("the leaf is %q, want the member's own", leaf)
+	}
 	limits := cgroups.Limits{Memory: "536870912", CPU: "100000 100000", Pids: 512}
-	leaf, err := f.EnsureProcess(ctx, "alice", process, 1005, 1005, limits)
+	placed, err := f.EnsureProcess(ctx, "alice", process, 1005, 1005, limits)
 	if err != nil {
 		t.Fatalf("EnsureProcess: %v", err)
 	}
-	if leaf != "/sys/fs/cgroup/kitbash/alice/"+process+"/run" {
-		t.Errorf("the leaf is %q, want the run cgroup of the Process", leaf)
+	// The podman child goes in the member's leaf, not under the ceiling it
+	// just wrote: the child is not the workload.
+	if placed != leaf {
+		t.Errorf("the child would start in %q, want the member's leaf %q", placed, leaf)
 	}
-	placed := f.Placed()
-	if len(placed) != 1 || placed[0].Limits != limits {
-		t.Fatalf("the cgroups placed are %+v, want one carrying the ceiling", placed)
+	joined, err := f.JoinSession(ctx, "alice", 1005, 1005, 4242)
+	if err != nil {
+		t.Fatalf("JoinSession: %v", err)
+	}
+	if joined != leaf {
+		t.Errorf("the session went to %q, want the member's leaf %q", joined, leaf)
+	}
+	if sessions := f.Sessions(); len(sessions) != 1 || sessions[0].PID != 4242 {
+		t.Errorf("the sessions placed are %+v, want the one pid", sessions)
+	}
+	if _, err := f.JoinSession(ctx, "alice", 1005, 1005, 0); !errors.Is(err, cgroups.ErrPID) {
+		t.Errorf("a join with no pid = %v, want ErrPID", err)
+	}
+	ceilings := f.Placed()
+	if len(ceilings) != 1 || ceilings[0].Limits != limits {
+		t.Fatalf("the cgroups placed are %+v, want one carrying the ceiling", ceilings)
 	}
 	if _, err := f.EnsureProcess(ctx, "alice", "../root", 1005, 1005, limits); !errors.Is(err, cgroups.ErrName) {
 		t.Errorf("an id that is a path = %v, want ErrName", err)
 	}
-	if err := f.EnsureMember(ctx, "../root", 1005, 1005); !errors.Is(err, cgroups.ErrName) {
+	if _, err := f.EnsureMember(ctx, "../root", 1005, 1005); !errors.Is(err, cgroups.ErrName) {
 		t.Errorf("a name that is a path = %v, want ErrName", err)
 	}
 }
@@ -63,6 +82,9 @@ func TestAFakeWithoutDelegationRefusesEveryCall(t *testing.T) {
 	if _, err := f.EnsureProcess(ctx, "alice", process, 1005, 1005, cgroups.Limits{}); err == nil {
 		t.Error("EnsureProcess answered a host that cannot delegate")
 	}
+	if _, err := f.JoinSession(ctx, "alice", 1005, 1005, 4242); err == nil {
+		t.Error("JoinSession answered a host that cannot delegate")
+	}
 }
 
 // Parent is what the container is created under: the Process's own cgroup,
@@ -71,9 +93,8 @@ func TestTheContainerIsCreatedUnderTheProcessCgroup(t *testing.T) {
 	if got := cgroups.Parent("alice", process); got != "/kitbash/alice/"+process {
 		t.Errorf("the cgroup parent is %q, want the Process's own cgroup", got)
 	}
-	if got := cgroups.LeafDir("/sys/fs/cgroup", "alice", process); got !=
-		"/sys/fs/cgroup/kitbash/alice/"+process+"/run" {
-		t.Errorf("the leaf is %q, want the run cgroup under the Process's", got)
+	if got := cgroups.LeafDir("/sys/fs/cgroup", "alice"); got != "/sys/fs/cgroup/kitbash/alice/run" {
+		t.Errorf("the leaf is %q, want the member's own, beside the ceilings", got)
 	}
 }
 
@@ -149,8 +170,10 @@ func TestTheRealTreeOnAWritableCgroupV2Mount(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EnsureProcess: %v", err)
 	}
-	if leaf != cgroups.LeafDir(root, name, process) {
-		t.Fatalf("the leaf is %q, want %q", leaf, cgroups.LeafDir(root, name, process))
+	// What a start is given is the member's leaf, beside the ceiling rather
+	// than under it: the podman child is not the workload.
+	if leaf != cgroups.LeafDir(root, name) {
+		t.Fatalf("the leaf is %q, want %q", leaf, cgroups.LeafDir(root, name))
 	}
 	if _, err := os.Stat(filepath.Join(leaf, "cgroup.procs")); err != nil {
 		t.Fatalf("the leaf is not a cgroup: %v", err)
@@ -175,14 +198,20 @@ func TestTheRealTreeOnAWritableCgroupV2Mount(t *testing.T) {
 			t.Errorf("the Process cgroup delegates %q, want %s", enabled, controller)
 		}
 	}
-	// The member is given the directory and the three delegation files, so
-	// their rootless podman can create the container's cgroup and move the
-	// container into it.
+	// The member is given the directory of the ceiling and its three
+	// delegation files, so their rootless podman can create the container's
+	// cgroup and move the container into it.
 	for _, path := range []string{dir, filepath.Join(dir, "cgroup.procs"),
-		filepath.Join(dir, "cgroup.subtree_control"), leaf} {
+		filepath.Join(dir, "cgroup.subtree_control")} {
 		if owner := ownerOf(t, path); owner != uid {
 			t.Errorf("%s belongs to uid %d, want the member's %d", path, owner, uid)
 		}
+	}
+	// And cgroup.procs of the member's own cgroup, because that is the common
+	// ancestor the kernel checks when a session execs into the container.
+	member := cgroups.MemberDir(root, name)
+	if owner := ownerOf(t, filepath.Join(member, "cgroup.procs")); owner != uid {
+		t.Errorf("the member's cgroup.procs belongs to uid %d, want the member's %d", owner, uid)
 	}
 	// And nothing else. The ceiling stays root's, which is the whole point of
 	// a Process cgroup: the member cannot raise what they may spend.
@@ -191,10 +220,32 @@ func TestTheRealTreeOnAWritableCgroupV2Mount(t *testing.T) {
 			t.Errorf("%s belongs to uid %d, want root", file, owner)
 		}
 	}
-	// The member cgroup above it is root's in full, so nobody can make a
-	// Process cgroup beside this one with no ceiling in it.
-	if owner := ownerOf(t, cgroups.MemberDir(root, name)); owner != 0 {
-		t.Errorf("the member cgroup belongs to uid %d, want root", owner)
+	// The member cgroup's directory is root's, so nobody can make a Process
+	// cgroup beside this one with no ceiling in it, and so is the leaf: only
+	// kitbashd puts anything in it.
+	for _, path := range []string{member, leaf} {
+		if owner := ownerOf(t, path); owner != 0 {
+			t.Errorf("%s belongs to uid %d, want root", path, owner)
+		}
+	}
+
+	// A session is placed in that leaf, which is what lets it exec into the
+	// container: from there the common ancestor with the container's cgroup is
+	// the member's own, whose cgroup.procs they have.
+	placed, err := c.JoinSession(ctx, name, uid, gid, os.Getpid())
+	if err != nil {
+		t.Fatalf("JoinSession: %v", err)
+	}
+	if placed != leaf {
+		t.Errorf("the session went to %q, want the leaf %q", placed, leaf)
+	}
+	if !strings.Contains(read(t, filepath.Join(leaf, "cgroup.procs")), strconv.Itoa(os.Getpid())) {
+		t.Errorf("the leaf holds %q, want this process", read(t, filepath.Join(leaf, "cgroup.procs")))
+	}
+	// Put it back where the test found it, or the cgroup cannot be removed.
+	if err := os.WriteFile(filepath.Join(cgroups.DefaultRoot, "cgroup.procs"),
+		[]byte(strconv.Itoa(os.Getpid())), 0); err != nil {
+		t.Fatalf("move this process back to the root cgroup: %v", err)
 	}
 
 	if err := c.RemoveProcess(ctx, name, process); err != nil {

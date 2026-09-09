@@ -111,8 +111,22 @@ func (p *Podman) Start(ctx context.Context, m Member, container, cgroup string) 
 	if err := p.exists(ctx, m, container); err != nil {
 		return err
 	}
-	_, err := p.runIn(ctx, m, cgroup, "start", container)
-	return err
+	// A daemon that restarted without the host finds its Processes still
+	// running. Asking the state first says so plainly; the runtime would
+	// otherwise refuse the start and the reason would be a message.
+	state, err := p.run(ctx, m, "inspect", "--format", "{{.State.Status}}", container)
+	if err == nil && strings.TrimSpace(state) == podman.StateRunning {
+		return fmt.Errorf("%w: %s", ErrAlreadyRunning, container)
+	}
+	if _, err := p.runIn(ctx, m, cgroup, "start", container); err != nil {
+		// The state can change between the two calls, and an older runtime
+		// answers a start of a running container with this and nothing else.
+		if strings.Contains(strings.ToLower(err.Error()), "must be in created or stopped state") {
+			return fmt.Errorf("%w: %s", ErrAlreadyRunning, container)
+		}
+		return err
+	}
+	return nil
 }
 
 // Stop stops one container as the member. The runtime is given the same

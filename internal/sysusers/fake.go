@@ -45,6 +45,9 @@ type Fake struct {
 	// Missing are containers Start, Stop and Remove answer ErrNoContainer
 	// for, by name, and images Run answers ErrNoImage for.
 	Missing map[string]bool
+	// Running are containers Start answers ErrAlreadyRunning for, which is
+	// what a daemon that restarted without the host finds.
+	Running map[string]bool
 
 	// Created, AddedKeys and Removed record what the caller asked for, and
 	// Started, Ran, Stopped, RemovedContainers and RemovedFor what the
@@ -291,6 +294,9 @@ func (f *Fake) Start(_ context.Context, m Member, container, cgroup string) erro
 	defer f.mu.Unlock()
 	if f.Missing[container] {
 		return fmt.Errorf("%w: %s", ErrNoContainer, container)
+	}
+	if f.Running[container] {
+		return fmt.Errorf("%w: %s", ErrAlreadyRunning, container)
 	}
 	if f.StartErr != nil {
 		return f.StartErr

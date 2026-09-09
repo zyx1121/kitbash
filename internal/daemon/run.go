@@ -315,6 +315,59 @@ const (
 	ActionDeadline = 90 * time.Second
 )
 
+// sessionResponse is what a join answers: who the session belongs to, which
+// process was placed and the cgroup it went into.
+type sessionResponse struct {
+	User   string `json:"user"`
+	PID    int    `json:"pid"`
+	Cgroup string `json:"cgroup"`
+}
+
+// joinSession puts the calling session in its member's cgroup leaf, which is
+// what lets it exec into its own containers: moving a process between two
+// cgroups needs write access to the common ancestor's cgroup.procs, and a
+// session that sshd started shares only the root cgroup with anything of
+// kitbash's, see internal/cgroups.
+//
+// The process placed is the peer of this connection, read from the kernel. A
+// caller cannot name another one: that is the same rule the whole socket
+// follows, and here it would move somebody else's process into a cgroup.
+func (s *Server) joinSession(w http.ResponseWriter, r *http.Request) {
+	caller, prob := s.caller(r)
+	if prob != nil {
+		writeProblem(w, prob)
+		return
+	}
+	if caller.Peer.PID <= 0 {
+		writeProblem(w, problem.Internal(r.URL.Path,
+			fmt.Sprintf("the connection of %s carries no process id", caller.User), ""))
+		return
+	}
+	m, found, err := s.users.Lookup(r.Context(), caller.User)
+	if err != nil {
+		writeProblem(w, problem.Internal(r.URL.Path, err.Error(), ""))
+		return
+	}
+	if !found || !m.IsMember() {
+		writeProblem(w, problem.NotPermitted(r.URL.Path,
+			fmt.Sprintf("%s is not a member of this host", caller.User),
+			"Ask an administrator to create a member for this account."))
+		return
+	}
+	cgroup, err := s.cgroups.JoinSession(r.Context(), m.Name, m.UID, m.GID, int(caller.Peer.PID))
+	if err != nil {
+		// A session that was not placed still works: everything but exec into
+		// a container kitbashd started, which says so when it is tried.
+		logger.Printf("cgroups: the session %d of %s was not placed: %v", caller.Peer.PID, m.Name, err)
+		writeProblem(w, problem.InternalDetail(r.URL.Path,
+			fmt.Sprintf("place the session %d of %s: %v", caller.Peer.PID, m.Name, err),
+			"this host could not place the session in its member's cgroup",
+			"Your session works; a Process you exec into may not. Ask an administrator to read the daemon log."))
+		return
+	}
+	writeJSON(w, r.URL.Path, sessionResponse{User: m.Name, PID: int(caller.Peer.PID), Cgroup: cgroup})
+}
+
 // extendResponse gives one response longer than the write timeout the daemon
 // serves every other path under. A server that cannot extend it is not a
 // reason to refuse the call: the work still happens and the answer is late,
@@ -629,7 +682,7 @@ func (s *Server) Prepare(ctx context.Context) {
 		return
 	}
 	for _, m := range members {
-		if err := s.cgroups.EnsureMember(ctx, m.Name, m.UID, m.GID); err != nil {
+		if _, err := s.cgroups.EnsureMember(ctx, m.Name, m.UID, m.GID); err != nil {
 			logger.Printf("cgroups: the cgroup of %s could not be prepared: %v", m.Name, err)
 		}
 	}
@@ -666,17 +719,19 @@ func (s *Server) sweepEnvDir() {
 // memberCgroup creates one member's cgroup, which is what an account gains
 // when it is created and loses when it goes.
 func (s *Server) memberCgroup(ctx context.Context, m sysusers.Member) {
-	if err := s.cgroups.EnsureMember(ctx, m.Name, m.UID, m.GID); err != nil {
+	if _, err := s.cgroups.EnsureMember(ctx, m.Name, m.UID, m.GID); err != nil {
 		logger.Printf("cgroups: the cgroup of %s could not be prepared: %v", m.Name, err)
 	}
 }
 
-// processCgroup creates the cgroup one Process runs under and answers the leaf
-// its podman child is started in. An empty leaf is a host that could not place
-// it: the Process still runs, its limits are recorded rather than enforced,
-// and this says so on every start rather than once, because the next start may
-// be on a host that has since been fixed, or for a member whose cgroup is
-// fine.
+// processCgroup creates the ceiling one Process runs under and answers the
+// member's leaf, which is where its podman child starts: the child is not the
+// workload and must not spend the workload's memory.
+//
+// An empty leaf is a host that could not place it: the Process still runs, its
+// limits are recorded rather than enforced, and this says so on every start
+// rather than once, because the next start may be on a host that has since
+// been fixed, or for a member whose cgroup is fine.
 func (s *Server) processCgroup(ctx context.Context, m sysusers.Member, p store.Process, limits cgroups.Limits) string {
 	leaf, err := s.cgroups.EnsureProcess(ctx, m.Name, p.ID, m.UID, m.GID, limits)
 	if err != nil {

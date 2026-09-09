@@ -17,8 +17,13 @@ const RestoreTimeout = 60 * time.Second
 
 // RestoreCounts is what one restore did, and what its log line reports.
 type RestoreCounts struct {
-	// Started is how many containers came back.
+	// Started is how many containers came back, the ones that were up
+	// already included: what restore promises is that every registered
+	// Process is running afterwards, not that it started each one.
 	Started int
+	// Running is how many of those were up already, which is what a daemon
+	// that restarted without the host finds.
+	Running int
 	// Missing is how many the runtime no longer has, which are unregistered.
 	Missing int
 	// Failed is how many the runtime refused to start, which stay registered
@@ -88,6 +93,7 @@ func (s *Server) Restore(ctx context.Context) RestoreCounts {
 			owned := s.restoreOwner(ctx, owner, processes)
 			mu.Lock()
 			counts.Started += owned.Started
+			counts.Running += owned.Running
 			counts.Missing += owned.Missing
 			counts.Failed += owned.Failed
 			mu.Unlock()
@@ -95,8 +101,8 @@ func (s *Server) Restore(ctx context.Context) RestoreCounts {
 	}
 	wg.Wait()
 
-	logger.Printf("restore: started %d, missing %d, failed %d, legacy %d",
-		counts.Started, counts.Missing, counts.Failed, counts.Legacy)
+	logger.Printf("restore: started %d (%d were already running), missing %d, failed %d, legacy %d",
+		counts.Started, counts.Running, counts.Missing, counts.Failed, counts.Legacy)
 	return counts
 }
 
@@ -142,6 +148,12 @@ func (s *Server) restoreOwner(ctx context.Context, owner string, processes []sto
 		switch {
 		case err == nil:
 			counts.Started++
+		case errors.Is(err, sysusers.ErrAlreadyRunning):
+			// The daemon restarted and the host did not: the Process never
+			// stopped. It is running, which is what restore is for, so it is
+			// counted with the rest and named only in the one line at the end.
+			counts.Started++
+			counts.Running++
 		case errors.Is(err, sysusers.ErrNoContainer):
 			// The container is gone, so the registration names nothing and
 			// its token belongs to no Process. Unregistering revokes it.

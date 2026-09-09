@@ -8,25 +8,37 @@
 // only what they need to start a container in it, and starts every podman
 // child inside it.
 //
-// The layout, one cgroup per Process:
+// The layout, one ceiling per Process and one leaf per member:
 //
-//	/sys/fs/cgroup/kitbash                    root, memory cpu pids delegated
-//	/sys/fs/cgroup/kitbash/<member>           root, same delegation
-//	/sys/fs/cgroup/kitbash/<member>/<id>      root, and the limits are written here
-//	/sys/fs/cgroup/kitbash/<member>/<id>/run  the leaf the podman child starts in
+//	/sys/fs/cgroup/kitbash                     root, memory cpu pids delegated
+//	/sys/fs/cgroup/kitbash/<member>            root, same delegation
+//	/sys/fs/cgroup/kitbash/<member>/run        the member's own processes
+//	/sys/fs/cgroup/kitbash/<member>/<id>       root, and the limits are here
+//	/sys/fs/cgroup/kitbash/<member>/<id>/<ctr> the container, made by crun
 //
 // The ceiling is the Process's own cgroup and it belongs to root: memory.max,
 // cpu.max and pids.max there are files the member cannot write. What they are
 // given is the directory of that cgroup and its three delegation files
 // (cgroup.procs, cgroup.threads, cgroup.subtree_control), which is exactly
 // enough for their rootless podman to create the container's cgroup beneath
-// the ceiling and move the container into it. The member's own cgroup stays
-// root's in full, so nobody can create a Process cgroup beside the ones
-// kitbashd made.
+// the ceiling and move the container into it. The member's own cgroup keeps
+// its directory root's, so nobody can put a Process cgroup beside the ones
+// kitbashd made; only its cgroup.procs and cgroup.threads are handed over, and
+// that is what lets a process already inside the member's subtree move between
+// the cgroups in it, because the kernel checks the common ancestor.
 //
-// Processes live in a leaf because a cgroup that holds processes may not
-// enable controllers for its children, and the container is a child of the
-// Process's cgroup, not of the leaf.
+// The leaf holds what belongs to the member rather than to one Process: their
+// MCP sessions, and the podman child that starts, stops or removes a
+// container. Neither is the workload. A podman child under the Process's own
+// ceiling would spend the memory the manifest meant for the container, and a
+// small limit would kill the starter instead of the thing being started.
+//
+// The leaf is also what makes podman exec work. Moving a process between
+// cgroups needs write access to cgroup.procs of the common ancestor of where
+// it is and where it is going, and a member's SSH session starts in sshd's
+// cgroup, whose only ancestor in common with anything of kitbash's is the root
+// cgroup. So a session asks kitbashd to place it in the leaf, and from there
+// the ancestor is /kitbash/<member>, whose cgroup.procs the member has.
 //
 // Everything that touches the cgroup filesystem lives behind Cgroups, so the
 // daemon is tested on a machine that is not root and has no writable cgroup
@@ -50,7 +62,7 @@ import (
 const DefaultRoot = "/sys/fs/cgroup"
 
 // Dir is the cgroup kitbashd owns under the root, and Leaf the child of one
-// Process's cgroup that holds the podman child.
+// member's cgroup that holds their own processes.
 const (
 	Dir  = "kitbash"
 	Leaf = "run"
@@ -81,12 +93,17 @@ var (
 var (
 	// ErrName reports a name that is not a member name or a Process id.
 	ErrName = errors.New("cgroups: not a name this package makes a cgroup for")
+	// ErrPID reports a process id that is not one, which is nothing this
+	// package writes into a cgroup.
+	ErrPID = errors.New("cgroups: not a process id")
 	// ErrUnsupported reports a machine with no cgroup filesystem to place
 	// anything in, which is anything that is not Linux.
 	ErrUnsupported = errors.New("cgroups: placing a Process needs Linux")
 )
 
 func errName(name string) error { return fmt.Errorf("%w: %q", ErrName, name) }
+
+func errPID(pid int) error { return fmt.Errorf("%w: %d", ErrPID, pid) }
 
 // Limits is the ceiling one Process runs under, already in the spelling the
 // cgroup files take. An empty field writes nothing, which leaves the kernel's
@@ -113,18 +130,25 @@ type Cgroups interface {
 	// EnsureRoot creates the kitbash cgroup and delegates the controllers to
 	// it. The daemon calls it at start, and every other method calls it.
 	EnsureRoot(ctx context.Context) error
-	// EnsureMember creates one member's cgroup, which holds the cgroup of
-	// each of their Processes and belongs to root in full.
-	EnsureMember(ctx context.Context, name string, uid, gid int) error
-	// EnsureProcess creates the cgroup of one Process with its limits written
-	// by root, and answers the leaf directory the member's podman child is
-	// started in.
+	// EnsureMember creates one member's cgroup and their leaf, and answers the
+	// leaf: where their own processes go, which is their MCP sessions and the
+	// podman children that start and stop their containers.
+	EnsureMember(ctx context.Context, name string, uid, gid int) (leaf string, err error)
+	// EnsureProcess creates the ceiling of one Process, with its limits
+	// written by root, and answers the member's leaf, because that is where
+	// the podman child that starts the container belongs: the child is not the
+	// workload and must not spend the workload's memory.
 	EnsureProcess(ctx context.Context, name, id string, uid, gid int, limits Limits) (leaf string, err error)
-	// RemoveProcess removes the cgroup of one Process, which the daemon does
+	// JoinSession puts one of the member's own processes, an MCP session, in
+	// their leaf and answers where it went. Only root can: the session starts
+	// in sshd's cgroup, and the only ancestor that has in common with anything
+	// of kitbash's is the root cgroup.
+	JoinSession(ctx context.Context, name string, uid, gid, pid int) (cgroup string, err error)
+	// RemoveProcess removes the ceiling of one Process, which the daemon does
 	// once its container is gone.
 	RemoveProcess(ctx context.Context, name, id string) error
-	// RemoveMember removes a member's cgroup and every Process cgroup left in
-	// it, which the daemon does when the account goes.
+	// RemoveMember removes a member's cgroup and everything left in it, which
+	// the daemon does when the account goes.
 	RemoveMember(ctx context.Context, name string) error
 }
 
@@ -137,11 +161,14 @@ func Parent(name, id string) string { return "/" + Dir + "/" + name + "/" + id }
 // MemberDir is where one member's cgroup lives under a mount point.
 func MemberDir(root, name string) string { return filepath.Join(root, Dir, name) }
 
-// ProcessDir is where one Process's cgroup lives.
-func ProcessDir(root, name, id string) string { return filepath.Join(MemberDir(root, name), id) }
+// LeafDir is where a member's own processes are placed: their sessions and the
+// podman children of their Processes. It is beside the ceilings rather than
+// under one, because a session outlives every Process it starts and a podman
+// child is not the workload it starts.
+func LeafDir(root, name string) string { return filepath.Join(MemberDir(root, name), Leaf) }
 
-// LeafDir is where one Process's podman child is placed.
-func LeafDir(root, name, id string) string { return filepath.Join(ProcessDir(root, name, id), Leaf) }
+// ProcessDir is where the ceiling of one Process lives.
+func ProcessDir(root, name, id string) string { return filepath.Join(MemberDir(root, name), id) }
 
 // New returns the Cgroups of this host, rooted at the cgroup mount point.
 // An empty root means DefaultRoot.
@@ -206,9 +233,10 @@ func CPUMax(cpus string) (string, bool) {
 	return strconv.FormatInt(quota, 10) + " " + strconv.Itoa(CPUPeriod), true
 }
 
-// Fake is an in memory Cgroups. It records what was ensured and removed and
-// answers a leaf under Base, so a test asserts on the directory a child would
-// have been placed in without a cgroup filesystem anywhere near it.
+// Fake is an in memory Cgroups. It records what was ensured, joined and
+// removed and answers the paths a real host would, so a test asserts on the
+// cgroup a child would have been placed in without a cgroup filesystem
+// anywhere near it.
 type Fake struct {
 	mu sync.Mutex
 
@@ -218,17 +246,19 @@ type Fake struct {
 	// cgroup filesystem that refuses would, which is what the caller runs a
 	// Process unplaced for.
 	Off bool
-	// RootErr, MemberErr, ProcessErr and RemoveErr fail on demand.
+	// RootErr, MemberErr, ProcessErr, SessionErr and RemoveErr fail on demand.
 	RootErr    error
 	MemberErr  error
 	ProcessErr error
+	SessionErr error
 	RemoveErr  error
 
-	// Roots is how many times the root was ensured, Members and Processes
-	// every call in order, and Removed every removal.
+	// Roots is how many times the root was ensured, Members, Processes and
+	// Joined every call in order, and Removed every removal.
 	Roots     int
 	Members   []MemberCall
 	Processes []ProcessCall
+	Joined    []SessionCall
 	Removed   []ProcessCall
 }
 
@@ -237,10 +267,12 @@ type MemberCall struct {
 	Name string
 	UID  int
 	GID  int
+	Leaf string
 }
 
 // ProcessCall is one recorded EnsureProcess or RemoveProcess, with the limits
-// that were written into the Process's own cgroup.
+// that were written into the Process's ceiling and the leaf its podman child
+// was told to start in.
 type ProcessCall struct {
 	Name   string
 	ID     string
@@ -248,6 +280,16 @@ type ProcessCall struct {
 	GID    int
 	Limits Limits
 	Leaf   string
+}
+
+// SessionCall is one recorded JoinSession: whose session it is, which process
+// was placed and where it went.
+type SessionCall struct {
+	Name   string
+	UID    int
+	GID    int
+	PID    int
+	Cgroup string
 }
 
 // NewFake returns a fake that places what it is asked to.
@@ -267,21 +309,22 @@ func (f *Fake) EnsureRoot(context.Context) error {
 	return nil
 }
 
-// EnsureMember records the call.
-func (f *Fake) EnsureMember(_ context.Context, name string, uid, gid int) error {
+// EnsureMember records the call and answers the leaf it would have created.
+func (f *Fake) EnsureMember(_ context.Context, name string, uid, gid int) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.refuse(f.MemberErr); err != nil {
-		return err
+		return "", err
 	}
 	if !member.MatchString(name) {
-		return errName(name)
+		return "", errName(name)
 	}
-	f.Members = append(f.Members, MemberCall{Name: name, UID: uid, GID: gid})
-	return nil
+	leaf := LeafDir(f.base(), name)
+	f.Members = append(f.Members, MemberCall{Name: name, UID: uid, GID: gid, Leaf: leaf})
+	return leaf, nil
 }
 
-// EnsureProcess records the call and answers the leaf it would have created.
+// EnsureProcess records the call and answers the member's leaf.
 func (f *Fake) EnsureProcess(_ context.Context, name, id string, uid, gid int, limits Limits) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -294,14 +337,33 @@ func (f *Fake) EnsureProcess(_ context.Context, name, id string, uid, gid int, l
 	if !processID.MatchString(id) {
 		return "", errName(id)
 	}
-	leaf := LeafDir(f.base(), name, id)
+	leaf := LeafDir(f.base(), name)
 	f.Processes = append(f.Processes, ProcessCall{
 		Name: name, ID: id, UID: uid, GID: gid, Limits: limits, Leaf: leaf,
 	})
 	return leaf, nil
 }
 
-// RemoveProcess records the removal of one Process's cgroup.
+// JoinSession records the call and answers the leaf it would have written the
+// pid into.
+func (f *Fake) JoinSession(_ context.Context, name string, uid, gid, pid int) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.refuse(f.SessionErr); err != nil {
+		return "", err
+	}
+	if !member.MatchString(name) {
+		return "", errName(name)
+	}
+	if pid <= 0 {
+		return "", errPID(pid)
+	}
+	leaf := LeafDir(f.base(), name)
+	f.Joined = append(f.Joined, SessionCall{Name: name, UID: uid, GID: gid, PID: pid, Cgroup: leaf})
+	return leaf, nil
+}
+
+// RemoveProcess records the removal of one Process's ceiling.
 func (f *Fake) RemoveProcess(_ context.Context, name, id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -312,7 +374,7 @@ func (f *Fake) RemoveProcess(_ context.Context, name, id string) error {
 	return nil
 }
 
-// RemoveMember records the removal of a member's whole subtree.
+// RemoveMember records the removal of a member's whole cgroup.
 func (f *Fake) RemoveMember(_ context.Context, name string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -335,6 +397,13 @@ func (f *Fake) Placed() []ProcessCall {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]ProcessCall(nil), f.Processes...)
+}
+
+// Sessions answers the recorded joins, newest last.
+func (f *Fake) Sessions() []SessionCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]SessionCall(nil), f.Joined...)
 }
 
 // Removals answers the recorded removals, newest last.

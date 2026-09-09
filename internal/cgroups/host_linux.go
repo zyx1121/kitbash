@@ -15,6 +15,9 @@ import (
 	"syscall"
 )
 
+// logger writes where the operator reads, the same shape internal/daemon uses.
+var logger = log.New(os.Stderr, "kitbashd: ", log.LstdFlags)
+
 // cgroup2Magic identifies the unified hierarchy, from the kernel's magic.h. A
 // version 1 mount, or no cgroup filesystem at all, is a host where limits are
 // recorded and not enforced.
@@ -56,8 +59,8 @@ func (h *host) EnsureRoot(context.Context) error {
 	// alone, and one that refuses is not fatal on its own: what matters is
 	// whether the kitbash cgroup ends up with them, which is checked next.
 	if err := delegate(h.root); err != nil {
-		log.New(os.Stderr, "kitbashd: ", log.LstdFlags).Printf(
-			"cgroups: %s does not delegate %s: %v", h.root, strings.Join(Controllers, ", "), err)
+		logger.Printf("cgroups: %s does not delegate %s: %v",
+			h.root, strings.Join(Controllers, ", "), err)
 	}
 	dir := filepath.Join(h.root, Dir)
 	if err := mkdir(dir); err != nil {
@@ -66,36 +69,58 @@ func (h *host) EnsureRoot(context.Context) error {
 	return delegate(dir)
 }
 
-// EnsureMember creates one member's cgroup. It belongs to root in full: it
-// holds the cgroup of each of their Processes, and a member who could write
-// here could make a Process cgroup of their own with no ceiling in it.
-func (h *host) EnsureMember(ctx context.Context, name string, uid, gid int) error {
+// EnsureMember creates one member's cgroup and the leaf their own processes
+// run in, and answers the leaf. The cgroup's directory stays root's: it holds
+// the ceiling of each of their Processes, and a member who could write here
+// could make a cgroup of their own with no ceiling in it. Its cgroup.procs and
+// cgroup.threads are handed over, because moving a process between two cgroups
+// under here needs write access to the common ancestor's, which this is:
+// without it a member's session cannot exec into their own container.
+func (h *host) EnsureMember(ctx context.Context, name string, uid, gid int) (string, error) {
 	if !member.MatchString(name) {
-		return errName(name)
+		return "", errName(name)
 	}
 	if uid <= 0 || gid <= 0 {
-		return fmt.Errorf("cgroups: %s has no uid and gid to run Processes as", name)
+		return "", fmt.Errorf("cgroups: %s has no uid and gid to run Processes as", name)
 	}
 	if err := h.EnsureRoot(ctx); err != nil {
-		return err
+		return "", err
 	}
 	dir := MemberDir(h.root, name)
 	if err := mkdir(dir); err != nil {
-		return err
+		return "", err
 	}
-	return delegate(dir)
+	if err := delegate(dir); err != nil {
+		return "", err
+	}
+	if err := handOverFiles(dir, uid, gid, procsFile, threadsFile); err != nil {
+		return "", err
+	}
+	// The leaf holds the member's own processes: their MCP sessions and the
+	// podman children that start and stop their containers. It stays root's,
+	// because kitbashd is what puts anything in it.
+	leaf := LeafDir(h.root, name)
+	if err := mkdir(leaf); err != nil {
+		return "", err
+	}
+	return leaf, nil
 }
 
-// EnsureProcess creates the cgroup of one Process, writes its ceiling as root
+// EnsureProcess creates the ceiling of one Process, writes its limits as root
 // and hands the member the little they need to start a container under it: the
 // directory, so their rootless podman can create the container's own cgroup,
 // and the three delegation files, so it can move the container into it. The
 // limit files are not among them.
+//
+// What it answers is the member's leaf, not this cgroup: the podman child that
+// creates the container is not the workload, and under the ceiling it would
+// spend the memory the manifest meant for the container.
 func (h *host) EnsureProcess(ctx context.Context, name, id string, uid, gid int, limits Limits) (string, error) {
 	if !processID.MatchString(id) {
 		return "", errName(id)
 	}
-	if err := h.EnsureMember(ctx, name, uid, gid); err != nil {
+	leaf, err := h.EnsureMember(ctx, name, uid, gid)
+	if err != nil {
 		return "", err
 	}
 	dir := ProcessDir(h.root, name, id)
@@ -111,20 +136,31 @@ func (h *host) EnsureProcess(ctx context.Context, name, id string, uid, gid int,
 	if err := delegate(dir); err != nil {
 		return "", err
 	}
-	leaf := filepath.Join(dir, Leaf)
-	if err := mkdir(leaf); err != nil {
-		return "", err
-	}
 	if err := handOver(dir, uid, gid); err != nil {
-		return "", err
-	}
-	if err := handOver(leaf, uid, gid); err != nil {
 		return "", err
 	}
 	return leaf, nil
 }
 
-// RemoveProcess removes the cgroup of one Process. A cgroup that still holds
+// JoinSession puts one of the member's own processes in their leaf. A session
+// cannot do this for itself: it starts in sshd's cgroup, and the only ancestor
+// that has in common with anything of kitbash's is the root cgroup, which is
+// root's.
+func (h *host) JoinSession(ctx context.Context, name string, uid, gid, pid int) (string, error) {
+	if pid <= 0 {
+		return "", errPID(pid)
+	}
+	leaf, err := h.EnsureMember(ctx, name, uid, gid)
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(filepath.Join(leaf, procsFile), []byte(strconv.Itoa(pid)), 0); err != nil {
+		return "", fmt.Errorf("cgroups: place %d in %s: %w", pid, leaf, err)
+	}
+	return leaf, nil
+}
+
+// RemoveProcess removes the ceiling of one Process. A cgroup that still holds
 // something is busy, which is a container that has not gone yet; the caller
 // logs it and the next removal or the next boot clears it.
 func (h *host) RemoveProcess(_ context.Context, name, id string) error {
@@ -134,8 +170,8 @@ func (h *host) RemoveProcess(_ context.Context, name, id string) error {
 	return removeTree(ProcessDir(h.root, name, id))
 }
 
-// RemoveMember removes a member's cgroup and every Process cgroup left in it,
-// which is what the account going away leaves behind.
+// RemoveMember removes a member's cgroup and everything left in it, which is
+// what the account going away leaves behind.
 func (h *host) RemoveMember(_ context.Context, name string) error {
 	if !member.MatchString(name) {
 		return errName(name)
@@ -214,7 +250,14 @@ func handOver(dir string, uid, gid int) error {
 	if err := os.Chown(dir, uid, gid); err != nil {
 		return fmt.Errorf("cgroups: give %s to %d: %w", dir, uid, err)
 	}
-	for _, file := range delegated {
+	return handOverFiles(dir, uid, gid, delegated...)
+}
+
+// handOverFiles gives one member named files of a cgroup without the directory
+// they are in, which is how a member may move a process between two cgroups
+// they cannot create anything in.
+func handOverFiles(dir string, uid, gid int, files ...string) error {
+	for _, file := range files {
 		path := filepath.Join(dir, file)
 		if err := os.Chown(path, uid, gid); err != nil {
 			// cgroup.threads is absent on a kernel built without thread

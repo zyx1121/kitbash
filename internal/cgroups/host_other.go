@@ -14,9 +14,15 @@ func newHost(string) Cgroups { return unsupported{} }
 
 func (unsupported) EnsureRoot(context.Context) error { return ErrUnsupported }
 
-func (unsupported) EnsureMember(context.Context, string, int, int) error { return ErrUnsupported }
+func (unsupported) EnsureMember(context.Context, string, int, int) (string, error) {
+	return "", ErrUnsupported
+}
 
 func (unsupported) EnsureProcess(context.Context, string, string, int, int, Limits) (string, error) {
+	return "", ErrUnsupported
+}
+
+func (unsupported) JoinSession(context.Context, string, int, int, int) (string, error) {
 	return "", ErrUnsupported
 }
 

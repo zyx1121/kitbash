@@ -313,6 +313,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc(usersPath+"/", s.user)
 	s.mux.HandleFunc(approvalsPath, s.approvalsFamily)
 	s.mux.HandleFunc(approvalsPath+"/", s.approval)
+	s.mux.HandleFunc(sessionsJoinPath, s.method(http.MethodPost, s.joinSession))
 	s.mux.HandleFunc(healthPath, s.method(http.MethodGet, s.health))
 	s.mux.HandleFunc(internalPath, s.method(http.MethodPost, s.internal))
 	s.mux.HandleFunc("/", s.notFound)
@@ -330,8 +331,11 @@ const (
 	processesPath = "/kitbash/v1/processes"
 	usersPath     = "/kitbash/v1/users"
 	approvalsPath = "/kitbash/v1/approvals"
-	healthPath    = "/kitbash/v1/health"
-	internalPath  = "/kitbash/v1/internal"
+	// sessionsJoinPath is where a session asks to be placed in its member's
+	// cgroup, see run.go.
+	sessionsJoinPath = "/kitbash/v1/sessions/join"
+	healthPath       = "/kitbash/v1/health"
+	internalPath     = "/kitbash/v1/internal"
 )
 
 // otlpPaths registers the three OTLP paths on one mux, with the identity that
