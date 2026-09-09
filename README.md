@@ -16,7 +16,7 @@ An organization installs kitbash on one machine. Every member gets a Linux user 
 
 ## Status
 
-Version 1 complete (v0.6.2): all six milestones done and the backlog cleared; what stays open is in PLAN.md 5.5. Read [PLAN.md](PLAN.md): positioning, the four object model, kits, kitbashOS, and version 1 milestones. Machine readable definitions live in [`spec/`](spec/).
+Version 2 hardening complete (v0.7.0): narrowed Process permits, enforced limits, shared images, backups, e2e in CI; what stays open is in PLAN.md 5.5. Read [PLAN.md](PLAN.md): positioning, the four object model, kits, kitbashOS, and version 1 milestones. Machine readable definitions live in [`spec/`](spec/).
 
 ## Install
 
