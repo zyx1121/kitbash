@@ -16,7 +16,8 @@ old=$(sed -n 's/^pkgver=//p' packaging/apk/APKBUILD)
 sed -i.bak "s/^pkgver=.*/pkgver=$new/; s/^pkgrel=.*/pkgrel=0/" packaging/apk/APKBUILD
 for f in README.md packaging/iso/README.md; do
 	[ -f "$f" ] || continue
-	sed -i.bak -E "s/(kitbashd-|kitbash-)$old([-.])/\1$new\2/g; s/\bv$old\b/v$new/g" "$f"
+	# ([^0-9]|$) rather than \b: BSD sed on macOS has no word boundary.
+	sed -i.bak -E "s/(kitbashd-|kitbash-|v)$old([^0-9]|\$)/\1$new\2/g" "$f"
 done
 find . -name '*.bak' -not -path './.git/*' -delete
 sh packaging/release/check.sh
