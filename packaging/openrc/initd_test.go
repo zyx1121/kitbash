@@ -76,6 +76,24 @@ func TestTheServiceScriptRunsTheRootlessPrerequisitesAndNotAfterLocal(t *testing
 	if !strings.Contains(script, "/usr/share/kitbash/rootless-prereqs.sh") {
 		t.Errorf("%s does not run the rootless prerequisites, so boot restore has no /run/user to start a Process in", scriptPath)
 	}
+	if !strings.Contains(script, "ewarn") {
+		t.Errorf("%s skips the rootless prerequisites silently when they are missing, which looks like a daemon that simply lost every Process", scriptPath)
+	}
+}
+
+// The path the service script runs is the path the apk has to install the
+// shared script at. They are in different files and nothing but this test
+// reads both, so a package() that stopped shipping it would only be found on
+// a host whose Processes did not come back.
+func TestTheApkInstallsTheRootlessPrerequisites(t *testing.T) {
+	body, err := os.ReadFile("../apk/APKBUILD")
+	if err != nil {
+		t.Fatalf("reading ../apk/APKBUILD: %v", err)
+	}
+	const want = `install -Dm755 deploy/rootless-prereqs.sh "$pkgdir"/usr/share/kitbash/rootless-prereqs.sh`
+	if !strings.Contains(string(body), want) {
+		t.Errorf("packaging/apk/APKBUILD does not carry %q, so %s runs a script that is not on the host", want, scriptPath)
+	}
 }
 
 // The shared script is shell too, and it is the only copy: the service script

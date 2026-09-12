@@ -180,7 +180,8 @@ rm -f "$keyfile"
 trap - EXIT INT TERM
 
 # 6. The runtime directory rootless podman needs. It lives in tmpfs, so
-#    /etc/local.d/kitbash-rootless.start creates it again at every boot.
+#    /usr/share/kitbash/rootless-prereqs.sh, which kitbashd's service script
+#    runs before it starts, creates it again at every boot.
 d=/run/user/$uid
 mkdir -p "$d"
 chown "$uid:$gid" "$d"

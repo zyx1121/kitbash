@@ -48,7 +48,20 @@ exec /usr/share/kitbash/rootless-prereqs.sh
 S
 chmod +x /etc/local.d/kitbash-rootless.start
 rc-update -q add local default 2>/dev/null || true
-/etc/local.d/kitbash-rootless.start
+#    Step 7 is where the apk arrives, so on a host that does not have it yet
+#    the shared script is not here to call and this run does the same two
+#    things itself. From the next boot on it is the daemon's job either way.
+if [ -x /usr/share/kitbash/rootless-prereqs.sh ]; then
+  /usr/share/kitbash/rootless-prereqs.sh
+else
+  log "kitbashd apk not installed yet; making / rshared and the /run/user directories here"
+  mount --make-rshared / || log "warning: mount --make-rshared / failed; rootless containers may not see their own mounts"
+  for u in $(awk -F: '$3>=1000 && $3<65534 {print $1":"$3}' /etc/passwd); do
+    name=${u%%:*}; uid=${u##*:}
+    d=/run/user/$uid
+    { mkdir -p "$d" && chown "$name" "$d" && chmod 700 "$d"; } || log "warning: could not prepare $d"
+  done
+fi
 
 # 5. Groups. kitbash-users get the MCP ForceCommand, kitbash-admin may also manage.
 getent group kitbash-users >/dev/null || addgroup -S kitbash-users

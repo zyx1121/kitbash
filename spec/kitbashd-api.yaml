@@ -607,8 +607,9 @@ restore:
     already running, which is what a daemon that restarted without the host
     finds, is counted as started and named only in the line at the end. Restore runs
     once per daemon start and is also what makes "all Processes come back
-    after a reboot" true; the OpenRC script orders kitbashd after localmount
-    and the local runlevel scripts.
+    after a reboot" true; the OpenRC script needs localmount and cgroups, and
+    its start_pre runs /usr/share/kitbash/rootless-prereqs.sh, which is what
+    restore needs from the host rather than any dependency on local.
   registration_fields: >
     The registration carries the container name and the digest from M5 on, so
     restore needs no manifest; the permits block of the Package's manifest, see
@@ -755,11 +756,14 @@ cgroups:
     container into its own cgroup and the start fails with
     "writing file .../cgroup.procs: Permission denied". This is not the fail
     open above: the Process does not start at all. A kitbash host runs OpenRC
-    and carries no logind, which is why deploy/install.sh makes /run/user/<uid>
-    in /etc/local.d/kitbash-rootless.start at boot instead of leaving it to a
-    session. On a systemd host, whoever runs kitbash there keeps its members
-    out of logind, opening no PAM session for them, and makes that directory
-    the same way; .github/workflows/e2e.yml does both.
+    and carries no logind, which is why /run/user/<uid> is made by
+    /usr/share/kitbash/rootless-prereqs.sh, run from the OpenRC script's
+    start_pre, instead of being left to a session. deploy/install.sh also
+    leaves an /etc/local.d/kitbash-rootless.start that calls that same script,
+    for a host installed before the daemon did this itself. On a systemd host,
+    whoever runs kitbash there keeps its members out of logind, opening no PAM
+    session for them, and makes that directory the same way;
+    .github/workflows/e2e.yml does both.
 
 client_behaviour:
   processes: >

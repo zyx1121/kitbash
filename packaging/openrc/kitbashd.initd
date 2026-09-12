@@ -78,9 +78,13 @@ start_pre() {
 	# tmpfs and are gone after a reboot. Boot restore starts each registered
 	# Process as its owner and needs them, see PLAN.md section 2.3. Doing it
 	# here rather than depending on local is what keeps this daemon startable
-	# from a local.d script, see issue #88. The guard is for a host whose
-	# kitbashd binary is newer than its apk's shared files.
+	# from a local.d script, see issue #88. A host that has the binary but
+	# not the shared script still starts, because a daemon is more use than
+	# no daemon, but it says so: what follows is Processes that do not come
+	# back and a member who cannot run one.
 	if [ -x /usr/share/kitbash/rootless-prereqs.sh ]; then
 		/usr/share/kitbash/rootless-prereqs.sh
+	else
+		ewarn "/usr/share/kitbash/rootless-prereqs.sh is missing; / is not rshared and no /run/user directory is made, so Processes will not restore"
 	fi
 }

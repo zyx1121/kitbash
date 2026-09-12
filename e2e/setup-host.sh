@@ -80,8 +80,9 @@ sh deploy/kitbash-adduser "$member" "$key"
 
 # 6b. /run/user/<uid> is where rootless podman keeps its state, and on this
 #     host nothing but this loop makes it. A kitbash host runs no logind:
-#     install.sh writes /etc/local.d/kitbash-rootless.start, which makes the
-#     directory for every member at boot, and this is that step.
+#     kitbashd's service script runs /usr/share/kitbash/rootless-prereqs.sh
+#     from start_pre, which makes the directory for every member at boot, and
+#     this is that step.
 #
 #     A member here must stay a user logind knows nothing about. Given a
 #     session, logind removes this directory as soon as the session ends, and
