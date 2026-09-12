@@ -45,10 +45,12 @@ depend() {
 	# per member, which is where a Process's limits are enforced.
 	need cgroups
 	use net
-	# local runs /etc/local.d/kitbash-rootless.start, which makes / rshared
-	# and creates every member's /run/user directory. Boot restore starts each
-	# registered Process as its owner and needs both, see PLAN.md section 2.3.
-	after local
+	# Nothing here waits for local. The rootless prerequisites boot restore
+	# needs used to come from /etc/local.d/kitbash-rootless.start, so this
+	# was after local, but deploy/install.sh may itself run from local.d,
+	# where its rc-service kitbashd restart then waited for the runlevel it
+	# was part of: a deadlock that took the console with it, see issue #88.
+	# start_pre runs those prerequisites instead.
 }
 
 healthcheck() {
@@ -72,4 +74,13 @@ start_pre() {
 	# earlier layout left looser, see PLAN.md section 4.7.
 	checkpath --directory --mode 0700 --owner root:root /var/lib/kitbash/backup
 	checkpath --file --mode 0640 --owner root:root /var/log/kitbashd.log
+	# / rshared and one /run/user directory per member, both of which live in
+	# tmpfs and are gone after a reboot. Boot restore starts each registered
+	# Process as its owner and needs them, see PLAN.md section 2.3. Doing it
+	# here rather than depending on local is what keeps this daemon startable
+	# from a local.d script, see issue #88. The guard is for a host whose
+	# kitbashd binary is newer than its apk's shared files.
+	if [ -x /usr/share/kitbash/rootless-prereqs.sh ]; then
+		/usr/share/kitbash/rootless-prereqs.sh
+	fi
 }
