@@ -14,7 +14,10 @@
 #   kitbash-mcp at /usr/bin/kitbash-mcp, which is where a session runs it from
 #
 # It installs no sshd rule: these tests run kitbash-mcp through sudo rather
-# than over SSH, so the ForceCommand has nothing to serve here.
+# than over SSH, so the ForceCommand has nothing to serve here. It writes no
+# nftables ruleset either: install.sh scopes TCP 4318 through OpenRC's nftables
+# service, which this host does not run, and nothing outside this runner can
+# reach the receiver anyway.
 #
 # Run as root from the repository root. KITBASH_BIN names the directory holding
 # the two built binaries.

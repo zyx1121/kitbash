@@ -39,7 +39,7 @@ profile_kitbash() {
 	apks="$apks
 		kitbashd
 		podman crun passt fuse-overlayfs shadow shadow-subids git openssh
-		qemu-guest-agent curl
+		qemu-guest-agent curl nftables
 		alpine-base alpine-conf openrc
 		e2fsprogs sfdisk syslinux grub-bios grub-efi dosfstools
 		"
