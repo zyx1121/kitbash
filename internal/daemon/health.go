@@ -414,7 +414,11 @@ func (s *Server) recordHealth(ctx context.Context, target probe, healthy bool, s
 	write, cancel := context.WithTimeout(ctx, HealthWriteTimeout)
 	defer cancel()
 	if err := s.store.Insert(write, export); err != nil {
-		logger.Printf("health: could not record the probe of %s: %v", target.id, err)
+		// A daemon that is stopping cancelled this write itself, which is not
+		// a failure to report: the probe is over and so is the store.
+		if ctx.Err() == nil {
+			logger.Printf("health: could not record the probe of %s: %v", target.id, err)
+		}
 		return
 	}
 	s.fanout.dispatch(export, InternalProducer)
