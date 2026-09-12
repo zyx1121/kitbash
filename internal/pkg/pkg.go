@@ -185,6 +185,16 @@ func (s *Service) build(ctx context.Context, span *telemetry.Span, path string) 
 		return nil, problem.InvalidManifest(folder,
 			"version 1 builds container units")
 	}
+	// A unit that names a builder is that kit's to build, but the commit is
+	// read first either way: kitbash builds from a commit whoever runs the
+	// build, and the commit is what the digest is the version of.
+	if unit.Builder != "" {
+		head, prob := s.head(ctx, folder)
+		if prob != nil {
+			return nil, prob
+		}
+		return s.buildWithKit(ctx, span, folder, unit, head.Sha)
+	}
 	contextDir, containerfile, cleanup, prob := s.source(folder, unit)
 	if cleanup != nil {
 		defer cleanup()
@@ -193,14 +203,9 @@ func (s *Service) build(ctx context.Context, span *telemetry.Span, path string) 
 		return nil, prob
 	}
 
-	head, prob := s.files.Head(ctx, folder)
+	head, prob := s.head(ctx, folder)
 	if prob != nil {
 		return nil, prob
-	}
-	if !head.Clean {
-		return nil, problem.ConflictFix(folder,
-			fmt.Sprintf("uncommitted changes under %s; kitbash builds from a commit", folder),
-			"Commit the folder with fs_write, then build again.")
 	}
 
 	tag := TagPrefix + m.Name + ":" + shortSha(head.Sha)
@@ -245,6 +250,22 @@ func (s *Service) build(ctx context.Context, span *telemetry.Span, path string) 
 		Commit: head.Sha,
 		Log:    tail(log),
 	}, nil
+}
+
+// head is the commit a build is made from. kitbash builds from a commit, so a
+// folder with uncommitted changes under it is a conflict rather than a build
+// nothing could name afterwards.
+func (s *Service) head(ctx context.Context, folder string) (*fs.Head, *problem.Problem) {
+	head, prob := s.files.Head(ctx, folder)
+	if prob != nil {
+		return nil, prob
+	}
+	if !head.Clean {
+		return nil, problem.ConflictFix(folder,
+			fmt.Sprintf("uncommitted changes under %s; kitbash builds from a commit", folder),
+			"Commit the folder with fs_write, then build again.")
+	}
+	return head, nil
 }
 
 // copied is the image of this commit that already exists: the one in this

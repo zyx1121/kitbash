@@ -131,11 +131,21 @@ nothing about any kit that implements it.
 | import | `kit: [import]` and a tool named `import` whose input `source` is a string with a `pattern`. `pkg_import` picks the running kit whose schema accepts the source, calls it, and writes the files it returns as one commit |
 | observe | `kit: [observe]`, `subscriptions: [telemetry]`, `expose: http` and a `port`. kitbashd POSTs every stored record to the Process as OTLP/HTTP JSON on `/v1/traces`, `/v1/logs` and `/v1/metrics` |
 | evaluate | `kit: [evaluate]`, usually with the observe declarations. The kit writes judgments back with `kitbash.eval: true` and `kitbash.subject.trace_id` and `kitbash.subject.span_id` |
-| build | `kit: [build]` and a tool `build` with input `{path, context}` and output `{digest, log}`. Declared, not dispatched: the built in OCI path builds every Package |
-| run | `kit: [run]` and a tool `run` with input `{package, digest, name, unit}` and output `{id, state, endpoint}`. Declared, not dispatched: the built in rootless podman runner runs every Process |
+| build | `kit: [build]` and a tool `build` with input `{path, context}` and output `{digest, log}`. `pkg_build` calls it for a unit whose `builder` names this Package folder |
+| run | `kit: [run]` and a tool `run` with input `{package, digest, name, unit}` and output `{id, state, endpoint}`, and optionally `stop` with input `{id}`. `proc_run` calls it for a unit whose `runner` names this Package folder |
 
 An import kit's `source` pattern is the route, so make it exact. Two running
 kits accepting the same source is a conflict, resolved by stopping one.
+
+A build or run kit is named rather than chosen: the Package that wants it
+writes `builder: /org/nix-build` or `runner: /org/pve-runner` beside its `build`
+context, and the kit has to be running as a Process of the caller when the tool
+is called. A kit that is not running is `not-found`, and a kit whose tool schema
+does not accept what the hook is called with is `invalid-manifest`. A Process a
+run kit started is the kit's: kitbashd registers it, lists it with its runner,
+and never starts, stops or restores it, so `proc_stop` forwards to the kit's
+`stop` tool and answers `not-permitted` when the kit declares none. The id the
+`run` tool answers with is the Process id, so it is a UUIDv7.
 
 Every fan out request carries `Authorization: Bearer` with the secret in
 `KITBASH_FANOUT_SECRET`. Check it and answer 401 otherwise, or anything else on

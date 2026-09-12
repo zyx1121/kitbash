@@ -61,6 +61,7 @@ type harness struct {
 	processes *proc.Service
 	bridge    *bridge.Bridge
 	server    *mcp.Server
+	daemon    *teltest.Daemon
 	folder    string
 	root      string
 }
@@ -91,7 +92,7 @@ func newHarness(t *testing.T, tool mcp.ToolHandler) *harness {
 	}
 	t.Cleanup(daemon.Close)
 	daemon.MirrorRuns(runner)
-	h := &harness{files: files, runner: runner, folder: folder, root: root}
+	h := &harness{files: files, runner: runner, daemon: daemon, folder: folder, root: root}
 	h.processes = proc.New(files, runner, telemetry.NewClient(daemon.Socket))
 	h.bridge = bridge.New(files, h.processes, runner)
 	h.server = server.New("test", server.Deps{
@@ -697,6 +698,152 @@ deploy:
 	}
 	if err := kits[0].Tool.ValidateInput([]byte(`{"source":"oci://alpine"}`)); err == nil {
 		t.Error("the kit accepted a source its pattern excludes")
+	}
+}
+
+// kitAtRunner builds and runs one run kit at a folder of the caller's, which
+// is what a manifest that names a runner points at.
+func kitAtRunner(t *testing.T, h *harness, name, yaml string) string {
+	t.Helper()
+	ctx := context.Background()
+	folder := filepath.Join(h.root, name)
+	if err := os.MkdirAll(folder, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(folder, manifest.FileName), yaml)
+	if _, _, err := h.runner.Build(ctx, folder, folder+"/Containerfile", "localhost/kitbash/"+name+":test",
+		map[string]string{podman.LabelPath: folder, podman.LabelName: name, podman.LabelUser: "tester"}); err != nil {
+		t.Fatalf("building: %v", err)
+	}
+	if _, prob := h.processes.Run(ctx, folder, "", ""); prob != nil {
+		t.Fatalf("proc.Run: %s", prob.Detail)
+	}
+	h.run(t)
+	return folder
+}
+
+// runKitManifest is a Package that implements the run hook, with the optional
+// stop tool a Process it owns is stopped through.
+const runKitManifest = `name: pve-runner
+description: Run a Package as a container on another machine, and stop it again.
+provides:
+  kit: [run]
+  tools:
+    - name: run
+      description: Start a Process of one Package on the machine this kit owns.
+      input:
+        type: object
+        required: [package, digest, name, unit]
+        properties:
+          package: { type: string }
+          digest: { type: string }
+          name: { type: string }
+          unit: { type: object }
+      output: { type: object }
+    - name: stop
+      description: Stop a Process this kit started on the machine it owns.
+      input:
+        type: object
+        required: [id]
+        properties:
+          id: { type: string }
+      output: { type: object }
+deploy:
+  units:
+    - type: container
+      build: .
+      expose: mcp
+`
+
+func TestKitAtFindsTheKitAManifestNames(t *testing.T) {
+	h := newHarness(t, echo)
+	folder := kitAtRunner(t, h, "pve-runner", runKitManifest)
+
+	kit, prob := h.bridge.KitAt(context.Background(), folder, manifest.HookRun, manifest.ToolRun)
+	if prob != nil {
+		t.Fatalf("KitAt: %s", prob.Detail)
+	}
+	if kit.Process.Package != folder || kit.Tool.Name != manifest.ToolRun {
+		t.Errorf("KitAt answered %+v, want the run tool of the kit at %s", kit, folder)
+	}
+	// The optional half of the hook is found through the same kit: proc_stop
+	// forwards to it rather than looking the Package up again.
+	if _, declared := kit.Declares(manifest.ToolStop); !declared {
+		t.Error("the kit declares a stop tool and Declares did not find it")
+	}
+	if err := kit.Tool.AcceptsArgs(map[string]any{
+		"package": folder, "digest": "sha256:abc", "name": "one", "unit": map[string]any{"type": "container"},
+	}); err != nil {
+		t.Errorf("the kit refused the arguments its hook is called with: %v", err)
+	}
+}
+
+func TestKitAtWithNothingRunningThere(t *testing.T) {
+	h := newHarness(t, echo)
+
+	_, prob := h.bridge.KitAt(context.Background(), filepath.Join(h.root, "pve-runner"),
+		manifest.HookRun, manifest.ToolRun)
+	if prob == nil {
+		t.Fatal("a kit that is not running was found")
+	}
+	if prob.Slug() != problem.SlugNotFound {
+		t.Errorf("problem is %s, want not-found", prob.Slug())
+	}
+	if !strings.Contains(prob.Fix, "proc_run") {
+		t.Errorf("fix is %q, want it to say to run the kit first", prob.Fix)
+	}
+}
+
+func TestKitAtWillNotDispatchToAKitARunKitOwns(t *testing.T) {
+	h := newHarness(t, echo)
+	// The kit's Package is itself run by another run kit, which is what a
+	// manifest that named a runner for the kit would do. There is no container
+	// of it on this host, so calling into it would be a podman exec on an
+	// empty container name.
+	folder := filepath.Join(h.root, "pve-runner")
+	if err := os.MkdirAll(folder, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(folder, manifest.FileName), runKitManifest)
+	h.daemon.AddProcess(teltest.Registration{
+		ID:      "01920000-0000-7000-8000-000000000001",
+		Package: folder,
+		Name:    "pve-runner",
+		Runner:  "/org/other-runner",
+		Expose:  manifest.ExposeMCP,
+	})
+
+	_, prob := h.bridge.KitAt(context.Background(), folder, manifest.HookRun, manifest.ToolRun)
+	if prob == nil {
+		t.Fatal("a kit whose own Process a run kit owns was dispatched to")
+	}
+	if prob.Slug() != problem.SlugNotFound {
+		t.Errorf("problem is %s, want not-found", prob.Slug())
+	}
+	if !strings.Contains(prob.Fix, "without a runner") {
+		t.Errorf("fix is %q, want it to say the kit has to run under the built in runner", prob.Fix)
+	}
+}
+
+func TestKitAtWithAPackageThatImplementsNoHook(t *testing.T) {
+	h := newHarness(t, echo)
+	// The echo Package of the harness runs and declares no kit at all, which
+	// is one of the two manifests being wrong rather than a caller's mistake.
+	folder := kitAtRunner(t, h, "not-a-kit", `name: not-a-kit
+description: A Package that runs and implements no lifecycle hook at all.
+deploy:
+  units:
+    - type: container
+      build: .
+      expose: mcp
+`)
+
+	_, prob := h.bridge.KitAt(context.Background(), folder, manifest.HookRun, manifest.ToolRun)
+	if prob == nil {
+		t.Fatal("a Package that declares no run hook was dispatched to")
+	}
+	if prob.Slug() != problem.SlugInvalidManifest {
+		t.Errorf("problem is %s, want invalid-manifest", prob.Slug())
 	}
 }
 

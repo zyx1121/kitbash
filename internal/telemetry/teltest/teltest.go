@@ -82,6 +82,9 @@ type Registration struct {
 	Expose        string   `json:"expose,omitempty"`
 	Endpoint      string   `json:"endpoint,omitempty"`
 	Subscriptions []string `json:"subscriptions,omitempty"`
+	// Runner is the Package path of the run kit that owns the Process, as a
+	// session whose manifest named a runner registers it.
+	Runner string `json:"runner,omitempty"`
 	// Permits is what the Package declared its Process may call over /mcp. A
 	// test reads it to see what the session child would be given.
 	Permits manifest.Permits `json:"permits,omitempty"`

@@ -25,7 +25,9 @@ func RegisterPackages(s *mcp.Server, packages *pkg.Service) {
 			"tail as a bad-request. kitbash builds from a commit, so an uncommitted change under the path is " +
 			"a conflict. Version 1 supports one container unit per Package. A unit with build is built from " +
 			"its context; a unit with image is pulled by digest and relabelled through a one line " +
-			"Containerfile so the result carries the same labels and its own image ID.",
+			"Containerfile so the result carries the same labels and its own image ID. A unit whose builder " +
+			"names a Package is built by that kit instead: the kit has to be running as a Process of the " +
+			"caller, and it is called with the Package path and the resolved build context.",
 		InputSchema:  pkgBuildInputSchema,
 		OutputSchema: pkgBuildOutputSchema,
 	}, buildHandler(packages))
@@ -74,7 +76,10 @@ func RegisterProcesses(s *mcp.Server, processes *proc.Service, b *bridge.Bridge)
 			"Process is registered with kitbashd, which mints its Telemetry token; the container receives " +
 			"KITBASH_TELEMETRY_ENDPOINT, KITBASH_TELEMETRY_TOKEN, KITBASH_PROCESS, KITBASH_PACKAGE and " +
 			"KITBASH_USER. A Process whose manifest declares subscriptions: [telemetry] with expose: http " +
-			"and a port is registered as a fan out subscriber.",
+			"and a port is registered as a fan out subscriber. A unit whose runner names a Package is started " +
+			"by that kit instead: the kit has to be running as a Process of the caller, it is called with the " +
+			"Package, digest, name and unit, and the id, state and endpoint it answers with are the Process. " +
+			"kitbashd registers such a Process and supervises none of it.",
 		InputSchema:  procRunInputSchema,
 		OutputSchema: procRunOutputSchema,
 	}, runHandler(processes, b))
@@ -89,7 +94,8 @@ func RegisterProcesses(s *mcp.Server, processes *proc.Service, b *bridge.Bridge)
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "proc_stop",
 		Description: "Stop a Process. It stays known and can be run again with proc_run. Its tools leave " +
-			"the surface.",
+			"the surface. A Process a run kit owns is stopped through that kit's stop tool; a kit that " +
+			"declares none owns a Process kitbash cannot stop, which is not-permitted.",
 		InputSchema:  procStopInputSchema,
 		OutputSchema: procStopOutputSchema,
 	}, stopHandler(processes, b))

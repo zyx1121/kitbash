@@ -106,6 +106,12 @@ type Registration struct {
 	Endpoint      string           `json:"endpoint,omitempty"`
 	Subscriptions []string         `json:"subscriptions,omitempty"`
 	Permits       manifest.Permits `json:"permits"`
+	// Runner is the Package path of the run kit that owns this Process, empty
+	// for every Process the built in runner started. It carries no container,
+	// because there is none on this host: the runner is what tells kitbashd
+	// that, so restore leaves the Process alone rather than unregistering it,
+	// see PLAN.md section 3.
+	Runner string `json:"runner,omitempty"`
 }
 
 // The shapes the two restore fields must have. kitbashd starts what the
@@ -140,9 +146,14 @@ func (r Registration) check() *problem.Problem {
 // registration. A member's list is their own, so it is an admin's list that
 // carries Processes with an owner other than the caller.
 type Registered struct {
-	ID            string   `json:"id"`
-	Package       string   `json:"package"`
-	Name          string   `json:"name"`
+	ID      string `json:"id"`
+	Package string `json:"package"`
+	Name    string `json:"name"`
+	// Digest and Runner are what proc_list reads for a Process a run kit
+	// owns: it has no container here, so this record is the only thing that
+	// says which image it runs and which kit to stop it through.
+	Digest        string   `json:"digest,omitempty"`
+	Runner        string   `json:"runner,omitempty"`
 	Expose        string   `json:"expose,omitempty"`
 	Endpoint      string   `json:"endpoint,omitempty"`
 	Subscriptions []string `json:"subscriptions,omitempty"`

@@ -147,7 +147,8 @@ const processDef = `{
     "digest": { "type": "string" },
     "state": { "type": "string", "enum": ["starting", "running", "unhealthy", "stopped", "failed"] },
     "expose": { "type": "string", "enum": ["mcp", "http", "none"] },
-    "startedAt": { "type": "string", "format": "date-time" }
+    "startedAt": { "type": "string", "format": "date-time" },
+    "runner": { "type": "string", "description": "Package path of the run kit that owns this Process, absent when kitbashd runs it" }
   }
 }`
 
@@ -259,7 +260,8 @@ var (
     "state": { "type": "string", "enum": ["starting", "running", "unhealthy", "stopped", "failed"] },
     "expose": { "type": "string", "enum": ["mcp", "http", "none"] },
     "endpoint": { "type": "string", "description": "Internal URL when expose is http" },
-    "tools": { "type": "array", "items": { "type": "string" }, "description": "Surface tool names added when expose is mcp" }
+    "tools": { "type": "array", "items": { "type": "string" }, "description": "Surface tool names added when expose is mcp" },
+    "runner": { "type": "string", "description": "Package path of the run kit that owns this Process, absent when kitbashd runs it" }
   }
 }`)
 

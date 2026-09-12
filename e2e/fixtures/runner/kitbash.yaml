@@ -1,0 +1,71 @@
+name: runner
+description: >-
+  The end to end fixture run kit. It starts nothing: it records what proc_run
+  handed it and answers with a Process, so dispatch can be proved from an agent
+  to a kit and back.
+tags: [e2e, fixture]
+
+provides:
+  # The hook this Package implements. A Package whose container unit names this
+  # folder as its runner is started by proc_run calling run below, see PLAN.md
+  # section 3.
+  kit: [run]
+  tools:
+    - name: run
+      description: >-
+        Start a Process of one Package somewhere this kit owns. The fixture
+        records the call and answers with an id, a state and an endpoint.
+      input:
+        type: object
+        additionalProperties: false
+        required: [package, digest, name, unit]
+        properties:
+          package: { type: string }
+          digest: { type: string }
+          name: { type: string }
+          unit: { type: object }
+      output:
+        type: object
+        required: [id, state]
+        properties:
+          id: { type: string }
+          state: { type: string }
+          endpoint: { type: string }
+    - name: stop
+      description: >-
+        Stop a Process this kit owns. proc_stop forwards to it, because kitbash
+        does not supervise a Process a run kit started.
+      input:
+        type: object
+        additionalProperties: false
+        required: [id]
+        properties:
+          id: { type: string }
+      output:
+        type: object
+        required: [id, state]
+        properties:
+          id: { type: string }
+          state: { type: string }
+    - name: calls
+      description: >-
+        What this kit was asked to do, oldest first. The end to end job reads
+        it to prove the hook arrived with the arguments the contract names.
+      input:
+        type: object
+        additionalProperties: false
+        properties: {}
+      output:
+        type: object
+        required: [calls]
+        properties:
+          calls:
+            type: array
+            items: { type: object }
+
+deploy:
+  units:
+    - type: container
+      build: .
+      expose: mcp
+      limits: { memory: 256Mi }

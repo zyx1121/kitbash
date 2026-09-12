@@ -92,6 +92,10 @@ func run() error {
 	processes := proc.New(files, runner, telem.Client())
 	tools := bridge.New(files, processes, runner)
 	defer tools.Close()
+	// The bridge is also how proc_run reaches the run kit a manifest names,
+	// and how proc_stop forwards to it: dispatch is one Process calling
+	// another's tools, see PLAN.md section 3.
+	processes.SetKits(tools)
 	// The same client again is the build registry: a build of an /org Package
 	// is recorded with kitbashd, and one another member already made is copied
 	// instead of made again, see PLAN.md section 2.2.

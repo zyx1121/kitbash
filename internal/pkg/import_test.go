@@ -8,37 +8,50 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/zyx1121/kitbash/internal/bridge"
 	"github.com/zyx1121/kitbash/internal/manifest"
 	"github.com/zyx1121/kitbash/internal/pkg"
 	"github.com/zyx1121/kitbash/internal/problem"
 	"github.com/zyx1121/kitbash/internal/proc"
 )
 
-// stubKits stands in for the MCP bridge: a set of running import kits and
-// whatever the chosen one returns.
+// stubKits stands in for the MCP bridge: a set of running import kits, the one
+// kit a manifest named, and whatever the kit that is called returns.
 type stubKits struct {
-	kits   []bridge.Kit
+	kits   []proc.Kit
+	at     map[string]proc.Kit
 	result string
 	called map[string]any
+	tool   string
 }
 
-func (s *stubKits) Kits(context.Context) ([]bridge.Kit, *problem.Problem) {
+func (s *stubKits) Kits(context.Context) ([]proc.Kit, *problem.Problem) {
 	return s.kits, nil
 }
 
-func (s *stubKits) CallTool(_ context.Context, _ *proc.Process, _ string, args map[string]any) (json.RawMessage, *problem.Problem) {
+// KitAt answers the way the bridge does: the kit running at that path, or the
+// not-found that tells the caller to run it.
+func (s *stubKits) KitAt(_ context.Context, path, hook, _ string) (*proc.Kit, *problem.Problem) {
+	if kit, running := s.at[path]; running {
+		return &kit, nil
+	}
+	return nil, problem.NotFoundFix(path,
+		"the manifest names the "+hook+" kit at "+path+", and no Process of it is running",
+		"Run the kit first with proc_run on "+path+", then call this tool again.")
+}
+
+func (s *stubKits) CallTool(_ context.Context, _ *proc.Process, tool string, args map[string]any) (json.RawMessage, *problem.Problem) {
 	s.called = args
+	s.tool = tool
 	return json.RawMessage(s.result), nil
 }
 
 // kit builds one running import kit whose import tool accepts sources matching
 // pattern.
-func kit(path, pattern string) bridge.Kit {
-	return bridge.Kit{
+func kit(path, pattern string) proc.Kit {
+	return proc.Kit{
 		Process: &proc.Process{ID: path, Package: path, State: proc.StateRunning, Expose: manifest.ExposeMCP},
 		Tool: manifest.Tool{
-			Name: bridge.ImportTool,
+			Name: manifest.ToolImport,
 			Input: map[string]any{
 				"type":     "object",
 				"required": []any{"source"},
@@ -72,7 +85,7 @@ func TestImportWritesTheKitsFilesAsOneCommit(t *testing.T) {
 		{"path": "README.md", "content": "# time\n"},
 		{"path": "src/Containerfile", "content": "FROM node:22-alpine\n"},
 	}})
-	kits := &stubKits{kits: []bridge.Kit{kit("/org/import-mcp", "^npm:")}, result: string(body)}
+	kits := &stubKits{kits: []proc.Kit{kit("/org/import-mcp", "^npm:")}, result: string(body)}
 	packages, root := newImporter(t, kits)
 	target := filepath.Join(root, "time")
 
@@ -97,7 +110,7 @@ func TestImportWritesTheKitsFilesAsOneCommit(t *testing.T) {
 }
 
 func TestImportWithNoAcceptingKit(t *testing.T) {
-	kits := &stubKits{kits: []bridge.Kit{kit("/org/import-mcp", "^npm:")}}
+	kits := &stubKits{kits: []proc.Kit{kit("/org/import-mcp", "^npm:")}}
 	packages, root := newImporter(t, kits)
 
 	_, prob := packages.Import(context.Background(), pkg.ImportRequest{Path: filepath.Join(root, "alpine"), Source: "oci://alpine@sha256:0"})
@@ -113,7 +126,7 @@ func TestImportWithNoAcceptingKit(t *testing.T) {
 }
 
 func TestImportWithTwoAcceptingKits(t *testing.T) {
-	kits := &stubKits{kits: []bridge.Kit{
+	kits := &stubKits{kits: []proc.Kit{
 		kit("/org/import-mcp", "^npm:"),
 		kit("/org/import-npm", "^npm:"),
 	}}
@@ -132,7 +145,7 @@ func TestImportWithTwoAcceptingKits(t *testing.T) {
 }
 
 func TestImportRefusesAnExistingFolder(t *testing.T) {
-	kits := &stubKits{kits: []bridge.Kit{kit("/org/import-mcp", "^npm:")}}
+	kits := &stubKits{kits: []proc.Kit{kit("/org/import-mcp", "^npm:")}}
 	packages, root := newImporter(t, kits)
 	target := filepath.Join(root, "time")
 	if err := os.MkdirAll(target, 0o755); err != nil {
@@ -152,7 +165,7 @@ func TestImportRequiresAManifestAmongTheFiles(t *testing.T) {
 	body, _ := json.Marshal(map[string]any{"files": []map[string]any{
 		{"path": "README.md", "content": "# time\n"},
 	}})
-	kits := &stubKits{kits: []bridge.Kit{kit("/org/import-mcp", "^npm:")}, result: string(body)}
+	kits := &stubKits{kits: []proc.Kit{kit("/org/import-mcp", "^npm:")}, result: string(body)}
 	packages, root := newImporter(t, kits)
 	target := filepath.Join(root, "time")
 
@@ -180,7 +193,7 @@ func TestImportRefusesAKitThatEscapesTheFolder(t *testing.T) {
 				{"path": "kitbash.yaml", "content": importedManifest},
 				{"path": tc.path, "content": "x\n"},
 			}})
-			kits := &stubKits{kits: []bridge.Kit{kit("/org/import-mcp", "^npm:")}, result: string(body)}
+			kits := &stubKits{kits: []proc.Kit{kit("/org/import-mcp", "^npm:")}, result: string(body)}
 			packages, root := newImporter(t, kits)
 
 			_, prob := packages.Import(context.Background(), pkg.ImportRequest{Path: filepath.Join(root, "time"), Source: "npm:time-mcp@1.0.0"})

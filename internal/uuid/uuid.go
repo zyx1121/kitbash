@@ -7,6 +7,7 @@ package uuid
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"regexp"
 	"time"
 )
 
@@ -40,3 +41,13 @@ func V7() string {
 	hex.Encode(out[24:36], b[10:16])
 	return string(out[:])
 }
+
+// v7 is the canonical form V7 writes. kitbashd holds a registration to the
+// same shape, see spec/kitbashd-api.yaml.
+var v7 = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+
+// Valid reports whether a string is a version 7 UUID in canonical form. A
+// Process id an outside program chose, such as the one a run kit answers with,
+// is held to it before it is registered: every other tool addresses a Process
+// by this shape, so an id of any other is a Process nothing could name again.
+func Valid(s string) bool { return v7.MatchString(s) }

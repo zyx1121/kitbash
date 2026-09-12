@@ -7,6 +7,24 @@ const (
 	ExposeNone = "none"
 )
 
+// The lifecycle hooks a manifest declares in provides.kit, and the tool each
+// hook binds to, see PLAN.md section 3. They are spelled here because they are
+// manifest vocabulary: a kit declares the hook, a manifest names the kit, and
+// both the bridge and the tool families read the same words.
+const (
+	HookImport = "import"
+	HookBuild  = "build"
+	HookRun    = "run"
+
+	ToolImport = "import"
+	ToolBuild  = "build"
+	ToolRun    = "run"
+	// ToolStop is the optional tool a run kit declares to stop a Process it
+	// owns. A kit without one owns a Process kitbash cannot stop, which
+	// proc_stop says rather than pretending to have stopped it.
+	ToolStop = "stop"
+)
+
 // Unit types spec/manifest.schema.json allows.
 const (
 	UnitContainer = "container"
@@ -50,16 +68,30 @@ type Limits struct {
 
 // Unit is one entry of deploy.units, read as a container unit. Version 1 runs
 // the first unit of a Package.
+//
+// Builder and Runner name the Package folder of a kit that builds or runs this
+// unit in place of the built in path, see PLAN.md section 3. They sit beside
+// Build rather than under it because build is the build context, a string, and
+// a folder that names its builder still names the context that builder reads.
+// A unit that names neither is built and run by kitbash itself, which is every
+// manifest written before this existed.
+//
+// Raw is the unit as the manifest wrote it, which is what a run kit is handed:
+// the kit decides what image, expose, port, env, health, limits and restart
+// mean where it runs a Process, and kitbash does not translate them for it.
 type Unit struct {
 	Type    string
 	Build   string
 	Image   string
+	Builder string
+	Runner  string
 	Expose  string
 	Port    int
 	Env     map[string]string
 	Health  map[string]any
 	Limits  Limits
 	Restart string
+	Raw     map[string]any
 }
 
 // Tools returns provides.tools in manifest order.
@@ -161,10 +193,12 @@ func (m *Manifest) Unit() (Unit, bool) {
 	if !ok {
 		return Unit{}, false
 	}
-	unit := Unit{Expose: ExposeNone, Restart: RestartAlways}
+	unit := Unit{Expose: ExposeNone, Restart: RestartAlways, Raw: raw}
 	unit.Type, _ = raw["type"].(string)
 	unit.Build, _ = raw["build"].(string)
 	unit.Image, _ = raw["image"].(string)
+	unit.Builder, _ = raw["builder"].(string)
+	unit.Runner, _ = raw["runner"].(string)
 	if expose, ok := raw["expose"].(string); ok && expose != "" {
 		unit.Expose = expose
 	}

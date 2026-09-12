@@ -43,6 +43,11 @@ type RestoreCounts struct {
 	// created again under it. They are counted with the started as well: a
 	// heal that worked is a Process that came back.
 	Healed int
+	// Kit is how many a run kit owns, which restore leaves alone: the Process
+	// runs wherever the kit put it, and kitbashd supervises none of it, see
+	// PLAN.md section 3. The registration stays, because it is what keeps the
+	// Process on its owner's proc_list and its token alive.
+	Kit int
 }
 
 // Restore starts every registered Process again as its owner, which is what
@@ -70,6 +75,13 @@ func (s *Server) Restore(ctx context.Context) RestoreCounts {
 	var counts RestoreCounts
 	byOwner := map[string][]store.Process{}
 	for _, p := range list {
+		// A Process a run kit owns is not this daemon's to start. It carries
+		// no container name either, so it is answered before the check below
+		// that would unregister it as a registration naming nothing.
+		if p.Runner != "" {
+			counts.Kit++
+			continue
+		}
 		// A registration without a container name was written before M5. It
 		// names nothing the runtime could start and no later boot will change
 		// that, so it goes: the row is deleted, which revokes its token and
@@ -112,8 +124,8 @@ func (s *Server) Restore(ctx context.Context) RestoreCounts {
 	}
 	wg.Wait()
 
-	logger.Printf("restore: started %d (%d were already running), missing %d, failed %d, legacy %d, healed %d",
-		counts.Started, counts.Running, counts.Missing, counts.Failed, counts.Legacy, counts.Healed)
+	logger.Printf("restore: started %d (%d were already running), missing %d, failed %d, legacy %d, healed %d, owned by a run kit %d",
+		counts.Started, counts.Running, counts.Missing, counts.Failed, counts.Legacy, counts.Healed, counts.Kit)
 	return counts
 }
 

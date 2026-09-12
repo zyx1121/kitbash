@@ -118,6 +118,19 @@ func openSchema(root, dir, ref string) (*os.File, error) {
 // already makes impossible.
 func (t Tool) ValidateInput(data []byte) error { return validateAgainst(t.Input, data) }
 
+// AcceptsArgs reports whether this tool's input schema accepts one set of hook
+// arguments, and says why not when it does not. Dispatch to a kit binds on
+// schemas and never on names, so a tool whose schema refuses what its hook is
+// called with is a Package that does not implement that hook, see PLAN.md
+// section 3.
+func (t Tool) AcceptsArgs(args map[string]any) error {
+	body, err := json.Marshal(args)
+	if err != nil {
+		return err
+	}
+	return t.ValidateInput(body)
+}
+
 // ValidateOutput reports whether a JSON document satisfies the tool's output
 // schema.
 func (t Tool) ValidateOutput(data []byte) error { return validateAgainst(t.Output, data) }

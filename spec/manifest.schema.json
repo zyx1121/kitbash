@@ -148,6 +148,18 @@
           "description": "An existing OCI image reference pinned by digest. Mutually exclusive with build.",
           "pattern": "^[^@\\s]+@sha256:[a-f0-9]{64}$"
         },
+        "builder": {
+          "type": "string",
+          "description": "Absolute path of a Package folder whose manifest declares provides.kit: [build] and a tool build with input {path, context}. pkg_build calls that kit instead of the built in OCI path; without this field the built in path builds the unit. The kit has to be running as a Process of the caller. A builder is paired with a runner in practice: the image it builds is in that kit's hands rather than in this member's image store, so the unit usually names the kit that runs it as well.",
+          "pattern": "^(/[A-Za-z0-9._-]*[A-Za-z0-9_-][A-Za-z0-9._-]*)+$",
+          "maxLength": 4096
+        },
+        "runner": {
+          "type": "string",
+          "description": "Absolute path of a Package folder whose manifest declares provides.kit: [run] and a tool run with input {package, digest, name, unit}. proc_run calls that kit instead of the built in rootless podman runner, and the kit owns the Process it answers with: kitbashd registers it, does not supervise it and does not restore it at boot. The kit has to be running as a Process of the caller.",
+          "pattern": "^(/[A-Za-z0-9._-]*[A-Za-z0-9_-][A-Za-z0-9._-]*)+$",
+          "maxLength": 4096
+        },
         "expose": {
           "type": "string",
           "description": "mcp: tools appear on the caller's MCP surface. http: an internal port, optionally a hostname. none: no ingress.",
