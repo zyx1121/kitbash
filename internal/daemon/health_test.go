@@ -3,14 +3,21 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/user"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/zyx1121/kitbash/internal/problem"
 	"github.com/zyx1121/kitbash/internal/store"
+	"github.com/zyx1121/kitbash/internal/sysusers"
+	"github.com/zyx1121/kitbash/internal/uuid"
 )
 
 // testHealthInterval is the floor the probe tests run with. A test cannot wait
@@ -46,16 +53,72 @@ func newProbeStub(t *testing.T, status int) *probeStub {
 	return stub
 }
 
-// serveProbing starts a daemon whose probe floor is short enough for a test,
-// and runs its probe loop until the test is over.
-func serveProbing(t *testing.T) *harness {
+// blockingStub is a Process that takes a request and answers nothing until the
+// test lets it, which is how a request in flight is held still while the
+// registration behind it changes.
+type blockingStub struct {
+	server  *httptest.Server
+	arrived atomic.Int64
+	held    chan struct{}
+	once    sync.Once
+}
+
+// newBlockingStub serves a health path that waits.
+func newBlockingStub(t *testing.T) *blockingStub {
 	t.Helper()
+	stub := &blockingStub{held: make(chan struct{})}
+	stub.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		stub.arrived.Add(1)
+		<-stub.held
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(func() {
+		stub.release()
+		stub.server.Close()
+	})
+	return stub
+}
+
+// release answers every request this stub is holding, once.
+func (s *blockingStub) release() { s.once.Do(func() { close(s.held) }) }
+
+// process reads one registration back, for a test that seeded it.
+func (h *harness) process(id string) store.Process {
+	h.t.Helper()
+	p, found, err := h.store.Process(context.Background(), id)
+	if err != nil || !found {
+		h.t.Fatalf("Process %s: %v, found %v", id, err, found)
+	}
+	return p
+}
+
+// serveProbing starts a daemon whose probe floor is short enough for a test,
+// on a fake host: what a container publishes is what kitbashd checks a probe
+// against, so it is the test's to stage. The probe loop runs until the test is
+// over, which is what kitbashd does after restore.
+func serveProbing(t *testing.T) (*harness, *sysusers.Fake) {
+	t.Helper()
+	h, fake := serveProbingHost(t)
+	h.probeLoop()
+	return h, fake
+}
+
+// serveProbingHost is serveProbing without the loop, for a test that seeds the
+// store first and starts the loop itself.
+func serveProbingHost(t *testing.T) (*harness, *sysusers.Fake) {
+	t.Helper()
+	fake := sysusers.NewFake()
 	h := serveWith(t, Options{
 		Admin:             func(*user.User) (bool, error) { return false, nil },
+		Users:             fake,
+		Runner:            fake,
 		HealthMinInterval: testHealthInterval,
 	})
-	h.probeLoop()
-	return h
+	// The member runs as whoever runs the tests: a start writes the
+	// environment file to that account, and root's uid is not the test's to
+	// hand a file to.
+	fake.Add(sysusers.Member{Name: h.user, UID: os.Getuid(), GID: os.Getgid()})
+	return h, fake
 }
 
 // probeLoop runs the daemon's health loop for the life of the test, which is
@@ -77,13 +140,71 @@ func (h *harness) probeLoop() {
 }
 
 // probeRegistration is one registration of a Process that declares a health
-// path on the endpoint given.
+// path on the endpoint given, with a container name of its own so a test can
+// say what that container publishes.
 func probeRegistration(endpoint, path, interval string) processRequest {
 	req := registration("")
 	req.Expose = ExposeHTTP
 	req.Endpoint = endpoint
+	req.Container = "kitbash-probe-" + strings.Split(req.ID, "-")[0]
+	// The digest is what a start runs, so a test that goes on to start this
+	// Process registers one, the way proc_run does.
+	req.Digest = testDigest
 	req.Health = &healthRequest{HTTP: path, Interval: interval}
 	return req
+}
+
+// registerProbed registers a Process whose container publishes the port its
+// endpoint names, which is the only thing kitbashd agrees to probe.
+func (h *harness) registerProbed(fake *sysusers.Fake, endpoint, path, interval string) processRequest {
+	h.t.Helper()
+	req := probeRegistration(endpoint, path, interval)
+	port, ok := endpointPort(endpoint)
+	if !ok {
+		h.t.Fatalf("the endpoint %q names no port", endpoint)
+	}
+	fake.Publish(req.Container, port)
+	if _, res, body := h.register(req); res.StatusCode != http.StatusOK {
+		h.t.Fatalf("register status = %d, body %s", res.StatusCode, body)
+	}
+	return req
+}
+
+// storedProbe writes one registration that declares a probe straight to the
+// store, with its container publishing the endpoint's port, which is what a
+// daemon that has just started finds. It answers the Process id.
+func (h *harness) storedProbe(fake *sysusers.Fake, container, endpoint, interval string) string {
+	h.t.Helper()
+	return h.storedProbeOf(fake, h.user, container, endpoint, interval)
+}
+
+// storedProbeOf is storedProbe for a Process of another member, which is what
+// an admin removing that member leaves behind.
+func (h *harness) storedProbeOf(fake *sysusers.Fake, owner, container, endpoint, interval string) string {
+	h.t.Helper()
+	port, ok := endpointPort(endpoint)
+	if !ok {
+		h.t.Fatalf("the endpoint %q names no port", endpoint)
+	}
+	fake.Publish(container, port)
+	_, hash, err := store.NewToken()
+	if err != nil {
+		h.t.Fatalf("NewToken: %v", err)
+	}
+	id := uuid.V7()
+	if err := h.store.RegisterProcess(context.Background(), store.Process{
+		ID:           id,
+		Owner:        owner,
+		Package:      "/org/sensorium",
+		Container:    container,
+		Expose:       ExposeHTTP,
+		Endpoint:     endpoint,
+		Health:       store.Health{HTTP: "/healthz", Interval: interval},
+		RegisteredAt: time.Now().UTC(),
+	}, hash, 0); err != nil {
+		h.t.Fatalf("RegisterProcess: %v", err)
+	}
+	return id
 }
 
 // metrics reads the metric records the store holds, newest first.
@@ -124,13 +245,10 @@ func (h *harness) waitForHealth(what string) store.Metric {
 // Process that declares a health path is probed, and what the probe saw is one
 // metric record carrying the four attributes PLAN.md section 2.4 requires.
 func TestHealthProbeRecordsAHealthyProcess(t *testing.T) {
-	h := serveProbing(t)
+	h, fake := serveProbing(t)
 	stub := newProbeStub(t, http.StatusOK)
 
-	req := probeRegistration(stub.server.URL, "/healthz", "")
-	if _, res, body := h.register(req); res.StatusCode != http.StatusOK {
-		t.Fatalf("register status = %d, body %s", res.StatusCode, body)
-	}
+	req := h.registerProbed(fake, stub.server.URL, "/healthz", "")
 
 	record := h.waitForHealth("the first health record")
 	if record.Value != healthyValue {
@@ -170,9 +288,9 @@ func TestHealthProbeRecordsAHealthyProcess(t *testing.T) {
 // The record is answered by tel_query, which is where a member reads it: the
 // probe is written through the path every stored record takes.
 func TestHealthProbeIsAnsweredByTheQuerySurface(t *testing.T) {
-	h := serveProbing(t)
+	h, fake := serveProbing(t)
 	stub := newProbeStub(t, http.StatusOK)
-	h.register(probeRegistration(stub.server.URL, "/healthz", ""))
+	h.registerProbed(fake, stub.server.URL, "/healthz", "")
 	h.waitForHealth("the first health record")
 
 	res, body := h.postJSON(http.MethodPost, queryPath, queryRequest{Signal: store.SignalMetrics})
@@ -199,11 +317,10 @@ func TestHealthProbeIsAnsweredByTheQuerySurface(t *testing.T) {
 // answered with. Nothing else happens: the registration stands and the
 // container is not touched.
 func TestHealthProbeRecordsAnUnhealthyProcess(t *testing.T) {
-	h := serveProbing(t)
+	h, fake := serveProbing(t)
 	stub := newProbeStub(t, http.StatusInternalServerError)
 
-	req := probeRegistration(stub.server.URL, "/healthz", "")
-	h.register(req)
+	req := h.registerProbed(fake, stub.server.URL, "/healthz", "")
 
 	record := h.waitForHealth("the health record of a Process answering 500")
 	if record.Value != unhealthyValue {
@@ -223,14 +340,14 @@ func TestHealthProbeRecordsAnUnhealthyProcess(t *testing.T) {
 // A Process nothing answers for is unhealthy with the class of the failure
 // rather than a status, because there was none.
 func TestHealthProbeRecordsAProcessItCannotReach(t *testing.T) {
-	h := serveProbing(t)
+	h, fake := serveProbing(t)
 	stub := newProbeStub(t, http.StatusOK)
 	endpoint := stub.server.URL
 	// The port is closed before anything is registered, so the probe finds
 	// nothing listening where the registration says the Process is.
 	stub.server.Close()
 
-	h.register(probeRegistration(endpoint, "/healthz", ""))
+	h.registerProbed(fake, endpoint, "/healthz", "")
 
 	record := h.waitForHealth("the health record of a Process nothing answers for")
 	if record.Value != unhealthyValue {
@@ -244,10 +361,10 @@ func TestHealthProbeRecordsAProcessItCannotReach(t *testing.T) {
 // The probe repeats on the interval the manifest declared, which is what makes
 // it a probe and not a reading taken once at registration.
 func TestHealthProbeRepeatsOnItsInterval(t *testing.T) {
-	h := serveProbing(t)
+	h, fake := serveProbing(t)
 	stub := newProbeStub(t, http.StatusOK)
 
-	h.register(probeRegistration(stub.server.URL, "/healthz", "10ms"))
+	h.registerProbed(fake, stub.server.URL, "/healthz", "10ms")
 
 	waitFor(t, "three probes on the interval", func() bool { return stub.requests.Load() >= 3 })
 	waitFor(t, "a record for each probe", func() bool { return len(h.healthRecords()) >= 3 })
@@ -278,11 +395,10 @@ func TestHealthProbeIntervalIsHeldToTheFloor(t *testing.T) {
 // Unregistering a Process stops its probe. The registration is what kitbashd
 // probes from, so a Process nobody runs is a Process nobody requests.
 func TestHealthProbeStopsWhenTheProcessIsUnregistered(t *testing.T) {
-	h := serveProbing(t)
+	h, fake := serveProbing(t)
 	stub := newProbeStub(t, http.StatusOK)
 
-	req := probeRegistration(stub.server.URL, "/healthz", "10ms")
-	h.register(req)
+	req := h.registerProbed(fake, stub.server.URL, "/healthz", "10ms")
 	waitFor(t, "the first probes", func() bool { return stub.requests.Load() >= 2 })
 
 	res, body := h.do(http.MethodDelete, processesPath+"/"+req.ID, "", nil)
@@ -308,7 +424,7 @@ func TestHealthProbeStopsWhenTheProcessIsUnregistered(t *testing.T) {
 // probed at all. Probing is what a Package asks for, not what every Process
 // gets.
 func TestHealthProbeNeedsADeclarationAndAnEndpoint(t *testing.T) {
-	h := serveProbing(t)
+	h, fake := serveProbing(t)
 	stub := newProbeStub(t, http.StatusOK)
 
 	noPath := registration("")
@@ -317,7 +433,9 @@ func TestHealthProbeNeedsADeclarationAndAnEndpoint(t *testing.T) {
 	h.register(noPath)
 
 	noEndpoint := registration("")
+	noEndpoint.Container = "kitbash-probe-none"
 	noEndpoint.Health = &healthRequest{HTTP: "/healthz"}
+	fake.Publish(noEndpoint.Container, 40275)
 	h.register(noEndpoint)
 
 	if n := h.server.probes.count(); n != 0 {
@@ -332,22 +450,9 @@ func TestHealthProbeNeedsADeclarationAndAnEndpoint(t *testing.T) {
 // The daemon probes the Processes it finds registered at start, which is what
 // a host that rebooted has: the loop runs after restore and loads them itself.
 func TestHealthLoopProbesWhatIsAlreadyRegistered(t *testing.T) {
-	h := serveWith(t, Options{
-		Admin:             func(*user.User) (bool, error) { return false, nil },
-		HealthMinInterval: testHealthInterval,
-	})
+	h, fake := serveProbingHost(t)
 	stub := newProbeStub(t, http.StatusOK)
-	if err := h.store.RegisterProcess(context.Background(), store.Process{
-		ID:           registration("").ID,
-		Owner:        h.user,
-		Package:      "/org/sensorium",
-		Expose:       ExposeHTTP,
-		Endpoint:     stub.server.URL,
-		Health:       store.Health{HTTP: "/healthz", Interval: "10ms"},
-		RegisteredAt: time.Now().UTC(),
-	}, "hash-of-a-token", 0); err != nil {
-		t.Fatalf("RegisterProcess: %v", err)
-	}
+	h.storedProbe(fake, "kitbash-probe-restored", stub.server.URL, "10ms")
 
 	h.probeLoop()
 	h.waitForHealth("the health record of a Process that was registered before the daemon started")
@@ -356,11 +461,10 @@ func TestHealthLoopProbesWhatIsAlreadyRegistered(t *testing.T) {
 // processes_list carries the declaration and the most recent reading, which is
 // what proc_list publishes as health: {last, healthy}.
 func TestProcessesListCarriesTheLastProbe(t *testing.T) {
-	h := serveProbing(t)
+	h, fake := serveProbing(t)
 	stub := newProbeStub(t, http.StatusOK)
 
-	req := probeRegistration(stub.server.URL, "/healthz", "10ms")
-	h.register(req)
+	req := h.registerProbed(fake, stub.server.URL, "/healthz", "10ms")
 	h.waitForHealth("the first health record")
 
 	var listed listedProcess
@@ -395,11 +499,8 @@ func TestProcessesListCarriesTheLastProbe(t *testing.T) {
 // The declaration survives a restart, because it travels with the
 // registration: restore has no manifest to read.
 func TestHealthDeclarationIsStoredWithTheRegistration(t *testing.T) {
-	h := serve(t, false)
-	req := probeRegistration("http://127.0.0.1:40275", "/healthz", "45s")
-	if _, res, body := h.register(req); res.StatusCode != http.StatusOK {
-		t.Fatalf("register status = %d, body %s", res.StatusCode, body)
-	}
+	h, fake := serveProbingHost(t)
+	req := h.registerProbed(fake, "http://127.0.0.1:40275", "/healthz", "45s")
 	p, found, err := h.store.Process(context.Background(), req.ID)
 	if err != nil || !found {
 		t.Fatalf("Process: %v, found %v", err, found)
@@ -415,7 +516,7 @@ func TestHealthDeclarationIsStoredWithTheRegistration(t *testing.T) {
 // A registration kitbashd cannot probe is refused with a fix, rather than
 // stored as a declaration nothing acts on.
 func TestRegisteringRefusesAHealthBlockItCannotProbe(t *testing.T) {
-	h := serve(t, false)
+	h, _ := serveProbingHost(t)
 	cases := []struct {
 		name   string
 		health healthRequest
@@ -437,5 +538,234 @@ func TestRegisteringRefusesAHealthBlockItCannotProbe(t *testing.T) {
 				t.Error("the problem carries no fix")
 			}
 		})
+	}
+}
+
+// The port a probe requests is not the member's to choose. kitbashd asks the
+// runtime, as the owner, what that Process's own container publishes, and a
+// registration naming anything else is refused: without this a member could
+// have the daemon request any loopback port on a schedule and read the status
+// back off kitbash.health, see verifyProbe.
+func TestRegisteringRefusesAPortTheContainerDoesNotPublish(t *testing.T) {
+	h, fake := serveProbingHost(t)
+	stub := newProbeStub(t, http.StatusOK)
+	published, _ := endpointPort(stub.server.URL)
+
+	req := probeRegistration(stub.server.URL, "/healthz", "")
+	// The container is there and publishes a different port, which is the
+	// neighbour's port this registration is trying to be pointed at.
+	fake.Publish(req.Container, published+1)
+	res, body := h.postJSON(http.MethodPost, processesPath, req)
+	if res.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, body %s", res.StatusCode, body)
+	}
+	prob := h.problemOf(res, body)
+	if prob.Slug() != problem.SlugNotPermitted {
+		t.Errorf("problem is %s, want not-permitted", prob.Slug())
+	}
+	if !strings.Contains(prob.Fix, "own published port") {
+		t.Errorf("fix is %q, want it to name the Process's own published port", prob.Fix)
+	}
+	if _, found, _ := h.store.Process(context.Background(), req.ID); found {
+		t.Error("the refused registration was written anyway")
+	}
+	if n := h.server.probes.count(); n != 0 {
+		t.Errorf("%d Processes are probed after a refused registration", n)
+	}
+}
+
+// The port the container does publish is accepted and probed.
+func TestRegisteringAcceptsThePortTheContainerPublishes(t *testing.T) {
+	h, fake := serveProbing(t)
+	stub := newProbeStub(t, http.StatusOK)
+
+	h.registerProbed(fake, stub.server.URL, "/healthz", "")
+	h.waitForHealth("the health record of a Process whose container publishes the port")
+}
+
+// A runtime that will not say what a container publishes is a registration
+// refused: kitbashd probes what it has checked and nothing it has not.
+func TestRegisteringRefusesAProbeItCannotCheck(t *testing.T) {
+	h, fake := serveProbingHost(t)
+	stub := newProbeStub(t, http.StatusOK)
+	port, _ := endpointPort(stub.server.URL)
+
+	req := probeRegistration(stub.server.URL, "/healthz", "")
+	fake.Publish(req.Container, port)
+	fake.ConfigErr = errors.New("podman: the runtime is not answering")
+
+	res, body := h.postJSON(http.MethodPost, processesPath, req)
+	if res.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, body %s", res.StatusCode, body)
+	}
+	if _, found, _ := h.store.Process(context.Background(), req.ID); found {
+		t.Error("a registration whose probe could not be checked was written anyway")
+	}
+}
+
+// proc_run registers the Process before its container exists, so that
+// registration is accepted and probed by nothing until the start that creates
+// the container checks the port.
+func TestAProcessIsProbedFromTheStartThatCreatesItsContainer(t *testing.T) {
+	h, fake := serveProbing(t)
+	stub := newProbeStub(t, http.StatusOK)
+	port, _ := endpointPort(stub.server.URL)
+
+	req := probeRegistration(stub.server.URL, "/healthz", "")
+	fake.Missing = map[string]bool{req.Container: true}
+	if _, res, body := h.register(req); res.StatusCode != http.StatusOK {
+		t.Fatalf("register status = %d, body %s", res.StatusCode, body)
+	}
+	if n := h.server.probes.count(); n != 0 {
+		t.Fatalf("%d Processes are probed before the container exists", n)
+	}
+
+	// The start creates the container, publishing the port the registration
+	// named, and the probe begins there.
+	fake.Missing = map[string]bool{}
+	res, body := h.start(req.ID, startRequest{
+		Publish: []portMapping{{HostPort: port, ContainerPort: 8080}},
+	})
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("start status = %d, body %s", res.StatusCode, body)
+	}
+	h.waitForHealth("the health record of a Process probed from its start")
+}
+
+// Registering the same Process again does not start a second probe and does
+// not bring the next one forward: one Process is requested at most once per
+// interval however often it is registered, see track.
+func TestReRegisteringDoesNotBypassTheInterval(t *testing.T) {
+	h, fake := serveProbing(t)
+	stub := newProbeStub(t, http.StatusOK)
+
+	// An interval far longer than this test, so every request after the first
+	// one would have to be a registration bypassing the schedule.
+	req := h.registerProbed(fake, stub.server.URL, "/healthz", "10m")
+	waitFor(t, "the first probe", func() bool { return stub.requests.Load() >= 1 })
+
+	for range 10 {
+		if _, res, body := h.register(req); res.StatusCode != http.StatusOK {
+			t.Fatalf("register status = %d, body %s", res.StatusCode, body)
+		}
+	}
+	time.Sleep(10 * testHealthInterval)
+	if n := stub.requests.Load(); n != 1 {
+		t.Errorf("the Process was requested %d times, want the one its interval allows", n)
+	}
+	if n := len(h.healthRecords()); n != 1 {
+		t.Errorf("%d health records, want the one its interval allows", n)
+	}
+}
+
+// A reading of a declaration that was replaced while the request was in flight
+// is dropped: it is about an endpoint this Process no longer names.
+func TestAReadingOfAReplacedDeclarationIsDropped(t *testing.T) {
+	h, fake := serveProbing(t)
+	slow := newBlockingStub(t)
+	quick := newProbeStub(t, http.StatusOK)
+
+	req := h.registerProbed(fake, slow.server.URL, "/healthz", "10m")
+	waitFor(t, "the request that is now in flight", func() bool { return slow.arrived.Load() >= 1 })
+
+	// The same Process is registered again at another endpoint, which its
+	// container publishes as well, while the first request is still waiting.
+	quickPort, _ := endpointPort(quick.server.URL)
+	fake.Publish(req.Container, quickPort)
+	moved := req
+	moved.Endpoint = quick.server.URL
+	if _, res, body := h.register(moved); res.StatusCode != http.StatusOK {
+		t.Fatalf("register status = %d, body %s", res.StatusCode, body)
+	}
+	slow.release()
+
+	time.Sleep(10 * testHealthInterval)
+	if n := len(h.healthRecords()); n != 0 {
+		t.Errorf("%d health records, want none: the reading was about the endpoint that was replaced", n)
+	}
+	if n := h.server.probes.count(); n != 1 {
+		t.Errorf("%d Processes are probed, want the one that was registered again", n)
+	}
+}
+
+// A reading of a Process that was unregistered while its request was in flight
+// is dropped as well, and nothing is written for it.
+func TestAReadingOfAnUnregisteredProcessIsDropped(t *testing.T) {
+	h, fake := serveProbing(t)
+	slow := newBlockingStub(t)
+
+	req := h.registerProbed(fake, slow.server.URL, "/healthz", "10m")
+	waitFor(t, "the request that is now in flight", func() bool { return slow.arrived.Load() >= 1 })
+
+	res, body := h.do(http.MethodDelete, processesPath+"/"+req.ID, "", nil)
+	if res.StatusCode != http.StatusNoContent {
+		t.Fatalf("unregister status = %d, body %s", res.StatusCode, body)
+	}
+	slow.release()
+
+	time.Sleep(10 * testHealthInterval)
+	if n := len(h.healthRecords()); n != 0 {
+		t.Errorf("%d health records, want none for a Process that is no longer registered", n)
+	}
+}
+
+// A Process that does not answer in time is unhealthy with the class of the
+// failure, which is not the same problem as nothing listening.
+func TestAProbeThatTimesOutIsRecordedAsATimeout(t *testing.T) {
+	h, _ := serveProbingHost(t)
+	slow := newBlockingStub(t)
+	t.Cleanup(slow.release)
+
+	// The deadline of the caller is what runs out here, which is the same
+	// path HealthTimeout takes without a test waiting five seconds for it.
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	healthy, status := h.server.request(ctx, probe{endpoint: slow.server.URL, path: "/healthz"})
+	if healthy {
+		t.Error("a Process that never answered was recorded as healthy")
+	}
+	if status != healthTimedOut {
+		t.Errorf("status = %q, want %q", status, healthTimedOut)
+	}
+}
+
+// Removing a member unregisters their Processes, and nothing of theirs is
+// probed afterwards.
+func TestRemovingAMemberStopsProbingTheirProcesses(t *testing.T) {
+	h, fake := serveUsers(t, true)
+	stub := newProbeStub(t, http.StatusOK)
+	fake.Add(sysusers.Member{Name: "alice", UID: 1007})
+	id := h.storedProbeOf(fake, "alice", "kitbash-probe-alice", stub.server.URL, "10ms")
+
+	h.server.loadProbes(context.Background(), []store.Process{h.process(id)})
+	if n := h.server.probes.count(); n != 1 {
+		t.Fatalf("%d Processes are probed, want the one of alice", n)
+	}
+
+	res, body := h.do(http.MethodDelete, usersPath+"/alice", "", nil)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("remove status = %d, body %s", res.StatusCode, body)
+	}
+	if n := h.server.probes.count(); n != 0 {
+		t.Errorf("%d Processes of a removed member are still probed", n)
+	}
+}
+
+// Restore unregisters a Process whose container the runtime no longer has, and
+// stops probing it with it.
+func TestRestoreStopsProbingAProcessWhoseContainerIsGone(t *testing.T) {
+	h, fake := serveUsers(t, false)
+	stub := newProbeStub(t, http.StatusOK)
+	id := h.storedProbe(fake, "kitbash-probe-gone", stub.server.URL, "10ms")
+
+	h.server.loadProbes(context.Background(), []store.Process{h.process(id)})
+	if n := h.server.probes.count(); n != 1 {
+		t.Fatalf("%d Processes are probed, want the one that is registered", n)
+	}
+
+	fake.Missing = map[string]bool{"kitbash-probe-gone": true}
+	h.server.Restore(context.Background())
+	if n := h.server.probes.count(); n != 0 {
+		t.Errorf("%d Processes are still probed after restore unregistered them", n)
 	}
 }

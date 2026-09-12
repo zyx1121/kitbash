@@ -194,6 +194,14 @@ func (s *Server) registerProcess(w http.ResponseWriter, r *http.Request, caller 
 		FanoutSecret:  secret,
 		RegisteredAt:  s.now().UTC(),
 	}
+	// A declared probe is checked against the container before the row is
+	// written, so a registration kitbashd would not probe is refused rather
+	// than stored as a declaration nothing acts on, see verifyProbe.
+	verified, prob := s.checkedProbe(r, caller, p)
+	if prob != nil {
+		writeProblem(w, prob)
+		return
+	}
 	if err := s.store.RegisterProcess(r.Context(), p, hash, MaxProcessesPerMember); err != nil {
 		if errors.Is(err, store.ErrProcessOwned) {
 			writeProblem(w, problem.ConflictFix(r.URL.Path,
@@ -211,10 +219,37 @@ func (s *Server) registerProcess(w http.ResponseWriter, r *http.Request, caller 
 		return
 	}
 	s.fanout.track(p)
-	// The probe starts with the registration and its first request goes out
-	// at once: the reading its owner is waiting for is the first one.
-	s.probes.track(p, s.now())
+	// The probe starts with the registration when the container already
+	// publishes the endpoint, and its first request goes out at once: the
+	// reading its owner is waiting for is the first one. A registration whose
+	// container does not exist yet, which is what proc_run sends, is probed
+	// from the start that creates it.
+	if verified {
+		s.probes.track(p, s.now())
+	} else {
+		s.probes.untrack(p.ID)
+	}
 	writeJSON(w, r.URL.Path, processResponse{ID: p.ID, Token: token, FanoutSecret: secret})
+}
+
+// checkedProbe holds one registration's declared probe to the ports its
+// container publishes and reports whether kitbashd may probe it. The caller's
+// own member record is what the runtime is asked as, because a member's
+// containers are in their own store and nowhere else.
+func (s *Server) checkedProbe(r *http.Request, caller Caller, p store.Process) (bool, *problem.Problem) {
+	if !p.Health.Declared() {
+		return false, nil
+	}
+	m, found, err := s.users.Lookup(r.Context(), caller.User)
+	if err != nil {
+		return false, problem.Internal(r.URL.Path, err.Error(), "")
+	}
+	if !found {
+		return false, problem.NotPermitted(r.URL.Path,
+			fmt.Sprintf("%s is not a member of this host, so kitbashd cannot check what their containers publish", caller.User),
+			"Ask an administrator to create a member for this account.")
+	}
+	return s.verifyProbe(r.Context(), m, p, r.URL.Path)
 }
 
 // declaredHealth reads the probe of one registration. A block naming no

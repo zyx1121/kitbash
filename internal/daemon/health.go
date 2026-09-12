@@ -6,11 +6,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"sync"
 	"time"
 
+	"github.com/zyx1121/kitbash/internal/problem"
 	"github.com/zyx1121/kitbash/internal/store"
+	"github.com/zyx1121/kitbash/internal/sysusers"
 )
 
 // The health probe of a Process. A Package declares deploy.units[0].health.http
@@ -154,10 +157,16 @@ func probed(p store.Process) bool {
 // no longer declares one. It is what a registration calls: one row changed, so
 // one entry changes.
 //
-// A re-registration at the same endpoint and path keeps its schedule and its
-// last reading: it is the same Process answering the same path, and resetting
-// the reading would report a Process as never probed because its token was
-// minted again.
+// A Process this prober already holds keeps its schedule and its in flight
+// marker, whatever the registration changed. That is the guarantee: one
+// Process is requested at most once per interval and has at most one request
+// in flight, however often it is registered again. A re-registration that
+// moved the endpoint or the path is therefore probed at the next due time
+// rather than at once, and the reading of a request already in flight for the
+// declaration it replaced is dropped, see finished.
+//
+// It keeps the last reading as well: resetting it would report a Process as
+// never probed because its token was minted again.
 func (pr *prober) track(p store.Process, now time.Time) {
 	if !probed(p) {
 		pr.untrack(p.ID)
@@ -165,9 +174,11 @@ func (pr *prober) track(p store.Process, now time.Time) {
 	}
 	pr.mu.Lock()
 	current, tracked := pr.targets[p.ID]
-	if tracked && current.endpoint == p.Endpoint && current.path == p.Health.HTTP {
+	if tracked {
 		current.owner = p.Owner
 		current.pkg = p.Package
+		current.endpoint = p.Endpoint
+		current.path = p.Health.HTTP
 		current.interval = pr.every(p.Health.Interval)
 		pr.mu.Unlock()
 		return
@@ -200,20 +211,126 @@ func (pr *prober) untrack(id string) {
 	}
 }
 
-// load starts probing the registered Processes that declare a path, which is
-// what a daemon that has just started finds in its store. It adds and never
-// removes: the set is empty before this runs, so everything in it was
-// registered while the daemon was already serving and is current.
-func (pr *prober) load(processes []store.Process, now time.Time) int {
-	tracked := 0
+// verifyProbe reports whether the endpoint a registration names is a port the
+// Process's own container publishes, which is what kitbashd probes and the
+// only thing it probes.
+//
+// The daemon runs as root and a probe is a GET it makes on a member's word. If
+// the endpoint were the member's to choose, a registration would turn kitbashd
+// into a loopback port scanner: the status of any port on the host would come
+// back through kitbash.health.status, and any neighbour's Process could be
+// requested on a schedule. So the port is not taken from the registration but
+// read off the container, as the owner, before anything is probed. What the
+// container publishes is what the kernel let that member bind, so a port
+// another member holds is never in this list.
+//
+// A container the runtime does not have yet is not a refusal: proc_run
+// registers the Process before the container is created, so the registration
+// is accepted and probed by nothing until the start that creates the container
+// checks again. A runtime that will not answer is a refusal: kitbashd probes
+// what it has checked, and nothing it has not.
+func (s *Server) verifyProbe(ctx context.Context, m sysusers.Member, p store.Process, instance string) (bool, *problem.Problem) {
+	if !probed(p) {
+		return false, nil
+	}
+	port, ok := endpointPort(p.Endpoint)
+	if !ok {
+		return false, problem.BadRequest(instance,
+			fmt.Sprintf("%q does not name a port to probe", p.Endpoint),
+			healthFix)
+	}
+	if p.Container == "" {
+		return false, problem.NotPermitted(instance,
+			"a health probe is checked against the Process's own container, and this registration names none",
+			"Register the Process with the container name the runtime holds it under, then declare health.http.")
+	}
+	config, err := s.runner.ContainerConfig(ctx, m, p.Container)
+	if errors.Is(err, sysusers.ErrNoContainer) {
+		return false, nil
+	}
+	if err != nil {
+		return false, problem.Internal(instance,
+			fmt.Sprintf("reading the configuration of %s: %v", p.Container, err), "")
+	}
+	for _, published := range config.Publish {
+		if published.HostPort == port {
+			return true, nil
+		}
+	}
+	return false, problem.NotPermitted(instance,
+		fmt.Sprintf("the endpoint of this registration names port %d, which %s does not publish",
+			port, p.Container),
+		fmt.Sprintf("health.http probes the Process's own published port; the endpoint names port %d, which this container does not publish.", port))
+}
+
+// trackProbe verifies one Process's declaration and points the prober at it,
+// or leaves it unprobed. It answers the problem the caller reports; a caller
+// that cannot refuse anything any more logs it, see startProcess.
+func (s *Server) trackProbe(ctx context.Context, p store.Process, instance string) *problem.Problem {
+	if !probed(p) {
+		s.probes.untrack(p.ID)
+		return nil
+	}
+	m, found, err := s.users.Lookup(ctx, p.Owner)
+	if err != nil || !found {
+		s.probes.untrack(p.ID)
+		return problem.Internal(instance,
+			fmt.Sprintf("%s owns the Process %s and could not be looked up: %v", p.Owner, p.ID, err), "")
+	}
+	return s.trackProbeAs(ctx, m, p, instance)
+}
+
+// trackProbeAs is trackProbe for a caller that has already looked the owner
+// up, which every start has.
+func (s *Server) trackProbeAs(ctx context.Context, m sysusers.Member, p store.Process, instance string) *problem.Problem {
+	verified, prob := s.verifyProbe(ctx, m, p, instance)
+	if !verified {
+		// A Process whose declaration cannot be checked is not probed, and one
+		// that was probed under a declaration that no longer checks out stops
+		// being probed.
+		s.probes.untrack(p.ID)
+		return prob
+	}
+	s.probes.track(p, s.now())
+	return nil
+}
+
+// endpointPort reads the port of a registered endpoint. Registration has
+// already held it to http://127.0.0.1:PORT, see validateEndpoint.
+func endpointPort(endpoint string) (int, bool) {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return 0, false
+	}
+	_, port, err := splitHostPort(u.Host)
+	if err != nil {
+		return 0, false
+	}
+	number, err := strconv.Atoi(port)
+	if err != nil || number <= 0 {
+		return 0, false
+	}
+	return number, true
+}
+
+// loadProbes starts probing the registered Processes whose declaration checks
+// out, which is what a daemon that has just started finds in its store. It
+// adds and never removes: the set is empty before this runs, so everything in
+// it was registered while the daemon was already serving and is current.
+//
+// It runs after restore, so the containers it checks the endpoints against are
+// the ones that came back. A Process whose declaration does not check out is
+// logged and not probed: nothing about it is a member's to be told again here,
+// and the next start of that Process refuses it to their face.
+func (s *Server) loadProbes(ctx context.Context, processes []store.Process) {
 	for _, p := range processes {
 		if !probed(p) {
 			continue
 		}
-		tracked++
-		pr.track(p, now)
+		if prob := s.trackProbe(ctx, p, healthPath); prob != nil {
+			logger.Printf("health: not probing %s of %s: %s", p.ID, p.Owner, prob.Detail)
+		}
 	}
-	return tracked
 }
 
 // every reads the interval a manifest spells, held to the floor. A spelling
@@ -259,17 +376,24 @@ func (pr *prober) due(now time.Time) ([]probe, time.Duration) {
 	return due, wait
 }
 
-// finished records one reading and reports whether the Process is still
-// registered. It answers false for one that was unregistered while its request
-// was in flight, which is a Process kitbashd no longer runs.
-func (pr *prober) finished(id string, at time.Time, healthy bool) bool {
+// finished records one reading and reports whether it counts. It answers false
+// for a Process that was unregistered while its request was in flight, which
+// is a Process kitbashd no longer runs, and for one whose declaration was
+// replaced while the request was in flight, which is a reading about an
+// endpoint the Process no longer names. Either way the Process stops being in
+// flight, so the next interval probes it again.
+func (pr *prober) finished(sent probe, at time.Time, healthy bool) bool {
 	pr.mu.Lock()
-	target, tracked := pr.targets[id]
+	current, tracked := pr.targets[sent.id]
+	sameDeclaration := tracked &&
+		current.endpoint == sent.endpoint && current.path == sent.path
 	if tracked {
-		target.running = false
-		target.last = at
-		target.healthy = healthy
-		target.probed = true
+		current.running = false
+	}
+	if sameDeclaration {
+		current.last = at
+		current.healthy = healthy
+		current.probed = true
 	}
 	pr.mu.Unlock()
 	if tracked {
@@ -277,7 +401,7 @@ func (pr *prober) finished(id string, at time.Time, healthy bool) bool {
 		// is waiting for, because it was not counted while it was in flight.
 		pr.wake()
 	}
-	return tracked
+	return sameDeclaration
 }
 
 // reading is the most recent probe of one Process, for processes_list.
@@ -319,8 +443,11 @@ func (s *Server) HealthLoop(ctx context.Context) {
 	list, err := s.store.Processes(ctx, "")
 	if err != nil {
 		logger.Printf("health: could not read the registered Processes: %v", err)
-	} else if tracked := s.probes.load(list, s.now()); tracked > 0 {
-		logger.Printf("health: probing %d registered Processes", tracked)
+	} else {
+		s.loadProbes(ctx, list)
+		if tracked := s.probes.count(); tracked > 0 {
+			logger.Printf("health: probing %d registered Processes", tracked)
+		}
 	}
 	for {
 		due, wait := s.probes.due(s.now())
@@ -346,11 +473,12 @@ func (s *Server) HealthLoop(ctx context.Context) {
 func (s *Server) probeOnce(ctx context.Context, target probe) {
 	healthy, status := s.request(ctx, target)
 	at := s.now()
-	if !s.probes.finished(target.id, at, healthy) {
-		// The Process was unregistered while this request was in flight, so
-		// the reading belongs to a registration that is gone. It is dropped
-		// rather than stored: what it would say is that a Process nobody runs
-		// any more is down.
+	if !s.probes.finished(target, at, healthy) {
+		// The Process was unregistered, or its declaration was replaced,
+		// while this request was in flight. The reading belongs to something
+		// that is no longer registered, so it is dropped rather than stored:
+		// what it would say is that a Process nobody runs any more, or an
+		// endpoint nobody named any more, is down.
 		return
 	}
 	s.recordHealth(ctx, target, healthy, status, at)
