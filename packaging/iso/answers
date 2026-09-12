@@ -1,0 +1,59 @@
+# setup-alpine answerfile for an unattended kitbashOS install to disk.
+# The ISO publishes it at /media/cdrom/kitbash/answers, so from the live
+# console:
+#
+#   setup-alpine -f /media/cdrom/kitbash/answers
+#
+# The install is a "sys" install: setup-disk copies the running /etc, which is
+# the kitbash configuration the firstboot script already wrote, and installs
+# /etc/apk/world, which contains kitbashd, from the ISO's own repository.
+# Nothing here asks a question and nothing here needs a network.
+
+# No keymap. Every member arrives over ssh; the console is break glass only.
+KEYMAPOPTS=none
+
+HOSTNAMEOPTS=kitbash
+
+DEVDOPTS=mdev
+
+INTERFACESOPTS="auto lo
+iface lo inet loopback
+
+auto eth0
+iface eth0 inet dhcp
+hostname kitbash
+"
+
+TIMEZONEOPTS=UTC
+PROXYOPTS=none
+
+# The CDN plus community. Offline this only prints a warning and the installed
+# system keeps the ISO repository, which is enough to finish the install.
+APKREPOSOPTS="-1 -c"
+
+# No human accounts. kitbash-adduser on the console creates the first admin,
+# and that admin creates every other member through the MCP surface.
+USEROPTS=none
+
+SSHDOPTS=openssh
+
+# qemu-guest-agent and the host clock. chrony is on the image if a real
+# deployment wants it: NTPOPTS=chrony.
+NTPOPTS=none
+
+# Unattended sys install to the first virtio disk. ERASE_DISKS has to repeat
+# the device or setup-disk stops to ask, and it has to be exported:
+# setup-alpine sources this file and setup-disk is a child process that reads
+# ERASE_DISKS from the environment.
+DISKOPTS="-m sys /dev/vda"
+export ERASE_DISKS="/dev/vda"
+
+# A sys install keeps its state on disk, so there is no lbu backup and no
+# second apk cache.
+LBUOPTS=none
+APKCACHEOPTS=none
+
+# Do not ask for a root password. Root has no password and no way in over ssh:
+# sshd_config carries PermitRootLogin prohibit-password, so the console is the
+# only path, which is what PLAN.md 4.5 calls break glass.
+empty_root_password=1

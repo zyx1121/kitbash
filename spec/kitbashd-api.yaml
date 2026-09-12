@@ -1,0 +1,789 @@
+# kitbashd socket API
+#
+# kitbashd listens on one unix socket. kitbash-mcp is its only client through
+# M3. Identity is the socket's peer credentials (SO_PEERCRED): kitbashd maps
+# the uid to a user name and reads groups from the system. There is no token.
+# An admin is a member of kitbash-admin.
+#
+# Two protocols share the socket:
+# - OTLP/HTTP on the standard paths, protobuf or JSON, as the OpenTelemetry
+#   protocol specification defines them.
+# - A small JSON API under /kitbash/v1 for what OTLP has no verb for: query
+#   and settings. Errors are RFC 9457 problem details with the same slugs as
+#   spec/mcp-surface.yaml, and the HTTP status is the problem's status.
+
+version: 1
+socket: /run/kitbash/kitbashd.sock
+socket_owner: root:kitbash-users
+socket_mode: "0660"
+store: /var/lib/kitbash/kitbashd.db
+
+tcp:
+  description: >
+    The Process receiver. kitbashd also listens for OTLP/HTTP on KITBASH_OTLP_LISTEN
+    (default 0.0.0.0:4318) because rootless networking delivers
+    host.containers.internal to the host's primary address, not to loopback.
+    The OTLP paths and /mcp are served there; the /kitbash/v1 API is socket
+    only.
+  authorization: >
+    Every request carries Authorization: Bearer <token>. The token was minted
+    by POST /kitbash/v1/processes and names one Process; kitbashd stamps
+    kitbash.user, kitbash.package and kitbash.process from it and sets
+    kitbash.producer to the Process id. A missing, unknown or revoked token
+    is 401 not-permitted. Records from a Process may carry any other
+    attribute except kitbash.caller and kitbash.internal, which are dropped
+    from every export whatever listener it arrives on; the eval rules below are
+    the one exception where claims on the stamped attributes are honoured.
+  environment_given_to_every_process:
+    KITBASH_TELEMETRY_ENDPOINT: http://host.containers.internal:4318
+    KITBASH_TELEMETRY_TOKEN: the Process token
+    KITBASH_PROCESS: the Process id
+    KITBASH_PACKAGE: the Package path
+    KITBASH_USER: the member who ran it
+    KITBASH_MCP_ENDPOINT: http://host.containers.internal:4318/mcp, see mcp_for_processes
+    KITBASH_FANOUT_SECRET: the bearer every fan out request to this Process carries, see fan_out.authentication
+  environment_when_kitbashd_is_unreachable: >
+    kitbash-mcp removes every variable above from the manifest's environment
+    before it adds back what a registration answered, so a Process started
+    while kitbashd was unreachable carries none of them: no token, no fan out
+    secret, and neither endpoint. It exports nothing, and a subscriber among
+    them accepts what arrives because it was given no secret to check. A
+    manifest that declares any of these names is never honoured; a Package that
+    could name its own fan out secret would take records from whoever wrote it.
+
+mcp_for_processes:
+  description: >
+    MCP over streamable HTTP (2025-06-18 revision) at POST, GET and DELETE
+    /mcp on the Process receiver, Authorization: Bearer <Process token>. For
+    each new session kitbashd starts /usr/bin/kitbash-mcp as the Process's
+    owner (setuid to the owner's uid and gid and its supplementary groups,
+    in a process group of its own, with HOME, USER, LOGNAME, PATH,
+    XDG_RUNTIME_DIR and KITBASH_CALLER=<caller credential> and nothing of the
+    daemon's) and relays the session to it, publishing the child's tools one
+    for one. The child's stderr goes into the daemon log, named by member and
+    bounded. A tools/list_changed from the child is relayed, so a Process the
+    owner starts later joins an open session. The child talks to
+    kitbashd over the unix socket like any member session, so identity,
+    Telemetry and the approval queue all behave as for the owner. The surface
+    is the owner's, narrowed to what the Process registered as its permits.
+  permits: >
+    A registration carries permits: { tools: [glob], paths: [prefix] }, the
+    provides.permits block of the Package's manifest, and kitbashd stores it
+    with the Process and lists it on processes_list. Every session of that
+    Process is started with KITBASH_PERMITS set to that block as JSON, an
+    empty object when the Package declared none and for a registration written
+    before this field existed. A tool entry is a glob over literal surface
+    names, built in tools included, or the reserved word packages, which is
+    every tool the owner's running Processes publish and no built in.
+    kitbash-mcp publishes only the tools an entry
+    names, built in and Package tools alike, and answers not-permitted at 403
+    to a call the block does not name and to one whose path or package
+    argument is outside every prefix. A Process with no permits therefore
+    reaches nothing over /mcp. A block whose globs kitbashd cannot honour is
+    refused at registration with bad-request; the variable is read by a child
+    only beside KITBASH_CALLER, so a member's own SSH session is narrowed by
+    nothing. A child that finds KITBASH_CALLER set and no KITBASH_PERMITS at
+    all, which is what a daemon of an earlier release starts and what the
+    minutes between deploy/install.sh replacing the binaries and restarting
+    kitbashd produce, is permitted nothing rather than everything.
+    approvals_approve executes the queued tool inside its own handler, so it
+    checks the queued path against the same prefixes and stores a
+    not-permitted on the approval when it does not fit. See PLAN.md section
+    2.3.
+  limits: >
+    At most 8 live sessions per Process; the ninth is refused with the
+    conflict problem at status 429, titled "Too many sessions" and carrying
+    Retry-After: 60, so a client tells it apart from a refusal a different
+    token would fix. A session ends on DELETE, when the client is idle for
+    10 minutes, when the Process is unregistered, when the child exits, or
+    when the receiver stops; the child exits with it. An open GET event
+    stream is not activity: a client listening on one and asking nothing for
+    10 minutes is the idle client this ends, and the stream closes with the
+    session. A request in flight is activity, so a slow call is never swept.
+    Request bodies are capped at 4 MiB like the OTLP paths, and a request
+    without a token is 401 before the MCP handler runs. The kitbash-mcp a
+    session runs is /usr/bin/kitbash-mcp, which -mcp-binary and
+    KITBASH_MCP_BINARY override; both must be absolute paths.
+  session_start: >
+    A POST carrying no Mcp-Session-Id opens a session only when its body is
+    an initialize request; anything else is 400 bad-request. A session costs
+    one kitbash-mcp, so a client probing for a protocol revision this daemon
+    does not speak, or sending a call before it has a session, starts no
+    child. Every later request carries the Mcp-Session-Id, and a session
+    identifier presented with another Process's token is not-permitted.
+  environment_given_to_every_process:
+    KITBASH_MCP_ENDPOINT: http://host.containers.internal:4318/mcp
+  telemetry: >
+    kitbash-mcp started this way sets kitbash.caller on every span it records,
+    alongside kitbash.user = the owner. The value it sends is the opaque
+    per-session credential kitbashd put in KITBASH_CALLER, not the Process id:
+    kitbashd resolves it back to the Process for the life of the session plus
+    a 30 s grace, so the last records a child flushes as it exits still
+    resolve. A caller kitbashd did not mint, one whose grace is over, and any
+    caller on a record that arrived over the TCP receiver are dropped rather
+    than stored. kitbash.caller is therefore never a claim a producer can
+    make, the same rule kitbash.user follows.
+
+producer_attribute:
+  kitbash.producer: >
+    Stamped by kitbashd on every record. The member name for a record that
+    arrived over the unix socket, the Process id for one that arrived over
+    TCP with a token. Never taken from the body.
+
+eval:
+  description: >
+    A record with attribute kitbash.eval = true is a judgment about a subject
+    named by kitbash.subject.trace_id and kitbash.subject.span_id. When the
+    producing Process was run by an admin, the record's kitbash.user,
+    kitbash.package, kitbash.process and kitbash.path are kept as sent so the
+    judgment is found by the same query as its subject. When the producer is
+    a member's Process, or a member's session, those four are stamped as for
+    any other record. kitbash.producer still names the kit.
+
+fan_out:
+  description: >
+    After a request is stored, kitbashd re-encodes each record as OTLP/HTTP
+    JSON (hex identifiers, string nanosecond timestamps) with the stamped
+    attributes and POSTs it to every eligible subscriber's endpoint on the
+    matching standard path (/v1/traces, /v1/logs, /v1/metrics). Eligible: a
+    registered Process with subscriptions containing telemetry and an
+    endpoint, run by an admin (receives everything) or by the record's
+    kitbash.user (receives that member's records). A record with
+    kitbash.internal = true goes to an admin's subscriber alone, the rule
+    tel_query follows, see internal_records.
+  authentication: >
+    Every fan out request carries Authorization: Bearer <fan out secret>. The
+    secret is minted with the Process token at registration and returned once
+    as fanoutSecret; kitbash-mcp hands it to the container as
+    KITBASH_FANOUT_SECRET. A subscriber accepts a fan out POST only when the
+    header matches, so nothing else on the host can feed it records. kitbashd
+    stores the secret in the processes table (the store is root only) because
+    it must send it, unlike the token of which only the hash is kept. A
+    registration written before this existed carries no secret: it is delivered
+    to without the header, which kitbashd says once per subscriber, until the
+    Process is registered again. A subscriber started without
+    KITBASH_FANOUT_SECRET accepts what arrives for the same reason and says so
+    once at start.
+  delivery: >
+    Asynchronous, one queue per subscriber bounded twice, at 1024 requests and
+    at 64 MiB, oldest dropped when either bound is reached, 5 s request
+    timeout, no retry. Transitions between delivering and failing are logged
+    once each with the dropped count. The store is the source of truth; the
+    push is a wake up.
+  transport: >
+    kitbashd never follows a redirect from a subscriber and never connects
+    anywhere but the loopback address, which is checked again when the
+    connection is made and not only when the endpoint is registered. kitbashd
+    runs as root and carries other members' records, so a subscriber is a place
+    records go and never a place that decides where they go next.
+  loops: >
+    A record whose producer is itself a registered subscriber is not fanned out
+    at all, to anyone. Refusing only to send a record back to its own producer
+    would still let two subscribed kits wake each other for as long as both
+    run. What a kit writes is stored and answered by tel_query; it is not
+    pushed.
+
+otlp:
+  paths:
+    traces: POST /v1/traces
+    logs: POST /v1/logs
+    metrics: POST /v1/metrics
+  content_types: [application/x-protobuf, application/json]
+  max_body_bytes: 4194304
+  identity:
+    description: >
+      kitbashd sets kitbash.user on every span, log record and metric point
+      from the peer uid, replacing whatever the producer sent, and drops
+      kitbash.internal from every record, see internal_records. The other
+      attributes are stored as sent. Resource attributes are merged into each
+      record's attributes, record attributes winning.
+  response: >
+    200 with an empty Export*ServiceResponse on success. 400 problem details
+    for a body that does not decode. 413 for a body over max_body_bytes.
+    Partial success is not used: a request is stored whole or refused whole.
+
+api:
+  query:
+    method: POST
+    path: /kitbash/v1/query
+    request: The tel_query input of spec/mcp-surface.yaml, verbatim.
+    response: The tel_query output of spec/mcp-surface.yaml, verbatim.
+    authorization: >
+      A regular user's query is forced to user = caller; a request naming
+      another user is 403 not-permitted. An admin may name any user or none.
+      The causes of internal problems are answered to admins alone, see
+      internal_records.
+    errors: [bad-request, not-permitted, internal]
+  retention_get:
+    method: GET
+    path: /kitbash/v1/retention
+    response: { traces: "30d", logs: "14d", metrics: "30d" }
+  retention_set:
+    method: PUT
+    path: /kitbash/v1/retention
+    request: The tel_retention input's set object, one or more signals, durations as ^[0-9]+(h|d)$.
+    response: The full retention after the change.
+    authorization: admin only, 403 not-permitted otherwise.
+    errors: [bad-request, not-permitted, internal]
+  processes_register:
+    method: POST
+    path: /kitbash/v1/processes
+    request: { id: "UUIDv7", package: "/home/loki/echo", name: "echo", container: "kitbash-echo-echo", digest: "sha256:...", expose: "mcp|http|none", endpoint: "http://127.0.0.1:40275 when expose is http", subscriptions: ["telemetry"] }
+    response: { id: "UUIDv7", token: "opaque, at least 32 bytes of entropy, returned once", fanoutSecret: "opaque, 32 bytes, returned once; the bearer the fan out presents to this Process" }
+    authorization: >
+      The caller is the member the Process belongs to; kitbashd records the
+      peer user as the Process owner and whether they are an admin at
+      registration time. Registering an id that already exists for the same
+      owner replaces the record and returns a new token (the old one is
+      revoked); the same id owned by another member is 409 conflict.
+    limit: >
+      A member holds at most 64 registered Processes; the 65th is 409 conflict.
+      A replacement is not a new Process and is never refused by the limit.
+      Every registration is a live token and, for a subscriber, a queue, so
+      this count is what bounds what one member costs the daemon.
+    validation: >
+      id is a canonical version 7 UUID of 36 characters, package an absolute
+      path, expose one of mcp, http or none, subscriptions a subset of
+      [telemetry], and endpoint http://127.0.0.1:PORT and nothing else: the fan
+      out POSTs to whatever it names, so it may never point at the network.
+    errors: [bad-request, conflict, internal]
+  processes_unregister:
+    method: DELETE
+    path: /kitbash/v1/processes/{id}
+    response: 204 on success, 404 not-found when unknown, 403 not-permitted when owned by another member
+    authorization: >
+      The owner and nobody else, admins included. Unregistering revokes a token
+      the container is still using, and in version 1 no member needs to do that
+      to another member's Process. An admin who must clear a stale registration
+      stops the Process. Widening this is a decision, not an oversight.
+  processes_start:
+    method: POST
+    path: /kitbash/v1/processes/{id}/start
+    request: >
+      { container: "kitbash-echo-echo, optional and checked against the
+      registration", image: "sha256:..., optional, the registration's digest by
+      default", labels: { "kitbash.commit": "..." }, env: { LOG_LEVEL: debug },
+      restart: "always|on-failure|no", cpu: "1", memory: "512Mi", pidsLimit:
+      512, publish: [{ hostPort: 40275, containerPort: 8080 }] }. The unit's
+      own environment only: kitbashd writes its own seven variables itself, so
+      no token and no secret is ever in a request body.
+    response: { id: "UUIDv7", container: "kitbash-echo-echo", containerId: "the id the runtime gave it" }
+    authorization: >
+      The owner of the registration and nobody else, admins included: this runs
+      a program as that member.
+    behaviour: >
+      kitbashd creates /sys/fs/cgroup/kitbash/<owner>/<id>, writes the unit's
+      limits into it as root, writes /run/kitbash/env/<id> (0600, owned by the
+      member) with the manifest's environment plus the seven kitbashd speaks
+      for, and runs podman run as the owner from inside that cgroup's run leaf
+      (SysProcAttr.UseCgroupFD) with --cgroups=enabled,
+      --cgroup-parent=/kitbash/<owner>/<id> and the --memory, --cpus and
+      --pids-limit of the unit. The environment file is removed
+      before the response is written. The limits are recorded with the
+      registration as the request carried them, so restore can write the same
+      ceiling after a reboot. The Telemetry token is minted here rather
+      than read back: the store keeps only its hash, so a start revokes the
+      token the registration answered and puts the new one in the container.
+      A host whose cgroup filesystem is not version 2 or not writable runs the
+      Process without placing it, records the limits, and says so on that
+      start. One action at a time is served per Process id.
+    timeouts: >
+      The runtime gets 120 s for a run and 40 s for a stop or a forced removal,
+      which is the ten second grace the container is given plus room to kill it
+      and tear it down: a budget shorter than the grace kills the child in the
+      middle of the stop. The response deadline is extended to 180 s and 90 s
+      so the answer arrives rather than the deadline. A caller that hangs up
+      does not cancel the child: a stop that has begun finishes. A runtime that
+      is still working when its budget runs out is internal with the detail
+      "the container runtime did not answer in time".
+    limits: >
+      pidsLimit is 1 to 4096 and defaults to 512, at most 8 published ports, 64
+      environment variables of at most 4096 bytes each and no line breaks in
+      them, 32 labels. The identity labels (kitbash.id, kitbash.user,
+      kitbash.package, kitbash.name, kitbash.expose, kitbash.digest) are
+      written from the registration, whatever the request carries, the endpoint
+      among them. An image that is not the registration's digest is refused
+      rather than run.
+    errors: >
+      [bad-request, not-permitted, not-found, internal]. A unit the runtime
+      will not parse (exit 125) is bad-request naming deploy.units[0]; an image
+      the member does not have is not-found naming pkg_build; an id nobody
+      registered is not-found.
+  processes_stop:
+    method: POST
+    path: /kitbash/v1/processes/{id}/stop
+    response: { id: "UUIDv7", container: "kitbash-echo-echo" }
+    behaviour: >
+      podman stop --time 10 as the owner. The registration is untouched: the
+      session unregisters, which is what revokes the token. A container the
+      runtime no longer has is not-found.
+    authorization: the owner, as processes_start.
+    errors: [not-permitted, not-found, internal]
+  processes_remove:
+    method: POST
+    path: /kitbash/v1/processes/{id}/remove
+    response: { id: "UUIDv7", container: "kitbash-echo-echo" }
+    behaviour: >
+      podman rm --force as the owner, which is what a run that replaces a
+      Process does to the one it takes the place of. The Process's cgroup goes
+      with the container; one that is still busy is left for the next removal
+      or the next boot.
+    authorization: the owner, as processes_start.
+    errors: [not-permitted, not-found, internal]
+  processes_list:
+    method: GET
+    path: /kitbash/v1/processes
+    response: >
+      { processes: [ { id, owner, admin, package, name, expose, endpoint,
+      limits: { memory, cpu, pids },
+      subscriptions, registeredAt } ] }. The caller's registered Processes,
+      every key present even when its value is empty, and no token anywhere.
+      An admin sees every member's.
+  builds_record:
+    method: POST
+    path: /kitbash/v1/builds
+    request: { path: "/org/ffmpeg", commit: "40 hex characters", digest: "sha256:...", size: 41943040 }
+    response: { path, commit, digest, builder, builtAt, size }
+    description: >
+      The build record of one Package. A member's images live in that member's
+      rootless store, which no other member can read, so this is what says an
+      image exists and who has it: pkg_build of an /org path records what it
+      built, and the next member's pkg_build of the same commit copies that
+      image instead of building it again, see images_fetch and PLAN.md section
+      2.2.
+    authorization: >
+      Any member; the builder is the peer and is never in the body. The path
+      must be under /org or under the caller's own home, and a path under
+      another member's home is 403 not-permitted. A home path is recorded and
+      never fetched: the client records what it builds, and the rule about who
+      may fetch is images_fetch's.
+    validation: >
+      path is absolute, at most 4096 bytes and carries no .. segment; commit is
+      40 lower case hexadecimal characters; digest is sha256: followed by 64;
+      size is a non negative number of bytes and may be left out, in which case
+      the size the runtime reports is recorded.
+    provenance: >
+      The record is checked against the caller's own image store before it is
+      written, with podman image inspect as the caller: they must hold the
+      digest, and the image's own kitbash.path and kitbash.commit labels must
+      be the path and the commit being recorded. A digest the caller does not
+      hold is 400 bad-request, "you do not hold the image", and labels that do
+      not match are 400 "the image you recorded is not a build of this commit";
+      a runtime that could not answer at all is internal, because that is the
+      host's failure and not the caller's. A digest is a
+      number the caller chose and the labels are what the build stamped inside
+      the image, so this is the whole of what kitbashd knows about provenance.
+      Without it a member could record any digest against any /org path and
+      commit, and every other member's pkg_build of that commit would answer
+      the image they named instead of building.
+    limits: >
+      One row per path, commit and digest. The builder of an existing row is
+      never replaced: recording a triple that is there refreshes the time and
+      the size for the member who recorded it and does nothing at all for
+      anybody else, because the row names the member kitbashd asks for a copy.
+      The response is the row as it stands rather than the record that was
+      sent, so a caller is never told they are the builder while the table says
+      another member is. At most 64 rows per path per member, and 4096 per
+      path, the oldest pruned beyond each. The per member cap is the one that
+      matters: a member's records can prune only their own, so nobody can push
+      another member's build out of the table.
+    row_ownership: >
+      A row belongs to its first builder until it is pruned. If that member
+      removes the image, images_fetch of it is 404 not-found and every other
+      member builds the commit locally rather than being sent to a store that
+      no longer has it; the second member to record the same triple does not
+      become the one kitbashd asks. This is the safe end of the trade: the cost
+      is a build somebody could have copied, and the alternative is a row whose
+      builder any member can take over.
+    errors: [bad-request, not-permitted, internal]
+  builds_list:
+    method: GET
+    path: /kitbash/v1/builds?path=&commit=&digest=
+    response: { builds: [{ path, commit, digest, builder, builtAt, size }] }
+    description: >
+      The builds of one Package, newest first, at most 100. path is required;
+      commit and digest narrow it, which is what pkg_build (by commit) and
+      proc_run (by digest) ask with.
+    authorization: >
+      A path under /org is read by every member, because every member may run
+      what it names. A path under a home is read by that member and by an
+      admin; another member's home is 403 not-permitted.
+    errors: [bad-request, not-permitted, internal]
+  images_fetch:
+    method: POST
+    path: /kitbash/v1/images/{digest}/fetch
+    request: { path: "/org/ffmpeg", from: "the member the build record names, optional" }
+    response: { digest: "sha256:...", bytes: 41943040, from: "kim" }
+    description: >
+      Copies one image into the caller's own store from the member who built
+      it. kitbashd runs podman save --format oci-archive <digest> as the
+      builder piped into podman load as the requester: two setuid children
+      joined by a pipe the kernel holds, each placed in its own member's run
+      leaf, with 300 s for the pair. Nothing of the archive passes through the
+      daemon and nothing touches the disk.
+    authorization: >
+      The requester is the peer. A copy is served when kitbashd has a build
+      record for that path and digest, the builder named by that record is
+      still a member of this host, and the path is under /org. A path under the
+      requester's own home is answered without copying anything, because the
+      builder is then the requester; a path under another member's home is 403
+      not-permitted, since kitbashd is root and must not read a private image
+      store on behalf of somebody the kernel keeps out of it.
+    behaviour: >
+      The builder's store is checked first with podman image inspect as the
+      builder: they must still have the image, and its own kitbash.path and
+      kitbash.commit labels must be the ones the build record names, or it is
+      404 not-found naming pkg_build. An image whose labels say it is a build
+      of something else is a record that was never true of it, and copying it
+      would hand the requester somebody else's image under a name they trust.
+      The requester's store is checked after the copy the same way: a save and
+      a load that both exited zero and moved nothing is a failure only this
+      call can see. bytes is the size of the image in the requester's store,
+      absent when the runtime did not say.
+    concurrency: >
+      One copy per requester and digest, and 2 per member at a time. Beyond
+      either it is 409 conflict carrying Retry-After: 60, because the caller is
+      not wrong and there is a copy of theirs running. Every copy is two setuid
+      podman children moving an image through a pipe, so the per member cap is
+      what bounds what one member can ask the host to carry.
+
+      An archive of one image saved by digest carries no name, so podman load
+      invents one of the form localhost/sha256:<hex>. It is untagged as the
+      requester once the load has finished, so the copied image carries the tag
+      pkg_build gives it and nothing else, and podman images shows one row for
+      it rather than two. Only that name is dropped; every other name on the
+      image is one the member put there. A name that could not be dropped is
+      logged and nothing more: the image is in the store, which is what the
+      copy was for.
+    timeouts: >
+      The two children share a 300 s budget and the response deadline is
+      extended to 360 s, so the answer arrives rather than the deadline. A
+      caller that hangs up does not cancel the children: a load that has begun
+      is writing into a member's store.
+    errors: >
+      [bad-request, not-permitted, not-found, conflict, internal]. A digest
+      that is not sha256: and 64 hexadecimal characters is bad-request; no
+      build record, or a builder who no longer has the image or is no longer a
+      member, is not-found naming pkg_build; anything the runtime said is
+      internal, with its own output kept in the daemon log.
+  users_create:
+    method: POST
+    path: /kitbash/v1/users
+    request: { name: "^[a-z][a-z0-9-]{1,31}$", sshKey: "one OpenSSH public key line", admin: false }
+    response: { user: "name", uid: 1005, admin: false }
+    authorization: admin only. Runs useradd -m -s /bin/sh -G kitbash-users, usermod -p '*', adds the member to kitbash-admin when admin is true, allocates a 65536 wide subuid and subgid range, writes authorized_keys 0600 in a 0700 .ssh, sets the home to 0700, creates /run/user/<uid> 0700 owned by the member.
+    errors: [bad-request, not-permitted, conflict, internal]
+  users_list:
+    method: GET
+    path: /kitbash/v1/users
+    response: { users: [{ user, uid, admin, keys, home, processes }] }
+    authorization: admin only.
+  users_me:
+    method: GET
+    path: /kitbash/v1/users/me
+    response: { user, uid, admin, groups }
+    authorization: any member; answers about the peer.
+  users_add_key:
+    method: POST
+    path: /kitbash/v1/users/{name}/keys
+    request: { sshKey: "one OpenSSH public key line" }
+    response: { user, keys }
+    authorization: admin only. The key line is validated as type, base64 body and optional comment, one line, at most 4096 bytes; duplicates are not added twice.
+  users_remove:
+    method: DELETE
+    path: /kitbash/v1/users/{name}
+    response: { user, archived: "/org/.archive/<name>" }
+    authorization: admin only; an admin cannot remove themselves or the last admin. Stops and removes the member's kitbash containers as the member, deletes their registrations, approvals and build records, kills their processes, moves the home to /org/.archive/<name> owned by root 0700, deletes the account and its subordinate ranges.
+    errors: [not-permitted, not-found, conflict, internal]
+  approvals_create:
+    method: POST
+    path: /kitbash/v1/approvals
+    request: { tool: "fs_write|pkg_import", input: { the tool's input verbatim } }
+    response: { id: "UUIDv7", state: "pending", requestedAt }
+    authorization: any member; the requester is the peer. Input is capped at 2 MiB plus the tool's own limits, which leaves room for the megabyte fs_write carries once base64 has grown it; at most 64 pending approvals per member (409 beyond).
+  approvals_list:
+    method: GET
+    path: /kitbash/v1/approvals?state=pending|approved|rejected
+    response: { approvals: [{ id, requester, tool, input, state, requestedAt, decidedAt, decidedBy, note, reason, result }] }
+    authorization: members see their own, admins all. result is the stored tool result (a normal output or a problem) once executed.
+  approvals_claim:
+    method: POST
+    path: /kitbash/v1/approvals/{id}/claim
+    request: { note }
+    response: { id, requester, tool, input, state: "approved" }
+    authorization: admin only; pending to approved, 409 when not pending. The admin's session then executes the tool and stores the outcome with approvals_result.
+  approvals_result:
+    method: PUT
+    path: /kitbash/v1/approvals/{id}/result
+    request: { result: { the tool's output or a problem } }
+    response: 204
+    authorization: the admin who claimed it, once.
+  approvals_reject:
+    method: POST
+    path: /kitbash/v1/approvals/{id}/reject
+    request: { reason }
+    response: { id, state: "rejected" }
+    authorization: admin only; pending to rejected, 409 otherwise.
+  internal_record:
+    method: POST
+    path: /kitbash/v1/internal
+    request: { instance: "the problem instance the agent was given", cause: "the cause, never shown to the agent", tool: "the tool the call was, when there was one" }
+    response: 204 on success, no body
+    authorization: >
+      Any member; the record is stamped kitbash.user and kitbash.producer from
+      the peer credentials and kitbash.internal true, and only an admin's query
+      returns it, see internal_records. A member reporting a cause therefore
+      writes a record they cannot read back, which is the point: what they keep
+      is the instance to quote.
+    limits: >
+      The cause is cut to 8192 bytes with a note saying so, and a peer may
+      record 60 causes a minute; the ones beyond that are refused with the
+      conflict problem at status 429, titled "Too many causes" and carrying
+      Retry-After: 60. The write itself is queued, so this path answers without
+      waiting for the store.
+    errors: [bad-request, not-permitted, conflict, internal]
+  sessions_join:
+    method: POST
+    path: /kitbash/v1/sessions/join
+    request: no body
+    response: { user: "loki", pid: 4242, cgroup: "/sys/fs/cgroup/kitbash/loki/run" }
+    description: >
+      Places the calling session in its member's cgroup leaf. The process
+      placed is the peer of the connection, read from the kernel with
+      SO_PEERCRED: a caller cannot name another one, which here would mean
+      moving somebody else's process into a cgroup.
+    why: >
+      Moving a process between cgroups needs write access to cgroup.procs of
+      the common ancestor of where it is and where it is going. A session sshd
+      started lives in sshd's cgroup, whose only ancestor in common with a
+      container of kitbash's is the root cgroup, so podman exec into a
+      container kitbashd started is refused by the kernel. From the leaf the
+      ancestor is /kitbash/<member>, whose cgroup.procs the member has.
+    client_behaviour: >
+      kitbash-mcp calls it once at startup, before it publishes the tools of
+      running Processes, and logs one line if it fails. A session that was not
+      placed still serves everything else; an exec into a Process is then
+      internal with the detail "this session is outside the member's cgroup;
+      kitbashd could not place it". The kitbash-mcp kitbashd starts for a
+      Process over /mcp is already placed and calls nothing.
+    authorization: >
+      Any member. An account that is not a member of kitbash-users is
+      not-permitted: this is not the path that creates a cgroup for one.
+    errors: [not-permitted, internal]
+  health:
+    method: GET
+    path: /kitbash/v1/health
+    response: >
+      { version: "v0.4.0", store: "/var/lib/kitbash/kitbashd.db",
+      uptimeSeconds: 12, listeners: { socket: "/run/kitbash/kitbashd.sock",
+      tcp: "0.0.0.0:4318" }, subscribers: 1, mcpSessions: 2,
+      lastBackup: "2026-09-06T03:00:00Z", backups: 7 }. A listener that
+      is not bound is absent; subscribers is how many registered Processes the
+      fan out is delivering to, and mcpSessions how many MCP sessions
+      Processes hold open on the receiver, see mcp_for_processes. lastBackup
+      and backups are the store backup, see backup; lastBackup is absent until
+      the first one and a run that failed adds lastBackupError with the reason
+      while lastBackup stays at the last good copy.
+    authorization: any member; the answer is about the daemon, not about the caller.
+    supervision: >
+      The OpenRC service script runs this path every 60 s as supervise-daemon's
+      healthcheck, over the unix socket with curl, and restarts kitbashd when
+      it fails: a daemon that is up but no longer answering costs every member
+      the same as one that is down, because Processes may not start untraced,
+      members cannot write /org and /mcp is gone, see PLAN.md section 4.5.
+      respawn_delay is 5 s and respawn_max 0, so restarts continue for as long
+      as the host is up.
+
+restore:
+  description: >
+    At start, after the store is open and before the listeners accept,
+    kitbashd restores Processes: for every registered Process whose owner
+    still exists it creates /run/user/<uid> (0700, owned by the member) and
+    runs podman start <container> as that member from inside the member's leaf
+    (setuid to the member's uid
+    and gid with HOME, USER, LOGNAME, PATH and XDG_RUNTIME_DIR set), 60 s per
+    container, in parallel per owner and serially within one owner. A
+    container that no longer exists is unregistered and logged, and one that is
+    already running, which is what a daemon that restarted without the host
+    finds, is counted as started and named only in the line at the end. Restore runs
+    once per daemon start and is also what makes "all Processes come back
+    after a reboot" true; the OpenRC script orders kitbashd after localmount
+    and the local runlevel scripts.
+  registration_fields: >
+    The registration carries the container name and the digest from M5 on, so
+    restore needs no manifest; the permits block of the Package's manifest, see
+    mcp_for_processes.permits; and the limits the Process was started with, so
+    restore writes its ceiling again.
+  cgroups: >
+    The cgroup of each Process is created again, with its ceiling, before its
+    container starts: the cgroup filesystem does not survive a reboot, and a
+    container whose cgroup parent is gone does not start at all. The limits
+    come from the registration, which is the only thing that remembers them
+    once the filesystem is empty, so the ceiling a Process was started with is
+    the ceiling it comes back under. A registration written before limits were
+    recorded carries none: that Process comes back without a ceiling, which is
+    logged once for it, and gains one the next time it is run. A container
+    created before this release has no cgroup parent at all either, and gains
+    one the same way.
+
+backup:
+  description: >
+    kitbashd copies its store with SQLite's VACUUM INTO once a day: the first
+    copy 5 minutes after start, then every 24 hours. The copy is a whole
+    database an operator can open, taken through the same connection every
+    other statement uses, so nothing is locked out while it runs.
+  path: /var/lib/kitbash/backup/kitbashd-<YYYYMMDD-HHMMSS>.db, the timestamp in UTC
+  modes: the directory is 0700 root:root and each copy 0600, the same as the store itself
+  retention: >
+    The newest 7 copies are kept and the older ones deleted after every
+    successful run. Nothing else in the directory is touched: only files named
+    kitbashd-<stamp>.db are ever removed.
+  logging: one line per run, naming the copy and how many are kept, or the reason it failed
+  health: lastBackup, backups and lastBackupError, see the health path
+  environment:
+    KITBASH_BACKUP_EVERY: >
+      Shortens the interval, for tests and for running outside a kitbash host.
+      A value that is not a positive Go duration leaves the daily interval in
+      place and is logged. The first copy is taken after 5 minutes or after
+      one interval, whichever is shorter.
+  not_covered: >
+    Files are git repositories, which the host snapshot covers, and the copies
+    live on the same host: this is the store's backup, not the host's.
+
+internal_records:
+  description: >
+    Every internal problem records its cause as a log record with
+    kitbash.internal = true, severity ERROR, the cause as the body, the
+    problem's instance as kitbash.path, the tool of the call it happened in as
+    kitbash.tool where there is one, and kitbash.error = internal.
+  claims: >
+    No producer may assert kitbash.internal. kitbashd drops the attribute from
+    every record that arrives over OTLP, on the socket and on the Process
+    receiver alike: a member with a shell on this host reaches the socket with
+    curl as easily as kitbash-mcp does, so honouring it there would let anyone
+    hide their own records from themselves and put their words in front of
+    every admin as kitbash's own. The path below is the only way a record is
+    marked.
+  writers: >
+    kitbash-mcp reports its causes to POST /kitbash/v1/internal, which stamps
+    the record from the peer credentials. kitbashd holds the store, so it
+    writes its own causes directly, stamped kitbash.producer and kitbash.user =
+    kitbashd. Both are written by one worker off the request path: a cause is
+    queued and the call that failed is already answering, and a queue that is
+    full drops rather than waits.
+  attribution: >
+    A cause kitbashd recorded is kitbash.user = kitbashd even when it was
+    raised while serving a member: the daemon serves everyone, and a failure
+    inside it is not a member's record. The instance is what ties the two
+    together, so an admin queries by the path the member quotes rather than by
+    the member's name.
+  authorization: >
+    A query returns these records to admins alone. A member's query excludes
+    them, and a member asking for internal = true is answered with an empty
+    page rather than a refusal: what the member has is the problem's instance,
+    to quote to an admin who then queries by it. The fan out follows the same
+    rule, so only an admin's subscriber receives one.
+  why: >
+    The detail an agent reads carries no host paths, git output or third party
+    messages. Those are what an operator needs and what a member may not have,
+    so they go where an admin can read them through MCP instead of into a log
+    file on the host that no tool reaches.
+
+retention:
+  defaults: { traces: 30d, logs: 14d, metrics: 30d }
+  sweep: on start and every hour; deletes records whose time is older than now minus the window
+  storage: settings table in the same SQLite file; a value survives restarts
+
+cgroups:
+  description: >
+    Resource limits are enforced, not recorded: a member cannot move their own
+    process into a delegated cgroup, so kitbashd owns the tree and runs the
+    container for them, see PLAN.md section 2.3.
+  layout: >
+    /sys/fs/cgroup/kitbash is root's, with memory, cpu and pids in its
+    cgroup.subtree_control; /sys/fs/cgroup/kitbash/<member> is root's, with the
+    same delegation; /sys/fs/cgroup/kitbash/<member>/run is the member's leaf;
+    and /sys/fs/cgroup/kitbash/<member>/<process id> is the ceiling of one
+    Process, under which the container runtime creates the container's own
+    cgroup.
+  leaf: >
+    The leaf holds what belongs to the member rather than to one Process: their
+    MCP sessions, and the podman child that starts, stops or removes a
+    container. Neither is the workload, and a podman child under the Process's
+    ceiling would spend the memory the manifest meant for the container, so a
+    small limit would kill the starter instead of the thing being started.
+  ceiling: >
+    memory.max, cpu.max and pids.max of the Process's cgroup are written by
+    root and stay root's. The member is given the directory of that cgroup and
+    its cgroup.procs, cgroup.threads and cgroup.subtree_control, which is what
+    the kernel's delegation convention names and exactly enough for a rootless
+    podman to create the container's cgroup under the ceiling and move the
+    container into it. Of the member's own cgroup they are given cgroup.procs
+    and cgroup.threads and not the directory: moving a process between two
+    cgroups needs write access to the common ancestor's cgroup.procs, and that
+    cgroup is the ancestor of the leaf and of every container. Nothing else is
+    theirs, so a member can neither raise their own limit nor create a Process
+    cgroup without one.
+  when: >
+    The root and one cgroup per member at daemon start and at users_create; the
+    ceiling of a Process at every start and at every restore; a session at
+    sessions_join. The cgroup of a Process goes at processes_remove, and a
+    member's whole cgroup at users_remove.
+  upgrades: >
+    Preparing a member's cgroup sets the ownership rather than assuming it: the
+    member cgroup and the leaf are taken back for root and the limit files of
+    every Process cgroup in it with them, because a release that handed a
+    member their whole subtree left a directory they could make a cgroup in
+    with no ceiling. What they must keep is left alone: the directory of each
+    Process cgroup and cgroup.procs of their own.
+  without_it: >
+    A host whose cgroup filesystem is not version 2 or not writable runs that
+    Process unplaced: the limits are still passed to the runtime and recorded,
+    and the daemon log says so on that start. The fail open is per member and
+    per attempt; the daemon never turns placement off for itself. It covers a
+    host with no tree to place anything in, and not a host that places some
+    processes outside the one kitbashd built, which is what logind does, see
+    logind below.
+  logind: >
+    A member must be a user logind knows nothing about. Given a session, logind
+    removes that member's /run/user/<uid> when the session ends, and given a
+    lingering one it starts a systemd user manager; rootless podman then asks
+    that manager for a scope to hold its pause process, and the scope is under
+    the user's slice rather than under /sys/fs/cgroup/kitbash. The common
+    ancestor of that scope and the container's cgroup is then the root cgroup,
+    whose cgroup.procs is root's alone, so the kernel refuses to move the
+    container into its own cgroup and the start fails with
+    "writing file .../cgroup.procs: Permission denied". This is not the fail
+    open above: the Process does not start at all. A kitbash host runs OpenRC
+    and carries no logind, which is why deploy/install.sh makes /run/user/<uid>
+    in /etc/local.d/kitbash-rootless.start at boot instead of leaving it to a
+    session. On a systemd host, whoever runs kitbash there keeps its members
+    out of logind, opening no PAM session for them, and makes that directory
+    the same way; .github/workflows/e2e.yml does both.
+
+client_behaviour:
+  processes: >
+    kitbash-mcp registers a Process at proc_run before the container starts and
+    then asks kitbashd to start it; it unregisters at proc_stop and when a
+    replace removes the old container. The session never runs, stops or removes
+    a Process container itself, except one kitbashd has no registration for,
+    which is the member's own to stop. bridge.Sync at session start
+    re-registers every running Process of the caller that kitbashd does not
+    know (compare with processes_list), so a restarted kitbashd learns the
+    running set from the next session; re-registration mints a new token and a
+    new fan out secret, so the container keeps the old pair, its exports fail
+    and it refuses the fan out until the Process is run again. That gap is
+    accepted in version 1 and logged.
+  internal_causes: >
+    kitbash-mcp posts the cause of every internal problem to
+    /kitbash/v1/internal, queued and off the calling goroutine, so a call never
+    waits for it. A session whose causes cannot be recorded says so once in the
+    server log, the same courtesy a dropping exporter gets, and the agent is
+    told nothing beyond the problem it already has.
+  description: >
+    kitbash-mcp exports asynchronously and never blocks a tool call on the
+    exporter. If the socket is absent or refuses, spans are dropped and one
+    line goes to the server log per session; tel_query and tel_retention then
+    return internal with fix "kitbashd is not running on this host; ask an
+    administrator to start it." KITBASH_SOCKET overrides the socket path
+    outside SSH sessions, for tests, the same rule as KITBASH_ROOTS.

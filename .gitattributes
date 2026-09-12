@@ -1,0 +1,4 @@
+# The store fixtures are SQLite files. Git must never guess at them: a line
+# ending rewrite would corrupt a page and the upgrade test would fail on a
+# checkout rather than on a migration.
+*.db binary

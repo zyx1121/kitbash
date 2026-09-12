@@ -1,0 +1,173 @@
+name: Release
+
+# PLAN.md 4.8. A release is the commit "Release X.Y.Z" that sets pkgver in
+# packaging/apk/APKBUILD; when it reaches main and no tag vX.Y.Z exists yet,
+# this workflow builds the apk and the ISO on a clean Alpine, boots the ISO
+# once, and only then creates the tag and the GitHub release. A push to main
+# whose pkgver already has a tag ends at the first job. Nobody tags by hand.
+#
+# A push to a ci/** branch runs the same build without tagging or releasing,
+# which is how a change to this workflow is tested. (workflow_dispatch needs
+# the workflow on the default branch first, so it is no help for a new one.)
+
+on:
+  push:
+    branches: [main, "ci/**"]
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      build: ${{ steps.v.outputs.build }}
+      publish: ${{ steps.v.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Every version the repository names is pkgver
+        run: make check-version
+
+      - id: v
+        name: Is this pkgver released already
+        run: |
+          ver=$(sed -n 's/^pkgver=//p' packaging/apk/APKBUILD)
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          if git rev-parse -q --verify "refs/tags/v$ver" >/dev/null; then
+            echo "v$ver is already released"
+            echo "build=${{ github.event_name == 'workflow_dispatch' }}" >> "$GITHUB_OUTPUT"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "v$ver has no tag yet"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "publish=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: version
+    if: needs.version.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          check-latest: true
+
+      - name: Lint, test, and build the two binaries
+        run: |
+          make lint test build-linux
+          bin/kitbashd-linux-amd64 -version | grep -x "v$VERSION"
+
+      # An Alpine of the release's own version, as a chroot on this runner:
+      # the apk and the ISO are built by Alpine's tools, on Alpine.
+      - uses: jirutka/setup-alpine@v1
+        with:
+          branch: v3.23
+          packages: >
+            alpine-sdk alpine-conf go xorriso squashfs-tools grub grub-efi grub-bios
+            syslinux mtools dosfstools
+
+      - name: Let the runner user build packages
+        shell: alpine.sh --root {0}
+        run: |
+          addgroup runner abuild
+          mkdir -p /home/runner/.abuild
+          chown -R runner /home/runner
+
+      - name: Install the signing key
+        shell: alpine.sh {0}
+        env:
+          ABUILD_PRIVKEY: ${{ secrets.ABUILD_PRIVKEY }}
+        run: |
+          pub=$(ls packaging/apk/keys/*.rsa.pub)
+          key=$HOME/.abuild/$(basename "$pub" .pub)
+          umask 077
+          printf '%s\n' "$ABUILD_PRIVKEY" > "$key"
+          cp "$pub" "$key.pub"
+          echo "PACKAGER_PRIVKEY=\"$key\"" > "$HOME/.abuild/abuild.conf"
+          openssl rsa -in "$key" -pubout 2>/dev/null | diff - "$key.pub"
+
+      - name: Trust the signing key
+        shell: alpine.sh --root {0}
+        run: cp packaging/apk/keys/*.rsa.pub /etc/apk/keys/
+
+      - name: Build the apk
+        shell: alpine.sh {0}
+        run: |
+          git archive --format=tar.gz --prefix="kitbash-$VERSION/" -o "/tmp/kitbash-$VERSION.tar.gz" HEAD
+          sh packaging/apk/build.sh "/tmp/kitbash-$VERSION.tar.gz"
+          mkdir -p dist
+          cp ~/packages/*/*/kitbashd-"$VERSION"-r0.apk dist/
+          cp packaging/apk/keys/*.rsa.pub dist/
+          cp bin/kitbash-mcp-linux-amd64 bin/kitbashd-linux-amd64 dist/
+
+      - name: Build the ISO
+        shell: alpine.sh {0}
+        run: sh packaging/iso/build.sh "dist/kitbashd-$VERSION-r0.apk" dist
+
+      - name: Boot the ISO once
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q qemu-system-x86 >/dev/null
+          sh packaging/iso/smoke.sh "dist/kitbash-$VERSION-x86_64.iso"
+
+      - name: Checksums
+        run: |
+          cd dist && rm -f SHA256SUMS && sha256sum * > SHA256SUMS && cat SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kitbash-${{ env.VERSION }}
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: [version, build]
+    if: needs.version.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: kitbash-${{ env.VERSION }}
+          path: dist
+
+      - name: Tag and release
+        run: |
+          {
+            git log -1 --format=%b "$GITHUB_SHA" | sed '/^Co-authored-by:/d; /^Claude-Session:/d'
+            echo
+            echo '## Files'
+            echo
+            echo '| File | What it is |'
+            echo '|------|------------|'
+            echo "| \`kitbashd-$VERSION-r0.apk\` | The package: kitbashd, kitbash-mcp, the OpenRC service, install.sh |"
+            echo '| `*.rsa.pub` | The apk signing key, for `/etc/apk/keys` |'
+            echo "| \`kitbash-$VERSION-x86_64.iso\` | Alpine with the apk on it, boots to a kitbash host, unattended install with the answer file |"
+            echo '| `kitbashd-linux-amd64`, `kitbash-mcp-linux-amd64` | The two static binaries |'
+            echo '| `SHA256SUMS` | Checksums of everything above |'
+          } > notes.md
+          gh release create "v$VERSION" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "kitbash v$VERSION" \
+            --notes-file notes.md

@@ -1,0 +1,33 @@
+name: upgrade
+description: >-
+  The Package the upgrade half of the end to end job registers with the previous
+  release and carries across the swap. The same server as the echo fixture.
+tags: [e2e, fixture]
+
+# No permits block. This manifest is written by the release being upgraded
+# from, whose schema was published before permits existed, and a key that
+# release does not know is a manifest it refuses.
+
+provides:
+  tools:
+    - name: echo
+      description: >-
+        Answer with the text that was sent, so the Process that survives the
+        upgrade can be proved to still answer.
+      input:
+        type: object
+        additionalProperties: false
+        required: [text]
+        properties:
+          text: { type: string, maxLength: 4096 }
+      output:
+        type: object
+        required: [text]
+        properties:
+          text: { type: string }
+
+deploy:
+  units:
+    - type: container
+      build: .
+      expose: mcp

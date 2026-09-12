@@ -1,0 +1,632 @@
+# kitbash MCP surface
+#
+# Every tool kitbashd exposes over MCP stdio, grouped by family. Tool names are
+# <family>_<verb> because MCP tool names allow [A-Za-z0-9_-] only; the dot form
+# used in PLAN.md is the same tool spoken aloud.
+#
+# fs is implemented in M1, pkg and proc in M2, tel in M3, users and approvals in M5. All six families are declared
+# here so the surface is designed as one piece and later milestones fill in the
+# implementation without renaming anything.
+#
+# Besides the families below, every running Process with expose: mcp adds the
+# tools its manifest declares under <package>_<tool>, see $package_tools.
+#
+# Conventions that hold for every tool:
+# - Input and output are JSON Schema 2020-12.
+# - Paths are absolute, rooted at /org or /home/<caller>. The caller never sees
+#   another user's home. Access control is the kernel's: kitbash-mcp runs as the
+#   connecting Linux user.
+# - A folder is visible only if it carries kitbash.yaml with name and
+#   description, and so does every folder between it and its root. kitbash
+#   follows no symlinks and refuses every path component that begins with a dot;
+#   every open kitbash itself makes below a root resolves with openat2
+#   RESOLVE_NO_SYMLINKS and RESOLVE_BENEATH, so a link swapped in at any
+#   component during a call is refused by the kernel, not by a check that could
+#   race. git is the exception and is scoped rather than hidden: it is handed
+#   the repository as a descriptor on the folder that was resolved, but it asks
+#   the kernel for that directory as a path and works by the path afterwards, so
+#   a folder renamed underneath a running git can still redirect git's own
+#   resolution. git runs as the caller, so what that reaches is what the caller
+#   could reach with their own git; it is not a way to read or write anything
+#   the caller could not.
+# - Timestamps are RFC 3339. Identifiers are UUIDv7 unless they are git SHAs or
+#   OCI digests.
+# - Errors are returned as an MCP tool result with isError: true whose single
+#   text content is a JSON object in RFC 9457 Problem Details form, see $error.
+# - Every call emits one span into Telemetry with kitbash.user, kitbash.tool
+#   and where relevant kitbash.package, kitbash.process and kitbash.path. The
+#   span is opened by middleware before the handler runs, so no call is untraced.
+
+version: 1
+mcp_protocol: "2025-06-18"
+
+$error:
+  description: RFC 9457 Problem Details, plus a fix extension.
+  schema:
+    type: object
+    required: [type, title, status, detail]
+    properties:
+      type: { type: string, format: uri, description: "Stable URI for the error class, https://kitbash.zyx.tw/errors/<slug>" }
+      title: { type: string }
+      status: { type: integer, description: "HTTP status semantics: 400 bad input, 403 not permitted, 404 not found, 409 conflict, 413 too large, 415 media type not renderable, 422 manifest invalid, 500 internal" }
+      detail: { type: string, description: "What went wrong, specific to this call" }
+      instance: { type: string, description: "Path or identifier the error is about" }
+      fix: { type: string, description: "What the caller should do next" }
+  types:
+    - https://kitbash.zyx.tw/errors/not-found
+    - https://kitbash.zyx.tw/errors/not-visible        # folder exists but has no manifest
+    - https://kitbash.zyx.tw/errors/not-permitted
+    - https://kitbash.zyx.tw/errors/bad-request        # malformed input, such as content that is not base64
+    - https://kitbash.zyx.tw/errors/invalid-path       # outside /org and /home/<caller>, contains .., names a symlink, or names a dot component
+    - https://kitbash.zyx.tw/errors/invalid-manifest   # kitbash.yaml fails spec/manifest.schema.json
+    - https://kitbash.zyx.tw/errors/unsupported-media-type  # fs_read cannot render this media type
+    - https://kitbash.zyx.tw/errors/too-large
+    - https://kitbash.zyx.tw/errors/conflict           # write raced another commit
+    - https://kitbash.zyx.tw/errors/queued             # status 202: the call waits in the approval queue; instance is the approval id
+    - https://kitbash.zyx.tw/errors/internal
+
+$package_tools:
+  description: >
+    A Process with expose: mcp puts every tool its manifest declares on the
+    owner's surface as <package>_<tool>, with the manifest's input and output
+    schemas. Input is validated against the manifest before the call is
+    forwarded to the container over podman exec. A tool the server offers but
+    the manifest does not declare is not published. Package names equal to a
+    family name (fs, pkg, proc, tel, users, approvals) are refused at proc_run.
+    Tool names keep the server's spelling (MCP allows [A-Za-z0-9_-]); package names carry no underscore, so the first underscore in a surface name is the split.
+    The set is read from the caller's running Processes when a session starts
+    and kept current within the session; other sessions see changes when they
+    reconnect.
+  permits: >
+    A Package's manifest may declare provides.permits, the tool name globs and
+    absolute path prefixes a Process of that Package may call over /mcp. The
+    reserved word packages in permits.tools is exactly the tools described
+    here, every <package>_<tool> the caller's running Processes publish, and
+    never a built in family tool; a glob matches literal names, built ins
+    included.
+    pkg_inspect returns the manifest as it is written, so the block is visible
+    there; proc_run registers it with the Process, and kitbashd narrows that
+    Process's own MCP sessions to it, see mcp_for_processes.permits in
+    spec/kitbashd-api.yaml and PLAN.md section 2.3. A session a member opens
+    over SSH is narrowed by nothing, so every tool below is described as that
+    member reads it.
+  errors: [bad-request, not-found, internal, and any problem the Package itself returns]
+  package_errors: >
+    When a Package tool answers isError with a single text block that parses
+    as problem details of a kitbash type, the surface returns that problem
+    unchanged, so a kit's own not-found or too-large reaches the agent as is.
+    Any other error text is wrapped as bad-request with the text as detail.
+  import_hook:
+    description: >
+      The contract an import kit implements. The kit's manifest declares
+      provides.kit: [import] and a tool named import whose input has a source
+      string constrained by pattern to the syntax the kit understands.
+      pkg_import picks the running kit whose import input schema accepts the
+      source and writes the files it returns into the target folder as one
+      commit.
+    input:
+      type: object
+      required: [source]
+      properties:
+        source: { type: string, description: "Constrained by pattern, for example ^npm:" }
+    output:
+      type: object
+      required: [files]
+      properties:
+        files: { type: array, minItems: 1, items: { $ref: "#/$defs/importFile" } }
+
+$defs:
+  folderEntry:
+    type: object
+    required: [path, name, description]
+    properties:
+      path: { type: string }
+      name: { type: string }
+      description: { type: string }
+      tags: { type: array, items: { type: string } }
+      package: { type: boolean, description: "true when the manifest carries a deploy block" }
+  fileEntry:
+    type: object
+    required: [path, name, size, mediaType]
+    properties:
+      path: { type: string }
+      name: { type: string }
+      size: { type: integer }
+      mediaType: { type: string, description: "IANA media type guessed from extension and sniffing" }
+      modified: { type: string, format: date-time }
+  importFile:
+    description: One file an import kit hands back. Exactly one of content and contentBase64 is set.
+    type: object
+    required: [path]
+    properties:
+      path: { type: string, description: "Relative to the target folder, no leading slash, no dot component" }
+      content: { type: string, description: "UTF-8 text" }
+      contentBase64: { type: string, contentEncoding: base64 }
+  telAttributes:
+    description: The four attributes plus tool, eval and internal, in short form. Absent when the record did not carry them.
+    type: object
+    properties:
+      user: { type: string }
+      package: { type: string }
+      process: { type: string }
+      path: { type: string }
+      tool: { type: string }
+      eval: { type: boolean }
+      producer: { type: string, description: "Member name or Process id that wrote the record" }
+      caller: { type: string, description: "Process id whose MCP session recorded this span, when a Process acted for its owner" }
+      internal: { type: boolean, description: "true when the record is the cause of an internal problem; admins alone are answered these" }
+      subject: { type: object, description: "For evaluation records: traceId and spanId of the judged span", properties: { traceId: { type: string }, spanId: { type: string } } }
+  spanRecord:
+    type: object
+    required: [traceId, spanId, name, start, end, status, attributes]
+    properties:
+      traceId: { type: string, pattern: "^[a-f0-9]{32}$" }
+      spanId: { type: string, pattern: "^[a-f0-9]{16}$" }
+      parentSpanId: { type: string, pattern: "^[a-f0-9]{16}$" }
+      name: { type: string, description: "Tool name for surface spans, build or run for children" }
+      start: { type: string, format: date-time }
+      end: { type: string, format: date-time }
+      durationMs: { type: number }
+      status: { type: string, enum: [ok, error, unset] }
+      statusMessage: { type: string }
+      attributes: { $ref: "#/$defs/telAttributes" }
+      other: { type: object, description: "Remaining span attributes by their wire name" }
+  logRecord:
+    type: object
+    required: [time, severity, body, attributes]
+    properties:
+      time: { type: string, format: date-time }
+      severity: { type: string }
+      body: { type: string }
+      traceId: { type: string }
+      spanId: { type: string }
+      attributes: { $ref: "#/$defs/telAttributes" }
+      other: { type: object }
+  metricRecord:
+    type: object
+    required: [time, name, value, attributes]
+    properties:
+      time: { type: string, format: date-time }
+      name: { type: string }
+      value: { type: number }
+      unit: { type: string }
+      attributes: { $ref: "#/$defs/telAttributes" }
+      other: { type: object }
+  commit:
+    type: object
+    required: [sha, author, time, message]
+    properties:
+      sha: { type: string, pattern: "^[a-f0-9]{40}$" }
+      author: { type: string, description: "Linux user name" }
+      time: { type: string, format: date-time }
+      message: { type: string }
+
+families:
+
+  # ---------------------------------------------------------------- fs (M1)
+  fs:
+    description: Files. Every top level folder under /org and /home/<caller> is a git repository.
+    implemented_in: M1
+    tools:
+
+      fs_list:
+        description: >
+          List what is visible at a path. With no path, returns the visible top
+          level folders across /org and the caller's home. A root path itself is
+          the same roots view: /org and /home/<caller> carry no manifest and are
+          always listable, returning their visible children. Inside any other
+          folder, returns visible subfolders (name and description only, no
+          contents) and the files directly in it. Folders without a manifest are
+          omitted.
+        input:
+          type: object
+          additionalProperties: false
+          properties:
+            path: { type: string, description: "Absolute folder path. Omit for the roots." }
+        output:
+          type: object
+          required: [path, folders, files]
+          properties:
+            path: { type: string }
+            manifest: { description: "This folder's parsed kitbash.yaml, absent at the roots", type: object }
+            folders: { type: array, items: { $ref: "#/$defs/folderEntry" } }
+            files: { type: array, items: { $ref: "#/$defs/fileEntry" } }
+        errors: [not-found, not-visible, not-permitted, invalid-path, internal]
+
+      fs_read:
+        description: >
+          Read one file. Text media types return text content. image/png and
+          image/jpeg return MCP image content. application/pdf returns extracted
+          text in M1. Files larger than 1 MiB return too-large; use offset and
+          limit for text.
+        input:
+          type: object
+          additionalProperties: false
+          required: [path]
+          properties:
+            path: { type: string }
+            offset: { type: integer, minimum: 0, description: "Byte offset for text files" }
+            limit: { type: integer, minimum: 1, maximum: 1048576, description: "Max bytes for text files" }
+        output:
+          description: >
+            Content blocks only. fs_read declares no outputSchema and returns no
+            structuredContent, because clients prefer structuredContent when it
+            is present and would then show the caller the metadata instead of
+            the file body. The first block is the file: text media types as a
+            text block, image/png and image/jpeg as an image block. The trailing
+            block is a text block holding this metadata object as JSON.
+          type: object
+          required: [path, mediaType, size]
+          properties:
+            path: { type: string }
+            mediaType: { type: string }
+            size: { type: integer }
+            sha: { type: string, description: "Commit that last touched this file" }
+            truncated: { type: boolean }
+        errors: [not-found, not-visible, not-permitted, invalid-path, unsupported-media-type, too-large, internal]
+
+      fs_write:
+        description: >
+          Create or replace one file and commit it to the enclosing top level
+          repository, attributed to the caller. Writing kitbash.yaml into a new
+          folder is how a folder becomes visible; the manifest is validated
+          against spec/manifest.schema.json before commit. Binary content is
+          base64. Pass expectedSha to refuse the write if the file changed since
+          it was read.
+          A member writing under /org does not fail: the call is queued for
+          an admin and the result is a queued problem (202) whose instance is
+          the approval id; approvals_list shows the outcome once an admin decides.
+        input:
+          type: object
+          additionalProperties: false
+          required: [path, message]
+          oneOf:
+            - required: [content]
+            - required: [contentBase64]
+          properties:
+            path: { type: string }
+            content: { type: string, description: "UTF-8 text" }
+            contentBase64: { type: string, contentEncoding: base64 }
+            message: { type: string, minLength: 3, maxLength: 200, description: "Commit message, imperative mood" }
+            expectedSha: { type: string, description: "Last known commit sha for this file; optimistic lock" }
+        output:
+          type: object
+          required: [path, commit]
+          properties:
+            path: { type: string }
+            commit: { $ref: "#/$defs/commit" }
+        errors: [bad-request, not-permitted, invalid-path, invalid-manifest, too-large, conflict, queued, internal]
+
+      fs_history:
+        description: List commits that touched a path, newest first.
+        input:
+          type: object
+          additionalProperties: false
+          required: [path]
+          properties:
+            path: { type: string }
+            limit: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        output:
+          type: object
+          required: [path, commits]
+          properties:
+            path: { type: string }
+            commits: { type: array, items: { $ref: "#/$defs/commit" } }
+        errors: [not-found, not-visible, not-permitted, invalid-path, internal]
+
+  # ---------------------------------------------------------------- pkg (M2)
+  pkg:
+    description: Packages. A folder with a deploy block, built to or imported as an OCI image.
+    implemented_in: M2
+    tools:
+      pkg_build:
+        description: >
+          Build the Package at path from its current commit with the caller's
+          rootless container runtime. The digest is the OCI image ID. The image
+          is labelled kitbash.path, kitbash.name, kitbash.commit and
+          kitbash.user, which is the whole build record. Only the tail of the
+          build log is returned; the full log never leaves the host. A build
+          that runs and fails is bad-request carrying that same tail, because
+          the build context is the caller's to fix; a runtime that will not run
+          at all is internal. An uncommitted change under the path is conflict:
+          kitbash builds from a commit. Version 1 supports one container unit
+          per Package. A unit with build is built from its context; a unit
+          with image is pulled by digest and relabelled through a one line
+          Containerfile so the result carries the same labels and its own
+          image ID.
+
+          For a Package under /org the builds kitbashd recorded for this commit
+          are read first, so one commit is one digest for every member: an
+          image of that commit already in the caller's store is returned as it
+          is with the log line "already built at <digest>", one another member
+          has is copied into the caller's store with the log line "copied from
+          <builder>", and only a commit nobody has built is built. When several
+          digests are recorded for one commit the earliest record wins, so
+          every member picks the same one. An image is accepted, held or
+          copied, only when its own kitbash.path and kitbash.commit labels are
+          this Package at this commit: a record is a claim another member
+          wrote, and the labels are what the build stamped inside the image.
+          Anything else, an image whose labels do not match included, falls
+          back to building. A build that did run is recorded, and a record
+          kitbashd refuses costs nothing but the record. Packages in a home are
+          neither recorded nor copied. See PLAN.md section 2.2.
+        input: { type: object, additionalProperties: false, required: [path], properties: { path: { type: string } } }
+        output:
+          type: object
+          required: [path, digest, commit]
+          properties:
+            path: { type: string }
+            digest: { type: string, pattern: "^sha256:[a-f0-9]{64}$" }
+            commit: { type: string, pattern: "^[a-f0-9]{40}$" }
+            log: { type: string, description: "Tail of the build log" }
+        errors: [bad-request, not-found, not-visible, not-permitted, invalid-path, invalid-manifest, conflict, internal]
+      pkg_import:
+        description: >
+          Wrap something external as a Package folder at path using a running
+          import kit, see $package_tools.import_hook. Writes the folder as one
+          commit, does not build. The target folder must not exist yet. Returns
+          not-found when no running kit accepts the source and conflict when
+          more than one does.
+        input:
+          type: object
+          additionalProperties: false
+          required: [path, source]
+          properties:
+            path: { type: string, description: "New folder to create" }
+            source: { type: string, description: "npm:<pkg>@<ver> today; oci://<ref>@sha256:... and pypi:<pkg>==<ver> once their kits exist" }
+        output: { type: object, required: [path, commit], properties: { path: { type: string }, commit: { $ref: "#/$defs/commit" } } }
+        errors: [bad-request, not-found, not-permitted, invalid-path, invalid-manifest, conflict, too-large, queued, internal]
+      pkg_list:
+        description: >
+          Packages visible to the caller with their latest built digest, if
+          any. Walks the visible folders under /org and the caller's home and
+          keeps those whose manifest carries a deploy block.
+        input: { type: object, additionalProperties: false, properties: {} }
+        output:
+          type: object
+          required: [packages]
+          properties:
+            packages:
+              type: array
+              items:
+                type: object
+                required: [path, name]
+                properties:
+                  path: { type: string }
+                  name: { type: string }
+                  digest: { type: string }
+                  builtAt: { type: string, format: date-time }
+                  running: { type: integer, description: "Number of Processes of this Package" }
+      pkg_inspect:
+        description: >
+          Manifest, build history and provenance of one Package. Builds are
+          newest first. For a Package under /org the local image store is
+          merged with the builds kitbashd recorded, so a build carries the
+          member who made it and a build another member has is listed even
+          though this member's store does not hold it, see PLAN.md section 2.2.
+        input: { type: object, additionalProperties: false, required: [path], properties: { path: { type: string } } }
+        output:
+          type: object
+          required: [path, manifest, builds]
+          properties:
+            path: { type: string }
+            manifest: { type: object }
+            builds:
+              type: array
+              items: { type: object, required: [digest, commit, builtAt], properties: { digest: { type: string }, commit: { type: string }, builtAt: { type: string, format: date-time }, builder: { type: string, description: "The member who built it, for a Package under /org" } } }
+        errors: [not-found, not-visible, not-permitted, invalid-path, invalid-manifest, internal]
+
+  # ---------------------------------------------------------------- proc (M2)
+  proc:
+    description: Processes. A Package running as a rootless container under the caller.
+    implemented_in: M2
+    tools:
+      proc_run:
+        description: >
+          Start a Process from a Package digest, or converge an existing one
+          with the same name to that digest. Idempotent: same name and digest
+          returns the running Process, a different digest replaces it. The
+          container is named kitbash-<package>-<name> and labelled kitbash.id,
+          kitbash.user, kitbash.package, kitbash.name and kitbash.digest. With
+          expose: mcp the manifest's tools join the caller's surface, see
+          $package_tools. A Process is identified by its Package path, not by
+          its container name: a name already held by a Process of another
+          Package is a conflict, and so is a tool name another running Process
+          already answers, which leaves the Process running with its tools off
+          the surface. Version 1 runs the first container unit. Before the
+          container starts the Process is registered with kitbashd, which
+          mints its Telemetry token; the container receives
+          KITBASH_TELEMETRY_ENDPOINT, KITBASH_TELEMETRY_TOKEN, KITBASH_PROCESS,
+          KITBASH_PACKAGE, KITBASH_USER and KITBASH_MCP_ENDPOINT, see
+          spec/kitbashd-api.yaml; through the last one a Process reaches this
+          same surface as its owner. A
+          Process whose manifest declares subscriptions: [telemetry] with
+          expose: http and a port is registered as a fan out subscriber.
+        input:
+          type: object
+          additionalProperties: false
+          required: [package]
+          properties:
+            package: { type: string, description: "Package path" }
+            digest: { type: string, pattern: "^sha256:[a-f0-9]{64}$", description: "Defaults to the latest build" }
+            name: { type: string, pattern: "^[a-z0-9]+(-[a-z0-9]+)*$", maxLength: 64, description: "Defaults to the package name" }
+        output:
+          type: object
+          required: [id, name, package, digest, state]
+          properties:
+            id: { type: string, description: "UUIDv7" }
+            name: { type: string }
+            package: { type: string }
+            digest: { type: string }
+            state: { type: string, enum: [starting, running, unhealthy, stopped, failed] }
+            expose: { type: string, enum: [mcp, http, none] }
+            endpoint: { type: string, description: "Internal URL when expose is http" }
+            tools: { type: array, items: { type: string }, description: "Surface tool names added when expose is mcp" }
+        errors: [not-found, not-visible, not-permitted, invalid-path, invalid-manifest, conflict, internal]
+      proc_list:
+        description: Processes owned by the caller, running or stopped. Admins see all from M5.
+        input: { type: object, additionalProperties: false, properties: {} }
+        output:
+          type: object
+          required: [processes]
+          properties:
+            processes:
+              type: array
+              items:
+                type: object
+                required: [id, name, package, digest, state]
+                properties:
+                  id: { type: string }
+                  name: { type: string }
+                  package: { type: string }
+                  digest: { type: string }
+                  state: { type: string, enum: [starting, running, unhealthy, stopped, failed] }
+                  expose: { type: string, enum: [mcp, http, none] }
+                  startedAt: { type: string, format: date-time }
+      proc_stop:
+        description: Stop a Process. It stays known and can be run again with proc_run. Its tools leave the surface.
+        input: { type: object, additionalProperties: false, required: [id], properties: { id: { type: string } } }
+        output: { type: object, required: [id, state], properties: { id: { type: string }, state: { type: string } } }
+        errors: [not-found, not-permitted, internal]
+      proc_logs:
+        description: Recent stdout and stderr of a Process. Structured logs are in Telemetry; this is the raw stream.
+        input: { type: object, additionalProperties: false, required: [id], properties: { id: { type: string }, lines: { type: integer, minimum: 1, default: 200, maximum: 5000 } } }
+        output: { type: object, required: [id, lines], properties: { id: { type: string }, lines: { type: array, items: { type: string } } } }
+        errors: [not-found, not-permitted, internal]
+
+  # ---------------------------------------------------------------- tel (M3)
+  tel:
+    description: >
+      Telemetry. OTLP in, queryable out. Every record carries user, package,
+      process and, where relevant, path. kitbash-mcp forwards both tools to
+      kitbashd over its unix socket, see spec/kitbashd-api.yaml; the caller's
+      identity is the socket's peer credentials.
+    implemented_in: M3
+    tools:
+      tel_query:
+        description: >
+          Query spans, logs or metrics by attributes and time range, newest
+          first. A member sees only their own records: user defaults to the
+          caller and naming another member is not-permitted. An admin may name
+          any member or omit user for the whole machine. since defaults to 24
+          hours ago, until to now. Metrics are accepted by the store but no
+          producer emits them before M4, so that signal returns an empty page.
+        input:
+          type: object
+          additionalProperties: false
+          required: [signal]
+          properties:
+            signal: { type: string, enum: [traces, metrics, logs] }
+            user: { type: string, description: "Linux user name; admins only when it is not the caller" }
+            package: { type: string, description: "Package path, as kitbash.package" }
+            process: { type: string, description: "Process id, as kitbash.process" }
+            path: { type: string, description: "Files path, as kitbash.path; prefix match" }
+            tool: { type: string, description: "Surface tool name, as kitbash.tool" }
+            eval: { type: boolean, description: "Only evaluation results written back by kits" }
+            producer: { type: string, description: "Member name or Process id that wrote the record" }
+            caller: { type: string, description: "Process id whose MCP session recorded the span, as kitbash.caller" }
+            internal: { type: boolean, description: "Only the causes of internal problems, which admins alone read; a member's query never returns them" }
+            since: { type: string, format: date-time }
+            until: { type: string, format: date-time }
+            limit: { type: integer, minimum: 1, default: 100, maximum: 1000 }
+        output:
+          type: object
+          required: [signal, records, truncated]
+          properties:
+            signal: { type: string }
+            truncated: { type: boolean, description: "true when more records matched than limit" }
+            records:
+              type: array
+              items:
+                oneOf:
+                  - $ref: "#/$defs/spanRecord"
+                  - $ref: "#/$defs/logRecord"
+                  - $ref: "#/$defs/metricRecord"
+        errors: [bad-request, not-permitted, internal]
+      tel_retention:
+        description: >
+          Read the retention window per signal, as a duration such as 720h or
+          30d. With set, an admin changes one or more windows; kitbashd deletes
+          older records on its next sweep. Defaults are traces 30d, logs 14d,
+          metrics 30d.
+        input:
+          type: object
+          additionalProperties: false
+          properties:
+            set:
+              type: object
+              additionalProperties: false
+              properties:
+                traces: { type: string, pattern: "^[0-9]+(h|d)$" }
+                metrics: { type: string, pattern: "^[0-9]+(h|d)$" }
+                logs: { type: string, pattern: "^[0-9]+(h|d)$" }
+        output: { type: object, required: [traces, metrics, logs], properties: { traces: { type: string }, metrics: { type: string }, logs: { type: string } } }
+        errors: [bad-request, not-permitted, internal]
+
+  # ---------------------------------------------------------------- users (M5)
+  users:
+    description: Organization members. Linux users with SSH keys. Admin only except users_me. Served by kitbashd over its socket, see spec/kitbashd-api.yaml.
+    implemented_in: M5
+    tools:
+      users_me:
+        description: Who am I and what groups am I in. Answered by kitbashd from the socket's peer credentials.
+        input: { type: object, additionalProperties: false, properties: {} }
+        output: { type: object, required: [user, uid, admin], properties: { user: { type: string }, uid: { type: integer }, admin: { type: boolean }, groups: { type: array, items: { type: string } } } }
+      users_create:
+        description: >
+          Create a member with an SSH public key, a private home and a
+          subordinate id range, through kitbashd. Admin only. The member can
+          connect immediately; their home is a root for Files and starts
+          empty.
+        input: { type: object, additionalProperties: false, required: [name, sshKey], properties: { name: { type: string, pattern: "^[a-z][a-z0-9-]{1,31}$" }, sshKey: { type: string, maxLength: 4096, description: "One OpenSSH public key line" }, admin: { type: boolean, default: false } } }
+        output: { type: object, required: [user, uid, admin], properties: { user: { type: string }, uid: { type: integer }, admin: { type: boolean } } }
+        errors: [bad-request, not-permitted, conflict, internal]
+      users_list:
+        description: All members with uid, admin flag, key count and running Process count. Admin only.
+        input: { type: object, additionalProperties: false, properties: {} }
+        output: { type: object, required: [users], properties: { users: { type: array, items: { type: object, required: [user, uid, admin], properties: { user: { type: string }, uid: { type: integer }, admin: { type: boolean }, keys: { type: integer }, processes: { type: integer } } } } } }
+        errors: [not-permitted, internal]
+      users_add_key:
+        description: Add an SSH public key to a member. Admin only. A key already present is not added twice.
+        input: { type: object, additionalProperties: false, required: [name, sshKey], properties: { name: { type: string, pattern: "^[a-z][a-z0-9-]{1,31}$" }, sshKey: { type: string, maxLength: 4096 } } }
+        output: { type: object, required: [user, keys], properties: { user: { type: string }, keys: { type: integer } } }
+        errors: [bad-request, not-permitted, not-found, internal]
+      users_remove:
+        description: >
+          Remove a member. Admin only. Their Processes stop and are
+          unregistered, their sessions end, their home is archived under
+          /org/.archive/<name> where the surface cannot see it, and the
+          account is deleted. An admin cannot remove themselves or the last
+          admin.
+        input: { type: object, additionalProperties: false, required: [name], properties: { name: { type: string, pattern: "^[a-z][a-z0-9-]{1,31}$" } } }
+        output: { type: object, required: [user, archived], properties: { user: { type: string }, archived: { type: string } } }
+        errors: [not-permitted, not-found, conflict, internal]
+
+  # ---------------------------------------------------------------- approvals (M5)
+  approvals:
+    description: >
+      The replacement for sudo. Operations outside the caller's own space, such
+      as writes to /org by a regular user, are queued here instead of failing.
+      An admin approves or rejects through the same surface.
+    implemented_in: M5
+    tools:
+      approvals_list:
+        description: Approvals by state. Members see their own, admins see all. An executed approval carries the tool's result, a normal output or a problem.
+        input: { type: object, additionalProperties: false, properties: { state: { type: string, enum: [pending, approved, rejected], default: pending } } }
+        output: { type: object, required: [approvals], properties: { approvals: { type: array, items: { type: object, required: [id, requester, tool, input, state, requestedAt], properties: { id: { type: string }, requester: { type: string }, tool: { type: string, enum: [fs_write, pkg_import] }, input: { type: object }, state: { type: string, enum: [pending, approved, rejected] }, requestedAt: { type: string, format: date-time }, decidedAt: { type: string, format: date-time }, decidedBy: { type: string }, note: { type: string }, reason: { type: string }, result: { type: object } } } } } }
+        errors: [not-permitted, internal]
+      approvals_approve:
+        description: >
+          Approve and execute a queued operation. Admin only. The tool runs in
+          the admin's session as the admin's Linux user; a commit is authored
+          by the requester with an Approved-by trailer naming the admin. The
+          result, a normal output or a problem, is returned here and stored on
+          the approval for the requester.
+        input: { type: object, additionalProperties: false, required: [id], properties: { id: { type: string }, note: { type: string, maxLength: 500 } } }
+        output: { type: object, required: [id, state, result], properties: { id: { type: string }, state: { type: string, enum: [approved] }, result: { type: object } } }
+        errors: [not-permitted, not-found, conflict, internal]
+      approvals_reject:
+        description: Reject a queued operation with a reason the requester will see. Admin only.
+        input: { type: object, additionalProperties: false, required: [id, reason], properties: { id: { type: string }, reason: { type: string, minLength: 3, maxLength: 500 } } }
+        output: { type: object, required: [id, state], properties: { id: { type: string }, state: { type: string, enum: [rejected] } } }
+        errors: [not-permitted, not-found, conflict, internal]

@@ -1,0 +1,208 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kitbash.zyx.tw/spec/manifest.schema.json",
+  "title": "kitbash.yaml",
+  "description": "The one manifest. A folder with name and description is visible knowledge. A folder that also carries deploy is a Package.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name", "description"],
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Lowercase kebab-case identifier, unique within its parent folder. Doubles as the tool namespace when the Package is exposed over MCP.",
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+      "maxLength": 64
+    },
+    "description": {
+      "type": "string",
+      "description": "One or two sentences an agent reads to decide whether to enter this folder or use this Package. Say what it is and when to use it.",
+      "minLength": 10,
+      "maxLength": 280
+    },
+    "tags": {
+      "type": "array",
+      "description": "Free text labels for humans to search by. Platform logic never reads tags.",
+      "items": { "type": "string", "maxLength": 32 },
+      "maxItems": 16,
+      "uniqueItems": true
+    },
+    "provides": {
+      "type": "object",
+      "description": "What this folder offers. Every block is optional. A Package with no provides block is a batch job or a subscriber.",
+      "additionalProperties": false,
+      "properties": {
+        "tools": {
+          "type": "array",
+          "description": "Tools this Package exposes. Composition binds on their schemas, never on names or tags.",
+          "items": { "$ref": "#/$defs/tool" }
+        },
+        "prompt": {
+          "type": "string",
+          "description": "Relative path to a file an agent should read before using the tools. Markdown by convention.",
+          "pattern": "^[^/].*$"
+        },
+        "subscriptions": {
+          "type": "array",
+          "description": "Streams this Package wants delivered. Only telemetry exists today.",
+          "items": { "type": "string", "enum": ["telemetry"] },
+          "uniqueItems": true
+        },
+        "kit": {
+          "type": "array",
+          "description": "Lifecycle hooks this Package implements. Presence makes it a kit.",
+          "items": { "type": "string", "enum": ["import", "build", "run", "observe", "evaluate"] },
+          "uniqueItems": true
+        },
+        "permits": {
+          "$ref": "#/$defs/permits"
+        }
+      }
+    },
+    "deploy": {
+      "type": "object",
+      "description": "How this folder runs. Presence makes the folder a Package.",
+      "additionalProperties": false,
+      "required": ["units"],
+      "properties": {
+        "units": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/unit" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "permits": {
+      "type": "object",
+      "description": "What a Process of this Package may call over /mcp. A Process with no permits block gets an empty surface: the block is the declaration, not a filter on top of one. It narrows nothing for a member's own SSH session.",
+      "additionalProperties": false,
+      "properties": {
+        "tools": {
+          "type": "array",
+          "description": "Surface tool names this Package may call, as globs, plus the reserved word packages. A * matches any run of characters within a name, so fs_* is the fs family; a glob matches whatever it matches, built in tools included, because writing one is declaring them. The word packages stands for every tool the owner's running Processes publish and for no built in, which is what a kit that composes other kits needs. A tool that matches nothing here is not published to the Process and calling it is not-permitted.",
+          "items": { "type": "string", "pattern": "^(packages|[A-Za-z0-9_*-]+)$", "maxLength": 63 },
+          "maxItems": 64,
+          "uniqueItems": true
+        },
+        "paths": {
+          "type": "array",
+          "description": "Absolute Files path prefixes this Package may name. A prefix covers the path itself and everything below it, and a * stands for exactly one whole component, so /home/*/flows is that folder in every member's home. A Process with tools but no paths may call nothing that takes a path.",
+          "items": { "type": "string", "pattern": "^(/(\\*|[A-Za-z0-9._-]+))+$", "maxLength": 4096 },
+          "maxItems": 32,
+          "uniqueItems": true
+        }
+      }
+    },
+    "tool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "description", "input", "output"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Tool name within the Package namespace, exactly as the server names it. MCP allows letters, digits, underscore and hyphen. Exposed to agents as <package>_<name>; package names carry no underscore, so the first underscore is the split.",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]*$",
+          "maxLength": 63
+        },
+        "description": { "type": "string", "minLength": 10, "maxLength": 280 },
+        "input": { "$ref": "#/$defs/schemaRef" },
+        "output": { "$ref": "#/$defs/schemaRef" }
+      }
+    },
+    "schemaRef": {
+      "description": "Either an inline JSON Schema 2020-12 object or a $ref to a schema file inside this folder.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["$ref"],
+          "additionalProperties": false,
+          "properties": { "$ref": { "type": "string", "pattern": "^[^/].*\\.json$" } }
+        },
+        {
+          "type": "object",
+          "required": ["type"],
+          "not": { "required": ["$ref"] }
+        }
+      ]
+    },
+    "unit": {
+      "oneOf": [
+        { "$ref": "#/$defs/containerUnit" },
+        { "$ref": "#/$defs/filesUnit" }
+      ]
+    },
+    "containerUnit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "properties": {
+        "type": { "const": "container" },
+        "build": {
+          "type": "string",
+          "description": "Relative path to a build context inside this folder. Mutually exclusive with image.",
+          "pattern": "^(\\.|[^/].*)$"
+        },
+        "image": {
+          "type": "string",
+          "description": "An existing OCI image reference pinned by digest. Mutually exclusive with build.",
+          "pattern": "^[^@\\s]+@sha256:[a-f0-9]{64}$"
+        },
+        "expose": {
+          "type": "string",
+          "description": "mcp: tools appear on the caller's MCP surface. http: an internal port, optionally a hostname. none: no ingress.",
+          "enum": ["mcp", "http", "none"],
+          "default": "none"
+        },
+        "port": {
+          "type": "integer",
+          "description": "Container port to expose when expose is http or mcp.",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "env": {
+          "type": "object",
+          "description": "Plain environment variables. Secrets are referenced as ${secret:NAME} and resolved at start.",
+          "additionalProperties": { "type": "string" }
+        },
+        "health": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "exec": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+            "http": { "type": "string", "description": "Path probed on port." },
+            "interval": { "type": "string", "pattern": "^[0-9]+(ms|s|m)$", "default": "30s" }
+          }
+        },
+        "limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "cpu": { "type": "string", "pattern": "^[0-9]+(\\.[0-9]+)?$" },
+            "memory": { "type": "string", "pattern": "^[0-9]+(Ki|Mi|Gi)$" }
+          }
+        },
+        "restart": {
+          "type": "string",
+          "enum": ["always", "on-failure", "never"],
+          "default": "always"
+        }
+      },
+      "oneOf": [
+        { "required": ["build"], "not": { "required": ["image"] } },
+        { "required": ["image"], "not": { "required": ["build"] } }
+      ]
+    },
+    "filesUnit": {
+      "type": "object",
+      "description": "Files placed somewhere at deploy time. Reserved; not implemented in version 1.",
+      "additionalProperties": false,
+      "required": ["type", "source", "target"],
+      "properties": {
+        "type": { "const": "files" },
+        "source": { "type": "string", "pattern": "^[^/].*$" },
+        "target": { "type": "string" }
+      }
+    }
+  }
+}

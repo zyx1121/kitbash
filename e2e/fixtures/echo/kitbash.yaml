@@ -1,0 +1,41 @@
+name: echo
+description: >-
+  The end to end fixture Package. One tool, echo, which answers with the text it
+  was given, so a tool call can be proved from an agent to a container and back.
+tags: [e2e, fixture]
+
+provides:
+  # What a Process of this Package may call over /mcp. Without this block the
+  # Process reaches nothing, see mcp_for_processes.permits in
+  # spec/kitbashd-api.yaml. echo_echo is this Package's own tool, which is how
+  # the second client proves a Package tool answers through the receiver;
+  # fs_list is a built in, narrowed to the homes by paths.
+  permits:
+    tools: [echo_echo, fs_list]
+    paths: [/home/*]
+  tools:
+    - name: echo
+      description: >-
+        Answer with the text that was sent. The end to end job calls it over
+        stdio as a member and over /mcp as the Process itself.
+      input:
+        type: object
+        additionalProperties: false
+        required: [text]
+        properties:
+          text: { type: string, maxLength: 4096 }
+      output:
+        type: object
+        required: [text]
+        properties:
+          text: { type: string }
+
+deploy:
+  units:
+    - type: container
+      build: .
+      expose: mcp
+      # A ceiling kitbashd writes into this Process's cgroup, which the job
+      # reads back: a limit that is only recorded is the thing delegation
+      # exists to fix. A Node process answering one tool needs far less.
+      limits: { memory: 256Mi }

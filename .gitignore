@@ -1,0 +1,10 @@
+bin/
+node_modules/
+bun.lock
+.claude/
+oc.stdout
+oc.stderr
+e2e/artifacts/
+package-lock.json
+!e2e/client/package-lock.json
+dist/

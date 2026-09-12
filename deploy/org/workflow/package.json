@@ -1,0 +1,12 @@
+{
+  "name": "workflow",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "kitbash workflow engine kit: runs graphs stored in Files by calling tools on the owner's MCP surface.",
+  "main": "index.js",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "yaml": "2.9.0"
+  }
+}

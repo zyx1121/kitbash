@@ -1,0 +1,56 @@
+name: import-mcp
+description: >-
+  Wraps an npm MCP server as a Package. Use it through pkg_import with source
+  npm:<pkg>@<version>: it installs the package, lists its tools over MCP, and
+  returns a manifest, a Dockerfile and one schema file per tool.
+tags: [kit, import, npm]
+
+provides:
+  kit: [import]
+  tools:
+    - name: import
+      description: >-
+        Wrap the npm MCP server named by source as a Package folder. Returns the
+        files pkg_import writes: kitbash.yaml, a Dockerfile and the input and
+        output schema of every tool the server declares.
+      input:
+        type: object
+        additionalProperties: false
+        required: [source]
+        properties:
+          source:
+            type: string
+            pattern: "^npm:(@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*@(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?(\\+[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$"
+            description: >-
+              The npm MCP server to wrap, as npm:<pkg>@<version>. The version is
+              one exact SemVer release: a range such as 1.x, a partial version
+              such as 1, and a dist-tag such as latest are all refused.
+      output:
+        type: object
+        required: [files]
+        properties:
+          files:
+            type: array
+            minItems: 1
+            items:
+              type: object
+              required: [path]
+              properties:
+                path:
+                  type: string
+                  description: Relative to the target folder, no leading slash, no dot component.
+                content:
+                  type: string
+                  description: UTF-8 text.
+                contentBase64:
+                  type: string
+                  contentEncoding: base64
+
+deploy:
+  units:
+    - type: container
+      build: .
+      expose: mcp
+      # This kit installs and runs third party code to read its tool list, so it
+      # is the one Package that must not be able to eat the machine.
+      limits: { memory: 512Mi }
