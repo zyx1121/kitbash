@@ -96,17 +96,33 @@ type Limits struct {
 	Memory string `json:"memory,omitempty"`
 	CPU    string `json:"cpu,omitempty"`
 	Pids   int    `json:"pids,omitempty"`
+	// Ceiling says kitbashd made this Process a ceiling cgroup of its own and
+	// created its container under it. It is what tells a restore that a
+	// Process with no limits at all is one it has already placed, rather than
+	// a registration written before limits were recorded, whose container
+	// still names its member's cgroup as its parent and cannot start there.
+	// A ceiling that limits nothing is still a ceiling: the directory exists,
+	// it is delegated, and the container lives under it.
+	Ceiling bool `json:"ceiling,omitempty"`
 }
 
 // Empty reports whether this ceiling limits nothing, which is what a
-// registration written before limits were recorded carries.
+// registration written before limits were recorded carries, and what a Process
+// healed by restore carries until it is run again.
 func (l Limits) Empty() bool { return l.Memory == "" && l.CPU == "" && l.Pids <= 0 }
 
-// JSON renders the limits for the column. An empty ceiling is an empty string
-// rather than an object of nulls, so a legacy row and a Process with no limits
-// read back the same.
+// Written reports whether kitbashd has placed this Process under a ceiling of
+// its own. A row that carries limits was written by a release that always
+// created the ceiling and always named it as the container's cgroup parent, so
+// it counts as written without the flag; one that carries neither is the
+// legacy registration restore heals, see spec/kitbashd-api.yaml.
+func (l Limits) Written() bool { return !l.Empty() || l.Ceiling }
+
+// JSON renders the limits for the column. A ceiling that is neither written
+// nor recorded is an empty string rather than an object of nulls, so a legacy
+// row and a Process with no limits read back the same.
 func (l Limits) JSON() string {
-	if l.Empty() {
+	if !l.Written() {
 		return ""
 	}
 	body, err := json.Marshal(l)

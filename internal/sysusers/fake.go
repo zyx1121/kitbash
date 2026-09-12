@@ -43,6 +43,12 @@ type Fake struct {
 	// ImageInfoErr makes reading an image fail for a reason that is not a
 	// missing image, which is the host's failure and not the caller's.
 	ImageInfoErr error
+	// ConfigErr makes reading one container's configuration fail, which is a
+	// host whose runtime answers nothing about a container it has.
+	ConfigErr error
+	// RenameErr makes a rename fail, which is the one step of a heal that
+	// leaves the container where it was.
+	RenameErr error
 	// LoseCopies makes a copy succeed without the image arriving, which is
 	// the one failure a caller cannot see from the exit status of the two
 	// children: a save and a load that both said nothing and moved nothing.
@@ -56,6 +62,10 @@ type Fake struct {
 	// Running are containers Start answers ErrAlreadyRunning for, which is
 	// what a daemon that restarted without the host finds.
 	Running map[string]bool
+	// Configs are the configurations ContainerConfig answers, by container
+	// name. A container with no entry answers an empty configuration, which
+	// is one created under no cgroup parent of its own.
+	Configs map[string]ContainerConfig
 
 	// Created, AddedKeys and Removed record what the caller asked for, and
 	// Started, Ran, Stopped, RemovedContainers, RemovedFor and Copied what
@@ -66,6 +76,7 @@ type Fake struct {
 	Started           []StartCall
 	Ran               []RunCall
 	Stopped           []StopCall
+	Renamed           []RenameCall
 	RemovedContainers []StopCall
 	RemovedFor        []string
 	Copied            []CopyCall
@@ -123,6 +134,13 @@ type RunCall struct {
 	EnvMode fs.FileMode
 	EnvUID  int
 	EnvGID  int
+}
+
+// RenameCall is one recorded rename.
+type RenameCall struct {
+	Member string
+	From   string
+	To     string
 }
 
 // StopCall is one recorded stop or removal.
@@ -372,6 +390,59 @@ func (f *Fake) Run(_ context.Context, m Member, opts podman.RunOptions, cgroup s
 	return "container-" + opts.Name, nil
 }
 
+// ContainerConfig answers what the fake host holds for one container. A
+// container named in Missing is ErrNoContainer, and one the test has staged no
+// configuration for answers an empty one: what a caller reads off it is the
+// cgroup parent, and no parent at all is what a container created before
+// kitbashd wrote a ceiling per Process has.
+func (f *Fake) ContainerConfig(_ context.Context, _ Member, container string) (ContainerConfig, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.Missing[container] {
+		return ContainerConfig{}, fmt.Errorf("%w: %s", ErrNoContainer, container)
+	}
+	if f.ConfigErr != nil {
+		return ContainerConfig{}, f.ConfigErr
+	}
+	return f.Configs[container], nil
+}
+
+// RenameContainer records a rename and moves what the fake host holds under
+// the old name to the new one. A container named in Missing is ErrNoContainer
+// and a name that is taken is refused, the way the runtime refuses it.
+func (f *Fake) RenameContainer(_ context.Context, m Member, from, to string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.Missing[from] {
+		return fmt.Errorf("%w: %s", ErrNoContainer, from)
+	}
+	if f.RenameErr != nil {
+		return f.RenameErr
+	}
+	if _, held := f.Configs[to]; held {
+		return fmt.Errorf("sysusers: podman rename %s: the name %s is already in use", from, to)
+	}
+	f.Renamed = append(f.Renamed, RenameCall{Member: m.Name, From: from, To: to})
+	if config, held := f.Configs[from]; held {
+		f.Configs[to] = config
+		delete(f.Configs, from)
+	}
+	if f.Running[from] {
+		delete(f.Running, from)
+		f.Running[to] = true
+	}
+	return nil
+}
+
+// Renames answers the recorded renames, newest last.
+func (f *Fake) Renames() []RenameCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]RenameCall, len(f.Renamed))
+	copy(out, f.Renamed)
+	return out
+}
+
 // Stop records a stop as one member.
 func (f *Fake) Stop(_ context.Context, m Member, container string, timeout int) error {
 	f.mu.Lock()
@@ -399,6 +470,8 @@ func (f *Fake) RemoveContainer(_ context.Context, m Member, container string, fo
 	f.RemovedContainers = append(f.RemovedContainers, StopCall{
 		Member: m.Name, Container: container, Force: force,
 	})
+	delete(f.Configs, container)
+	delete(f.Running, container)
 	return nil
 }
 
@@ -424,6 +497,14 @@ func (f *Fake) addImage(member, digest string, info ImageInfo) {
 		info.Labels = map[string]string{}
 	}
 	f.images[member][digest] = info
+}
+
+// DropImages empties one member's image store, which is a member who removed
+// what they had built.
+func (f *Fake) DropImages(member string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.images, member)
 }
 
 // HasImage reports whether a member's store holds one image, which is how a

@@ -211,6 +211,18 @@ type Server struct {
 
 	noRestore bool
 
+	// restoreProblems is why a Process is not running, by Process id: the
+	// restore that could not bring it back writes one here and the next start
+	// that works clears it. It is what processes_list answers as problem, so
+	// proc_list can say failed with a reason its owner can act on rather than
+	// leaving them to read the daemon log, which is the operator's.
+	//
+	// It is memory and not a column: it says what happened to this daemon, so
+	// a daemon that starts again works it out again rather than reading a
+	// verdict from a boot that is over.
+	restoreMu       sync.Mutex
+	restoreProblems map[string]restoreProblem
+
 	// bound is what health reports as its listeners, written when a listener
 	// starts serving and read by every health request.
 	boundMu sync.Mutex
@@ -256,7 +268,8 @@ func New(st *store.Store, opts Options) *Server {
 		internalCauses: make(chan internalCause, InternalQueue),
 		internalRate:   newRateLimiter(InternalRate, InternalRateWindow),
 
-		noRestore: opts.NoRestore,
+		noRestore:       opts.NoRestore,
+		restoreProblems: map[string]restoreProblem{},
 	}
 	if s.runner == nil {
 		s.runner = sysusers.NewPodman()

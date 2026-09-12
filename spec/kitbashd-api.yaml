@@ -335,10 +335,19 @@ api:
     path: /kitbash/v1/processes
     response: >
       { processes: [ { id, owner, admin, package, name, expose, endpoint,
-      limits: { memory, cpu, pids },
-      subscriptions, registeredAt } ] }. The caller's registered Processes,
-      every key present even when its value is empty, and no token anywhere.
-      An admin sees every member's.
+      limits: { memory, cpu, pids, ceiling },
+      subscriptions, registeredAt, problem, problemFix } ] }. The caller's
+      registered Processes, every key present even when its value is empty,
+      and no token anywhere. An admin sees every member's.
+      limits.ceiling says kitbashd has made this Process a cgroup of its own
+      and created its container under it; a ceiling that limits nothing is
+      still a ceiling, see restore.cgroups. problem and problemFix are why a
+      Process is not running, written by the restore that could not bring it
+      back and cleared by the next start that works; both are left out for a
+      Process kitbashd has nothing to report about. They are the daemon's
+      memory of this boot and not a column: a daemon that starts again works
+      them out again. proc_list reports a Process with a problem as failed
+      with the reason, see spec/mcp-surface.yaml.
   builds_record:
     method: POST
     path: /kitbash/v1/builds
@@ -605,7 +614,9 @@ restore:
     container, in parallel per owner and serially within one owner. A
     container that no longer exists is unregistered and logged, and one that is
     already running, which is what a daemon that restarted without the host
-    finds, is counted as started and named only in the line at the end. Restore runs
+    finds, is counted as started and named only in the line at the end. The
+    line at the end counts started, already running, missing, failed, legacy
+    and healed. Restore runs
     once per daemon start and is also what makes "all Processes come back
     after a reboot" true; the OpenRC script needs localmount and cgroups, and
     its start_pre runs /usr/share/kitbash/rootless-prereqs.sh, which is what
@@ -614,18 +625,69 @@ restore:
     The registration carries the container name and the digest from M5 on, so
     restore needs no manifest; the permits block of the Package's manifest, see
     mcp_for_processes.permits; and the limits the Process was started with, so
-    restore writes its ceiling again.
+    restore writes its ceiling again. The limits block carries ceiling: true
+    from this release on, which says the ceiling cgroup was made and the container was
+    created under it. A row with limits and no flag was written by a release
+    that always did both, so it counts as placed; a row with neither is a
+    registration from before either existed, and is the one restore heals.
   cgroups: >
     The cgroup of each Process is created again, with its ceiling, before its
     container starts: the cgroup filesystem does not survive a reboot, and a
     container whose cgroup parent is gone does not start at all. The limits
     come from the registration, which is the only thing that remembers them
     once the filesystem is empty, so the ceiling a Process was started with is
-    the ceiling it comes back under. A registration written before limits were
-    recorded carries none: that Process comes back without a ceiling, which is
-    logged once for it, and gains one the next time it is run. A container
-    created before this release has no cgroup parent at all either, and gains
-    one the same way.
+    the ceiling it comes back under.
+  healing_a_legacy_registration: >
+    A registration with neither limits nor limits.ceiling was written before
+    kitbashd gave each Process a cgroup of its own. Its container may name its
+    member's own cgroup, /kitbash/<member>, as its cgroup parent, and that
+    directory belongs to root: the member's rootless runtime cannot create the
+    container's own cgroup under it, so the start fails with permission denied
+    at every boot, for ever. Restore heals that container rather than logging
+    it again each time.
+    The heal is narrow. It runs only after a start of that container has
+    failed, and only when that failure is the runtime refusing it: a start that
+    ran out of its budget or was cancelled says nothing about the cgroup parent
+    and is reported failed, because the container may yet be coming up. It runs
+    only when podman container inspect answers exactly /kitbash/<member> as the
+    cgroup parent; a container that names none, one that is already under its
+    ceiling and one that names anything else are left where they are. It runs
+    only when the ceiling could be made, because there would otherwise be
+    nowhere to create the container. A Process that comes back is never taken
+    apart to be given a ceiling.
+    What the heal does: the ceiling directory is there already, unlimited,
+    and because the cgroup parent of a container is fixed when the container is
+    created and podman start cannot change it, kitbashd creates the container
+    again under the ceiling. Nothing is removed before the replacement is up:
+    the old container is renamed to <name>-preceiling, the new one takes the
+    name the registration holds, and the old one is removed only once the new
+    one has been created. A heal that fails puts the name back, so there is no
+    moment in which the registration names a container that does not exist and
+    no later boot unregisters the Process because of it; a heal that did not
+    finish leaves a container under -preceiling, which the next heal refuses to
+    overwrite because it may be the only copy of that Process left.
+    What is carried over: the image the registration names, the container's
+    labels, its environment, its published ports and its restart policy. The
+    labels that name the Process are written from the registration, as every
+    start writes them. Container level limits are not carried over and none are
+    put on the command line: this Process was registered without any, and the
+    ceiling is where a limit goes once the Process is run again. The image is
+    checked in the member's store before anything is moved, because a member
+    who no longer holds it is one this heal can do nothing for.
+    Credentials: the Telemetry token is minted again, because the store keeps
+    only the hash of the one the old container holds and it cannot be read back
+    to put in the new one. The fan out secret is kept: it is stored in the
+    clear, so the new container is given the one the registration already
+    carries. The new token hash and limits.ceiling are written to the
+    registration only once the container has been created, so a heal that
+    failed leaves the old container holding a token that still works.
+    It is logged as "restore: the Process <id> of <owner> was registered
+    without limits; it now runs under an unlimited ceiling, run it again to
+    write limits", and the next boot takes the ordinary path. Running the
+    Process again is what writes real limits into the ceiling. Every Process
+    that came back without a ceiling is counted in one line for its owner
+    rather than one line each. One that still cannot start is counted failed
+    and its owner reads the reason through proc_list, see processes_list.
 
 backup:
   description: >

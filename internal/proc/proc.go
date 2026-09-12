@@ -54,6 +54,14 @@ type Process struct {
 	Endpoint  string   `json:"endpoint,omitempty"`
 	StartedAt string   `json:"startedAt,omitempty"`
 	Tools     []string `json:"tools,omitempty"`
+	// Problem is why a Process that is not running did not come back, as
+	// kitbashd reported it, and Fix what its owner can do about it. They are
+	// empty for every Process kitbashd has nothing to say about. A container
+	// the boot restore could not start sits in the runtime looking like one on
+	// its way up, so without these proc_list would call it starting forever,
+	// see restore in spec/kitbashd-api.yaml.
+	Problem string `json:"problem,omitempty"`
+	Fix     string `json:"fix,omitempty"`
 
 	// Container is the runtime name the bridge execs into. It is not part of
 	// the tool's output: the surface names a Process by its id.
@@ -329,19 +337,55 @@ func (s *Service) run(ctx context.Context, span *telemetry.Span, path, digest, n
 }
 
 // List answers proc_list: every Process of the caller, running or stopped.
+//
+// The container runtime holds the state and this reads it back, with one thing
+// added that the runtime does not know: why a Process is not running. A
+// container the boot restore could not start is still in the runtime as
+// created, which reads as starting, so kitbashd is asked what it could not
+// bring back and those are reported failed with the reason, see restore in
+// spec/kitbashd-api.yaml.
 func (s *Service) List(ctx context.Context) (*ListResult, *problem.Problem) {
 	containers, prob := s.containers(ctx, podman.Filter{podman.LabelUser: s.files.User()}, true)
 	if prob != nil {
 		return nil, prob
 	}
+	problems := s.problems(ctx)
 	result := &ListResult{Processes: []Process{}}
 	for _, container := range containers {
-		result.Processes = append(result.Processes, s.describe(container, manifest.Unit{}))
+		process := s.describe(container, manifest.Unit{})
+		if reported, held := problems[process.ID]; held && process.State != StateRunning {
+			process.State = StateFailed
+			process.Problem = reported.Problem
+			process.Fix = reported.ProblemFix
+		}
+		result.Processes = append(result.Processes, process)
 	}
 	sort.Slice(result.Processes, func(i, j int) bool {
 		return result.Processes[i].Name < result.Processes[j].Name
 	})
 	return result, nil
+}
+
+// problems is what kitbashd could not bring back, by Process id. A session
+// without kitbashd, or one whose call to it fails, gets none: proc_list reads
+// the caller's own runtime and must keep working when the daemon does not, see
+// PLAN.md section 4.5.
+func (s *Service) problems(ctx context.Context) map[string]telemetry.Registered {
+	if s.registry == nil {
+		return nil
+	}
+	known, prob := s.registry.ListProcesses(ctx)
+	if prob != nil {
+		s.logger.Printf("proc_list: kitbashd did not answer what it could not restore: %s", prob.Detail)
+		return nil
+	}
+	problems := map[string]telemetry.Registered{}
+	for _, entry := range known {
+		if entry.Problem != "" {
+			problems[entry.ID] = entry
+		}
+	}
+	return problems
 }
 
 // Stop answers proc_stop. The Process stays known and can be run again.

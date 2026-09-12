@@ -244,7 +244,11 @@ func (s *Server) startProcess(w http.ResponseWriter, r *http.Request, p store.Pr
 	// Minting again revokes the previous one, which nothing holds. The
 	// ceiling is written with it: after a reboot the cgroup filesystem is
 	// empty and the registration is the only thing that remembers.
-	p.Limits = store.Limits{Memory: req.Memory, CPU: req.CPU, Pids: opts.PidsLimit}
+	// Ceiling says the cgroup was made as well as recorded: a restore reads it
+	// to tell a Process it has already placed from one registered before
+	// kitbashd wrote a ceiling per Process, whose container names its member's
+	// cgroup as its parent and cannot start under it, see restore.go.
+	p.Limits = store.Limits{Memory: req.Memory, CPU: req.CPU, Pids: opts.PidsLimit, Ceiling: leaf != ""}
 	token, err := s.mintToken(r.Context(), p)
 	if err != nil {
 		writeProblem(w, problem.Internal(r.URL.Path, err.Error(), ""))
@@ -270,6 +274,9 @@ func (s *Server) startProcess(w http.ResponseWriter, r *http.Request, p store.Pr
 		writeProblem(w, s.runProblem(r, err, p, opts))
 		return
 	}
+	// The Process is running, so whatever the last boot could not do for it is
+	// over and proc_list stops reporting it.
+	s.clearProcessProblem(p.ID)
 	logger.Printf("processes: %s started %s for %s in %s", p.ID, p.Container, m.Name, cgroupOrNone(leaf))
 	writeJSON(w, r.URL.Path, startResponse{ID: p.ID, Container: p.Container, ContainerID: id})
 }
