@@ -30,7 +30,8 @@ var version = "dev"
 // The socket, the store and the Process receiver as spec/kitbashd-api.yaml
 // declares them. The receiver binds every address because rootless networking
 // delivers host.containers.internal to the host's primary address and not to
-// loopback; the host firewall scopes who else may reach it, and the token
+// loopback; deploy/install.sh writes the nftables ruleset that keeps it to the
+// loopback interface, which is where pasta delivers a Process, and the token
 // decides whose records arrive, see PLAN.md section 4.5.
 const (
 	defaultSocket     = "/run/kitbash/kitbashd.sock"

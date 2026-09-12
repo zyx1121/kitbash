@@ -14,9 +14,11 @@ if [ ! -s /etc/resolv.conf ]; then
   printf 'nameserver %s\nnameserver 8.8.8.8\n' "${KITBASH_DNS:-1.1.1.1}" > /etc/resolv.conf
 fi
 
-# 2. Host packages. Exactly the seven components plus their runtime deps.
+# 2. Host packages. Exactly the seven components plus their runtime deps, and
+#    nftables, which is the kernel's own packet filter and what step 11 writes
+#    one ruleset with.
 log "installing host packages"
-apk add -q --no-progress podman crun passt fuse-overlayfs shadow shadow-subids git openssh qemu-guest-agent curl
+apk add -q --no-progress podman crun passt fuse-overlayfs shadow shadow-subids git openssh qemu-guest-agent curl nftables
 
 # 3. cgroups v2 and kernel modules for rootless podman. kitbashd owns
 #    /sys/fs/cgroup/kitbash: it creates one root owned ceiling cgroup per
@@ -165,35 +167,28 @@ rc-service -q sshd restart
 #     loopback, so the port is scoped here rather than left to the operator
 #     (issue #90). Every other port stays as it was: the input policy is
 #     accept and 4318 is the only port this ruleset decides.
-log "writing the nftables ruleset"
-apk add -q --no-progress nftables
-#     The source a Process reaches the receiver from, measured on a kitbash
-#     host rather than guessed: Alpine 3.23, podman 5.7, the default rootless
+#
+#     Where a Process reaches the receiver from was measured on a kitbash host
+#     rather than guessed: Alpine 3.23, podman 5.7, the default rootless
 #     network command pasta. A container that curls
 #     http://host.containers.internal:4318 arrives on lo with the host's own
 #     primary address as both source and destination
 #     (tcpdump: "lo In IP 10.10.10.115.38060 > 10.10.10.115.4318"), because
 #     pasta gives the container the host's address and the kernel routes a
-#     packet to the host's own address through loopback. So the sources
-#     allowed on 4318 are loopback and this host's own address, computed here
-#     from the default route interface and never hardcoded. slirp4netns lands
-#     in the same two: its host side process is what opens the connection.
-fw_iface=$(ip -4 route show default 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit } }')
-fw_addr=""
-[ -n "$fw_iface" ] && fw_addr=$(ip -4 -o addr show dev "$fw_iface" scope global 2>/dev/null | awk '{ sub("/.*", "", $4); print $4; exit }')
-fw_sources="127.0.0.1"
-if [ -n "$fw_addr" ]; then
-  fw_sources="127.0.0.1, $fw_addr"
-else
-  log "warning: no address on the default route interface; 4318 will accept loopback only"
-fi
+#     packet to the host's own address through loopback. So the interface is
+#     what the ruleset decides on and not the address: an address can be
+#     spoofed from the wire, and a host that later takes this one over DHCP
+#     would inherit the permission with it. slirp4netns arrives the same way,
+#     over loopback from its host side process.
+#
 #     Written to a temporary file first and checked with nft -c, so a ruleset
 #     that does not parse never becomes /etc/nftables.nft and a failed load
 #     leaves the running one alone. The directory the ruleset includes is made
 #     before the check, because a check is worth nothing if it passes on a
 #     path that is not there yet.
+log "writing the nftables ruleset"
 mkdir -p /etc/nftables.d
-cat > /etc/nftables.nft.kitbash-new <<NFT
+cat > /etc/nftables.nft.kitbash-new <<'NFT'
 #!/usr/sbin/nft -f
 # kitbash owns this file and deploy/install.sh rewrites it on every run.
 # Put operator rules in /etc/nftables.d/<name>.nft: the include at the end
@@ -216,19 +211,20 @@ table inet kitbash {
 		# way back into the host never depends on a rule further down.
 		tcp dport 22 accept comment "SSH, the MCP transport and the way in"
 
-		iif lo accept comment "Whatever the host says to itself"
+		# This also carries every Process to the receiver below: a
+		# rootless container reaches it as host.containers.internal,
+		# which pasta delivers over loopback.
+		iif lo accept comment "Whatever the host says to itself, Processes included"
+
 		ct state { established, related } accept comment "Answers to what this host asked for"
 		ip protocol icmp accept comment "ICMP"
 		ip6 nexthdr icmpv6 accept comment "ICMPv6, which IPv6 needs to work at all"
 
-		# The Process receiver. A rootless container reaches it as
-		# host.containers.internal, which pasta delivers from loopback
-		# with this host's own address; install.sh computed that address
-		# from the default route interface. Every request still needs the
-		# token kitbashd minted for that Process: this only decides who
-		# may open the connection.
-		tcp dport 4318 ip saddr { $fw_sources } accept comment "Processes on this host"
-		tcp dport 4318 ip6 saddr ::1 accept comment "Processes on this host over IPv6 loopback"
+		# The Process receiver, off the wire. Loopback was accepted
+		# above, so what reaches this line came in on a real interface
+		# and is not a Process of this host, whatever source address it
+		# claims. The token kitbashd minted still decides whose records
+		# the accepted ones are; this decides who may open a connection.
 		tcp dport 4318 drop comment "The receiver is for this host's Processes only"
 	}
 }
@@ -238,25 +234,31 @@ include "/etc/nftables.d/*.nft"
 NFT
 if nft -c -f /etc/nftables.nft.kitbash-new; then
   mv /etc/nftables.nft.kitbash-new /etc/nftables.nft
-  #   boot, not default: the ruleset is up before the network is, and before
-  #   kitbashd opens the receiver in the default runlevel. The service loads
-  #   /etc/nftables.nft, so loading it through the service rather than with
-  #   nft is what makes OpenRC's idea of the state the running one. reload on
-  #   a started service is the same load without the flush a restart does.
-  rc-update -q add nftables boot 2>/dev/null || true
-  if rc-service -q nftables status >/dev/null 2>&1; then
-    action=reload
-  else
-    action=start
-  fi
-  if rc-service -q nftables "$action"; then
-    log "nftables: 4318 accepts ${fw_sources}, drops the rest"
-  else
-    log "warning: loading /etc/nftables.nft failed; the ruleset that was running is still running"
-  fi
 else
   rm -f /etc/nftables.nft.kitbash-new
-  log "warning: the generated ruleset did not parse; /etc/nftables.nft is unchanged"
+  echo "kitbash: the generated nftables ruleset did not parse; /etc/nftables.nft is unchanged and 4318 is open" >&2
+  exit 1
+fi
+#     boot, not default: the ruleset is up before the network is, and before
+#     kitbashd opens the receiver in the default runlevel. The service loads
+#     /etc/nftables.nft, so loading it through the service rather than with
+#     nft is what makes OpenRC's idea of the state the running one. reload on
+#     a started service is the same load without the flush a restart does.
+rc-update -q add nftables boot 2>/dev/null || true
+if rc-service -q nftables status >/dev/null 2>&1; then
+  action=reload
+else
+  action=start
+fi
+#     A host whose ruleset did not load has the receiver open to the network,
+#     which is the thing this step exists to prevent, so this is the one step
+#     that ends the run rather than warning. Everything before it is done and
+#     install.sh is idempotent: fix the cause and run it again.
+if rc-service -q nftables "$action"; then
+  log "nftables: 4318 is reachable over loopback only"
+else
+  echo "kitbash: loading /etc/nftables.nft failed; the ruleset that was running is still running and 4318 may be open" >&2
+  exit 1
 fi
 
 log "done. create the first admin on this console with: kitbash-adduser <name> '<ssh public key>' admin"
