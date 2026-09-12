@@ -53,9 +53,21 @@ install.sh is idempotent. It writes `/etc/resolv.conf` when the cloud image left
 it empty, installs the host packages, sets cgroups v2 unified mode and the `tun`
 and `fuse` modules, creates the `kitbash-users` and `kitbash-admin` groups,
 removes the cloud image's `alpine` user, enables kitbashd, seeds `/org` from
-`/usr/share/kitbash/org`, and writes the sshd rule that gives every member the
-MCP surface and no shell. It configures no firewall: kitbashd also listens on
-TCP 4318 for Processes, and scoping that port is the operator's.
+`/usr/share/kitbash/org`, writes the sshd rule that gives every member the MCP
+surface and no shell, and writes one nftables ruleset.
+
+That ruleset decides one port. kitbashd listens on TCP 4318 for Processes, and
+only this host may open a connection to it: a rootless container reaches the
+receiver as `host.containers.internal`, which pasta delivers over loopback with
+the host's own primary address as the source, so the rule accepts `127.0.0.1`
+and that address, computed at install time from the default route interface and
+never hardcoded, and drops 4318 from anywhere else. The token kitbashd minted
+for the Process still decides whose records they are. Port 22 is accepted
+before any of it, so a ruleset that loads is never a ruleset that locks the
+operator out, and every other port is left as it was: this is not a host
+firewall. `install.sh` rewrites `/etc/nftables.nft` on every run; operator rules
+belong in `/etc/nftables.d/<name>.nft`, which that file includes after kitbash's
+own table and `install.sh` never touches.
 
 **Or boot the ISO.** `kitbash-0.1.0-x86_64.iso` on the release is Alpine's own
 image with the kitbashd apk and its dependencies on it. Booted from a VM's CD
@@ -83,6 +95,7 @@ claude mcp add kitbash -- ssh alice@kitbash.example.org
 ```sh
 kitbash-mcp --version
 rc-service kitbashd status
+nft list chain inet kitbash input
 ```
 
 From the member's machine, one MCP session that lists the surface:
