@@ -94,6 +94,18 @@ type Registration struct {
 	// member's Process in an admin's list.
 	Owner string `json:"owner,omitempty"`
 	Admin bool   `json:"admin,omitempty"`
+	// Health is the probe the Package declared, as the registration carries
+	// it, plus the reading a test seeds to stand in for a probe kitbashd ran.
+	Health *Health `json:"health,omitempty"`
+}
+
+// Health is one Process's probe on the wire: the declaration a registration
+// sends, and the reading processes_list answers with.
+type Health struct {
+	HTTP     string `json:"http,omitempty"`
+	Interval string `json:"interval,omitempty"`
+	Last     string `json:"last,omitempty"`
+	Healthy  *bool  `json:"healthy,omitempty"`
 }
 
 // Response is what the daemon answers on the JSON API.

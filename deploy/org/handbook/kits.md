@@ -218,7 +218,7 @@ text is wrapped as `bad-request`. Never answer a bare string, and always write a
 - `limits.cpu` and `limits.memory` are passed to the container runtime and
   recorded, and not enforced until kitbashd runs Processes in delegated cgroups.
   Declare them anyway: the manifest is the declared state.
-- `health` is recorded, not probed. Liveness is PID 1 of the container.
+- `health.http` is probed: kitbashd requests that path on the Process's endpoint every `health.interval` (30s by default, 5s at the fastest) and writes one `kitbash.health` metric record per probe, 1 for healthy and 0 for unhealthy. It restarts nothing. `health.exec` is recorded, not run. Liveness is still PID 1 of the container.
 - A member holds at most 64 registered Processes and 64 pending approvals.
 
 ## Test before building

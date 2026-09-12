@@ -112,6 +112,22 @@ type Registration struct {
 	// that, so restore leaves the Process alone rather than unregistering it,
 	// see PLAN.md section 3.
 	Runner string `json:"runner,omitempty"`
+	// Health is the probe the Package's manifest declares, sent only when it
+	// declares one and kitbashd runs the Process itself: the daemon requests
+	// that path on the Process's endpoint and records what it saw, see
+	// PLAN.md section 2.4. A Process a run kit owns is not probed.
+	Health *Health `json:"health,omitempty"`
+}
+
+// Health is one Process's probe as kitbashd carries it: the declaration, and
+// the result of the most recent request the daemon made. A registration sends
+// HTTP and Interval; processes_list answers all four, with Last and Healthy
+// absent for a Process that has not been probed yet.
+type Health struct {
+	HTTP     string `json:"http,omitempty"`
+	Interval string `json:"interval,omitempty"`
+	Last     string `json:"last,omitempty"`
+	Healthy  *bool  `json:"healthy,omitempty"`
 }
 
 // The shapes the two restore fields must have. kitbashd starts what the
@@ -168,6 +184,10 @@ type Registered struct {
 	// looking like one on its way up, see restore in spec/kitbashd-api.yaml.
 	Problem    string `json:"problem,omitempty"`
 	ProblemFix string `json:"problemFix,omitempty"`
+	// Health is the probe this Process declares and the reading of the most
+	// recent one kitbashd ran, which is what proc_list publishes. A daemon of
+	// an earlier release answers none.
+	Health *Health `json:"health,omitempty"`
 }
 
 // UnmarshalJSON reads a listed Process, accepting user as a spelling of owner.

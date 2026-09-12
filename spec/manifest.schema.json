@@ -179,11 +179,12 @@
         },
         "health": {
           "type": "object",
+          "description": "How a Process is probed. kitbashd requests http on the Process's endpoint every interval and records the answer as the metric kitbash.health; it restarts nothing. exec is recorded and run by nobody.",
           "additionalProperties": false,
           "properties": {
-            "exec": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
-            "http": { "type": "string", "description": "Path probed on port." },
-            "interval": { "type": "string", "pattern": "^[0-9]+(ms|s|m)$", "default": "30s" }
+            "exec": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Reserved. Recorded, not run." },
+            "http": { "type": "string", "description": "Path probed on port, for expose: http and expose: mcp. Probed only when the Process publishes an endpoint." },
+            "interval": { "type": "string", "pattern": "^[0-9]+(ms|s|m)$", "default": "30s", "description": "How often the path is requested. An interval under 5s is raised to 5s." }
           }
         },
         "limits": {

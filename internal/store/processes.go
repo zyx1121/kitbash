@@ -85,6 +85,11 @@ type Process struct {
 	// empty and nothing else remembers. A registration written before this
 	// carries none and restores without a ceiling until it is run again.
 	Limits Limits `json:"limits"`
+	// Health is the probe this Process declares and the result of the most
+	// recent one kitbashd ran, see internal/daemon/health.go. Only the
+	// declaration is stored, because a probe is a reading of a moment and
+	// this table is the registration.
+	Health Health `json:"health"`
 	// FanoutSecret is the bearer kitbashd puts on every fan out request to
 	// this Process. It is minted with the token at registration and handed to
 	// the container once. The tag keeps it out of processes_list, which is the
@@ -92,6 +97,39 @@ type Process struct {
 	// secret any more than it carries a token. A registration written before
 	// the fan out was authenticated carries none.
 	FanoutSecret string `json:"-"`
+}
+
+// Health is the probe of one Process: the path its Package's manifest declared
+// under deploy.units[0].health.http, how often kitbashd requests it, and what
+// the most recent request saw.
+//
+// HTTP and Interval are the registration and are stored. Last and Healthy are
+// the prober's own memory, filled in when processes_list is answered: a daemon
+// that has just started lists a declaration with no result yet, and nothing is
+// written to the table when a probe runs. The records a probe writes are
+// Telemetry, see PLAN.md section 2.4.
+type Health struct {
+	HTTP     string `json:"http,omitempty"`
+	Interval string `json:"interval,omitempty"`
+	Last     string `json:"last,omitempty"`
+	Healthy  *bool  `json:"healthy,omitempty"`
+}
+
+// Declared reports whether this Process declares an HTTP probe at all.
+func (h Health) Declared() bool { return h.HTTP != "" }
+
+// JSON renders the declaration for the column, and nothing a probe saw. A
+// Process that declares no probe is an empty string rather than an object of
+// nulls, so a legacy row and a Process without a probe read back the same.
+func (h Health) JSON() string {
+	if !h.Declared() {
+		return ""
+	}
+	body, err := json.Marshal(Health{HTTP: h.HTTP, Interval: h.Interval})
+	if err != nil {
+		return ""
+	}
+	return string(body)
 }
 
 // Limits is one Process's ceiling, in the spelling the start request carried:
@@ -229,23 +267,27 @@ func (s *Store) RegisterProcess(ctx context.Context, p Process, tokenHash string
 	// cgroup filesystem is empty, and this is the only thing that remembers
 	// what the Process was limited to.
 	limits := p.Limits.JSON()
+	// The probe travels with the registration for the same reason the limits
+	// do: after a reboot nothing else remembers what a Process declared, and
+	// the prober starts from the registrations kitbashd holds.
+	health := p.Health.JSON()
 	// The fan out secret is replaced with the token, because the two are minted
 	// together: a container holding the old token holds the old secret.
 	if _, err := tx.ExecContext(ctx, `INSERT INTO processes
 		(id, owner, admin, package, name, container, digest, expose, endpoint,
-		 subscriptions, runner, permits, limits, token_hash, fanout_secret, registered_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		 subscriptions, runner, permits, limits, health, token_hash, fanout_secret, registered_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 			owner = excluded.owner, admin = excluded.admin, package = excluded.package,
 			name = excluded.name, container = excluded.container, digest = excluded.digest,
 			expose = excluded.expose, endpoint = excluded.endpoint,
 			subscriptions = excluded.subscriptions, runner = excluded.runner,
 			permits = excluded.permits,
-			limits = excluded.limits,
+			limits = excluded.limits, health = excluded.health,
 			token_hash = excluded.token_hash,
 			fanout_secret = excluded.fanout_secret, registered_at = excluded.registered_at`,
 		p.ID, p.Owner, p.Admin, p.Package, p.Name, p.Container, p.Digest, p.Expose, p.Endpoint,
-		string(subscriptions), p.Runner, string(permits), limits, tokenHash, p.FanoutSecret,
+		string(subscriptions), p.Runner, string(permits), limits, health, tokenHash, p.FanoutSecret,
 		p.RegisteredAt.UnixNano()); err != nil {
 		return fmt.Errorf("store: register the Process %s: %w", p.ID, err)
 	}
@@ -379,7 +421,7 @@ func (s *Store) Processes(ctx context.Context, owner string) ([]Process, error) 
 
 // processColumns is the one select every read of this table shares.
 const processColumns = `SELECT id, owner, admin, package, name, container, digest,
-	expose, endpoint, subscriptions, runner, permits, limits, fanout_secret, registered_at`
+	expose, endpoint, subscriptions, runner, permits, limits, health, fanout_secret, registered_at`
 
 // scanner is what both a single row and a row of a result set satisfy.
 type scanner interface {
@@ -388,10 +430,11 @@ type scanner interface {
 
 func scanProcess(row scanner) (Process, error) {
 	var p Process
-	var subscriptions, permits, limits string
+	var subscriptions, permits, limits, health string
 	var registered int64
 	if err := row.Scan(&p.ID, &p.Owner, &p.Admin, &p.Package, &p.Name, &p.Container, &p.Digest,
-		&p.Expose, &p.Endpoint, &subscriptions, &p.Runner, &permits, &limits, &p.FanoutSecret,
+		&p.Expose, &p.Endpoint, &subscriptions, &p.Runner, &permits, &limits, &health,
+		&p.FanoutSecret,
 		&registered); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Process{}, err
@@ -411,6 +454,11 @@ func scanProcess(row scanner) (Process, error) {
 	if limits != "" {
 		if err := json.Unmarshal([]byte(limits), &p.Limits); err != nil {
 			return Process{}, fmt.Errorf("store: read the limits of %s: %w", p.ID, err)
+		}
+	}
+	if health != "" {
+		if err := json.Unmarshal([]byte(health), &p.Health); err != nil {
+			return Process{}, fmt.Errorf("store: read the health probe of %s: %w", p.ID, err)
 		}
 	}
 	if permits != "" {
@@ -470,7 +518,12 @@ func migrate(db *sql.DB) error {
 	// the kit that owns the Process, and the thing that tells restore there is
 	// no container of it here to start. Every registration written before it
 	// carries none, which is a Process kitbashd runs itself.
-	for _, column := range []string{"container", "digest", "fanout_secret", "permits", "limits", "runner"} {
+	// The health probe arrives with the probe loop: the path a Process
+	// declares and how often it is requested. A registration written before it
+	// declares none, so that Process is not probed until it is run again.
+	for _, column := range []string{
+		"container", "digest", "fanout_secret", "permits", "limits", "runner", "health",
+	} {
 		if err := addTextColumn(db, "processes", column); err != nil {
 			return err
 		}

@@ -113,6 +113,8 @@ Every record also carries `kitbash.producer`, stamped by kitbashd: the member fo
 
 **Fan out.** A Process whose manifest declares `provides.subscriptions: [telemetry]`, `expose: http` and a `port` receives every record kitbashd stores, as OTLP/HTTP JSON POSTed to the standard paths on its endpoint, after the record is stored and stamped. Delivery is best effort and asynchronous with a bounded queue per subscriber; a subscriber that is down loses records and the gap is logged, the store is the source of truth. Every delivery carries a bearer secret minted for that Process at registration and given to its container, so a subscriber knows the records came from kitbashd and not from a neighbour on the host. A subscriber run by an admin receives the whole machine. A subscriber run by a member receives that member's records only, the same rule as `tel_query`.
 
+**Health.** A Process whose Package declares `deploy.units[0].health.http` and is exposed as `http` or `mcp` is probed by kitbashd: it requests that path on the Process's endpoint every `health.interval`, thirty seconds by default and five seconds at the fastest, with a five second timeout, and writes one metric record `kitbash.health` per probe, value 1 for healthy and 0 for unhealthy, carrying the four attributes plus `kitbash.health.status`, the HTTP status or the class of the failure. A probe restarts nothing and changes no registration: what it produces is Telemetry, so acting on it belongs to a kit or to the owner, and `health.exec` is recorded and run by nobody.
+
 **Evaluation.** An evaluation kit is a subscriber that writes judgments back through the Process receiver with `kitbash.eval: true`. A judgment is about a subject, named by `kitbash.subject.trace_id` and `kitbash.subject.span_id`, and it carries the subject's `kitbash.user`, `kitbash.package`, `kitbash.process` and `kitbash.path` so that the query that asks what a Package did also returns how it was judged. kitbashd accepts those claims on an evaluation record only when the producing Process was run by an admin; a member's evaluation kit has them forced to the member's own. `kitbash.producer` always names the kit's Process, so a judgment is never mistaken for the act it judges.
 
 **Reading.** `tel_query` returns records of one signal filtered by the four attributes and a time range. A member reads their own records; an admin reads everyone's. `tel_retention` reads the window per signal and lets an admin set it.
@@ -153,7 +155,7 @@ deploy:
       builder: /org/nix-build # optional, the build kit that builds this unit, see section 3
       runner: /org/pve-runner # optional, the run kit that runs this Process, see section 3
       expose: mcp
-      health: { exec: ["ffmpeg", "-version"] }
+      health: { http: /healthz, interval: 30s }  # probed and recorded, see section 2.4
       limits: { cpu: "1", memory: "512Mi" }
 ```
 
@@ -362,7 +364,6 @@ Each milestone is done when its acceptance sentence is true on a real machine, n
 The MCP tool surface is decided in `spec/mcp-surface.yaml`: six families, `fs` implemented in M1, the rest declared.
 
 - Whether `files` deploy units are needed in version 1 at all, or whether every Package is a container until a real case appears.
-- Health: `health` is recorded but not probed until kitbashd supervises Processes. Liveness in M2 is PID 1 of the container.
 - A Process started in one MCP session appears on another session's surface when that session reconnects, not live.
 - Import kits run under the member who imports. Whether an admin can run a kit once for every member is an M5 question.
 - Metrics: the store and the receiver accept them from M3; the first producers are the M4 kits.

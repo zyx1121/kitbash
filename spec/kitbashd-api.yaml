@@ -228,7 +228,7 @@ api:
   processes_register:
     method: POST
     path: /kitbash/v1/processes
-    request: { id: "UUIDv7", package: "/home/loki/echo", name: "echo", container: "kitbash-echo-echo", digest: "sha256:...", expose: "mcp|http|none", endpoint: "http://127.0.0.1:40275 when expose is http", subscriptions: ["telemetry"], runner: "/org/pve-runner when a run kit owns this Process" }
+    request: { id: "UUIDv7", package: "/home/loki/echo", name: "echo", container: "kitbash-echo-echo", digest: "sha256:...", expose: "mcp|http|none", endpoint: "http://127.0.0.1:40275 when expose is http", subscriptions: ["telemetry"], runner: "/org/pve-runner when a run kit owns this Process", health: { http: "/healthz", interval: "30s" } }
     response: { id: "UUIDv7", token: "opaque, at least 32 bytes of entropy, returned once", fanoutSecret: "opaque, 32 bytes, returned once; the bearer the fan out presents to this Process" }
     authorization: >
       The caller is the member the Process belongs to; kitbashd records the
@@ -247,6 +247,13 @@ api:
       [telemetry], runner an absolute path with no parent reference, and
       endpoint http://127.0.0.1:PORT and nothing else: the fan out POSTs to
       whatever it names, so it may never point at the network.
+      health is the probe the Package's manifest declares, sent only when it
+      declares one: http is a path of at most 256 bytes starting with / and
+      carrying no space or control character, because kitbashd requests it on
+      the Process's own endpoint, and interval matches ^[0-9]+(ms|s|m)$. A
+      health block naming no path is bad-request, and one on a registration
+      that names a runner is not-permitted: a Process a run kit owns has no
+      container here to check the endpoint against, see health_probes.
     errors: [bad-request, conflict, internal]
   processes_unregister:
     method: DELETE
@@ -337,12 +344,16 @@ api:
     response: >
       { processes: [ { id, owner, admin, package, name, expose, endpoint,
       limits: { memory, cpu, pids, ceiling },
+      health: { http, interval, last, healthy },
       subscriptions, registeredAt, problem, problemFix } ] }. The caller's
       registered Processes, every key present even when its value is empty,
       and no token anywhere. An admin sees every member's.
       limits.ceiling says kitbashd has made this Process a cgroup of its own
       and created its container under it; a ceiling that limits nothing is
-      still a ceiling, see restore.cgroups. problem and problemFix are why a
+      still a ceiling, see restore.cgroups. In health, http and interval are
+      the declaration the registration carried and last and healthy the reading
+      of the most recent probe, absent for a Process kitbashd has not probed
+      yet, see health_probes. problem and problemFix are why a
       Process is not running, written by the restore that could not bring it
       back and cleared by the next start that works; both are left out for a
       Process kitbashd has nothing to report about. They are the daemon's
@@ -586,11 +597,13 @@ api:
     response: >
       { version: "v0.4.0", store: "/var/lib/kitbash/kitbashd.db",
       uptimeSeconds: 12, listeners: { socket: "/run/kitbash/kitbashd.sock",
-      tcp: "0.0.0.0:4318" }, subscribers: 1, mcpSessions: 2,
+      tcp: "0.0.0.0:4318" }, subscribers: 1, mcpSessions: 2, probes: 1,
       lastBackup: "2026-09-06T03:00:00Z", backups: 7 }. A listener that
       is not bound is absent; subscribers is how many registered Processes the
-      fan out is delivering to, and mcpSessions how many MCP sessions
-      Processes hold open on the receiver, see mcp_for_processes. lastBackup
+      fan out is delivering to, mcpSessions how many MCP sessions
+      Processes hold open on the receiver, see mcp_for_processes, and probes
+      how many Processes declare a health path kitbashd requests, see
+      health_probes. lastBackup
       and backups are the store backup, see backup; lastBackup is absent until
       the first one and a run that failed adds lastBackupError with the reason
       while lastBackup stays at the last good copy.
@@ -639,8 +652,10 @@ restore:
   registration_fields: >
     The registration carries the container name and the digest from M5 on, so
     restore needs no manifest; the permits block of the Package's manifest, see
-    mcp_for_processes.permits; and the limits the Process was started with, so
-    restore writes its ceiling again. The limits block carries ceiling: true
+    mcp_for_processes.permits; the limits the Process was started with, so
+    restore writes its ceiling again; and the health probe it declares, so the
+    prober starts after a reboot without reading a manifest either. The limits
+    block carries ceiling: true
     from this release on, which says the ceiling cgroup was made and the container was
     created under it. A row with limits and no flag was written by a release
     that always did both, so it counts as placed; a row with neither is a
@@ -703,6 +718,37 @@ restore:
     that came back without a ceiling is counted in one line for its owner
     rather than one line each. One that still cannot start is counted failed
     and its owner reads the reason through proc_list, see processes_list.
+
+health_probes:
+  description: >
+    A Process whose Package declares deploy.units[0].health.http, is exposed as
+    http or mcp, and publishes an endpoint is probed by kitbashd: GET
+    <endpoint><health.http> every health.interval, with a 5 s timeout, from one
+    goroutine that starts after restore and follows the registrations as they
+    come and go. The interval defaults to 30 s and an interval under 5 s is
+    raised to 5 s. The request is made with the same two rules the fan out
+    follows: no redirect is followed, and a connection that does not land on a
+    loopback address is refused.
+  records: >
+    Each probe writes one metric record named kitbash.health, value 1 for
+    healthy and 0 for unhealthy, carrying kitbash.user (the owner),
+    kitbash.package, kitbash.process and kitbash.path (the path requested),
+    kitbash.producer = kitbashd, and kitbash.health.status: the HTTP status as
+    a number, or "timeout" or "unreachable" when there was none. Any 2xx is
+    healthy. The record is stored and fanned out like every other record, so
+    tel_query answers it to the Process's owner and to admins.
+  does_nothing_else: >
+    A probe restarts nothing, stops nothing and changes no registration: what
+    it produces is Telemetry, and acting on it is a kit's or the owner's. A
+    Process unregistered while its probe is in flight has that reading dropped.
+  exec: >
+    health.exec is recorded and run by nobody. A manifest that declares one
+    stays valid and kitbash-mcp says so once per proc_run, see PLAN.md
+    section 2.4.
+  reporting: >
+    The health path reports probes: how many Processes are being probed.
+    processes_list carries the last reading per Process and proc_list publishes
+    it as health: { last, healthy }.
 
 backup:
   description: >
