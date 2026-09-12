@@ -152,6 +152,10 @@ type Options struct {
 	// still resolves, so the records its child flushed on the way out are not
 	// stored without the Process that recorded them. Zero means CallerGrace.
 	MCPCallerGrace time.Duration
+	// HealthMinInterval is the floor every declared probe interval is held
+	// to. Zero means MinHealthInterval. It exists for tests, which cannot
+	// wait five seconds to see a second probe.
+	HealthMinInterval time.Duration
 	// NoRestore stops the daemon from starting the registered Processes,
 	// which an operator sets with KITBASH_NO_RESTORE to bring a host up
 	// without its Processes, and a test sets to keep the runtime out of it.
@@ -191,6 +195,10 @@ type Server struct {
 	// fetches holds one image copy per member and digest, see images.go. The
 	// second caller is refused rather than queued: a copy takes minutes.
 	fetches *fetchLock
+	// probes holds the Processes whose declared health path kitbashd
+	// requests, see health.go. The loop that requests them is started by the
+	// caller after restore.
+	probes *prober
 
 	// The MCP endpoint of the Process receiver: the handler of the SDK, the
 	// live sessions, the binary each one runs and how long one may sit idle,
@@ -258,6 +266,7 @@ func New(st *store.Store, opts Options) *Server {
 		endpoint: opts.ProcessEndpoint,
 		actions:  newActionLock(),
 		fetches:  newFetchLock(),
+		probes:   newProber(opts.HealthMinInterval),
 
 		mcpSessions: newMCPRegistry(),
 		mcpBinary:   mcpBinaryPath(opts.MCPBinary),

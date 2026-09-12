@@ -324,7 +324,8 @@ func (s *Server) retention(w http.ResponseWriter, r *http.Request) {
 
 // healthResponse is what /kitbash/v1/health answers. The listeners say which
 // of the two receivers is bound, subscribers how many Processes the fan out is
-// delivering to, and mcpSessions how many MCP sessions Processes hold open.
+// delivering to, mcpSessions how many MCP sessions Processes hold open, and
+// probes how many Processes declare a health path kitbashd requests.
 //
 // lastBackup is when the nightly store backup last succeeded and backups how
 // many copies are kept; lastBackupError is the reason the last attempt failed
@@ -336,6 +337,7 @@ type healthResponse struct {
 	Listeners       listeners `json:"listeners"`
 	Subscribers     int       `json:"subscribers"`
 	MCPSessions     int       `json:"mcpSessions"`
+	Probes          int       `json:"probes"`
 	LastBackup      string    `json:"lastBackup,omitempty"`
 	Backups         int       `json:"backups"`
 	LastBackupError string    `json:"lastBackupError,omitempty"`
@@ -361,6 +363,7 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		Listeners:       s.listeners(),
 		Subscribers:     s.fanout.count(),
 		MCPSessions:     s.mcpSessions.count(),
+		Probes:          s.probes.count(),
 		LastBackup:      backup.LastBackup,
 		Backups:         backup.Backups,
 		LastBackupError: backup.LastBackupError,

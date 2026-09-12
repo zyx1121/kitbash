@@ -384,6 +384,19 @@ func (f *Fake) Run(_ context.Context, m Member, opts podman.RunOptions, cgroup s
 		return "", f.RunErr
 	}
 	f.Ran = append(f.Ran, call)
+	// The container exists now, with the configuration the run gave it, which
+	// is what ContainerConfig answers and what a health probe is checked
+	// against.
+	if f.Configs == nil {
+		f.Configs = map[string]ContainerConfig{}
+	}
+	f.Configs[opts.Name] = ContainerConfig{
+		CgroupParent: opts.CgroupParent,
+		Image:        opts.Image,
+		Labels:       opts.Labels,
+		Restart:      opts.Restart,
+		Publish:      opts.Publish,
+	}
 	if f.RunID != "" {
 		return f.RunID, nil
 	}
@@ -473,6 +486,23 @@ func (f *Fake) RemoveContainer(_ context.Context, m Member, container string, fo
 	delete(f.Configs, container)
 	delete(f.Running, container)
 	return nil
+}
+
+// Publish stages a container that publishes these host ports, which is what a
+// health probe is checked against. Only the host side matters to the check, so
+// the container side is the same one for each.
+func (f *Fake) Publish(container string, ports ...int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.Configs == nil {
+		f.Configs = map[string]ContainerConfig{}
+	}
+	config := f.Configs[container]
+	config.Publish = nil
+	for _, port := range ports {
+		config.Publish = append(config.Publish, podman.PortMapping{HostPort: port, ContainerPort: 8080})
+	}
+	f.Configs[container] = config
 }
 
 // AddImage puts one image in a member's store, which is what a build of

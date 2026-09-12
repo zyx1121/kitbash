@@ -546,7 +546,9 @@ families:
           from M5. The container runtime holds the state; a Process kitbashd
           could not bring back at the last boot is reported failed with
           problem and fix, because its container sits in the runtime looking
-          like one on its way up, see restore in spec/kitbashd-api.yaml.
+          like one on its way up, see restore in spec/kitbashd-api.yaml. A
+          Process whose manifest declares a health path carries the most recent
+          probe kitbashd ran, see health_probes there.
         input: { type: object, additionalProperties: false, properties: {} }
         output:
           type: object
@@ -568,6 +570,16 @@ families:
                   problem: { type: string, description: "Why this Process is not running, when kitbashd could not bring it back" }
                   fix: { type: string, description: "What the owner can do about it" }
                   runner: { type: string, description: "Package path of the run kit that owns this Process, absent when kitbashd runs it" }
+                  health:
+                    type: object
+                    description: >
+                      The most recent health probe kitbashd ran, for a Process kitbashd runs
+                      itself whose manifest declares deploy.units[0].health.http. Absent until
+                      it has been probed once.
+                    required: [healthy]
+                    properties:
+                      last: { type: string, format: date-time }
+                      healthy: { type: boolean }
       proc_stop:
         description: >
           Stop a Process. It stays known and can be run again with proc_run.

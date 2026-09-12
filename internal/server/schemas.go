@@ -148,7 +148,16 @@ const processDef = `{
     "state": { "type": "string", "enum": ["starting", "running", "unhealthy", "stopped", "failed"] },
     "expose": { "type": "string", "enum": ["mcp", "http", "none"] },
     "startedAt": { "type": "string", "format": "date-time" },
-    "runner": { "type": "string", "description": "Package path of the run kit that owns this Process, absent when kitbashd runs it" }
+    "runner": { "type": "string", "description": "Package path of the run kit that owns this Process, absent when kitbashd runs it" },
+    "health": {
+      "type": "object",
+      "description": "The most recent health probe kitbashd ran, for a Process kitbashd runs itself whose manifest declares deploy.units[0].health.http. Absent until it has been probed once.",
+      "required": ["healthy"],
+      "properties": {
+        "last": { "type": "string", "format": "date-time" },
+        "healthy": { "type": "boolean" }
+      }
+    }
   }
 }`
 

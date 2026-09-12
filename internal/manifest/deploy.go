@@ -94,6 +94,29 @@ type Unit struct {
 	Raw     map[string]any
 }
 
+// HealthProbe is the HTTP probe this unit declares: the path kitbashd requests
+// on the Process's endpoint, and how often it requests it, both as the
+// manifest spells them. A unit that declares no health.http answers two empty
+// strings, which is a Process nothing probes.
+//
+// health.exec is read by HealthExec and run by nobody. Version 1 probes over
+// HTTP and records the answer as Telemetry; a command probe is a second
+// mechanism with none of that, so the key stays in the schema, a manifest that
+// declares one stays valid, and the Package is told once that it is not
+// probed, see PLAN.md section 2.4.
+func (u Unit) HealthProbe() (path, interval string) {
+	path, _ = u.Health["http"].(string)
+	interval, _ = u.Health["interval"].(string)
+	return path, interval
+}
+
+// HealthExec reports whether the unit declares a command probe, which kitbash
+// records and does not run.
+func (u Unit) HealthExec() bool {
+	command, ok := u.Health["exec"].([]any)
+	return ok && len(command) > 0
+}
+
 // Tools returns provides.tools in manifest order.
 func (m *Manifest) Tools() []Tool {
 	provides, ok := m.Raw["provides"].(map[string]any)

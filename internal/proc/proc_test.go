@@ -45,6 +45,17 @@ deploy:
       port: 8080
 `
 
+const healthManifest = `name: dashboard
+description: A small web interface a member opens in a browser on this host.
+deploy:
+  units:
+    - type: container
+      build: .
+      expose: http
+      port: 8080
+      health: { http: /healthz, interval: 10s }
+`
+
 type fixture struct {
 	files     *fs.Service
 	runner    *podman.Fake
@@ -482,6 +493,75 @@ func TestRunPublishesAnEndpointForHTTP(t *testing.T) {
 	}
 	if len(process.Tools) != 0 {
 		t.Errorf("an http Process published tools: %v", process.Tools)
+	}
+}
+
+// The probe a manifest declares travels with the registration, because
+// kitbashd is the one that requests it and after a reboot the registration is
+// the only thing that remembers, see PLAN.md section 2.4.
+func TestRunRegistersTheDeclaredHealthProbe(t *testing.T) {
+	f := newFixture(t)
+	folder := f.pack(t, "dashboard", healthManifest)
+	f.build(folder, "dashboard")
+
+	process, prob := f.processes.Run(context.Background(), folder, "", "")
+	if prob != nil {
+		t.Fatalf("Run: %s", prob.Detail)
+	}
+	reg, found := f.daemon.Registration(process.ID)
+	if !found {
+		t.Fatalf("the Process was not registered")
+	}
+	if reg.Health == nil {
+		t.Fatal("the registration carries no health probe")
+	}
+	if reg.Health.HTTP != "/healthz" || reg.Health.Interval != "10s" {
+		t.Errorf("health = %+v, want the declaration of the manifest", reg.Health)
+	}
+}
+
+// proc_list carries the most recent probe kitbashd ran, which is the one place
+// a member sees it without querying Telemetry.
+func TestListCarriesTheLastHealthProbe(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	folder := f.pack(t, "dashboard", healthManifest)
+	f.build(folder, "dashboard")
+	process, prob := f.processes.Run(ctx, folder, "", "")
+	if prob != nil {
+		t.Fatalf("Run: %s", prob.Detail)
+	}
+	// The reading is kitbashd's, so it is seeded on the registry rather than
+	// produced here: this session reads it back with the listing.
+	healthy := true
+	f.daemon.AddProcess(teltest.Registration{
+		ID:      process.ID,
+		Package: folder,
+		Health: &teltest.Health{
+			HTTP:    "/healthz",
+			Last:    "2026-09-12T10:00:00Z",
+			Healthy: &healthy,
+		},
+	})
+
+	list, prob := f.processes.List(ctx)
+	if prob != nil {
+		t.Fatalf("List: %s", prob.Detail)
+	}
+	var listed *proc.Process
+	for i := range list.Processes {
+		if list.Processes[i].ID == process.ID {
+			listed = &list.Processes[i]
+		}
+	}
+	if listed == nil {
+		t.Fatalf("the Process is not in the listing")
+	}
+	if listed.Health == nil {
+		t.Fatal("the listed Process carries no health reading")
+	}
+	if !listed.Health.Healthy || listed.Health.Last != "2026-09-12T10:00:00Z" {
+		t.Errorf("health = %+v, want the reading kitbashd holds", listed.Health)
 	}
 }
 

@@ -171,6 +171,48 @@ func TestReservedNames(t *testing.T) {
 	}
 }
 
+// The probe kitbashd runs is read off the unit, and the command probe it does
+// not run is readable so the caller can say so once, see PLAN.md section 2.4.
+func TestUnitHealthProbe(t *testing.T) {
+	cases := []struct {
+		name     string
+		health   string
+		path     string
+		interval string
+		exec     bool
+	}{
+		{name: "none", health: ""},
+		{name: "http", health: `health: { http: /healthz, interval: 10s }`, path: "/healthz", interval: "10s"},
+		{name: "http without an interval", health: `health: { http: /healthz }`, path: "/healthz"},
+		{name: "exec", health: `health: { exec: ["ffmpeg", "-version"] }`, exec: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m, err := manifest.Parse([]byte(`name: ffmpeg
+description: Transcode and probe media files. Use for any audio or video conversion.
+deploy:
+  units:
+    - type: container
+      build: src
+      ` + tc.health + "\n"))
+			if err != nil {
+				t.Fatalf("parsing the manifest: %v", err)
+			}
+			unit, ok := m.Unit()
+			if !ok {
+				t.Fatal("the manifest carries a deploy block but no unit was read")
+			}
+			path, interval := unit.HealthProbe()
+			if path != tc.path || interval != tc.interval {
+				t.Errorf("HealthProbe() = %q, %q, want %q, %q", path, interval, tc.path, tc.interval)
+			}
+			if unit.HealthExec() != tc.exec {
+				t.Errorf("HealthExec() = %v, want %v", unit.HealthExec(), tc.exec)
+			}
+		})
+	}
+}
+
 func TestUnitDefaults(t *testing.T) {
 	m, err := manifest.Parse([]byte(`name: ffmpeg
 description: Transcode and probe media files. Use for any audio or video conversion.

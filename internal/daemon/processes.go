@@ -36,6 +36,9 @@ const (
 	MaxEndpointBytes  = 256
 	MaxSubscriptions  = 8
 	MaxContainerBytes = 128
+	// MaxHealthPathBytes bounds the path a probe requests. It is the path of
+	// a URL kitbashd builds, and a health endpoint is named in a word.
+	MaxHealthPathBytes = 256
 )
 
 // MaxProcessesPerMember is how many Processes one member may hold registered.
@@ -55,6 +58,10 @@ var (
 	containerName = regexp.MustCompile(`^kitbash-[a-z0-9-]+$`)
 	imageDigest   = regexp.MustCompile(`^sha256:[a-f0-9]{64}$`)
 )
+
+// healthInterval is how spec/manifest.schema.json spells an interval, which is
+// what a registration carries through unchanged.
+var healthInterval = regexp.MustCompile(`^[0-9]+(ms|s|m)$`)
 
 var uuidV7 = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 
@@ -81,7 +88,18 @@ type processRequest struct {
 	// because the Process runs wherever the kit put it: kitbashd registers it,
 	// mints its token, and neither starts nor restores it, see PLAN.md
 	// section 3.
-	Runner string `json:"runner,omitempty"`
+	Runner string         `json:"runner,omitempty"`
+	Health *healthRequest `json:"health,omitempty"`
+}
+
+// healthRequest is the probe a registration declares, which is the part of
+// deploy.units[0].health kitbashd implements: the path it requests and how
+// often. A registration that carries no block declares no probe, which is
+// every registration written before probing existed and every Package that
+// asks for none.
+type healthRequest struct {
+	HTTP     string `json:"http,omitempty"`
+	Interval string `json:"interval,omitempty"`
 }
 
 // processResponse is what a registration answers. The token is returned once
@@ -172,8 +190,17 @@ func (s *Server) registerProcess(w http.ResponseWriter, r *http.Request, caller 
 		Subscriptions: req.Subscriptions,
 		Runner:        req.Runner,
 		Permits:       req.Permits,
+		Health:        declaredHealth(req.Health),
 		FanoutSecret:  secret,
 		RegisteredAt:  s.now().UTC(),
+	}
+	// A declared probe is checked against the container before the row is
+	// written, so a registration kitbashd would not probe is refused rather
+	// than stored as a declaration nothing acts on, see verifyProbe.
+	verified, prob := s.checkedProbe(r, caller, p)
+	if prob != nil {
+		writeProblem(w, prob)
+		return
 	}
 	if err := s.store.RegisterProcess(r.Context(), p, hash, MaxProcessesPerMember); err != nil {
 		if errors.Is(err, store.ErrProcessOwned) {
@@ -192,7 +219,47 @@ func (s *Server) registerProcess(w http.ResponseWriter, r *http.Request, caller 
 		return
 	}
 	s.fanout.track(p)
+	// The probe starts with the registration when the container already
+	// publishes the endpoint, and its first request goes out at once: the
+	// reading its owner is waiting for is the first one. A registration whose
+	// container does not exist yet, which is what proc_run sends, is probed
+	// from the start that creates it.
+	if verified {
+		s.probes.track(p, s.now())
+	} else {
+		s.probes.untrack(p.ID)
+	}
 	writeJSON(w, r.URL.Path, processResponse{ID: p.ID, Token: token, FanoutSecret: secret})
+}
+
+// checkedProbe holds one registration's declared probe to the ports its
+// container publishes and reports whether kitbashd may probe it. The caller's
+// own member record is what the runtime is asked as, because a member's
+// containers are in their own store and nowhere else.
+func (s *Server) checkedProbe(r *http.Request, caller Caller, p store.Process) (bool, *problem.Problem) {
+	if !p.Health.Declared() {
+		return false, nil
+	}
+	m, found, err := s.users.Lookup(r.Context(), caller.User)
+	if err != nil {
+		return false, problem.Internal(r.URL.Path, err.Error(), "")
+	}
+	if !found {
+		return false, problem.NotPermitted(r.URL.Path,
+			fmt.Sprintf("%s is not a member of this host, so kitbashd cannot check what their containers publish", caller.User),
+			"Ask an administrator to create a member for this account.")
+	}
+	return s.verifyProbe(r.Context(), m, p, r.URL.Path)
+}
+
+// declaredHealth reads the probe of one registration. A block naming no
+// path declares nothing, which is what a caller sending an interval alone
+// asked for and is refused by validateProcess before it reaches here.
+func declaredHealth(req *healthRequest) store.Health {
+	if req == nil {
+		return store.Health{}
+	}
+	return store.Health{HTTP: req.HTTP, Interval: req.Interval}
 }
 
 // listProcesses answers with the caller's Processes, or every member's for an
@@ -207,8 +274,11 @@ func (s *Server) listProcesses(w http.ResponseWriter, r *http.Request, caller Ca
 		writeProblem(w, problem.Internal(r.URL.Path, err.Error(), ""))
 		return
 	}
+	// One listing carries both of the things kitbashd knows and the store
+	// does not: why a Process did not come back, and what its last health
+	// probe saw.
 	listed := make([]listedProcess, 0, len(list))
-	for _, p := range list {
+	for _, p := range s.withReadings(list) {
 		entry := listedProcess{Process: p}
 		if prob := s.processProblem(p.ID); prob.Detail != "" {
 			entry.Problem = prob.Detail
@@ -286,6 +356,9 @@ func (s *Server) unregisterProcess(w http.ResponseWriter, r *http.Request, id st
 	}
 	s.fanout.untrack(id)
 	s.clearProcessProblem(id)
+	// Nothing is probed for a Process nobody runs. A request already in
+	// flight for it is answered to nobody, see probeOnce.
+	s.probes.untrack(id)
 	// The token that opened them is revoked, so the sessions it opened are
 	// over and the kitbash-mcp of each one exits.
 	s.endMCPSessions(id)
@@ -369,6 +442,9 @@ func validateProcess(instance string, req processRequest) *problem.Problem {
 				"Declare subscriptions: [telemetry], which is the only one that exists.")
 		}
 	}
+	if prob := validateHealth(instance, req.Health); prob != nil {
+		return prob
+	}
 	// A permits block kitbashd cannot honour is refused here rather than
 	// stored: a glob nobody can read would otherwise sit in the registry
 	// permitting nothing, and the member would look for the mistake in the
@@ -378,6 +454,37 @@ func validateProcess(instance string, req processRequest) *problem.Problem {
 			"Declare provides.permits.tools as tool name globs and provides.permits.paths as absolute path prefixes in the Package's kitbash.yaml.")
 	}
 	return validateEndpoint(instance, req.Endpoint)
+}
+
+// validateHealth checks the declared probe. kitbashd requests this path on the
+// Process's own endpoint, so what it has to be is a path: a registration that
+// named a whole URL would be asking the daemon to request something else.
+func validateHealth(instance string, req *healthRequest) *problem.Problem {
+	if req == nil {
+		return nil
+	}
+	refuse := func(detail string) *problem.Problem {
+		return problem.BadRequest(instance, detail, healthFix)
+	}
+	if req.HTTP == "" {
+		return refuse("the health block names no path to request")
+	}
+	if len(req.HTTP) > MaxHealthPathBytes {
+		return refuse(fmt.Sprintf("the health path is %d bytes, over the %d this API carries",
+			len(req.HTTP), MaxHealthPathBytes))
+	}
+	if !strings.HasPrefix(req.HTTP, "/") {
+		return refuse(fmt.Sprintf("%q is not a path on the Process's endpoint", req.HTTP))
+	}
+	for _, r := range req.HTTP {
+		if r <= ' ' || r == 0x7f {
+			return refuse(fmt.Sprintf("%q carries a character a request line cannot", req.HTTP))
+		}
+	}
+	if req.Interval != "" && !healthInterval.MatchString(req.Interval) {
+		return refuse(fmt.Sprintf("%q is not an interval", req.Interval))
+	}
+	return nil
 }
 
 // validateEndpoint refuses anything but a loopback HTTP endpoint. The fan out

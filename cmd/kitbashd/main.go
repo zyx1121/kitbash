@@ -200,6 +200,12 @@ func run() error {
 	go func() {
 		srv.Prepare(serve)
 		srv.Restore(serve)
+		// The health probes start after restore rather than beside it: a
+		// Process that is still coming back would be probed while its
+		// container is starting, and the first record of the boot would say
+		// unhealthy about a host that is merely booting, see PLAN.md
+		// section 2.4.
+		srv.HealthLoop(serve)
 	}()
 
 	var failed error

@@ -286,6 +286,16 @@ func (s *Server) startProcess(w http.ResponseWriter, r *http.Request, p store.Pr
 	// over and proc_list stops reporting it.
 	s.clearProcessProblem(p.ID)
 	logger.Printf("processes: %s started %s for %s in %s", p.ID, p.Container, m.Name, cgroupOrNone(leaf))
+	// The container exists now, so this is where a Process registered before
+	// it did gets its probe checked and started, see verifyProbe. The start
+	// itself is not refused by a declaration that does not check out: the
+	// Process is running, and what a failed check costs is the probe. The
+	// registration that declared it was refused to the member's face when the
+	// container was already there, and is refused again the next time they
+	// run this Process.
+	if prob := s.trackProbeAs(r.Context(), m, p, r.URL.Path); prob != nil {
+		logger.Printf("health: not probing %s of %s: %s", p.ID, p.Owner, prob.Detail)
+	}
 	writeJSON(w, r.URL.Path, startResponse{ID: p.ID, Container: p.Container, ContainerID: id})
 }
 

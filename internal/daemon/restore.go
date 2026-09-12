@@ -94,6 +94,7 @@ func (s *Server) Restore(ctx context.Context) RestoreCounts {
 				logger.Printf("restore: unregistering %s: %v", p.ID, err)
 			}
 			s.fanout.untrack(p.ID)
+			s.probes.untrack(p.ID)
 			s.endMCPSessions(p.ID)
 			continue
 		}
@@ -195,6 +196,7 @@ func (s *Server) restoreOwner(ctx context.Context, owner string, processes []sto
 			s.fanout.untrack(p.ID)
 			// There is no Process left to report a problem about.
 			s.clearProcessProblem(p.ID)
+			s.probes.untrack(p.ID)
 			s.endMCPSessions(p.ID)
 		default:
 			logger.Printf("restore: starting %s of %s: %v", p.Container, owner, err)
