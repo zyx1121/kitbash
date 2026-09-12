@@ -392,13 +392,14 @@ func builtElsewhere(prob *problem.Problem, unit manifest.Unit) *problem.Problem 
 
 // List answers proc_list: every Process of the caller, running or stopped.
 //
-// The container runtime holds the state and this reads it back, with the two
+// The container runtime holds the state and this reads it back, with the three
 // things added that the runtime does not know: why a Process is not running,
-// and what its last health probe saw. A container the boot restore could not
-// start is still in the runtime as created, which reads as starting, so
-// kitbashd is asked what it could not bring back and those are reported failed
-// with the reason, see restore in spec/kitbashd-api.yaml. Both come from the
-// one registry call.
+// what its last health probe saw, and the Processes a run kit owns, which have
+// no container here at all. A container the boot restore could not start is
+// still in the runtime as created, which reads as starting, so kitbashd is
+// asked what it could not bring back and those are reported failed with the
+// reason, see restore in spec/kitbashd-api.yaml. All three come from the one
+// registry call.
 func (s *Service) List(ctx context.Context) (*ListResult, *problem.Problem) {
 	containers, prob := s.containers(ctx, podman.Filter{podman.LabelUser: s.files.User()}, true)
 	if prob != nil {
@@ -423,7 +424,7 @@ func (s *Service) List(ctx context.Context) (*ListResult, *problem.Problem) {
 	// The Processes a run kit owns run wherever the kit put them, so the
 	// runtime here has nothing to report about them and the registry is what
 	// says they exist.
-	result.Processes = append(result.Processes, s.kitOwnedProcesses(ctx, result.Processes)...)
+	result.Processes = append(result.Processes, s.kitOwnedProcesses(known, result.Processes)...)
 	sort.Slice(result.Processes, func(i, j int) bool {
 		return result.Processes[i].Name < result.Processes[j].Name
 	})

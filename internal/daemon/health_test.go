@@ -769,3 +769,76 @@ func TestRestoreStopsProbingAProcessWhoseContainerIsGone(t *testing.T) {
 		t.Errorf("%d Processes are still probed after restore unregistered them", n)
 	}
 }
+
+// A Process a run kit owns is not probed: kitbashd does not supervise it, and
+// there is no container of it here to check an endpoint against. A Package
+// that declares one anyway is refused rather than ignored, see PLAN.md
+// section 3.
+func TestRegisteringRefusesAProbeOnAProcessARunKitOwns(t *testing.T) {
+	h, _ := serveProbing(t)
+	stub := newProbeStub(t, http.StatusOK)
+
+	req := probeRegistration(stub.server.URL, "/healthz", "")
+	// A Process a kit owns carries a runner and no container, which is what
+	// proc_run registers when a manifest names one.
+	req.Runner = "/org/pve-runner"
+	req.Container = ""
+	req.Digest = ""
+	res, body := h.postJSON(http.MethodPost, processesPath, req)
+	if res.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, body %s", res.StatusCode, body)
+	}
+	prob := h.problemOf(res, body)
+	if prob.Slug() != problem.SlugNotPermitted {
+		t.Errorf("problem is %s, want not-permitted", prob.Slug())
+	}
+	if !strings.Contains(prob.Detail, "run kit owns") {
+		t.Errorf("detail is %q, want it to say a run kit owns this Process", prob.Detail)
+	}
+	if n := h.server.probes.count(); n != 0 {
+		t.Errorf("%d Processes are probed, want none", n)
+	}
+
+	// The same Process without a health block is registered as it was, and
+	// still nothing probes it.
+	kitOwned := registration("")
+	kitOwned.Runner = "/org/pve-runner"
+	kitOwned.Expose = ExposeHTTP
+	kitOwned.Endpoint = stub.server.URL
+	if _, res, body := h.register(kitOwned); res.StatusCode != http.StatusOK {
+		t.Fatalf("register status = %d, body %s", res.StatusCode, body)
+	}
+	if n := h.server.probes.count(); n != 0 {
+		t.Errorf("%d Processes are probed, want none for a Process a kit owns", n)
+	}
+	time.Sleep(10 * testHealthInterval)
+	if n := stub.requests.Load(); n != 0 {
+		t.Errorf("a Process a run kit owns was probed %d times", n)
+	}
+}
+
+// The prober leaves a stored registration a kit owns alone as well, which is
+// what a daemon that has just started finds for one.
+func TestTheProbeLoopSkipsAProcessARunKitOwns(t *testing.T) {
+	h, fake := serveProbingHost(t)
+	stub := newProbeStub(t, http.StatusOK)
+	id := h.storedProbe(fake, "kitbash-probe-kit", stub.server.URL, "10ms")
+	p := h.process(id)
+	p.Runner = "/org/pve-runner"
+	p.Container = ""
+	if err := h.store.RegisterProcess(context.Background(), p, "hash-of-a-token", 0); err != nil {
+		t.Fatalf("RegisterProcess: %v", err)
+	}
+
+	h.probeLoop()
+	time.Sleep(10 * testHealthInterval)
+	if n := h.server.probes.count(); n != 0 {
+		t.Errorf("%d Processes are probed, want none for a Process a kit owns", n)
+	}
+	if n := stub.requests.Load(); n != 0 {
+		t.Errorf("a Process a run kit owns was probed %d times", n)
+	}
+	if n := len(h.healthRecords()); n != 0 {
+		t.Errorf("%d health records for a Process a run kit owns", n)
+	}
+}

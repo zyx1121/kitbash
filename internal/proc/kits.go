@@ -292,18 +292,15 @@ func (s *Service) kitOwned(ctx context.Context, id string) (telemetry.Registered
 	return telemetry.Registered{}, false
 }
 
-// kitOwnedProcesses are the caller's Processes that a run kit owns. They have
-// no container here, so the registry is the only thing that knows they exist:
-// proc_list reads them from it and merges them with the runtime's own.
-func (s *Service) kitOwnedProcesses(ctx context.Context, listed []Process) []Process {
-	if s.registry == nil {
-		return nil
-	}
-	known, prob := s.registry.ListProcesses(ctx)
-	if prob != nil {
-		s.logger.Printf("proc: reading the Process registry: %s", prob.Detail)
-		return nil
-	}
+// kitOwnedProcesses are the caller's Processes that a run kit owns, out of
+// what the registry answered. They have no container here, so the registry is
+// the only thing that knows they exist: proc_list reads them from it and
+// merges them with the runtime's own.
+//
+// The listing is passed in rather than fetched again: one proc_list is one
+// call to kitbashd, which also answers why a Process did not come back and
+// what its last health probe saw, see Service.registered.
+func (s *Service) kitOwnedProcesses(known map[string]telemetry.Registered, listed []Process) []Process {
 	here := map[string]bool{}
 	for _, p := range listed {
 		here[p.ID] = true

@@ -730,6 +730,12 @@ health_probes:
     Process is a stdio server and publishes no endpoint. The request is made
     with the same two rules the fan out follows: no redirect is followed, and a
     connection that does not land on a loopback address is refused.
+  not_probed: >
+    A Process a run kit owns is not probed. It has no container on this host,
+    so there is nothing to check its endpoint against and kitbashd does not
+    supervise it at all; a registration that names a runner and declares health
+    is 403 not-permitted with the detail "a Process a run kit owns is not
+    probed by kitbashd", see PLAN.md section 3.
   what_may_be_probed: >
     The port is not taken from the registration. A registration that declares
     health is accepted only when the endpoint names a host port the Process's

@@ -146,7 +146,15 @@ func newProber(minInterval time.Duration) *prober {
 // Process that declares a path, publishes an endpoint on this host, and is
 // exposed over HTTP or as an MCP server. A Process exposed as none publishes
 // nothing to request.
+//
+// A Process a run kit owns is never probed. There is no container of it on
+// this host, so there is nothing to check its endpoint against, and kitbashd
+// does not supervise it at all: the kit that started it is the one that knows
+// whether it is up, see PLAN.md section 3.
 func probed(p store.Process) bool {
+	if p.Runner != "" {
+		return false
+	}
 	if !p.Health.Declared() || p.Endpoint == "" {
 		return false
 	}
@@ -230,6 +238,18 @@ func (pr *prober) untrack(id string) {
 // checks again. A runtime that will not answer is a refusal: kitbashd probes
 // what it has checked, and nothing it has not.
 func (s *Server) verifyProbe(ctx context.Context, m sysusers.Member, p store.Process, instance string) (bool, *problem.Problem) {
+	if p.Runner != "" {
+		// A run kit owns this Process, so there is no container of it here
+		// and nothing to check an endpoint against. A declared probe is
+		// refused rather than ignored: the Package asked for something
+		// kitbashd cannot do for a Process it does not supervise.
+		if p.Health.Declared() {
+			return false, problem.NotPermitted(instance,
+				"a Process a run kit owns is not probed by kitbashd",
+				fmt.Sprintf("Remove deploy.units[0].health from this Package, or have %s probe the Process it runs.", p.Runner))
+		}
+		return false, nil
+	}
 	if !probed(p) {
 		return false, nil
 	}
