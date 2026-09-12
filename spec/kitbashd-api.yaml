@@ -228,7 +228,7 @@ api:
   processes_register:
     method: POST
     path: /kitbash/v1/processes
-    request: { id: "UUIDv7", package: "/home/loki/echo", name: "echo", container: "kitbash-echo-echo", digest: "sha256:...", expose: "mcp|http|none", endpoint: "http://127.0.0.1:40275 when expose is http", subscriptions: ["telemetry"] }
+    request: { id: "UUIDv7", package: "/home/loki/echo", name: "echo", container: "kitbash-echo-echo", digest: "sha256:...", expose: "mcp|http|none", endpoint: "http://127.0.0.1:40275 when expose is http", subscriptions: ["telemetry"], runner: "/org/pve-runner when a run kit owns this Process" }
     response: { id: "UUIDv7", token: "opaque, at least 32 bytes of entropy, returned once", fanoutSecret: "opaque, 32 bytes, returned once; the bearer the fan out presents to this Process" }
     authorization: >
       The caller is the member the Process belongs to; kitbashd records the
@@ -244,8 +244,9 @@ api:
     validation: >
       id is a canonical version 7 UUID of 36 characters, package an absolute
       path, expose one of mcp, http or none, subscriptions a subset of
-      [telemetry], and endpoint http://127.0.0.1:PORT and nothing else: the fan
-      out POSTs to whatever it names, so it may never point at the network.
+      [telemetry], runner an absolute path with no parent reference, and
+      endpoint http://127.0.0.1:PORT and nothing else: the fan out POSTs to
+      whatever it names, so it may never point at the network.
     errors: [bad-request, conflict, internal]
   processes_unregister:
     method: DELETE
@@ -621,6 +622,20 @@ restore:
     after a reboot" true; the OpenRC script needs localmount and cgroups, and
     its start_pre runs /usr/share/kitbash/rootless-prereqs.sh, which is what
     restore needs from the host rather than any dependency on local.
+  runner_owned_registrations: >
+    A registration carries a runner when the Package's container unit named a
+    run kit, see PLAN.md section 3. That Process runs wherever the kit put it,
+    so the registration carries no container name and kitbashd supervises none
+    of it: restore skips it rather than starting, healing or unregistering it,
+    and processes_start, processes_stop and processes_remove are 403
+    not-permitted for it. The registration is still what mints its Telemetry
+    token, keeps it on its owner's proc_list and holds its permits.
+    Downgrading is what to be careful with. The restore of 0.2.0 and earlier
+    does not know the column: it reads a runner owned row as a registration
+    that names no container, unregisters it and revokes its token at the first
+    boot, so a host rolled back from 0.3.0 loses the record of every Process a
+    run kit owns while those Processes keep running wherever the kit put them.
+    Stop them through their kits before rolling back.
   registration_fields: >
     The registration carries the container name and the digest from M5 on, so
     restore needs no manifest; the permits block of the Package's manifest, see

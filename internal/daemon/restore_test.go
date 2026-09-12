@@ -219,6 +219,108 @@ func TestRestoreSkipsWhatItCannotStart(t *testing.T) {
 	}
 }
 
+// registeredByKit writes one registration of a Process a run kit owns: no
+// container name, because the Process runs wherever the kit put it, and the
+// runner that says so, see PLAN.md section 3.
+func (h *harness) registeredByKit(owner, runner string) string {
+	h.t.Helper()
+	token, hash, err := store.NewToken()
+	if err != nil {
+		h.t.Fatalf("NewToken: %v", err)
+	}
+	id := uuid.V7()
+	if err := h.store.RegisterProcess(context.Background(), store.Process{
+		ID:           id,
+		Owner:        owner,
+		Package:      "/home/" + owner + "/trainer",
+		Name:         "trainer",
+		Runner:       runner,
+		Digest:       "sha256:" + "ab12cd34" + "00000000000000000000000000000000000000000000000000000000",
+		Expose:       ExposeNone,
+		FanoutSecret: "fanout-secret-of-" + id,
+		RegisteredAt: time.Now().UTC(),
+	}, hash, 0); err != nil {
+		h.t.Fatalf("RegisterProcess: %v", err)
+	}
+	h.tokens[id] = token
+	return id
+}
+
+// TestRestoreLeavesARunnerOwnedRegistrationAlone is the guard that keeps the
+// run hook working across a reboot. A Process a run kit owns carries no
+// container name, which is exactly the shape restore unregisters as a legacy
+// row: without the runner check it would be deleted at every boot, its token
+// revoked and its fan out dropped, while the Process kept running wherever the
+// kit put it.
+func TestRestoreLeavesARunnerOwnedRegistrationAlone(t *testing.T) {
+	h, fake := serveUsers(t, true)
+	fake.Add(sysusers.Member{Name: "alice", UID: 1005})
+
+	owned := h.registeredByKit("alice", "/org/pve-runner")
+	ordinary := h.registered("alice", "kitbash-echo-one")
+
+	counts := h.server.Restore(context.Background())
+	if counts != (RestoreCounts{Started: 1, Kit: 1}) {
+		t.Fatalf("counts = %+v, want the ordinary Process started and the kit owned one counted", counts)
+	}
+
+	ctx := context.Background()
+	p, found, err := h.store.Process(ctx, owned)
+	if err != nil || !found {
+		t.Fatalf("the registration of a Process a run kit owns was removed (%t, %v)", found, err)
+	}
+	if p.Runner != "/org/pve-runner" {
+		t.Errorf("the registration came back as %+v, want the runner it was written with", p)
+	}
+	if _, found, err := h.store.Process(ctx, ordinary); err != nil || !found {
+		t.Errorf("the ordinary Process is no longer registered (%t, %v)", found, err)
+	}
+	// Nothing of it was started here, and no cgroup was made for a Process
+	// this host does not run.
+	for _, call := range fake.Calls() {
+		if call.Container == "" {
+			t.Errorf("restore started %+v, want nothing for a Process a run kit owns", call)
+		}
+	}
+	if len(fake.Calls()) != 1 {
+		t.Fatalf("restore started %+v, want only the ordinary Process", fake.Calls())
+	}
+	for _, placed := range h.cgroups.Placed() {
+		if placed.ID == owned {
+			t.Errorf("a cgroup was made for %s, which runs wherever its kit put it", owned)
+		}
+	}
+}
+
+// TestRestoreNeverHealsARunnerOwnedRegistration is the same guard against the
+// other end of restore: a registration with no limits and no ceiling is the
+// shape the heal acts on, and a Process a run kit owns has neither. It must
+// not be read back, renamed aside or created again, because the container the
+// heal would work on is not on this host at all.
+func TestRestoreNeverHealsARunnerOwnedRegistration(t *testing.T) {
+	h, fake, owner, _ := legacyHarness(t)
+	owned := h.registeredByKit(owner, "/org/pve-runner")
+	// The runtime refuses every start in this harness, which is what makes the
+	// legacy Process healable. The kit owned one never reaches the runtime.
+	counts := h.server.Restore(context.Background())
+	if counts.Kit != 1 {
+		t.Fatalf("counts = %+v, want the kit owned registration counted as one", counts)
+	}
+	for _, rename := range fake.Renames() {
+		if strings.Contains(rename.From, "trainer") {
+			t.Errorf("the heal renamed %+v, which belongs to a run kit", rename)
+		}
+	}
+	for _, run := range fake.Runs() {
+		if run.Options.Name == "" || strings.Contains(run.Options.Name, "trainer") {
+			t.Errorf("the heal created %+v again, which belongs to a run kit", run.Options)
+		}
+	}
+	if _, found, err := h.store.Process(context.Background(), owned); err != nil || !found {
+		t.Fatalf("the registration of a Process a run kit owns was removed (%t, %v)", found, err)
+	}
+}
+
 // TestRestoreOff is the operator's switch, KITBASH_NO_RESTORE: a host comes up
 // without its Processes.
 func TestRestoreOff(t *testing.T) {

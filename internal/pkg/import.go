@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/zyx1121/kitbash/internal/bridge"
 	"github.com/zyx1121/kitbash/internal/fs"
 	"github.com/zyx1121/kitbash/internal/manifest"
 	"github.com/zyx1121/kitbash/internal/problem"
@@ -16,11 +15,13 @@ import (
 	"github.com/zyx1121/kitbash/internal/telemetry"
 )
 
-// Kits is what pkg_import needs from the MCP bridge: the caller's running
-// import kits and a way to call one. internal/bridge implements it, which
-// keeps every MCP type out of this package.
+// Kits is what pkg_import and pkg_build need from the MCP bridge: the caller's
+// running import kits, the one kit a manifest named as its builder, and a way
+// to call either. internal/bridge implements it, which keeps every MCP type
+// out of this package.
 type Kits interface {
-	Kits(ctx context.Context) ([]bridge.Kit, *problem.Problem)
+	Kits(ctx context.Context) ([]proc.Kit, *problem.Problem)
+	KitAt(ctx context.Context, path, hook, tool string) (*proc.Kit, *problem.Problem)
 	CallTool(ctx context.Context, p *proc.Process, tool string, args map[string]any) (json.RawMessage, *problem.Problem)
 }
 
@@ -76,7 +77,7 @@ func (s *Service) Import(ctx context.Context, req ImportRequest) (*ImportResult,
 		return nil, prob
 	}
 
-	raw, prob := s.kits.CallTool(ctx, accepting.Process, bridge.ImportTool,
+	raw, prob := s.kits.CallTool(ctx, accepting.Process, manifest.ToolImport,
 		map[string]any{"source": source})
 	if prob != nil {
 		return nil, prob
@@ -103,12 +104,12 @@ func (s *Service) Import(ctx context.Context, req ImportRequest) (*ImportResult,
 
 // accept picks the one running kit whose import input schema accepts the
 // source.
-func accept(kits []bridge.Kit, source string) (*bridge.Kit, *problem.Problem) {
+func accept(kits []proc.Kit, source string) (*proc.Kit, *problem.Problem) {
 	args, err := json.Marshal(map[string]any{"source": source})
 	if err != nil {
 		return nil, problem.Internal(source, err.Error(), "")
 	}
-	var accepting []bridge.Kit
+	var accepting []proc.Kit
 	for _, kit := range kits {
 		if err := kit.Tool.ValidateInput(args); err == nil {
 			accepting = append(accepting, kit)

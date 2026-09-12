@@ -43,8 +43,19 @@ const (
 	clientMount = "/e2e-client"
 )
 
-// fixtures are the files of the echo Package, written in this order: the
-// manifest first, because that is what makes the folder visible.
+// The run kit this job dispatches to, and the Package that names it. The kit
+// starts nothing: what is proved is that proc_run reached it with the hook's
+// arguments and registered the Process it answered with, see PLAN.md section 3.
+const (
+	runnerName    = "runner"
+	elsewhereName = "elsewhere"
+	runTool       = "runner_run"
+	stopTool      = "runner_stop"
+	callsTool     = "runner_calls"
+)
+
+// fixtures are the files of the echo and runner Packages, written in this
+// order: the manifest first, because that is what makes the folder visible.
 var fixtures = []string{"kitbash.yaml", "Dockerfile", "server.js"}
 
 // state is what one step of the job leaves for the next.
@@ -57,6 +68,12 @@ type state struct {
 	processID  string
 	approvalID string
 	echoText   string
+	// The run kit, the Package that names it, and the Process the kit
+	// answered proc_run with.
+	runnerPath     string
+	elsewherePath  string
+	elsewhereID    string
+	elsewhereImage string
 }
 
 // TestSurface is the job: one admin and one member driving the whole surface
@@ -64,9 +81,11 @@ type state struct {
 func TestSurface(t *testing.T) {
 	requireHost(t)
 	s := &state{
-		pkgPath:  filepath.Join("/home", adminName(), packageName),
-		orgFile:  "/org/handbook/e2e.md",
-		echoText: fmt.Sprintf("end to end at %s", time.Now().UTC().Format(time.RFC3339)),
+		pkgPath:       filepath.Join("/home", adminName(), packageName),
+		runnerPath:    filepath.Join("/home", adminName(), runnerName),
+		elsewherePath: filepath.Join("/home", adminName(), elsewhereName),
+		orgFile:       "/org/handbook/e2e.md",
+		echoText:      fmt.Sprintf("end to end at %s", time.Now().UTC().Format(time.RFC3339)),
 	}
 	steps := []struct {
 		name string
@@ -85,6 +104,9 @@ func TestSurface(t *testing.T) {
 		{"the admin approves it and the member is the author", approveTheWrite},
 		{"tel_query returns the span and the build log", queryTelemetry},
 		{"the new member is served their own identity", theNewMember},
+		{"a run kit is built and joins the surface", buildTheRunKit},
+		{"proc_run dispatches to the run kit", dispatchToTheRunKit},
+		{"proc_stop forwards to the run kit", stopThroughTheRunKit},
 	}
 	// The steps are one story and share the host, so they run in order on one
 	// test rather than as subtests: the first failure ends the job, and the
@@ -121,26 +143,40 @@ func theBuiltInSurface(t *testing.T, s *state) {
 }
 
 func writeThePackage(t *testing.T, s *state) {
+	writeFixture(t, s.admin, packageName, s.pkgPath)
+}
+
+// writeFixture writes one fixture Package into Files as the session's member,
+// one file per commit, the manifest first because that is what makes the
+// folder visible.
+func writeFixture(t *testing.T, session *session, fixture, target string) {
+	t.Helper()
 	for _, name := range fixtures {
-		body, err := os.ReadFile(filepath.Join("fixtures", packageName, name))
+		body, err := os.ReadFile(filepath.Join("fixtures", fixture, name))
 		if err != nil {
 			t.Fatalf("reading the fixture %s: %v", name, err)
 		}
-		var out struct {
-			Path   string `json:"path"`
-			Commit struct {
-				Sha    string `json:"sha"`
-				Author string `json:"author"`
-			} `json:"commit"`
-		}
-		s.admin.ok("fs_write", map[string]any{
-			"path":    filepath.Join(s.pkgPath, name),
-			"content": string(body),
-			"message": "Add " + name + " of the end to end Package",
-		}, &out)
-		if out.Commit.Author != adminName() || len(out.Commit.Sha) != 40 {
-			t.Fatalf("fs_write %s committed %+v, want a commit by %s", name, out.Commit, adminName())
-		}
+		writeFile(t, session, filepath.Join(target, name), string(body))
+	}
+}
+
+// writeFile writes one file and holds the commit to the member who wrote it.
+func writeFile(t *testing.T, session *session, path, content string) {
+	t.Helper()
+	var out struct {
+		Path   string `json:"path"`
+		Commit struct {
+			Sha    string `json:"sha"`
+			Author string `json:"author"`
+		} `json:"commit"`
+	}
+	session.ok("fs_write", map[string]any{
+		"path":    path,
+		"content": content,
+		"message": "Add " + filepath.Base(path) + " of the end to end Package",
+	}, &out)
+	if out.Commit.Author != session.user || len(out.Commit.Sha) != 40 {
+		t.Fatalf("fs_write %s committed %+v, want a commit by %s", path, out.Commit, session.user)
 	}
 }
 
@@ -481,6 +517,205 @@ func theNewMember(t *testing.T, s *state) {
 		t.Fatalf("users_me answered %+v, want %s as a regular member", me, secondName())
 	}
 	member.close()
+}
+
+// buildTheRunKit builds and runs the fixture run kit. It is a Package like any
+// other: what makes it a kit is the provides.kit block in its manifest, and
+// what puts its tools within reach of dispatch is expose: mcp.
+func buildTheRunKit(t *testing.T, s *state) {
+	writeFixture(t, s.admin, runnerName, s.runnerPath)
+
+	var built struct {
+		Digest string `json:"digest"`
+	}
+	res := s.admin.callWithin(buildTimeout, "pkg_build", map[string]any{"path": s.runnerPath})
+	res.mustSucceed(t, "pkg_build")
+	if err := json.Unmarshal(res.Structured, &built); err != nil {
+		t.Fatalf("decoding pkg_build: %v", err)
+	}
+
+	var out struct {
+		State  string   `json:"state"`
+		Runner string   `json:"runner"`
+		Tools  []string `json:"tools"`
+	}
+	s.admin.ok("proc_run", map[string]any{"package": s.runnerPath}, &out)
+	if out.State != "running" {
+		t.Fatalf("proc_run answered %+v, want the run kit running", out)
+	}
+	if out.Runner != "" {
+		t.Fatalf("the kit itself names the runner %q, want the built in runner to have started it", out.Runner)
+	}
+	names := append([]string{}, out.Tools...)
+	sort.Strings(names)
+	want := []string{callsTool, runTool, stopTool}
+	if strings.Join(names, " ") != strings.Join(want, " ") {
+		t.Fatalf("the run kit published %v, want %v", names, want)
+	}
+}
+
+// dispatchToTheRunKit is the whole point of the two manifest fields: a Package
+// whose unit names a runner is started by that kit, and what the kit answers
+// with is the Process kitbash registers and lists.
+func dispatchToTheRunKit(t *testing.T, s *state) {
+	// The manifest is written here rather than kept as a fixture because the
+	// runner is an absolute path, and which home it is under is this host's
+	// answer rather than the repository's.
+	writeFile(t, s.admin, filepath.Join(s.elsewherePath, "kitbash.yaml"), fmt.Sprintf(`name: %s
+description: A Package this host never starts. The fixture run kit answers for it, see PLAN.md section 3.
+deploy:
+  units:
+    - type: container
+      build: .
+      runner: %s
+      expose: none
+`, elsewhereName, s.runnerPath))
+	writeFile(t, s.admin, filepath.Join(s.elsewherePath, "Dockerfile"),
+		"FROM "+baseImage(t)+"\nENTRYPOINT [\"/bin/true\"]\n")
+
+	var built struct {
+		Digest string `json:"digest"`
+	}
+	res := s.admin.callWithin(buildTimeout, "pkg_build", map[string]any{"path": s.elsewherePath})
+	res.mustSucceed(t, "pkg_build")
+	if err := json.Unmarshal(res.Structured, &built); err != nil {
+		t.Fatalf("decoding pkg_build: %v", err)
+	}
+	s.elsewhereImage = built.Digest
+
+	var out struct {
+		ID     string `json:"id"`
+		Name   string `json:"name"`
+		State  string `json:"state"`
+		Digest string `json:"digest"`
+		Runner string `json:"runner"`
+	}
+	s.admin.ok("proc_run", map[string]any{"package": s.elsewherePath}, &out)
+	if out.Runner != s.runnerPath || out.State != "running" {
+		t.Fatalf("proc_run answered %+v, want a running Process owned by the kit at %s", out, s.runnerPath)
+	}
+	if out.Digest != s.elsewhereImage {
+		t.Fatalf("proc_run registered the digest %s, want the one pkg_build answered, %s", out.Digest, s.elsewhereImage)
+	}
+	s.elsewhereID = out.ID
+
+	// The kit was called with the four arguments of the hook, and the unit is
+	// the one the manifest wrote.
+	call := lastKitCall(t, s, "run")
+	if call.Package != s.elsewherePath || call.Digest != s.elsewhereImage || call.Name != elsewhereName {
+		t.Fatalf("the kit was called with %+v, want the Package, its digest and the Process name", call)
+	}
+	if call.Unit["type"] != "container" || call.Unit["runner"] != s.runnerPath {
+		t.Fatalf("the kit was handed the unit %v, want the container unit as the manifest wrote it", call.Unit)
+	}
+	if call.ID != out.ID {
+		t.Fatalf("the kit answered the id %s and proc_run registered %s", call.ID, out.ID)
+	}
+
+	// The Process is on proc_list with the kit that owns it, although nothing
+	// of it runs on this host: the registration is what knows it exists.
+	process, found := listed(t, s, out.ID)
+	if !found {
+		t.Fatalf("proc_list does not hold the Process %s the kit runs", out.ID)
+	}
+	if process.Runner != s.runnerPath || process.Package != s.elsewherePath {
+		t.Fatalf("proc_list answered %+v, want the Package and the kit that runs it", process)
+	}
+	if out, err := runAs(t, adminName(), "podman", "ps", "--all", "--format", "{{.Names}}"); err == nil {
+		if strings.Contains(out, "kitbash-"+elsewhereName) {
+			t.Fatalf("a container of %s exists here: %s", elsewhereName, out)
+		}
+	}
+}
+
+// stopThroughTheRunKit is the other half of the ownership: kitbash cannot stop
+// what it did not start, so proc_stop forwards to the kit's stop tool and the
+// registration goes with the Process.
+func stopThroughTheRunKit(t *testing.T, s *state) {
+	var stopped struct {
+		ID    string `json:"id"`
+		State string `json:"state"`
+	}
+	s.admin.ok("proc_stop", map[string]any{"id": s.elsewhereID}, &stopped)
+	if stopped.State != "stopped" {
+		t.Fatalf("proc_stop answered %+v, want the stopped state", stopped)
+	}
+	call := lastKitCall(t, s, "stop")
+	if call.ID != s.elsewhereID {
+		t.Fatalf("the kit was asked to stop %s, want %s", call.ID, s.elsewhereID)
+	}
+	if _, found := listed(t, s, s.elsewhereID); found {
+		t.Fatalf("proc_list still holds the stopped Process %s", s.elsewhereID)
+	}
+}
+
+// kitCall is one call the fixture kit recorded, as its calls tool hands it
+// back.
+type kitCall struct {
+	Tool    string         `json:"tool"`
+	ID      string         `json:"id"`
+	Package string         `json:"package"`
+	Digest  string         `json:"digest"`
+	Name    string         `json:"name"`
+	Unit    map[string]any `json:"unit"`
+}
+
+// lastKitCall is the newest call of one tool the fixture kit recorded, read
+// through the kit's own surface tool.
+func lastKitCall(t *testing.T, s *state, tool string) kitCall {
+	t.Helper()
+	var out struct {
+		Calls []kitCall `json:"calls"`
+	}
+	s.admin.ok(callsTool, map[string]any{}, &out)
+	for i := len(out.Calls) - 1; i >= 0; i-- {
+		if out.Calls[i].Tool == tool {
+			return out.Calls[i]
+		}
+	}
+	t.Fatalf("the kit recorded no %s call: %+v", tool, out.Calls)
+	return kitCall{}
+}
+
+// listedProcess is one entry of proc_list this job reads.
+type listedProcess struct {
+	ID      string `json:"id"`
+	Package string `json:"package"`
+	Digest  string `json:"digest"`
+	State   string `json:"state"`
+	Runner  string `json:"runner"`
+}
+
+// listed is one Process of the admin's proc_list, by id.
+func listed(t *testing.T, s *state, id string) (listedProcess, bool) {
+	t.Helper()
+	var out struct {
+		Processes []listedProcess `json:"processes"`
+	}
+	s.admin.ok("proc_list", map[string]any{}, &out)
+	for _, process := range out.Processes {
+		if process.ID == id {
+			return process, true
+		}
+	}
+	return listedProcess{}, false
+}
+
+// baseImage is the image the fixtures are built on, read from the echo
+// Dockerfile so the job pulls one image and builds every Package on it.
+func baseImage(t *testing.T) string {
+	t.Helper()
+	body, err := os.ReadFile(filepath.Join("fixtures", packageName, "Dockerfile"))
+	if err != nil {
+		t.Fatalf("reading the fixture Dockerfile: %v", err)
+	}
+	for _, line := range strings.Split(string(body), "\n") {
+		if after, found := strings.CutPrefix(line, "FROM "); found {
+			return strings.TrimSpace(after)
+		}
+	}
+	t.Fatal("the fixture Dockerfile carries no FROM line")
+	return ""
 }
 
 // lastJSONLine is the answer a script printed after whatever it logged before.

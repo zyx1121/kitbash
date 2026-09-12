@@ -29,24 +29,9 @@ import (
 	"github.com/zyx1121/kitbash/internal/proc"
 )
 
-// ImportHook is the lifecycle hook and the tool name an import kit declares,
-// see PLAN.md section 3.
-const (
-	ImportHook = "import"
-	ImportTool = "import"
-)
-
 // Transport opens the connection to one Process. The default runs
 // podman exec inside its container; tests substitute an in memory pair.
 type Transport func(ctx context.Context, p *proc.Process) (mcp.Transport, error)
-
-// Kit is a running Process that implements the import hook, with the resolved
-// input schema of its import tool. pkg_import picks between kits by validating
-// the source against these schemas, never by name.
-type Kit struct {
-	Process *proc.Process
-	Tool    manifest.Tool
-}
 
 // Bridge publishes Package tools on one MCP server and forwards their calls.
 type Bridge struct {
@@ -156,7 +141,7 @@ func (b *Bridge) Sync(ctx context.Context) {
 	b.reconcile(ctx, list.Processes)
 	for i := range list.Processes {
 		p := list.Processes[i]
-		if p.State != proc.StateRunning || p.Expose != manifest.ExposeMCP {
+		if !b.reachable(&p) {
 			continue
 		}
 		if prob := b.Add(ctx, &p); prob != nil {
@@ -190,7 +175,7 @@ func (b *Bridge) reconcile(ctx context.Context, running []proc.Process) {
 
 // Add publishes the tools of one Process. It is called after proc_run.
 func (b *Bridge) Add(ctx context.Context, p *proc.Process) *problem.Problem {
-	if p == nil || p.Expose != manifest.ExposeMCP || p.State != proc.StateRunning {
+	if p == nil || !b.reachable(p) {
 		return nil
 	}
 	m, folder, prob := b.files.Manifest(ctx, p.Package)
@@ -562,40 +547,125 @@ func (b *Bridge) execTransport(ctx context.Context, p *proc.Process) (mcp.Transp
 }
 
 // Kits are the caller's running import kits: Processes whose manifest declares
-// provides.kit with import and a tool named import.
-func (b *Bridge) Kits(ctx context.Context) ([]Kit, *problem.Problem) {
+// provides.kit with import and a tool named import. pkg_import picks between
+// them by validating the source against their schemas, never by name.
+//
+// A Process whose manifest cannot be read or whose schemas do not resolve is
+// skipped rather than fatal: the caller is choosing between the kits that work
+// and the reason the rest do not is in the session log.
+func (b *Bridge) Kits(ctx context.Context) ([]proc.Kit, *problem.Problem) {
 	list, prob := b.processes.List(ctx)
 	if prob != nil {
 		return nil, prob
 	}
-	var kits []Kit
+	var kits []proc.Kit
 	for i := range list.Processes {
 		p := list.Processes[i]
-		if p.State != proc.StateRunning || p.Expose != manifest.ExposeMCP {
+		if !b.reachable(&p) {
 			continue
 		}
-		m, folder, prob := b.files.Manifest(ctx, p.Package)
-		if prob != nil {
-			b.logger.Printf("bridge: skipping kit at %s: %s", p.Package, prob.Detail)
-			continue
-		}
-		if !m.HasKit(ImportHook) {
-			continue
-		}
-		tools, err := b.schemas(m, folder)
+		kit, err := b.kit(ctx, &p, manifest.HookImport, manifest.ToolImport)
 		if err != nil {
 			b.logger.Printf("bridge: skipping kit at %s: %v", p.Package, err)
 			continue
 		}
-		for _, tool := range tools {
-			if tool.Name != ImportTool {
-				continue
-			}
-			kits = append(kits, Kit{Process: &p, Tool: tool})
-			break
+		if kit == nil {
+			continue
 		}
+		kits = append(kits, *kit)
 	}
 	return kits, nil
+}
+
+// KitAt is the caller's running kit at one Package path, which is how a
+// manifest that names its builder or its runner is dispatched: the Package
+// path is the name, and the hook's tool schema is what the call is held to,
+// see PLAN.md section 3.
+//
+// Nothing of the caller's running at that path is not-found, because the
+// manifest named a kit and the answer is to run it. A Process running there
+// that does not implement the hook is invalid-manifest: one of the two
+// manifests is wrong, and neither is the caller's input.
+func (b *Bridge) KitAt(ctx context.Context, path, hook, tool string) (*proc.Kit, *problem.Problem) {
+	list, prob := b.processes.List(ctx)
+	if prob != nil {
+		return nil, prob
+	}
+	var running, owned *proc.Process
+	for i := range list.Processes {
+		p := list.Processes[i]
+		if p.Package != path || p.State != proc.StateRunning {
+			continue
+		}
+		if p.Runner != "" {
+			// A Process another kit owns runs wherever that kit put it, so
+			// there is no container here to exec into and its tools are not on
+			// this host at all. It is remembered only to say so below.
+			owned = &p
+			continue
+		}
+		running = &p
+		break
+	}
+	if running == nil {
+		if owned != nil {
+			return nil, problem.NotFoundFix(path, fmt.Sprintf(
+				"the manifest names the %s kit at %s, and the Process of it running here is owned by the run kit at %s, which kitbash cannot call into",
+				hook, path, owned.Runner),
+				fmt.Sprintf("Stop that Process with proc_stop and run %s again without a runner, so it runs as a container on this host.", path))
+		}
+		return nil, problem.NotFoundFix(path, fmt.Sprintf(
+			"the manifest names the %s kit at %s, and no Process of it is running", hook, path),
+			fmt.Sprintf("Run the kit first with proc_run on %s, then call this tool again.", path))
+	}
+	if running.Expose != manifest.ExposeMCP {
+		return nil, problem.InvalidManifestFix(path, fmt.Sprintf(
+			"the kit at %s is running with expose: %s, so it publishes no tools to call", path, running.Expose),
+			"Give the kit's deploy unit expose: mcp, then build and run it again.")
+	}
+	kit, err := b.kit(ctx, running, hook, tool)
+	if err != nil {
+		return nil, problem.InvalidManifest(path, err.Error())
+	}
+	if kit == nil {
+		return nil, problem.InvalidManifestFix(path, fmt.Sprintf(
+			"the Package at %s does not declare provides.kit: [%s] and a tool named %s", path, hook, tool),
+			fmt.Sprintf("Declare the hook and the tool in the kit's kitbash.yaml, or take the %s field out of the manifest that names it.", hook))
+	}
+	return kit, nil
+}
+
+// reachable reports whether a Process is one the bridge can call: running, and
+// exposing the MCP surface its tools arrive on.
+func (b *Bridge) reachable(p *proc.Process) bool {
+	// A Process a run kit owns has no container on this host to exec into.
+	// Its tools are the kit's to publish where it runs it, see PLAN.md
+	// section 3.
+	return p.Runner == "" && p.State == proc.StateRunning && p.Expose == manifest.ExposeMCP
+}
+
+// kit reads one running Process as a kit of the hook given. It answers nil for
+// a Process whose manifest declares neither the hook nor the tool, and an
+// error for a manifest that cannot be read or whose schemas do not resolve.
+func (b *Bridge) kit(ctx context.Context, p *proc.Process, hook, tool string) (*proc.Kit, error) {
+	m, folder, prob := b.files.Manifest(ctx, p.Package)
+	if prob != nil {
+		return nil, errors.New(prob.Detail)
+	}
+	if !m.HasKit(hook) {
+		return nil, nil
+	}
+	tools, err := b.schemas(m, folder)
+	if err != nil {
+		return nil, err
+	}
+	for _, declared := range tools {
+		if declared.Name != tool {
+			continue
+		}
+		return &proc.Kit{Process: p, Tool: declared, Tools: tools}, nil
+	}
+	return nil, nil
 }
 
 // CallTool calls one tool of a Process and returns its structured content.

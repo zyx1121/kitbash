@@ -114,6 +114,68 @@ $package_tools:
       required: [files]
       properties:
         files: { type: array, minItems: 1, items: { $ref: "#/$defs/importFile" } }
+  build_hook:
+    description: >
+      The contract a build kit implements. The kit's manifest declares
+      provides.kit: [build] and a tool named build. A Package is built by that
+      kit when its container unit carries builder: <package path>; without the
+      field the built in OCI path builds it, which is every manifest written
+      before this existed. pkg_build resolves the commit and the build context
+      first, because kitbash builds from a commit and a Package cannot reach
+      outside its own tree whoever does the building, and then calls the kit
+      with the Package folder and that context. The digest the kit answers with
+      is the Package version and the log tail is the one log record per build.
+      A named kit that is not running is not-found; one whose build tool does
+      not accept the hook's arguments is invalid-manifest. A build a kit made
+      elsewhere is not recorded with kitbashd, because a record is a claim
+      about an image in the recording member's own store.
+    input:
+      type: object
+      required: [path, context]
+      properties:
+        path: { type: string, description: "Absolute path of the Package folder" }
+        context: { type: string, description: "Absolute path of the build context inside that folder" }
+    output:
+      type: object
+      required: [digest]
+      properties:
+        digest: { type: string, pattern: "^sha256:[a-f0-9]{64}$" }
+        log: { type: string, description: "Build log; kitbash returns only its tail" }
+  run_hook:
+    description: >
+      The contract a run kit implements. The kit's manifest declares
+      provides.kit: [run] and a tool named run, and optionally a tool named
+      stop whose input is the Process id. A Package is started by that kit when
+      its container unit carries runner: <package path>; without the field the
+      built in rootless podman runner starts it. proc_run calls the kit with
+      the Package path, the digest to run, the Process name and the container
+      unit as the manifest wrote it, and registers the id, state and endpoint
+      it answers with as the Process. The id is the Process id everywhere else,
+      so it is a UUIDv7. The kit is the one that converges: it is called with
+      the same Package and name every time, and a run that answers with a new
+      id has replaced the Process of that name, whose registration is dropped. The kit owns what it started: kitbashd registers the
+      Process, mints its Telemetry token and lists it, and does not start,
+      stop, restore or probe it. proc_stop forwards to the kit's stop tool, and
+      a kit that declares none owns a Process kitbash answers not-permitted
+      for. An endpoint that is not on this host's loopback address is reported
+      to the caller and not registered, because the Telemetry fan out is POSTed
+      to what is registered. A named kit that is not running is not-found; one
+      whose run tool does not accept the hook's arguments is invalid-manifest.
+    input:
+      type: object
+      required: [package, digest, name, unit]
+      properties:
+        package: { type: string, description: "Absolute path of the Package folder" }
+        digest: { type: string, description: "OCI image id to run" }
+        name: { type: string, description: "Process name, the manifest's name by default" }
+        unit: { type: object, description: "deploy.units[0] as the manifest wrote it" }
+    output:
+      type: object
+      required: [id, state]
+      properties:
+        id: { type: string, description: "Process id, a UUIDv7" }
+        state: { type: string, enum: [starting, running, unhealthy, stopped, failed] }
+        endpoint: { type: string, description: "Where the Process is reachable, empty when it is not" }
 
 $defs:
   folderEntry:
@@ -350,6 +412,12 @@ families:
           back to building. A build that did run is recorded, and a record
           kitbashd refuses costs nothing but the record. Packages in a home are
           neither recorded nor copied. See PLAN.md section 2.2.
+
+          A unit whose builder names a Package folder is built by that kit
+          instead of by the built in path, see $package_tools.build_hook. The
+          kit has to be running as a Process of the caller: a builder that is
+          not is not-found, and a build tool whose schema does not accept the
+          hook's arguments is invalid-manifest.
         input: { type: object, additionalProperties: false, required: [path], properties: { path: { type: string } } }
         output:
           type: object
@@ -442,6 +510,14 @@ families:
           same surface as its owner. A
           Process whose manifest declares subscriptions: [telemetry] with
           expose: http and a port is registered as a fan out subscriber.
+
+          A unit whose runner names a Package folder is started by that kit
+          instead of by the built in runner, see $package_tools.run_hook. The
+          kit has to be running as a Process of the caller: a runner that is
+          not is not-found, and a run tool whose schema does not accept the
+          hook's arguments is invalid-manifest. The Process the kit answers
+          with is registered with its runner and reported with it, and
+          kitbashd supervises none of it.
         input:
           type: object
           additionalProperties: false
@@ -462,6 +538,7 @@ families:
             expose: { type: string, enum: [mcp, http, none] }
             endpoint: { type: string, description: "Internal URL when expose is http" }
             tools: { type: array, items: { type: string }, description: "Surface tool names added when expose is mcp" }
+            runner: { type: string, description: "Package path of the run kit that owns this Process, absent when kitbashd runs it" }
         errors: [not-found, not-visible, not-permitted, invalid-path, invalid-manifest, conflict, internal]
       proc_list:
         description: >
@@ -490,11 +567,17 @@ families:
                   startedAt: { type: string, format: date-time }
                   problem: { type: string, description: "Why this Process is not running, when kitbashd could not bring it back" }
                   fix: { type: string, description: "What the owner can do about it" }
+                  runner: { type: string, description: "Package path of the run kit that owns this Process, absent when kitbashd runs it" }
       proc_stop:
-        description: Stop a Process. It stays known and can be run again with proc_run. Its tools leave the surface.
+        description: >
+          Stop a Process. It stays known and can be run again with proc_run.
+          Its tools leave the surface. A Process a run kit owns is stopped
+          through that kit's stop tool, see $package_tools.run_hook; a kit that
+          declares no stop tool owns a Process kitbash cannot stop, which is
+          not-permitted with a fix naming the kit.
         input: { type: object, additionalProperties: false, required: [id], properties: { id: { type: string } } }
         output: { type: object, required: [id, state], properties: { id: { type: string }, state: { type: string } } }
-        errors: [not-found, not-permitted, internal]
+        errors: [not-found, not-permitted, invalid-manifest, internal]
       proc_logs:
         description: Recent stdout and stderr of a Process. Structured logs are in Telemetry; this is the raw stream.
         input: { type: object, additionalProperties: false, required: [id], properties: { id: { type: string }, lines: { type: integer, minimum: 1, default: 200, maximum: 5000 } } }

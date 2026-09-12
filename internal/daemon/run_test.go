@@ -330,6 +330,68 @@ func TestStartRefusesAnotherMembersProcess(t *testing.T) {
 	}
 }
 
+// superviseKit registers one Process a run kit owns: no container, because it
+// runs wherever the kit put it, and the runner that says so.
+func (h *harness) superviseKit(owner, runner string) string {
+	h.t.Helper()
+	_, hash, err := store.NewToken()
+	if err != nil {
+		h.t.Fatalf("NewToken: %v", err)
+	}
+	id := uuid.V7()
+	if err := h.store.RegisterProcess(context.Background(), store.Process{
+		ID:           id,
+		Owner:        owner,
+		Package:      "/home/" + owner + "/trainer",
+		Name:         "trainer",
+		Runner:       runner,
+		Digest:       testDigest,
+		Expose:       ExposeNone,
+		FanoutSecret: "the-secret",
+		RegisteredAt: time.Now().UTC(),
+	}, hash, 0); err != nil {
+		h.t.Fatalf("RegisterProcess: %v", err)
+	}
+	return id
+}
+
+// TestActionsOnARunnerOwnedProcessAreNotPermitted is the other half of the run
+// hook's ownership: kitbashd did not start that container and it is not on
+// this host, so none of the three actions may touch the runtime on its behalf.
+// proc_stop forwards to the kit instead, see PLAN.md section 3.
+func TestActionsOnARunnerOwnedProcessAreNotPermitted(t *testing.T) {
+	h, fake := supervised(t)
+	id := h.superviseKit(h.user, "/org/pve-runner")
+
+	for _, action := range []string{actionStart, actionStop, actionRemove} {
+		res, body := h.postJSON(http.MethodPost, processesPath+"/"+id+"/"+action, startRequest{Image: testDigest})
+		if res.StatusCode != http.StatusForbidden {
+			t.Fatalf("%s = %d %s, want 403", action, res.StatusCode, body)
+		}
+		prob := h.problemOf(res, body)
+		if prob.Slug() != problem.SlugNotPermitted {
+			t.Errorf("%s problem is %s, want not-permitted", action, prob.Slug())
+		}
+		if !strings.Contains(prob.Detail, "/org/pve-runner") {
+			t.Errorf("%s detail is %q, want it to name the kit that owns the Process", action, prob.Detail)
+		}
+		if !strings.Contains(prob.Fix, "proc_stop") {
+			t.Errorf("%s fix is %q, want it to send the caller to proc_stop", action, prob.Fix)
+		}
+	}
+	if runs, stops := fake.Runs(), fake.Stops(); len(runs) != 0 || len(stops) != 0 {
+		t.Errorf("the runtime was asked for %+v and %+v on a Process a run kit owns", runs, stops)
+	}
+	if removals := fake.Removals(); len(removals) != 0 {
+		t.Errorf("the runtime removed %+v on a Process a run kit owns", removals)
+	}
+	// The registration is untouched: it is what keeps the Process on its
+	// owner's proc_list and its token alive.
+	if _, found, err := h.store.Process(context.Background(), id); err != nil || !found {
+		t.Errorf("the registration is gone (%t, %v)", found, err)
+	}
+}
+
 // An id nobody registered is a Process kitbashd does not know, on all three
 // actions: the registration is what says who may run what.
 func TestActionsOnAnUnknownProcessAreNotFound(t *testing.T) {

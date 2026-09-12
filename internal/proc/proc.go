@@ -62,6 +62,11 @@ type Process struct {
 	// see restore in spec/kitbashd-api.yaml.
 	Problem string `json:"problem,omitempty"`
 	Fix     string `json:"fix,omitempty"`
+	// Runner is the Package path of the run kit that owns this Process, empty
+	// for one the built in runner started. kitbashd does not supervise a
+	// Process a kit owns: it is registered, it is not restored at boot, and
+	// proc_stop forwards to the kit, see PLAN.md section 3.
+	Runner string `json:"runner,omitempty"`
 
 	// Container is the runtime name the bridge execs into. It is not part of
 	// the tool's output: the surface names a Process by its id.
@@ -127,6 +132,7 @@ type Service struct {
 	files    *fs.Service
 	runner   podman.Runner
 	registry Registry
+	kits     Kits
 	logger   *log.Logger
 }
 
@@ -142,6 +148,12 @@ func New(files *fs.Service, runner podman.Runner, registry Registry) *Service {
 		logger:   log.New(os.Stderr, "kitbash: ", log.LstdFlags),
 	}
 }
+
+// SetKits gives the service the MCP bridge, which is how a Process reaches the
+// run kit a manifest names. Without one every Package runs through the built
+// in runner, and a manifest that names a runner is refused rather than run
+// somewhere nobody asked for.
+func (s *Service) SetKits(kits Kits) { s.kits = kits }
 
 // SetLogger replaces where the service says what it could not do, such as a
 // Process that started untraced. Tests read those lines; the server leaves it
@@ -196,10 +208,16 @@ func (s *Service) run(ctx context.Context, span *telemetry.Span, path, digest, n
 	if !ok || unit.Type != manifest.UnitContainer {
 		return nil, problem.InvalidManifest(folder, "version 1 runs the first container unit of a Package")
 	}
+	// A unit that names a runner is the kit's to start. Dispatch is routing
+	// and not a third built in: the built in rootless podman runner below is
+	// still what runs every Package that names none, see PLAN.md section 3.
+	if unit.Runner != "" {
+		return s.runWithKit(ctx, m, folder, unit, digest, name)
+	}
 
 	image, prob := s.image(ctx, folder, digest)
 	if prob != nil {
-		return nil, prob
+		return nil, builtElsewhere(prob, unit)
 	}
 	if name == "" {
 		name = m.Name
@@ -336,6 +354,25 @@ func (s *Service) run(ctx context.Context, span *telemetry.Span, path, digest, n
 	return &process, nil
 }
 
+// builtElsewhere says what a Package that names a builder and no runner is
+// missing. Its images are made wherever the build kit builds them, so the
+// caller's own store has nothing to run and "this Package has not been built
+// yet" would send them to pkg_build, which they have already called. A builder
+// is paired with a runner in practice, see PLAN.md section 3.
+func builtElsewhere(prob *problem.Problem, unit manifest.Unit) *problem.Problem {
+	if prob.Slug() != problem.SlugNotFound || unit.Builder == "" || unit.Runner != "" {
+		return prob
+	}
+	answer := *prob
+	answer.Detail = fmt.Sprintf(
+		"%s: this Package names the build kit at %s, and the image it builds is in that kit's hands rather than in this member's image store",
+		prob.Detail, unit.Builder)
+	answer.Fix = fmt.Sprintf(
+		"Give the unit a runner as well, so the kit that holds the image is the one that runs it, or name the digest to run if this host has the image. A Package built by %s is normally run by a kit too.",
+		unit.Builder)
+	return &answer
+}
+
 // List answers proc_list: every Process of the caller, running or stopped.
 //
 // The container runtime holds the state and this reads it back, with one thing
@@ -360,6 +397,10 @@ func (s *Service) List(ctx context.Context) (*ListResult, *problem.Problem) {
 		}
 		result.Processes = append(result.Processes, process)
 	}
+	// The Processes a run kit owns run wherever the kit put them, so the
+	// runtime here has nothing to report about them and the registry is what
+	// says they exist.
+	result.Processes = append(result.Processes, s.kitOwnedProcesses(ctx, result.Processes)...)
 	sort.Slice(result.Processes, func(i, j int) bool {
 		return result.Processes[i].Name < result.Processes[j].Name
 	})
@@ -390,6 +431,12 @@ func (s *Service) problems(ctx context.Context) map[string]telemetry.Registered 
 
 // Stop answers proc_stop. The Process stays known and can be run again.
 func (s *Service) Stop(ctx context.Context, id string) (*StopResult, *problem.Problem) {
+	// A Process a run kit owns has no container here to stop, so the kit is
+	// asked first: the registry is the only thing that knows the Process
+	// exists at all.
+	if reg, owned := s.kitOwned(ctx, id); owned {
+		return s.stopWithKit(ctx, id, reg)
+	}
 	container, prob := s.byID(ctx, id)
 	if prob != nil {
 		return nil, prob

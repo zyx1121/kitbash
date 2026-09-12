@@ -198,6 +198,14 @@ func (s *Server) owned(r *http.Request, caller Caller, id string) (store.Process
 			fmt.Sprintf("the Process %s belongs to another member", id),
 			"Run your own Processes; the member who registered this one runs it.")
 	}
+	if p.Runner != "" {
+		// A Process a run kit owns runs wherever the kit put it, so there is
+		// no container here for kitbashd to act on. Saying so is better than
+		// the missing container name below, which reads like a client bug.
+		return store.Process{}, sysusers.Member{}, problem.NotPermitted(r.URL.Path,
+			fmt.Sprintf("the Process %s is owned by the run kit at %s, which kitbashd does not supervise", id, p.Runner),
+			"Stop it with proc_stop, which forwards to the kit that runs it.")
+	}
 	if p.Container == "" {
 		return store.Process{}, sysusers.Member{}, problem.BadRequest(r.URL.Path,
 			fmt.Sprintf("the Process %s was registered without a container name", id),

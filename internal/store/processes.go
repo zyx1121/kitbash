@@ -65,6 +65,12 @@ type Process struct {
 	Endpoint      string    `json:"endpoint"`
 	Subscriptions []string  `json:"subscriptions"`
 	RegisteredAt  time.Time `json:"registeredAt"`
+	// Runner is the Package path of the run kit that owns this Process, empty
+	// for every Process kitbashd runs itself. A Process a kit owns has no
+	// container on this host, so this is what restore reads to leave it alone
+	// rather than unregister it as a registration that names nothing, see
+	// PLAN.md section 3.
+	Runner string `json:"runner"`
 	// Permits is what this Process may call back over /mcp, as its Package's
 	// manifest declared it at registration. It is listed like the rest of the
 	// record: what a Process may do is not a secret from its owner, and
@@ -227,18 +233,19 @@ func (s *Store) RegisterProcess(ctx context.Context, p Process, tokenHash string
 	// together: a container holding the old token holds the old secret.
 	if _, err := tx.ExecContext(ctx, `INSERT INTO processes
 		(id, owner, admin, package, name, container, digest, expose, endpoint,
-		 subscriptions, permits, limits, token_hash, fanout_secret, registered_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		 subscriptions, runner, permits, limits, token_hash, fanout_secret, registered_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 			owner = excluded.owner, admin = excluded.admin, package = excluded.package,
 			name = excluded.name, container = excluded.container, digest = excluded.digest,
 			expose = excluded.expose, endpoint = excluded.endpoint,
-			subscriptions = excluded.subscriptions, permits = excluded.permits,
+			subscriptions = excluded.subscriptions, runner = excluded.runner,
+			permits = excluded.permits,
 			limits = excluded.limits,
 			token_hash = excluded.token_hash,
 			fanout_secret = excluded.fanout_secret, registered_at = excluded.registered_at`,
 		p.ID, p.Owner, p.Admin, p.Package, p.Name, p.Container, p.Digest, p.Expose, p.Endpoint,
-		string(subscriptions), string(permits), limits, tokenHash, p.FanoutSecret,
+		string(subscriptions), p.Runner, string(permits), limits, tokenHash, p.FanoutSecret,
 		p.RegisteredAt.UnixNano()); err != nil {
 		return fmt.Errorf("store: register the Process %s: %w", p.ID, err)
 	}
@@ -372,7 +379,7 @@ func (s *Store) Processes(ctx context.Context, owner string) ([]Process, error) 
 
 // processColumns is the one select every read of this table shares.
 const processColumns = `SELECT id, owner, admin, package, name, container, digest,
-	expose, endpoint, subscriptions, permits, limits, fanout_secret, registered_at`
+	expose, endpoint, subscriptions, runner, permits, limits, fanout_secret, registered_at`
 
 // scanner is what both a single row and a row of a result set satisfy.
 type scanner interface {
@@ -384,7 +391,8 @@ func scanProcess(row scanner) (Process, error) {
 	var subscriptions, permits, limits string
 	var registered int64
 	if err := row.Scan(&p.ID, &p.Owner, &p.Admin, &p.Package, &p.Name, &p.Container, &p.Digest,
-		&p.Expose, &p.Endpoint, &subscriptions, &permits, &limits, &p.FanoutSecret, &registered); err != nil {
+		&p.Expose, &p.Endpoint, &subscriptions, &p.Runner, &permits, &limits, &p.FanoutSecret,
+		&registered); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Process{}, err
 		}
@@ -458,7 +466,11 @@ func migrate(db *sql.DB) error {
 	// into it, and after a reboot the registration is the only thing that
 	// remembers what the ceiling was. A registration written before this
 	// restores without one until the Process is run again.
-	for _, column := range []string{"container", "digest", "fanout_secret", "permits", "limits"} {
+	// The runner arrives with build and run kit dispatch: the Package path of
+	// the kit that owns the Process, and the thing that tells restore there is
+	// no container of it here to start. Every registration written before it
+	// carries none, which is a Process kitbashd runs itself.
+	for _, column := range []string{"container", "digest", "fanout_secret", "permits", "limits", "runner"} {
 		if err := addTextColumn(db, "processes", column); err != nil {
 			return err
 		}

@@ -8,9 +8,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/zyx1121/kitbash/internal/bridge"
 	"github.com/zyx1121/kitbash/internal/pkg"
 	"github.com/zyx1121/kitbash/internal/problem"
+	"github.com/zyx1121/kitbash/internal/proc"
 	"github.com/zyx1121/kitbash/internal/telemetry"
 )
 
@@ -57,7 +57,7 @@ func TestImportUnderTheSharedRootIsQueued(t *testing.T) {
 	body, _ := json.Marshal(map[string]any{"files": []map[string]any{
 		{"path": "kitbash.yaml", "content": importedManifest},
 	}})
-	kits := &stubKits{kits: []bridge.Kit{kit("/org/import-mcp", "^npm:")}, result: string(body)}
+	kits := &stubKits{kits: []proc.Kit{kit("/org/import-mcp", "^npm:")}, result: string(body)}
 	q := &queue{}
 	packages, root := sharedImporter(t, kits, q)
 	target := filepath.Join(root, "time")
@@ -99,7 +99,7 @@ func TestImportUnderTheSharedRootIsQueued(t *testing.T) {
 // A folder that already exists is a conflict before anything is queued: an
 // admin never reads a call that could not have run.
 func TestImportOfAnExistingFolderIsNotQueued(t *testing.T) {
-	kits := &stubKits{kits: []bridge.Kit{kit("/org/import-mcp", "^npm:")}}
+	kits := &stubKits{kits: []proc.Kit{kit("/org/import-mcp", "^npm:")}}
 	q := &queue{}
 	packages, root := sharedImporter(t, kits, q)
 	target := filepath.Join(root, "time")
@@ -126,7 +126,7 @@ func TestAdminImportUnderTheSharedRootRuns(t *testing.T) {
 	body, _ := json.Marshal(map[string]any{"files": []map[string]any{
 		{"path": "kitbash.yaml", "content": importedManifest},
 	}})
-	kits := &stubKits{kits: []bridge.Kit{kit("/org/import-mcp", "^npm:")}, result: string(body)}
+	kits := &stubKits{kits: []proc.Kit{kit("/org/import-mcp", "^npm:")}, result: string(body)}
 	q := &queue{admin: true}
 	packages, root := sharedImporter(t, kits, q)
 
@@ -148,7 +148,7 @@ func TestApprovedImportIsAuthoredByTheRequester(t *testing.T) {
 	body, _ := json.Marshal(map[string]any{"files": []map[string]any{
 		{"path": "kitbash.yaml", "content": importedManifest},
 	}})
-	kits := &stubKits{kits: []bridge.Kit{kit("/org/import-mcp", "^npm:")}, result: string(body)}
+	kits := &stubKits{kits: []proc.Kit{kit("/org/import-mcp", "^npm:")}, result: string(body)}
 	q := &queue{admin: true}
 	packages, root := sharedImporter(t, kits, q)
 

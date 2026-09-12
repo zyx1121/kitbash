@@ -76,6 +76,12 @@ type processRequest struct {
 	Endpoint      string           `json:"endpoint,omitempty"`
 	Subscriptions []string         `json:"subscriptions,omitempty"`
 	Permits       manifest.Permits `json:"permits,omitempty"`
+	// Runner is the Package path of the run kit that owns this Process, sent
+	// by a session whose manifest named a runner. It carries no container,
+	// because the Process runs wherever the kit put it: kitbashd registers it,
+	// mints its token, and neither starts nor restores it, see PLAN.md
+	// section 3.
+	Runner string `json:"runner,omitempty"`
 }
 
 // processResponse is what a registration answers. The token is returned once
@@ -164,6 +170,7 @@ func (s *Server) registerProcess(w http.ResponseWriter, r *http.Request, caller 
 		Expose:        req.Expose,
 		Endpoint:      req.Endpoint,
 		Subscriptions: req.Subscriptions,
+		Runner:        req.Runner,
 		Permits:       req.Permits,
 		FanoutSecret:  secret,
 		RegisteredAt:  s.now().UTC(),
@@ -328,6 +335,14 @@ func validateProcess(instance string, req processRequest) *problem.Problem {
 			return problem.BadRequest(instance,
 				fmt.Sprintf("%q is not a container name kitbash writes", req.Container),
 				"Send the container as the name the runtime holds it under, which starts with kitbash- and carries lower case letters, digits and hyphens.")
+		}
+	}
+	if req.Runner != "" {
+		if !strings.HasPrefix(req.Runner, "/") || len(req.Runner) > MaxPackageBytes ||
+			strings.Contains(req.Runner, "/../") || strings.HasSuffix(req.Runner, "/..") {
+			return problem.BadRequest(instance,
+				fmt.Sprintf("%q is not a package path", req.Runner),
+				"Send the runner as the absolute path of the run kit's Package folder.")
 		}
 	}
 	if req.Digest != "" && !imageDigest.MatchString(req.Digest) {

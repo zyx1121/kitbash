@@ -150,6 +150,8 @@ deploy:
   units:
     - type: container
       build: .                # or image: docker.io/jrottenberg/ffmpeg@sha256:...
+      builder: /org/nix-build # optional, the build kit that builds this unit, see section 3
+      runner: /org/pve-runner # optional, the run kit that runs this Process, see section 3
       expose: mcp
       health: { exec: ["ffmpeg", "-version"] }
       limits: { cpu: "1", memory: "512Mi" }
@@ -211,12 +213,22 @@ A kit installs the same way as any Package and is versioned, traced and removabl
 | Hook | The kit declares | kitbashd does |
 |------|------------------|---------------|
 | import | `kit: [import]` and a tool `import` whose `source` pattern is the route | `pkg_import` picks the kit whose schema accepts the source and writes the files it returns |
-| build | `kit: [build]` and a tool `build` with input `{path, context}` and output `{digest, log}` | declared for version 1; the built in OCI path builds every Package until a manifest can name a builder |
-| run | `kit: [run]` and a tool `run` with input `{package, digest, name, unit}` and output `{id, state, endpoint}` | declared for version 1; the built in rootless podman runner runs every Process until a manifest can name a runner |
+| build | `kit: [build]` and a tool `build` with input `{path, context}` and output `{digest, log}` | `pkg_build` calls the kit a unit's `builder` names and records the digest it answers as the Package version |
+| run | `kit: [run]` and a tool `run` with input `{package, digest, name, unit}` and output `{id, state, endpoint}` | `proc_run` calls the kit a unit's `runner` names and registers what it answers as the Process |
 | observe | `kit: [observe]`, `subscriptions: [telemetry]`, `expose: http`, `port` | POSTs every stored record to the Process as OTLP/HTTP JSON, see 2.4 Fan out |
 | evaluate | `kit: [evaluate]` and usually the observe declarations as well | accepts records with `kitbash.eval: true` and subject attributes through the Process receiver, see 2.4 Evaluation |
 
-Build and run dispatch to an installed kit is the one part of the contract version 1 declares without exercising: nothing needs a second builder or runner yet, and the manifest field that would name one is not added until something does.
+**The build and run hooks, and how dispatch works.** A container unit names its kit in a field beside its build context: `builder: /org/nix-build` and `runner: /org/pve-runner`. The value is a Package folder, and the manifest of that folder declares `provides.kit: [build]` or `[run]` with the hook's tool. `build` is the build context, a string, which is why the two fields sit beside it rather than under it: a folder that names its builder still names the context that builder reads. A unit that names neither is built by the OCI path and run by the rootless podman runner, so nothing changes for a manifest written before the fields existed.
+
+Dispatch is core routing and not a third built in: the two built ins of the paragraph above are still the only things that build and run a Package on their own, and what the core adds is the choice between them and a kit the caller is already running.
+
+`pkg_build` resolves the commit and the build context first, because kitbash builds from a commit and rule 4 of section 2.5 is the core's whoever does the building, and then calls the kit's `build` with `{path, context}`. The digest it answers is the Package version and its log tail is the one log record per build; the span is the same span a local build opens. A build a kit made elsewhere is not recorded with kitbashd, because a record is a claim about an image in the recording member's own store and a copy is served from there.
+
+`proc_run` calls the kit's `run` with `{package, digest, name, unit}`, the unit as the manifest wrote it, and registers the `{id, state, endpoint}` it answers as the Process. The kit owns what it started: the registration carries the runner and no container name, so boot restore skips it, kitbashd refuses to start, stop or remove a container it does not have, and `proc_stop` forwards to the kit's optional `stop` tool or answers `not-permitted` saying the runner owns it. `proc_list` reads such a Process back from the registry, which is the only thing on this host that knows it exists. The kit is the one that converges, because it is called with the same Package and the same name every time; a run that answers with a new id has replaced the Process of that name, and the registration it replaced is dropped rather than left holding a token. An endpoint the kit answers that is not this host's loopback address is reported to the caller and not registered, because the Telemetry fan out is POSTed to what is registered.
+
+A builder is paired with a runner in practice. The image a build kit makes is wherever that kit made it, not in the member's own image store, so a Package that names a builder and nothing else has a digest this host cannot start: `proc_run` says so and names the builder rather than sending the agent back to `pkg_build`.
+
+Both hooks fail the same way. A kit a manifest names and nobody is running is `not-found` with the fix to run it; a kit whose tool schema does not accept what the hook is called with is `invalid-manifest`, because dispatch binds on schemas and a Package whose tool refuses the hook does not implement it.
 
 **The import hook.** An import kit is a running Process whose manifest declares `provides.kit: [import]` and a tool named `import`. The tool's input schema has a `source` string, constrained by a pattern to the source syntax the kit understands, and its output is a list of files, each a relative path with text or base64 content. `pkg_import` walks the caller's running kits, picks the one whose `import` input schema accepts the source string, calls the tool, and writes the returned files into the target folder as one commit. The choice binds on schemas, not on a registry of kit names. Two kits accepting the same source is a conflict the caller resolves by stopping one.
 
@@ -354,7 +366,6 @@ The MCP tool surface is decided in `spec/mcp-surface.yaml`: six families, `fs` i
 - A Process started in one MCP session appears on another session's surface when that session reconnects, not live.
 - Import kits run under the member who imports. Whether an admin can run a kit once for every member is an M5 question.
 - Metrics: the store and the receiver accept them from M3; the first producers are the M4 kits.
-- Build and run kits: the contract is declared, dispatch is not implemented, and the manifest has no field to name a builder or runner. Add the field when a second builder or runner exists.
 - Fan out is best effort. A subscriber that must not miss a record should read the store through `tel_query` and treat the push as a wake up.
 - Approvals cover `fs_write` and `pkg_import` into `/org`. Whether `proc_run` of an `/org` Package by a member should run as a shared Process rather than a private one is open; today it runs privately under the member.
 - A Process acting as an agent has its owner's full surface. Narrowing what a Process may call (a per Process allow list in the manifest) is deferred until a kit needs less than its owner has.
