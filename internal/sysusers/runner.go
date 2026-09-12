@@ -255,6 +255,20 @@ func containerConfig(out string) (ContainerConfig, error) {
 	return config, nil
 }
 
+// RenameContainer renames one container as the member, which is how a
+// container is created again under a name that is already taken by the
+// container being replaced.
+func (p *Podman) RenameContainer(ctx context.Context, m Member, from, to string) error {
+	if err := ensureRuntimeDir(p.runUser(), m); err != nil {
+		return err
+	}
+	if err := p.exists(ctx, m, from); err != nil {
+		return err
+	}
+	_, err := p.run(ctx, m, "rename", from, to)
+	return err
+}
+
 // Stop stops one container as the member. The runtime is given the same
 // timeout the surface publishes, and the call itself the daemon's.
 func (p *Podman) Stop(ctx context.Context, m Member, container string, timeout int) error {

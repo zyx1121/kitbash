@@ -41,6 +41,10 @@ type harness struct {
 	// unit test writes no cgroup filesystem and nothing under /run.
 	cgroups *cgroups.Fake
 	envDir  string
+	// tokens are the Process tokens the test itself wrote, by Process id. The
+	// store keeps only their hashes, so a test that has to prove a token was
+	// not revoked keeps the token here.
+	tokens map[string]string
 }
 
 // serve starts a daemon whose admin answer is fixed, which is how a test gets
@@ -113,7 +117,7 @@ func serveWith(t *testing.T, opts Options) *harness {
 		}
 	})
 	h := &harness{t: t, client: client, store: st, server: srv, user: me.Username, socket: socket,
-		envDir: opts.EnvDir}
+		envDir: opts.EnvDir, tokens: map[string]string{}}
 	h.cgroups, _ = opts.Cgroups.(*cgroups.Fake)
 	return h
 }

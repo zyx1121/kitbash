@@ -156,6 +156,15 @@ type Runner interface {
 	// the cgroup parent of a container cannot be changed, so the container is
 	// made again, and everything here is what would otherwise be lost.
 	ContainerConfig(ctx context.Context, m Member, container string) (ContainerConfig, error)
+	// RenameContainer renames one container as the member. A container the
+	// runtime does not have is ErrNoContainer, and a name that is taken is
+	// the runtime's own refusal.
+	//
+	// It is what lets restore create a container again without a moment in
+	// which the registration names nothing: the old one is moved aside, the
+	// new one takes its name, and the old one is removed only once the new
+	// one is up. A heal that fails puts the name back.
+	RenameContainer(ctx context.Context, m Member, from, to string) error
 	// Stop stops one container as the member, giving it timeout seconds to
 	// exit on its own. A container the runtime does not have is
 	// ErrNoContainer.

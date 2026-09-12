@@ -151,9 +151,6 @@ func (s *Server) restoreOwner(ctx context.Context, owner string, processes []sto
 		// container that has to be created again is created under.
 		limits := limitsOf(p.Limits.Memory, p.Limits.CPU, p.Limits.Pids)
 		leaf := s.processCgroup(ctx, m, p, limits)
-		if !p.Limits.Written() {
-			unplaced++
-		}
 		start, cancel := context.WithTimeout(ctx, RestoreTimeout)
 		err := s.runner.Start(start, m, p.Container, leaf)
 		cancel()
@@ -161,6 +158,9 @@ func (s *Server) restoreOwner(ctx context.Context, owner string, processes []sto
 		case err == nil:
 			counts.Started++
 			s.clearProcessProblem(p.ID)
+			if !p.Limits.Written() {
+				unplaced++
+			}
 		case errors.Is(err, sysusers.ErrAlreadyRunning):
 			// The daemon restarted and the host did not: the Process never
 			// stopped. It is running, which is what restore is for, so it is
@@ -168,6 +168,9 @@ func (s *Server) restoreOwner(ctx context.Context, owner string, processes []sto
 			counts.Started++
 			counts.Running++
 			s.clearProcessProblem(p.ID)
+			if !p.Limits.Written() {
+				unplaced++
+			}
 		case errors.Is(err, sysusers.ErrNoContainer):
 			// The container is gone, so the registration names nothing and
 			// its token belongs to no Process. Unregistering revokes it.
@@ -178,6 +181,8 @@ func (s *Server) restoreOwner(ctx context.Context, owner string, processes []sto
 				logger.Printf("restore: unregistering %s: %v", p.ID, err)
 			}
 			s.fanout.untrack(p.ID)
+			// There is no Process left to report a problem about.
+			s.clearProcessProblem(p.ID)
 			s.endMCPSessions(p.ID)
 		default:
 			logger.Printf("restore: starting %s of %s: %v", p.Container, owner, err)
@@ -188,7 +193,13 @@ func (s *Server) restoreOwner(ctx context.Context, owner string, processes []sto
 			// at every boot, for ever. The ceiling above exists now, so the
 			// container is created again under it rather than left to fail
 			// again at the next boot.
-			if p.Limits.Written() {
+			//
+			// Only this one failure is healed. A start that ran out of its
+			// budget, or one the daemon cancelled, says nothing about the
+			// cgroup parent and everything about the runtime being busy: the
+			// container may yet be coming up, and taking it apart because a
+			// call was slow would break a Process that was about to run.
+			if p.Limits.Written() || timedOut(err) {
 				counts.Failed++
 				s.startFailed(p)
 				continue
@@ -198,7 +209,6 @@ func (s *Server) restoreOwner(ctx context.Context, owner string, processes []sto
 			case healed:
 				counts.Started++
 				counts.Healed++
-				unplaced--
 				s.clearProcessProblem(p.ID)
 				logger.Printf("restore: the Process %s of %s was registered without limits; it now runs under an unlimited ceiling, run it again to write limits",
 					p.ID, owner)
@@ -224,6 +234,16 @@ func (s *Server) restoreOwner(ctx context.Context, owner string, processes []sto
 	return counts
 }
 
+// timedOut reports a start that did not finish rather than one that failed: the
+// runtime's own budget ran out, or the context this restore runs under was
+// cancelled, which is a daemon that is stopping. Neither says anything about
+// the container, so neither is a reason to take one apart.
+func timedOut(err error) bool {
+	return errors.Is(err, sysusers.ErrTimeout) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, context.Canceled)
+}
+
 // startFailed is what the owner reads through proc_list about a Process the
 // runtime would not start. The runtime's own words stay in the daemon log,
 // which is the operator's: they carry host paths and container ids.
@@ -233,28 +253,40 @@ func (s *Server) startFailed(p store.Process) {
 		"Read proc_logs for this Process and run it again.")
 }
 
+// AsideSuffix is what the container being replaced is renamed to while its
+// replacement is created. A heal that does not finish leaves it under this
+// name, which is a container an operator can read and remove; the next heal
+// refuses rather than removing it, because that container may be the only copy
+// of the Process left.
+const AsideSuffix = "-preceiling"
+
 // healCeiling gives one legacy Process a ceiling of its own and answers whether
 // its container was created again, which is a Process that is running once this
 // returns.
 //
 // The cgroup parent of a container is written into it when it is created and
 // podman start cannot change it, so a container created under its member's
-// cgroup cannot be moved under the ceiling: it is removed and created again
-// from the registration and from its own configuration, keeping its id, its
-// name and everything the unit declared. The token is minted again with it,
-// the way every start does, because the store keeps only the hash of the one
-// the container is holding.
+// cgroup cannot be moved under the ceiling: it is created again from the
+// registration and from its own configuration, keeping its id, its name and
+// everything the unit declared.
 //
-// Only a container whose cgroup parent it cannot use is created again, and only
-// after a start of it has failed: one that names no parent at all starts where
-// it always has, and a container that is running is a Process that came back.
+// Nothing is removed before the replacement is up. The old container is
+// renamed aside, the new one takes its name, and the old one is removed only
+// once the new one has been created: a heal that fails puts the name back, so
+// there is no moment in which the registration names a container that does not
+// exist, and no boot in which the Process is unregistered because of it.
+//
+// Only the one container this can heal is touched: the cgroup parent has to be
+// the member's own cgroup, which is the directory a rootless runtime is
+// refused by. A container that names no parent, or one that is already under
+// its ceiling, or one that names anything else, is left where it is.
+//
 // A host that could not make the ceiling heals nothing either: leaf is empty
 // there, so there would be nothing to create the container under.
 func (s *Server) healCeiling(ctx context.Context, m sysusers.Member, p store.Process, leaf string) (bool, error) {
 	if leaf == "" {
 		return false, nil
 	}
-	parent := cgroups.Parent(m.Name, p.ID)
 	config, err := s.runner.ContainerConfig(ctx, m, p.Container)
 	if err != nil {
 		if errors.Is(err, sysusers.ErrNoContainer) {
@@ -262,9 +294,8 @@ func (s *Server) healCeiling(ctx context.Context, m sysusers.Member, p store.Pro
 		}
 		return false, err
 	}
-	if config.CgroupParent == "" || config.CgroupParent == parent {
-		// Nothing about the cgroup parent stopped this start: the container
-		// goes where it always has, or it is already under its ceiling.
+	if config.CgroupParent != cgroups.MemberParent(m.Name) {
+		// Nothing about the cgroup parent stopped this start.
 		return false, nil
 	}
 	image := p.Digest
@@ -274,6 +305,7 @@ func (s *Server) healCeiling(ctx context.Context, m sysusers.Member, p store.Pro
 	if image == "" {
 		return false, fmt.Errorf("daemon: %s names no image to create %s from", p.ID, p.Container)
 	}
+	parent := cgroups.Parent(m.Name, p.ID)
 	opts := podman.RunOptions{
 		Name:  p.Container,
 		Image: image,
@@ -285,18 +317,19 @@ func (s *Server) healCeiling(ctx context.Context, m sysusers.Member, p store.Pro
 		Publish:      config.Publish,
 		CgroupParent: parent,
 	}
-	// No limits are written into the ceiling and none are put on the command
-	// line: this Process was registered without any, so what it gains here is
-	// a cgroup of its own and not a bound it never had.
+	// No limits are put on the command line and none are written into the
+	// ceiling: this Process was registered without any, so what it gains here
+	// is a cgroup of its own and not a bound it never had. The ceiling is
+	// where a limit would go once the Process is run again.
 	labels, prob := labelsOf("", p, healedLabels(config.Labels))
 	if prob != nil {
 		return false, fmt.Errorf("daemon: the labels of %s: %s", p.Container, prob.Detail)
 	}
 	opts.Labels = labels
 
-	// The image is checked before anything is removed. Creating the container
-	// again needs it, and a member whose store no longer holds it would
-	// otherwise be left with neither the old container nor a new one.
+	// The image is checked before anything is moved. Creating the container
+	// again needs it, and a member whose store no longer holds it is one this
+	// heal can do nothing for.
 	if _, err := s.runner.ImageInfo(ctx, m, image); err != nil {
 		if errors.Is(err, sysusers.ErrNoImage) {
 			return false, fmt.Errorf("%s is no longer in %s's image store: %w", image, m.Name, err)
@@ -304,10 +337,13 @@ func (s *Server) healCeiling(ctx context.Context, m sysusers.Member, p store.Pro
 		return false, err
 	}
 
-	// The token is minted with the ceiling recorded, so the next boot takes
-	// the ordinary path: the store keeps only the hash of a token, so the one
-	// the old container holds cannot be read back and put in the new one.
-	token, err := s.mintToken(ctx, ceilingWritten(p))
+	// The token is minted here and recorded only once the container is up: the
+	// store keeps the hash alone, so the one the old container holds cannot be
+	// read back and put in the new one, and a heal that fails must leave the
+	// old container with the token it is holding. The fan out secret is not
+	// minted again: it is kept in the clear, so the new container is given the
+	// one the registration already carries.
+	token, hash, err := store.NewToken()
 	if err != nil {
 		return false, err
 	}
@@ -322,16 +358,36 @@ func (s *Server) healCeiling(ctx context.Context, m sysusers.Member, p store.Pro
 	}()
 	opts.EnvFile = envFile
 
-	// The old container goes first: its name is the one the new one takes,
-	// and the registration is what names it.
-	if err := s.runner.RemoveContainer(ctx, m, p.Container, true); err != nil &&
-		!errors.Is(err, sysusers.ErrNoContainer) {
+	aside := p.Container + AsideSuffix
+	if err := s.runner.RenameContainer(ctx, m, p.Container, aside); err != nil {
 		return false, err
 	}
 	run, cancel := context.WithTimeout(ctx, RestoreTimeout)
 	defer cancel()
 	if _, err := s.runner.Run(run, m, opts, leaf); err != nil {
+		// The name goes back to the container that holds this Process, so the
+		// registration still names something the next boot can find and this
+		// Process is reported failed rather than unregistered.
+		if back := s.runner.RenameContainer(ctx, m, aside, p.Container); back != nil {
+			logger.Printf("restore: %s of %s is left under %s: %v", p.Container, m.Name, aside, back)
+		}
 		return false, err
+	}
+	// The registration catches up only now: the ceiling is recorded, so the
+	// next boot takes the ordinary path, and the token is the one the new
+	// container is holding.
+	if err := s.store.RegisterProcess(ctx, ceilingWritten(p), hash, 0); err != nil {
+		// The container is up and the store missed the write. Saying so is the
+		// whole answer: the Process runs, its exports are refused until it is
+		// run again, and the next boot heals nothing because the container is
+		// under its ceiling already.
+		logger.Printf("restore: recording the ceiling and the token of %s: %v", p.ID, err)
+	}
+	// The container that was replaced goes last, once its name is free and the
+	// new one exists.
+	if err := s.runner.RemoveContainer(ctx, m, aside, true); err != nil &&
+		!errors.Is(err, sysusers.ErrNoContainer) {
+		logger.Printf("restore: removing %s, which %s replaced: %v", aside, p.Container, err)
 	}
 	return true, nil
 }

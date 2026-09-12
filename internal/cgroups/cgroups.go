@@ -162,7 +162,14 @@ type Cgroups interface {
 // Process's own cgroup, below the ceiling and above the container. The path is
 // relative to the mount point, which is what podman means by an absolute
 // cgroup path.
-func Parent(name, id string) string { return "/" + Dir + "/" + name + "/" + id }
+func Parent(name, id string) string { return MemberParent(name) + "/" + id }
+
+// MemberParent is the member's own cgroup in that same spelling. It is not a
+// cgroup parent kitbashd ever writes: the directory belongs to root and a
+// rootless runtime cannot create a container's cgroup under it, so a container
+// that names this was created before kitbashd gave each Process a cgroup of
+// its own, and it is the one thing restore heals, see internal/daemon.
+func MemberParent(name string) string { return "/" + Dir + "/" + name }
 
 // MemberDir is where one member's cgroup lives under a mount point.
 func MemberDir(root, name string) string { return filepath.Join(root, Dir, name) }
