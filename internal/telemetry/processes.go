@@ -149,6 +149,14 @@ type Registered struct {
 	Owner         string   `json:"owner,omitempty"`
 	Admin         bool     `json:"admin,omitempty"`
 	RegisteredAt  string   `json:"registeredAt,omitempty"`
+	// Problem is why this Process is not running, when the restore of the
+	// last boot could not bring it back, and ProblemFix what its owner can do
+	// about it. Both are empty for a Process kitbashd has nothing to report
+	// about, which is every Process that is running. proc_list reports them,
+	// so a container that never started is failed with a reason rather than
+	// looking like one on its way up, see restore in spec/kitbashd-api.yaml.
+	Problem    string `json:"problem,omitempty"`
+	ProblemFix string `json:"problemFix,omitempty"`
 }
 
 // UnmarshalJSON reads a listed Process, accepting user as a spelling of owner.

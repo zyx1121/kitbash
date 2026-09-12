@@ -464,7 +464,12 @@ families:
             tools: { type: array, items: { type: string }, description: "Surface tool names added when expose is mcp" }
         errors: [not-found, not-visible, not-permitted, invalid-path, invalid-manifest, conflict, internal]
       proc_list:
-        description: Processes owned by the caller, running or stopped. Admins see all from M5.
+        description: >
+          Processes owned by the caller, running or stopped. Admins see all
+          from M5. The container runtime holds the state; a Process kitbashd
+          could not bring back at the last boot is reported failed with
+          problem and fix, because its container sits in the runtime looking
+          like one on its way up, see restore in spec/kitbashd-api.yaml.
         input: { type: object, additionalProperties: false, properties: {} }
         output:
           type: object
@@ -483,6 +488,8 @@ families:
                   state: { type: string, enum: [starting, running, unhealthy, stopped, failed] }
                   expose: { type: string, enum: [mcp, http, none] }
                   startedAt: { type: string, format: date-time }
+                  problem: { type: string, description: "Why this Process is not running, when kitbashd could not bring it back" }
+                  fix: { type: string, description: "What the owner can do about it" }
       proc_stop:
         description: Stop a Process. It stays known and can be run again with proc_run. Its tools leave the surface.
         input: { type: object, additionalProperties: false, required: [id], properties: { id: { type: string } } }

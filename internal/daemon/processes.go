@@ -91,7 +91,18 @@ type processResponse struct {
 
 // processList is what processes_list answers, without a token anywhere in it.
 type processList struct {
-	Processes []store.Process `json:"processes"`
+	Processes []listedProcess `json:"processes"`
+}
+
+// listedProcess is one registration as processes_list answers it: the record
+// as it is stored, plus why this Process is not running if the last restore
+// could not bring it back. The reason is the daemon's and not a column, see
+// Server.restoreProblems; it is here so proc_list can report a Process that
+// did not come back as failed with something its owner can act on.
+type listedProcess struct {
+	store.Process
+	Problem string `json:"problem,omitempty"`
+	Fix     string `json:"problemFix,omitempty"`
 }
 
 // processes answers POST and GET on /kitbash/v1/processes.
@@ -189,7 +200,16 @@ func (s *Server) listProcesses(w http.ResponseWriter, r *http.Request, caller Ca
 		writeProblem(w, problem.Internal(r.URL.Path, err.Error(), ""))
 		return
 	}
-	writeJSON(w, r.URL.Path, processList{Processes: list})
+	listed := make([]listedProcess, 0, len(list))
+	for _, p := range list {
+		entry := listedProcess{Process: p}
+		if prob := s.processProblem(p.ID); prob.Detail != "" {
+			entry.Problem = prob.Detail
+			entry.Fix = prob.Fix
+		}
+		listed = append(listed, entry)
+	}
+	writeJSON(w, r.URL.Path, processList{Processes: listed})
 }
 
 // process answers everything under /kitbash/v1/processes/{id}: the DELETE that
@@ -258,6 +278,7 @@ func (s *Server) unregisterProcess(w http.ResponseWriter, r *http.Request, id st
 		return
 	}
 	s.fanout.untrack(id)
+	s.clearProcessProblem(id)
 	// The token that opened them is revoked, so the sessions it opened are
 	// over and the kitbash-mcp of each one exits.
 	s.endMCPSessions(id)

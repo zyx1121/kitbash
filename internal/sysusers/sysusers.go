@@ -146,6 +146,16 @@ type Runner interface {
 	// daemon restart. A container keeps the cgroup parent it was created
 	// with, so restoring one only has to place the child again.
 	Start(ctx context.Context, m Member, container, cgroup string) error
+	// ContainerConfig reads back the part of one container's configuration
+	// that has to survive being created again: what cgroup it was made under,
+	// the image it runs, and the environment, labels, ports and restart policy
+	// it was given. A container the runtime does not have is ErrNoContainer.
+	//
+	// It is what restore reads before it heals a Process whose container was
+	// created under its member's cgroup instead of under a ceiling of its own:
+	// the cgroup parent of a container cannot be changed, so the container is
+	// made again, and everything here is what would otherwise be lost.
+	ContainerConfig(ctx context.Context, m Member, container string) (ContainerConfig, error)
 	// Stop stops one container as the member, giving it timeout seconds to
 	// exit on its own. A container the runtime does not have is
 	// ErrNoContainer.

@@ -266,7 +266,10 @@ func TestStartRecordsTheCeilingItWrote(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("Process: found %t, err %v", found, err)
 	}
-	want := store.Limits{Memory: "512Mi", CPU: "0.5", Pids: DefaultPidsLimit}
+	// Ceiling is recorded with them: it says the cgroup was made as well as
+	// the limits written, which is what tells a restore that this Process is
+	// already under a ceiling of its own, see restore.go.
+	want := store.Limits{Memory: "512Mi", CPU: "0.5", Pids: DefaultPidsLimit, Ceiling: true}
 	if p.Limits != want {
 		t.Errorf("the recorded limits are %+v, want %+v as the request carried them", p.Limits, want)
 	}

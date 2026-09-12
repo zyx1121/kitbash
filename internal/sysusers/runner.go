@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -139,6 +140,119 @@ func (p *Podman) Start(ctx context.Context, m Member, container, cgroup string) 
 		return err
 	}
 	return nil
+}
+
+// ContainerConfig is the part of one container's configuration kitbashd reads
+// back off the runtime. It is not everything podman knows: it is what a
+// container has to be created again with so that nothing a manifest declared
+// is lost, plus the cgroup parent, which is the thing that cannot be changed
+// on a container that already exists.
+type ContainerConfig struct {
+	// CgroupParent is the cgroup the container's own one is created under, as
+	// podman was given it. A container created before kitbashd wrote a
+	// ceiling per Process names its member's cgroup here, which is root's and
+	// which crun cannot create anything under.
+	CgroupParent string
+	// Image is the reference the container runs, which for a kitbash Process
+	// is the digest its registration names.
+	Image string
+	// Env is the environment the container was created with, as KEY=value
+	// pairs the runtime reports. It carries the image's own variables as well
+	// as the ones the unit declared; kitbashd drops the ones it speaks for
+	// before it writes them again.
+	Env map[string]string
+	// Labels are the container's labels, the six that name the Process among
+	// them. kitbashd writes those from the registration rather than from
+	// here, the same rule a start follows.
+	Labels map[string]string
+	// Restart is the restart policy, empty when the container has none.
+	Restart string
+	// Publish is what the container publishes on the host.
+	Publish []podman.PortMapping
+}
+
+// ContainerConfig reads one container's configuration back as the member who
+// owns it. A container the member's runtime does not have is ErrNoContainer.
+func (p *Podman) ContainerConfig(ctx context.Context, m Member, container string) (ContainerConfig, error) {
+	if err := ensureRuntimeDir(p.runUser(), m); err != nil {
+		return ContainerConfig{}, err
+	}
+	if err := p.exists(ctx, m, container); err != nil {
+		return ContainerConfig{}, err
+	}
+	out, err := p.run(ctx, m, "container", "inspect", "--format", "json", container)
+	if err != nil {
+		return ContainerConfig{}, err
+	}
+	return containerConfig(out)
+}
+
+// containerInspect is the part of podman container inspect this package reads.
+type containerInspect struct {
+	ImageName string `json:"ImageName"`
+	Config    struct {
+		Env    []string          `json:"Env"`
+		Labels map[string]string `json:"Labels"`
+	} `json:"Config"`
+	HostConfig struct {
+		CgroupParent  string `json:"CgroupParent"`
+		RestartPolicy struct {
+			Name string `json:"Name"`
+		} `json:"RestartPolicy"`
+		PortBindings map[string][]struct {
+			HostPort string `json:"HostPort"`
+		} `json:"PortBindings"`
+	} `json:"HostConfig"`
+}
+
+// containerConfig reads one podman container inspect. It is a function of its
+// own because it is the part worth testing without a container runtime.
+func containerConfig(out string) (ContainerConfig, error) {
+	var decoded []containerInspect
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &decoded); err != nil || len(decoded) == 0 {
+		return ContainerConfig{}, fmt.Errorf("sysusers: reading podman container inspect: %v", err)
+	}
+	first := decoded[0]
+	config := ContainerConfig{
+		CgroupParent: first.HostConfig.CgroupParent,
+		Image:        first.ImageName,
+		Env:          map[string]string{},
+		Labels:       first.Config.Labels,
+		Restart:      first.HostConfig.RestartPolicy.Name,
+	}
+	if config.Labels == nil {
+		config.Labels = map[string]string{}
+	}
+	for _, entry := range first.Config.Env {
+		key, value, found := strings.Cut(entry, "=")
+		if !found || key == "" {
+			continue
+		}
+		config.Env[key] = value
+	}
+	for spec, bindings := range first.HostConfig.PortBindings {
+		// The key is <port>/<protocol> and kitbash publishes tcp only, so the
+		// protocol is dropped rather than carried into a mapping that has no
+		// field for it.
+		number, _, _ := strings.Cut(spec, "/")
+		containerPort, err := strconv.Atoi(number)
+		if err != nil || containerPort < 1 || containerPort > 65535 {
+			continue
+		}
+		for _, binding := range bindings {
+			hostPort, err := strconv.Atoi(binding.HostPort)
+			if err != nil || hostPort < 0 || hostPort > 65535 {
+				continue
+			}
+			config.Publish = append(config.Publish, podman.PortMapping{
+				HostPort: hostPort, ContainerPort: containerPort,
+			})
+		}
+	}
+	sort.Slice(config.Publish, func(i, j int) bool {
+		return config.Publish[i].ContainerPort < config.Publish[j].ContainerPort
+	})
+	return config, nil
 }
 
 // Stop stops one container as the member. The runtime is given the same

@@ -43,6 +43,9 @@ type Fake struct {
 	// ImageInfoErr makes reading an image fail for a reason that is not a
 	// missing image, which is the host's failure and not the caller's.
 	ImageInfoErr error
+	// ConfigErr makes reading one container's configuration fail, which is a
+	// host whose runtime answers nothing about a container it has.
+	ConfigErr error
 	// LoseCopies makes a copy succeed without the image arriving, which is
 	// the one failure a caller cannot see from the exit status of the two
 	// children: a save and a load that both said nothing and moved nothing.
@@ -56,6 +59,10 @@ type Fake struct {
 	// Running are containers Start answers ErrAlreadyRunning for, which is
 	// what a daemon that restarted without the host finds.
 	Running map[string]bool
+	// Configs are the configurations ContainerConfig answers, by container
+	// name. A container with no entry answers an empty configuration, which
+	// is one created under no cgroup parent of its own.
+	Configs map[string]ContainerConfig
 
 	// Created, AddedKeys and Removed record what the caller asked for, and
 	// Started, Ran, Stopped, RemovedContainers, RemovedFor and Copied what
@@ -370,6 +377,23 @@ func (f *Fake) Run(_ context.Context, m Member, opts podman.RunOptions, cgroup s
 		return f.RunID, nil
 	}
 	return "container-" + opts.Name, nil
+}
+
+// ContainerConfig answers what the fake host holds for one container. A
+// container named in Missing is ErrNoContainer, and one the test has staged no
+// configuration for answers an empty one: what a caller reads off it is the
+// cgroup parent, and no parent at all is what a container created before
+// kitbashd wrote a ceiling per Process has.
+func (f *Fake) ContainerConfig(_ context.Context, _ Member, container string) (ContainerConfig, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.Missing[container] {
+		return ContainerConfig{}, fmt.Errorf("%w: %s", ErrNoContainer, container)
+	}
+	if f.ConfigErr != nil {
+		return ContainerConfig{}, f.ConfigErr
+	}
+	return f.Configs[container], nil
 }
 
 // Stop records a stop as one member.
