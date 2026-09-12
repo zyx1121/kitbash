@@ -17,7 +17,7 @@ func TestEveryProblemSlugHasAPage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	re := regexp.MustCompile(`Slug[A-Za-z]+\s*=\s*"([a-z-]+)"`)
+	re := regexp.MustCompile(`Slug[A-Za-z]+\s*=\s*"([a-z0-9-]+)"`)
 	want := map[string]bool{}
 	for _, m := range re.FindAllStringSubmatch(string(src), -1) {
 		want[m[1]] = true
