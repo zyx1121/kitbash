@@ -34,19 +34,34 @@ rc-service -q cgroups start 2>/dev/null || true
 rc-update -q add qemu-guest-agent default 2>/dev/null || true
 rc-service -q qemu-guest-agent start 2>/dev/null || true
 
-# 4. Boot time prerequisites that live in tmpfs.
+# 4. Boot time prerequisites that live in tmpfs. The kitbashd apk ships them
+#    as /usr/share/kitbash/rootless-prereqs.sh and kitbashd.initd runs that
+#    from start_pre, so the daemon no longer waits for local (issue #88). The
+#    local.d hook stays, calling the same script, for a host installed before
+#    that change; on a host that has both, running it twice changes nothing.
 cat > /etc/local.d/kitbash-rootless.start <<'S'
 #!/bin/sh
-# Rootless podman prerequisites that do not survive a reboot.
-mount --make-rshared / 2>/dev/null || true
-for u in $(awk -F: '$3>=1000 && $3<65534 {print $1":"$3}' /etc/passwd); do
-  name=${u%%:*}; uid=${u##*:}
-  d=/run/user/$uid; mkdir -p "$d"; chown "$name" "$d"; chmod 700 "$d"
-done
+# Rootless podman prerequisites. kitbashd.initd runs this same script from
+# start_pre; this hook is what a host installed before that had instead.
+[ -x /usr/share/kitbash/rootless-prereqs.sh ] || exit 0
+exec /usr/share/kitbash/rootless-prereqs.sh
 S
 chmod +x /etc/local.d/kitbash-rootless.start
 rc-update -q add local default 2>/dev/null || true
-/etc/local.d/kitbash-rootless.start
+#    Step 7 is where the apk arrives, so on a host that does not have it yet
+#    the shared script is not here to call and this run does the same two
+#    things itself. From the next boot on it is the daemon's job either way.
+if [ -x /usr/share/kitbash/rootless-prereqs.sh ]; then
+  /usr/share/kitbash/rootless-prereqs.sh
+else
+  log "kitbashd apk not installed yet; making / rshared and the /run/user directories here"
+  mount --make-rshared / || log "warning: mount --make-rshared / failed; rootless containers may not see their own mounts"
+  for u in $(awk -F: '$3>=1000 && $3<65534 {print $1":"$3}' /etc/passwd); do
+    name=${u%%:*}; uid=${u##*:}
+    d=/run/user/$uid
+    { mkdir -p "$d" && chown "$name" "$d" && chmod 700 "$d"; } || log "warning: could not prepare $d"
+  done
+fi
 
 # 5. Groups. kitbash-users get the MCP ForceCommand, kitbash-admin may also manage.
 getent group kitbash-users >/dev/null || addgroup -S kitbash-users

@@ -27,6 +27,7 @@ package() {
 	install -Dm755 packaging/openrc/kitbashd.initd "$pkgdir"/etc/init.d/kitbashd
 	install -Dm755 deploy/kitbash-adduser "$pkgdir"/usr/bin/kitbash-adduser
 	install -Dm755 deploy/install.sh "$pkgdir"/usr/share/kitbash/install.sh
+	install -Dm755 deploy/rootless-prereqs.sh "$pkgdir"/usr/share/kitbash/rootless-prereqs.sh
 	mkdir -p "$pkgdir"/usr/share/kitbash/org
 	cp -R deploy/org/. "$pkgdir"/usr/share/kitbash/org/
 }

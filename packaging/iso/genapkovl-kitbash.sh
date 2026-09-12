@@ -106,18 +106,12 @@ if [ ! -f /usr/share/kitbash/install.sh ]; then
 	exit 1
 fi
 
-# Detached on purpose. install.sh starts kitbashd, whose init script is after
-# local, and OpenRC will not start a service while one it is after is still
-# starting: local is starting because of this very script, so calling
-# install.sh inline deadlocks. Let local finish first, then do the work.
-# Output goes to the console because OpenRC sends local.d output to /dev/null
-# unless rc_verbose is set, and the first boot is what an operator watches.
-(
-	i=0
-	while [ ! -e /run/openrc/started/local ] && [ "$i" -lt 120 ]; do
-		sleep 1
-		i=$((i + 1))
-	done
+# Inline, and the boot waits for it. kitbashd no longer depends on local, so
+# install.sh starting the daemon from inside local.d is just a service start
+# (issue #88). Output goes to the console because OpenRC sends local.d output
+# to /dev/null unless rc_verbose is set, and the first boot is what an
+# operator watches.
+{
 	sh /usr/share/kitbash/install.sh
 	kitbashd --version
 	kitbash-mcp --version
@@ -125,7 +119,7 @@ fi
 	mkdir -p /var/lib/kitbash
 	touch "$marker"
 	echo kitbash-firstboot-ok
-) > /dev/console 2>&1 &
+} > /dev/console 2>&1
 FIRSTBOOT_EOF
 
 rc_add devfs sysinit
@@ -146,9 +140,9 @@ rc_add bootmisc boot
 rc_add syslog boot
 rc_add networking boot
 
-# sshd is the MCP transport. local runs the firstboot script above, and after
-# that the rootless podman prerequisites install.sh writes into
-# /etc/local.d/kitbash-rootless.start.
+# sshd is the MCP transport. local runs the firstboot script above, and on
+# every later boot the /etc/local.d/kitbash-rootless.start install.sh leaves
+# behind, which calls the same rootless prerequisites kitbashd runs itself.
 rc_add sshd default
 rc_add local default
 

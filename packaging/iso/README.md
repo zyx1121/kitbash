@@ -105,13 +105,15 @@ wrote, the sshd drop in, the groups and the runlevels, all carry over.
   The firstboot script writes to `/dev/console` itself, which is also why the
   profile puts `console=ttyS0` last on the kernel command line: the last
   console is the one `/dev/console` points at.
-- **A `local.d` script cannot start kitbashd inline.** `kitbashd.initd` is
-  `after local`, and OpenRC will not start a service while one it is after is
-  still starting, so `rc-service kitbashd restart` inside `install.sh` blocks
-  forever and takes the boot with it: busybox init only starts the gettys
-  after `::wait:/sbin/openrc default` returns, so even the console is gone.
-  The firstboot script therefore waits for `/run/openrc/started/local` in a
-  detached child and does the work after the runlevel is up.
+- **kitbashd must not depend on `local`.** It used to be `after local`, for
+  the rootless prerequisites that hook installs, and OpenRC will not start a
+  service while one it is after is still starting: `rc-service kitbashd
+  restart` inside `install.sh`, which the firstboot script runs from
+  `local.d`, then blocked forever and took the boot with it, because busybox
+  init only starts the gettys after `::wait:/sbin/openrc default` returns.
+  Those prerequisites are `/usr/share/kitbash/rootless-prereqs.sh` now and
+  the service script runs them from `start_pre`, so the firstboot script
+  calls `install.sh` inline (issue #88).
 - **mkimage cannot run as root.** It calls `apk add --initdb --no-chown`, and
   apk-tools 3 answers `--usermode not allowed as root`. `build.sh` creates
   `kitbash-build` (override with `KITBASH_ISO_USER`) and re-runs itself as
