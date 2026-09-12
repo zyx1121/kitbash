@@ -16,7 +16,7 @@ An organization installs kitbash on one machine. Every member gets a Linux user 
 
 ## Status
 
-v0.1.0: the first release built and published by CI. The version 1 loop (PLAN.md 5.3, M1 to M6) and the hardening that followed it (narrowed Process permits, enforced limits, shared images, backups, an end to end job in CI) are in. What stays open is in PLAN.md 5.5. Read [PLAN.md](PLAN.md): positioning, the four object model, kits, kitbashOS, releases, and version 1 milestones. Machine readable definitions live in [`spec/`](spec/).
+v0.2.0: the first release built and published by CI. The version 1 loop (PLAN.md 5.3, M1 to M6) and the hardening that followed it (narrowed Process permits, enforced limits, shared images, backups, an end to end job in CI) are in. What stays open is in PLAN.md 5.5. Read [PLAN.md](PLAN.md): positioning, the four object model, kits, kitbashOS, releases, and version 1 milestones. Machine readable definitions live in [`spec/`](spec/).
 
 ## Install
 
@@ -31,13 +31,13 @@ there and everything third party arrives as a Package.
 the ISO and `SHA256SUMS`. The repository is private, so download with `gh`:
 
 ```sh
-gh release download v0.1.0 --repo zyx1121/kitbash --pattern 'kitbashd-*.apk' --pattern '*.rsa.pub'
-scp kitbashd-0.1.0-r0.apk *.rsa.pub root@kitbash.example.org:
+gh release download v0.2.0 --repo zyx1121/kitbash --pattern 'kitbashd-*.apk' --pattern '*.rsa.pub'
+scp kitbashd-0.2.0-r0.apk *.rsa.pub root@kitbash.example.org:
 ```
 
 To build the apk yourself instead, on any Alpine host with `alpine-sdk` and
-`go`, as a non root user: `git archive --format=tar.gz --prefix=kitbash-0.1.0/ -o kitbash-0.1.0.tar.gz v0.1.0`
-then `sh packaging/apk/build.sh kitbash-0.1.0.tar.gz`. The package lands in
+`go`, as a non root user: `git archive --format=tar.gz --prefix=kitbash-0.2.0/ -o kitbash-0.2.0.tar.gz v0.2.0`
+then `sh packaging/apk/build.sh kitbash-0.2.0.tar.gz`. The package lands in
 `~/packages/`, signed with the key build.sh creates on its first run.
 
 **2. Install the host.** As root on the kitbash machine. The key goes in first,
@@ -45,7 +45,7 @@ so apk verifies the signature it was built with:
 
 ```sh
 cp *.rsa.pub /etc/apk/keys/
-apk add kitbashd-0.1.0-r0.apk
+apk add kitbashd-0.2.0-r0.apk
 KITBASH_DNS=1.1.1.1 sh /usr/share/kitbash/install.sh
 ```
 
@@ -72,7 +72,7 @@ that skipped it has the receiver open; operator rules belong in
 `/etc/nftables.d/<name>.nft`, which that file includes after kitbash's own table
 and `install.sh` never touches.
 
-**Or boot the ISO.** `kitbash-0.1.0-x86_64.iso` on the release is Alpine's own
+**Or boot the ISO.** `kitbash-0.2.0-x86_64.iso` on the release is Alpine's own
 image with the kitbashd apk and its dependencies on it. Booted from a VM's CD
 drive it comes up as a working kitbash host in memory; `setup-alpine -f
 /media/cdrom/kitbash/answers` on its console installs it to `/dev/vda`
