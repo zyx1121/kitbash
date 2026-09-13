@@ -5,7 +5,7 @@ pkgrel=0
 pkgdesc="kitbash: an operating system layer for AI agents. MCP over SSH, Files, Packages, Processes, Telemetry."
 url="https://github.com/zyx1121/kitbash"
 arch="x86_64 aarch64"
-license="Proprietary"
+license="MIT"
 depends="podman crun passt shadow shadow-subids git openssh"
 makedepends="go"
 options="!check net"
@@ -22,6 +22,7 @@ build() {
 }
 
 package() {
+	install -Dm644 LICENSE "$pkgdir"/usr/share/licenses/$pkgname/LICENSE
 	install -Dm755 kitbash-mcp "$pkgdir"/usr/bin/kitbash-mcp
 	install -Dm755 kitbashd "$pkgdir"/usr/bin/kitbashd
 	install -Dm755 packaging/openrc/kitbashd.initd "$pkgdir"/etc/init.d/kitbashd
