@@ -105,10 +105,13 @@ type state struct {
 	elsewherePath  string
 	elsewhereID    string
 	elsewhereImage string
-	// The CLI Package import-cli drafted, and what its probe reported about
-	// the binary, which is what refine is called with.
-	cliPath string
-	probe   probeOutput
+	// The CLI Package import-cli drafted, what its probe reported about the
+	// binary, and the image and the Process of the draft, which the
+	// refinement has to replace.
+	cliPath      string
+	probe        probeOutput
+	cliDigest    string
+	cliProcessID string
 }
 
 // probeOutput is what a drafted Package's probe tool reports about its binary,
@@ -733,7 +736,10 @@ func runTheImportKit(t *testing.T, s *state) {
 		State string   `json:"state"`
 		Tools []string `json:"tools"`
 	}
-	s.admin.ok("proc_run", map[string]any{"package": importKitPath}, &out)
+	// The digest is passed rather than left to default, here and at every
+	// proc_run below: a Process is converged onto one image, and naming it is
+	// how the caller knows which build is answering.
+	s.admin.ok("proc_run", map[string]any{"package": importKitPath, "digest": built.Digest}, &out)
 	if out.State != "running" {
 		t.Fatalf("proc_run answered %+v, want the import kit running", out)
 	}
@@ -771,17 +777,27 @@ func importTheCLI(t *testing.T, s *state) {
 		t.Fatalf("the drafted Dockerfile does not install %s unpinned:\n%s", cliName, truncate(dockerfile.text()))
 	}
 
+	var built struct {
+		Digest string `json:"digest"`
+	}
 	res := s.admin.callWithin(buildTimeout, "pkg_build", map[string]any{"path": s.cliPath})
 	res.mustSucceed(t, "pkg_build")
+	if err := json.Unmarshal(res.Structured, &built); err != nil {
+		t.Fatalf("decoding pkg_build: %v", err)
+	}
+	s.cliDigest = built.Digest
 
 	var out struct {
-		State string   `json:"state"`
-		Tools []string `json:"tools"`
+		ID     string   `json:"id"`
+		State  string   `json:"state"`
+		Digest string   `json:"digest"`
+		Tools  []string `json:"tools"`
 	}
-	s.admin.ok("proc_run", map[string]any{"package": s.cliPath}, &out)
-	if out.State != "running" {
-		t.Fatalf("proc_run answered %+v, want the drafted Package running", out)
+	s.admin.ok("proc_run", map[string]any{"package": s.cliPath, "digest": built.Digest}, &out)
+	if out.State != "running" || out.Digest != built.Digest {
+		t.Fatalf("proc_run answered %+v, want the drafted Package running at %s", out, built.Digest)
 	}
+	s.cliProcessID = out.ID
 	names := append([]string{}, out.Tools...)
 	sort.Strings(names)
 	want := []string{cliProbeTool, cliRunTool}
@@ -832,16 +848,34 @@ func refineTheDraft(t *testing.T, s *state) {
 		writeFile(t, s.admin, filepath.Join(s.cliPath, file.Path), file.Content)
 	}
 
+	var built struct {
+		Digest string `json:"digest"`
+	}
 	res := s.admin.callWithin(buildTimeout, "pkg_build", map[string]any{"path": s.cliPath})
 	res.mustSucceed(t, "pkg_build")
+	if err := json.Unmarshal(res.Structured, &built); err != nil {
+		t.Fatalf("decoding pkg_build: %v", err)
+	}
+	// The refinement rewrote tools.json, which the image carries, so this is a
+	// different image from the draft's. A Package that built to the same
+	// digest would leave the draft's container answering the refined
+	// manifest's tools.
+	if built.Digest == s.cliDigest {
+		t.Fatalf("the refined Package built to %s, the same image as the draft", built.Digest)
+	}
 
 	var out struct {
-		State string   `json:"state"`
-		Tools []string `json:"tools"`
+		ID     string   `json:"id"`
+		State  string   `json:"state"`
+		Digest string   `json:"digest"`
+		Tools  []string `json:"tools"`
 	}
-	s.admin.ok("proc_run", map[string]any{"package": s.cliPath}, &out)
-	if out.State != "running" {
-		t.Fatalf("proc_run answered %+v, want the refined Package running", out)
+	s.admin.ok("proc_run", map[string]any{"package": s.cliPath, "digest": built.Digest}, &out)
+	if out.State != "running" || out.Digest != built.Digest {
+		t.Fatalf("proc_run answered %+v, want the refined Package running at %s", out, built.Digest)
+	}
+	if out.ID == s.cliProcessID {
+		t.Fatalf("proc_run answered the draft's Process %s, want the refined image to have replaced it", out.ID)
 	}
 	names := append([]string{}, out.Tools...)
 	sort.Strings(names)
