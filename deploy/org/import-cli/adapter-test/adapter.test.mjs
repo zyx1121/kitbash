@@ -97,6 +97,25 @@ const toolsDocument = () => ({
       stdin: null,
       outputs: [],
     },
+    fork: {
+      inputSchema: { type: "object", properties: {} },
+      argv: [node, fakeCli, "fork"],
+      options: {},
+      positionals: [],
+      stdin: null,
+      outputs: [],
+    },
+    link: {
+      inputSchema: {
+        type: "object",
+        properties: { target: { type: "string" }, output: { type: "string" } },
+      },
+      argv: [node, fakeCli, "symlink"],
+      options: {},
+      positionals: ["target", "output"],
+      stdin: null,
+      outputs: ["output"],
+    },
     absent: {
       inputSchema: { type: "object", properties: {} },
       argv: ["/nonexistent/kitbash-adapter-binary"],
@@ -218,7 +237,7 @@ test("initialize and tools/list answer with what tools.json declares", async () 
 
   const listed = await adapter.request("tools/list", {});
   const names = listed.result.tools.map((tool) => tool.name).sort();
-  assert.deepEqual(names, ["absent", "dump", "fail", "flood", "hang", "probe", "run", "upper"]);
+  assert.deepEqual(names, ["absent", "dump", "fail", "flood", "fork", "hang", "link", "probe", "run", "upper"]);
   const dump = listed.result.tools.find((tool) => tool.name === "dump");
   assert.equal(dump.description, "Print the arguments the adapter built.");
   assert.equal(dump.inputSchema.properties.filter.type, "string");
@@ -315,6 +334,66 @@ test("a command that runs past the timeout is killed", async () => {
   } finally {
     shortLived.stop();
   }
+});
+
+test("a command that forks a grandchild holding stdout is killed with its group", async () => {
+  const shortLived = startAdapter({ IMPORT_CLI_TIMEOUT_MS: "500" });
+  try {
+    // The command exits at once and its child keeps the pipe open, so a run
+    // that waited for the pipe to close would never answer at all.
+    const started = Date.now();
+    const body = payload(await shortLived.call("fork", {}));
+    const elapsed = Date.now() - started;
+    assert.equal(body.timedOut, true);
+    assert.equal(body.exitCode, null);
+    assert.ok(elapsed < 1500, `the call took ${elapsed} ms, which is past the timeout plus a second`);
+    // The queue is serialized, so an adapter still waiting on that call would
+    // never answer this one either.
+    const listed = await shortLived.request("tools/list", {});
+    assert.ok(listed.result.tools.length > 0);
+  } finally {
+    shortLived.stop();
+  }
+});
+
+test("files past the total input cap are refused before they are decoded", async () => {
+  // Four files of three mebibytes each are inside the per file cap and over
+  // the cap for one call, which is the shape that had the container killed.
+  const megabytes = (count) => "A".repeat(count * 4 * (MEBIBYTE / 3));
+  const document = problem(
+    await adapter.call("upper", {
+      source: "one.bin",
+      output: "out.txt",
+      files: [
+        { name: "one.bin", contentBase64: megabytes(3) },
+        { name: "two.bin", contentBase64: megabytes(3) },
+        { name: "three.bin", contentBase64: megabytes(3) },
+        { name: "four.bin", contentBase64: megabytes(3) },
+      ],
+    }),
+  );
+  assert.equal(document.status, 413);
+  assert.equal(document.type, "https://kitbash.zyx.tw/errors/too-large");
+  assert.match(document.detail, /over the 8 MiB limit for one call/);
+});
+
+test("stdin counts toward the total input cap", async () => {
+  const document = problem(
+    await adapter.call("dump", {
+      filter: ".",
+      stdin: "s".repeat(5 * MEBIBYTE),
+      files: [{ name: "one.bin", contentBase64: "A".repeat(4 * 4 * (MEBIBYTE / 3)) }],
+    }),
+  );
+  assert.equal(document.status, 413);
+  assert.match(document.detail, /and stdin/);
+});
+
+test("an output the command left as a symbolic link is not read back", async () => {
+  const body = payload(await adapter.call("link", { target: "/etc/hosts", output: "stolen.txt" }));
+  assert.equal(body.exitCode, 0);
+  assert.deepEqual(body.files, []);
+  assert.deepEqual(body.notes, ["stolen.txt is a symbolic link and was not read back."]);
 });
 
 test("an unknown tool is a not-found problem", async () => {

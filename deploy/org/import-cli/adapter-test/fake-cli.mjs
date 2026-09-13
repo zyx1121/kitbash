@@ -8,7 +8,8 @@
 // applets with their own spellings. It is executable and carries a shebang,
 // because the adapter's probe runs it as a bare binary.
 
-import { readFileSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { readFileSync, symlinkSync, writeFileSync } from "node:fs";
 
 const argv = process.argv.slice(2);
 
@@ -58,6 +59,28 @@ switch (command) {
   case "hang": {
     // Never exits, so the adapter's timeout is the only thing that ends it.
     setInterval(() => {}, 1000);
+    break;
+  }
+  case "fork": {
+    // The shape that used to wedge the adapter: a command that starts a child
+    // of its own, lets it inherit the standard output pipe and exits at once.
+    // The pipe stays open after this process is gone, so only killing the
+    // whole process group ends the call.
+    const grandchild = spawn(process.execPath, [process.argv[1], "hang"], {
+      stdio: ["ignore", "inherit", "inherit"],
+    });
+    // Unreferenced so this process exits at once and leaves the grandchild
+    // holding the pipe, which is the whole point of the fixture.
+    grandchild.unref();
+    process.stdout.write("forked\n");
+    break;
+  }
+  case "symlink": {
+    // Writes the output name as a link to a file outside the working
+    // directory, which the adapter must refuse to read back.
+    const [target, name] = rest;
+    symlinkSync(target, name);
+    process.stdout.write(`linked ${name}\n`);
     break;
   }
   case "fail": {
