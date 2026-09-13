@@ -16,7 +16,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { parseHelp } from "../parse.js";
-import { draft, refined, parseSource, toYaml } from "../generate.js";
+import { apkConstraint, draft, refined, parseSource, toYaml } from "../generate.js";
 import { readYaml, validate } from "./support.mjs";
 
 const here = import.meta.dirname;
@@ -62,7 +62,8 @@ test("the draft for cli:apk:jq@1.7.1 is a Package that builds", () => {
 
   const dockerfile = fileNamed(files, "Dockerfile").content;
   assert.match(dockerfile, /^FROM node:22-alpine$/m);
-  assert.match(dockerfile, /^RUN apk add --no-cache jq=1\.7\.1$/m);
+  // 1.7.1 names no apk release, so it is asked for with the fuzzy match.
+  assert.match(dockerfile, /^RUN apk add --no-cache jq~=1\.7\.1$/m);
   assert.match(dockerfile, /^COPY package\.json adapter\.js tools\.json \.\/$/m);
   assert.match(dockerfile, /^CMD \["node", "adapter\.js"\]$/m);
 
@@ -72,6 +73,34 @@ test("the draft for cli:apk:jq@1.7.1 is a Package that builds", () => {
   // A source without a version installs whatever the base image carries.
   const loose = draft({ source: "cli:apk:jq" });
   assert.match(fileNamed(loose, "Dockerfile").content, /^RUN apk add --no-cache jq$/m);
+
+  // A version that names an apk release is pinned to exactly that release.
+  const pinned = draft({ source: "cli:apk:jq@1.8.2-r0" });
+  assert.match(fileNamed(pinned, "Dockerfile").content, /^RUN apk add --no-cache jq=1\.8\.2-r0$/m);
+});
+
+test("the three apk constraints a source version can become", () => {
+  // apk names a release as <pkgver>-r<pkgrel>, and = wants the whole of it, so
+  // an upstream version without the suffix has to be asked for with ~=.
+  assert.equal(apkConstraint("jq", ""), "jq");
+  assert.equal(apkConstraint("jq", "1.8.2"), "jq~=1.8.2");
+  assert.equal(apkConstraint("jq", "1.8.2-r0"), "jq=1.8.2-r0");
+  assert.equal(apkConstraint("github-cli", "2.83.0-r12"), "github-cli=2.83.0-r12");
+  // A version with a suffix that is not a release number is still a prefix.
+  assert.equal(apkConstraint("ffmpeg", "8.0.1_rc1"), "ffmpeg~=8.0.1_rc1");
+
+  // And the notes of each say which of the three happened.
+  assert.match(fileNamed(draft({ source: "cli:apk:jq" }), "NOTES.md").content, /The source named none/);
+  assert.match(fileNamed(draft({ source: "cli:apk:jq@1.8.2" }), "NOTES.md").content, /Which release `jq~=1\.8\.2` resolves to/);
+  assert.match(
+    fileNamed(draft({ source: "cli:apk:jq@1.8.2-r0" }), "NOTES.md").content,
+    /Whether the branch still carries `jq=1\.8\.2-r0`/,
+  );
+  // The refined Package is pinned the same way and says so as well.
+  const parsed = parseHelp({ binary: "jq", help: jqHelp });
+  const notes = fileNamed(refined({ source: "cli:apk:jq@1.8.2", parsed, help: jqHelp }), "NOTES.md").content;
+  assert.match(notes, /Which release `jq~=1\.8\.2` resolves to/);
+  assert.match(fileNamed(refined({ source: "cli:apk:jq@1.8.2", parsed, help: jqHelp }), "Dockerfile").content, /jq~=1\.8\.2/);
 });
 
 test("the draft manifest satisfies spec/manifest.schema.json", () => {
@@ -171,6 +200,8 @@ test("the refined NOTES.md carries the help text and the doubts", () => {
   // What the generator could not decide, named rather than implied.
   assert.match(notes, /## What the generator could not decide/);
   assert.match(notes, /`--arg` takes more than one value/);
+  // The notes say what repeat means, because the adapter honours both settings.
+  assert.match(notes, /`"repeat": false`, so the flag is written once and every element follows it as its own argv word/);
   assert.match(notes, /`file` was taken for a file the caller supplies/);
   // The raw help text is quoted back so the next reader can check the work.
   assert.match(notes, /jq - commandline JSON processor/);
