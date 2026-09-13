@@ -23,7 +23,7 @@
 //         "options": {                          // input property -> flag
 //           "<prop>": {"flag": "--compact-output", "takesValue": false, "type": "boolean"},
 //           "<prop2>": {"flag": "--arg", "takesValue": true, "type": "string", "repeat": false}
-//         },
+//         },                                    // an array value with repeat true writes the flag before every element, and with repeat false writes the flag once followed by every element
 //         "positionals": ["filter", "input"],  // input property names, in argv order; a property whose schema has "format": "kitbash-file" names an entry of the reserved input `files` by name, the adapter writes it to a tmp dir and passes the path
 //         "stdin": "stdin",                     // input property whose string goes to stdin, or null
 //         "outputs": ["output"]                 // positional property names that name files the adapter reads back after the run (base64 in result.files)
@@ -306,12 +306,13 @@ function buildArgv(spec, args, files, outputs) {
     if (Array.isArray(value)) {
       const parts = value.map((element) => word(prop, element));
       if (parts.length === 0) continue;
-      // A repeatable flag is written once per element, and one that is not
-      // repeatable takes the elements as one comma separated value.
+      // A repeatable flag is written once per element, as --arg a --arg b,
+      // and one that is not repeatable is written once and takes every
+      // element as its own word after it, as --arg a b.
       if (option.repeat) {
         for (const part of parts) argv.push(option.flag, part);
       } else {
-        argv.push(option.flag, parts.join(","));
+        argv.push(option.flag, ...parts);
       }
       continue;
     }

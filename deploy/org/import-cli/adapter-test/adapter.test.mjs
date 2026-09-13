@@ -224,16 +224,17 @@ test("initialize and tools/list answer with what tools.json declares", async () 
   assert.equal(dump.inputSchema.properties.filter.type, "string");
 });
 
-test("options become flags: a boolean, a value, a repeated array and a comma joined array", async () => {
+test("options become flags: a boolean, a value and a repeated array", async () => {
   const result = await adapter.call("dump", {
     compact: true,
     quiet: false,
     arg: "value",
     raw: ["one", "two"],
-    tag: ["red", "blue"],
   });
   const body = payload(result);
   assert.equal(body.exitCode, 0);
+  // A boolean that is false is the caller asking for the flag not to be
+  // there, and repeat true puts --raw before every element.
   assert.deepEqual(JSON.parse(body.stdout).args, [
     "--compact-output",
     "--arg",
@@ -242,9 +243,12 @@ test("options become flags: a boolean, a value, a repeated array and a comma joi
     "one",
     "--raw",
     "two",
-    "--tag",
-    "red,blue",
   ]);
+});
+
+test("an array option that does not repeat writes its flag once with the elements after it", async () => {
+  const result = await adapter.call("dump", { tag: ["red", "blue"], filter: "." });
+  assert.deepEqual(JSON.parse(payload(result).stdout).args, ["--tag", "red", "blue", "."]);
 });
 
 test("positionals follow the options in the order tools.json records", async () => {
