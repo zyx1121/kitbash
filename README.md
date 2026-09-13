@@ -201,3 +201,7 @@ release with `kitbashd-<ver>-r0.apk`, the signing public key, both binaries,
 `kitbash-<ver>-x86_64.iso` and `SHA256SUMS`. A push to `main` whose version
 already has a tag releases nothing. `make check-version` is the guard CI runs on
 every push: every version the README names must be `pkgver`.
+
+## License
+
+[MIT](LICENSE)
