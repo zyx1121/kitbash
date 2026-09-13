@@ -39,13 +39,29 @@
 // directory which is also the command's working directory. The directory is
 // removed after every call, so one call never sees another call's files.
 //
+// One call may carry 8 MiB of input in total, counting every file and the
+// standard input together rather than each of them on its own, and it is
+// refused before anything is decoded. Each captured stream is capped at 8 MiB
+// as well, and each output file is read back only if it is a regular file: an
+// output the command left as a symbolic link or a directory comes back as a
+// note in `notes` rather than as contents from outside the directory.
+//
+// A positional value reaches the command verbatim, so a value that looks like
+// a flag is passed as one: `-rf` is `-rf` and the adapter inserts no `--`
+// before the positionals. That is accepted rather than fixed, because the
+// `run` tool every generated Package carries already hands the caller the
+// whole argv, so an adapter that fenced its positionals would be guarding a
+// door that stands open beside it. What matters is the fence the adapter does
+// hold: no shell, one temporary working directory, and a file name reduced to
+// one path component.
+//
 // A command that exits non zero is a normal result carrying its exit code,
 // because a CLI reporting a failure is an answer and not a transport fault.
 // An MCP error is returned only when the call itself is wrong: bad input, an
 // unknown tool, a file entry that was never sent, or a size cap exceeded.
 
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
@@ -201,33 +217,38 @@ class Cap {
 // resolves with what it did: an exit code, a signal when it was killed, and
 // both streams capped. A spawn that never started rejects, because that is the
 // adapter's own failure and not the command's answer.
+//
+// The child leads a process group of its own, and the timeout kills the group
+// rather than the child. A CLI that forks and exits leaves a grandchild
+// holding the standard output pipe, and killing only the child would leave
+// that grandchild alive with the pipe open.
+//
+// The timeout also settles this promise itself instead of waiting for close,
+// because close is exactly what a grandchild holding the pipe never lets
+// happen. Without that, one forking command would wedge the adapter's call
+// queue for the life of the Process and leak its temporary directory.
 function runCommand(command, argv, { cwd, input, timeoutMs, env }) {
   return new Promise((resolve, reject) => {
     let child;
     try {
-      child = spawn(command, argv, { cwd, env: env ?? process.env, stdio: ["pipe", "pipe", "pipe"] });
+      child = spawn(command, argv, {
+        cwd,
+        env: env ?? process.env,
+        stdio: ["pipe", "pipe", "pipe"],
+        detached: true,
+      });
     } catch (err) {
       reject(err);
       return;
     }
     const out = new Cap();
     const err = new Cap();
+    let settled = false;
     let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill("SIGKILL");
-    }, timeoutMs);
-    child.stdout.on("data", (chunk) => out.push(chunk));
-    child.stderr.on("data", (chunk) => err.push(chunk));
-    // A command that exits before it has read all of stdin closes the pipe,
-    // and writing to a closed pipe is that command's choice rather than an
-    // error of ours.
-    child.stdin.on("error", () => {});
-    child.on("error", (spawnError) => {
-      clearTimeout(timer);
-      reject(spawnError);
-    });
-    child.on("close", (code, signal) => {
+
+    const settle = (code, signal) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
       resolve({
         exitCode: code,
@@ -237,23 +258,58 @@ function runCommand(command, argv, { cwd, input, timeoutMs, env }) {
         stderr: err.text(),
         truncated: out.truncated || err.truncated,
       });
+    };
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try {
+        // The negative pid is the process group, which is the child and
+        // everything it started.
+        process.kill(-child.pid, "SIGKILL");
+      } catch {
+        // A child that is already gone, or a platform that refused the group,
+        // still gets the one signal that is certain to be deliverable.
+        child.kill("SIGKILL");
+      }
+      // Nothing more will be read from a killed command, and dropping the
+      // pipes is what lets this adapter forget a grandchild that is still
+      // holding them.
+      child.stdout.destroy();
+      child.stderr.destroy();
+      child.stdin.destroy();
+      child.unref();
+      settle(null, "SIGKILL");
+    }, timeoutMs);
+
+    child.stdout.on("data", (chunk) => out.push(chunk));
+    child.stderr.on("data", (chunk) => err.push(chunk));
+    // A command that exits before it has read all of stdin closes the pipe,
+    // and writing to a closed pipe is that command's choice rather than an
+    // error of ours.
+    child.stdin.on("error", () => {});
+    child.on("error", (spawnError) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(spawnError);
     });
+    child.on("close", (code, signal) => settle(code, signal));
     child.stdin.end(input ?? "");
   });
 }
 
 // ---------------------------------------------------------------- input
 
-// materialiseFiles decodes the reserved `files` input into the call's own
-// temporary directory and answers with the map from the name the caller used
-// to the path the command will see.
-async function materialiseFiles(value, dir) {
-  const written = new Map();
-  if (value === undefined || value === null) return written;
+// plannedFiles checks the shape of the reserved `files` input and answers with
+// the entries, decoding nothing. Reading a size from a base64 length is what
+// lets an oversized call be refused before its contents are ever turned into
+// buffers this process has to hold.
+function plannedFiles(value) {
+  if (value === undefined || value === null) return [];
   if (!Array.isArray(value)) {
     throw badRequest("files must be an array of {name, contentBase64} objects.", "Send files as an array.");
   }
-  for (const entry of value) {
+  return value.map((entry) => {
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
       throw badRequest("every entry of files must be an object with name and contentBase64.", "Fix the files array.");
     }
@@ -264,16 +320,59 @@ async function materialiseFiles(value, dir) {
     if (typeof contentBase64 !== "string" || !BASE64_ONLY.test(contentBase64)) {
       throw badRequest(`the contents of ${name} must be a base64 string.`, "Encode the file as base64.", name);
     }
-    if (contentBase64.length > MAX_BASE64) {
-      throw tooLarge(`${name} is larger than the 8 MiB limit for one file.`, "Send a smaller file.", name);
+    return { name, contentBase64, bytes: decodedLength(contentBase64) };
+  });
+}
+
+// decodedLength is how many bytes a base64 string will become, read from the
+// string rather than from the buffer it would make.
+function decodedLength(encoded) {
+  const characters = encoded.replace(/[\r\n]/g, "");
+  const padding = characters.endsWith("==") ? 2 : characters.endsWith("=") ? 1 : 0;
+  return Math.max(0, Math.floor(characters.length / 4) * 3 - padding);
+}
+
+// checkInputBudget refuses a call whose input is too big for the Process to
+// hold, before a byte of it is decoded.
+//
+// The cap is one budget over every file and the standard input together, not
+// one cap per file. A schema that allows thirty two files of eight mebibytes
+// allows a quarter of a gigabyte of base64 to become buffers, files and a
+// result, and the generated Package is given 512Mi, so a call that every
+// schema accepts was enough to have the container killed for running out of
+// memory.
+function checkInputBudget(planned, input) {
+  const stdinBytes = Buffer.byteLength(input);
+  let total = stdinBytes;
+  for (const file of planned) {
+    if (file.bytes > MAX_BYTES || file.contentBase64.length > MAX_BASE64) {
+      throw tooLarge(`${file.name} is larger than the 8 MiB limit for one file.`, "Send a smaller file.", file.name);
     }
-    const bytes = Buffer.from(contentBase64, "base64");
+    total += file.bytes;
+  }
+  if (total > MAX_BYTES) {
+    throw tooLarge(
+      `this call carries ${total} bytes of input across ${planned.length} file(s) and stdin, over the 8 MiB limit for one call.`,
+      "Send fewer or smaller files, or send them in several calls.",
+    );
+  }
+}
+
+// writeFiles decodes the planned entries into the call's own temporary
+// directory and answers with the map from the name the caller used to the path
+// the command will see.
+async function writeFiles(planned, dir) {
+  const written = new Map();
+  for (const file of planned) {
+    const bytes = Buffer.from(file.contentBase64, "base64");
+    // The length read from the string is what the budget was checked against,
+    // so a buffer that disagrees with it is refused rather than written.
     if (bytes.length > MAX_BYTES) {
-      throw tooLarge(`${name} is larger than the 8 MiB limit for one file.`, "Send a smaller file.", name);
+      throw tooLarge(`${file.name} is larger than the 8 MiB limit for one file.`, "Send a smaller file.", file.name);
     }
-    const target = path.join(dir, safeName(name));
+    const target = path.join(dir, safeName(file.name));
     await writeFile(target, bytes);
-    written.set(name, target);
+    written.set(file.name, target);
   }
   return written;
 }
@@ -373,8 +472,14 @@ function stdinFor(spec, args) {
 // collectOutputs reads back the files the tool declared as outputs. A file the
 // command did not write is simply absent, because a command that failed is a
 // normal result and an empty files array is the honest report of it.
+//
+// The name is looked at with lstat and nothing but a regular file is read. A
+// command is free to write a symbolic link where its output was meant to go,
+// and following one would read a file outside the temporary directory back to
+// the caller, so `out -> /etc/passwd` returns a note instead of the file.
 async function collectOutputs(spec, args, dir) {
   const files = [];
+  const notes = [];
   for (const prop of spec.outputs ?? []) {
     const value = args[prop];
     if (typeof value !== "string" || value === "") continue;
@@ -382,17 +487,24 @@ async function collectOutputs(spec, args, dir) {
     const target = path.join(dir, name);
     let info;
     try {
-      info = await stat(target);
+      info = await lstat(target);
     } catch {
       continue;
     }
-    if (!info.isFile()) continue;
+    if (info.isSymbolicLink()) {
+      notes.push(`${name} is a symbolic link and was not read back.`);
+      continue;
+    }
+    if (!info.isFile()) {
+      notes.push(`${name} is not a regular file and was not read back.`);
+      continue;
+    }
     if (info.size > MAX_BYTES) {
       throw tooLarge(`the output file ${name} is larger than the 8 MiB limit.`, "Ask for less output.", name);
     }
     files.push({ name, contentBase64: (await readFile(target)).toString("base64") });
   }
-  return files;
+  return { files, notes };
 }
 
 // ---------------------------------------------------------------- tools
@@ -410,12 +522,17 @@ async function callTool(name, args) {
   }
   if (spec.probe) return probe();
 
+  // What the call carries is weighed before anything is written or decoded,
+  // and the temporary directory is only made once the call is known to fit.
+  const planned = plannedFiles(args.files);
+  const input = stdinFor(spec, args);
+  checkInputBudget(planned, input);
+
   const dir = await mkdtemp(path.join(tmpdir(), "kitbash-cli-"));
   try {
-    const files = await materialiseFiles(args.files, dir);
+    const files = await writeFiles(planned, dir);
     const outputs = new Set(spec.outputs ?? []);
     const argv = buildArgv(spec, args, files, outputs);
-    const input = stdinFor(spec, args);
     let result;
     try {
       result = await runCommand(argv[0], argv.slice(1), {
@@ -426,13 +543,17 @@ async function callTool(name, args) {
     } catch (err) {
       throw internal(`${argv[0]} could not be started: ${err.message}`, "Check that the binary is in the image.", argv[0]);
     }
+    const collected = await collectOutputs(spec, args, dir);
     const payload = {
       exitCode: result.exitCode,
       stdout: result.stdout,
       stderr: result.stderr,
-      files: await collectOutputs(spec, args, dir),
+      files: collected.files,
       truncated: result.truncated,
     };
+    // A note is what the caller gets in place of an output that was there but
+    // was not a regular file.
+    if (collected.notes.length > 0) payload.notes = collected.notes;
     // A killed command has no exit code, so the signal and the timeout are how
     // the caller learns why.
     if (result.signal) payload.signal = result.signal;
