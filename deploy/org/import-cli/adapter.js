@@ -24,7 +24,7 @@
 //           "<prop>": {"flag": "--compact-output", "takesValue": false, "type": "boolean"},
 //           "<prop2>": {"flag": "--arg", "takesValue": true, "type": "string", "repeat": false}
 //         },                                    // an array value with repeat true writes the flag before every element, and with repeat false writes the flag once followed by every element
-//         "positionals": ["filter", "input"],  // input property names, in argv order; a property whose schema has "format": "kitbash-file" names an entry of the reserved input `files` by name, the adapter writes it to a tmp dir and passes the path
+//         "positionals": ["filter", "input"],  // input property names, in argv order; a property whose schema has "format": "kitbash-file", on itself or on its items, names entries of the reserved input `files` by name, the adapter writes each to a tmp dir and passes the paths
 //         "stdin": "stdin",                     // input property whose string goes to stdin, or null
 //         "outputs": ["output"]                 // positional property names that name files the adapter reads back after the run (base64 in result.files)
 //       },
@@ -175,11 +175,14 @@ function word(prop, value) {
   );
 }
 
-// Whether a property names one of the entries of the reserved `files` input
-// rather than carrying its own value. The kit marks those with the
-// kitbash-file format in the tool's own schema.
+// Whether a property names entries of the reserved `files` input rather than
+// carrying its own value. The kit marks those with the kitbash-file format in
+// the tool's own schema: on the property itself when the command takes one
+// file, and on the items when the help text said it takes several, which is
+// what a synopsis such as jq's [file...] is generated as.
 function namesAFile(spec, prop) {
-  return spec.inputSchema?.properties?.[prop]?.format === "kitbash-file";
+  const schema = spec.inputSchema?.properties?.[prop];
+  return schema?.format === "kitbash-file" || schema?.items?.format === "kitbash-file";
 }
 
 // Cap collects one output stream and stops at the cap rather than growing the
@@ -432,14 +435,17 @@ function buildArgv(spec, args, files, outputs) {
     }
     // A property that names an input file is replaced by the path that file
     // was written to, and a name nobody sent is a missing file rather than a
-    // literal argument.
+    // literal argument. An array names several files and becomes one argv word
+    // each, in the order the caller wrote them.
     if (namesAFile(spec, prop)) {
-      const name = word(prop, value);
-      const file = files.get(name);
-      if (file === undefined) {
-        throw notFound(`${prop} names the file ${name}, which was not sent in files.`, "Send that file in files.", name);
+      for (const element of Array.isArray(value) ? value : [value]) {
+        const name = word(prop, element);
+        const file = files.get(name);
+        if (file === undefined) {
+          throw notFound(`${prop} names the file ${name}, which was not sent in files.`, "Send that file in files.", name);
+        }
+        argv.push(file);
       }
-      argv.push(file);
       continue;
     }
     // An output is a name the command writes and the adapter reads back, so it

@@ -17,7 +17,7 @@ jobs:
   e2e:
     runs-on: ubuntu-latest
     # The budget of issue #73. A job that has spent it is a job that hung: it
-    # runs in about two and a half minutes.
+    # runs in about three minutes, of which the surface test is half a minute.
     timeout-minutes: 8
     env:
       KITBASH_E2E: "1"
@@ -80,15 +80,25 @@ jobs:
       - name: Start kitbashd
         run: sudo sh e2e/daemon.sh start /usr/bin/kitbashd "$MAIN_STORE" "$KITBASH_E2E_LOGS/kitbashd.log"
 
-      - name: Warm the image the Package is built on
-        # Pulled here, by digest, as the member whose store the build reads, so
-        # a slow or unreachable registry fails this step by name instead of the
-        # build. Once, then once more: a pull is the one thing in this job that
-        # depends on somebody else's service.
+      - name: Warm the images the Packages are built on
+        # Pulled here, as the member whose store the build reads, so a slow or
+        # unreachable registry fails this step by name instead of the build.
+        # Each reference is tried once and then once more: a pull is the one
+        # thing in this job that depends on somebody else's service.
+        #
+        # There are two references for one image. The fixtures pin the base by
+        # digest, and the import-cli kit and every Package it drafts name it by
+        # tag, which podman resolves separately even when it ends at the same
+        # digest. Pulling the tag here leaves it in the member's store under
+        # its fully qualified name, so those builds reach no registry either.
         run: |
           image=$(sed -n 's/^FROM //p' e2e/fixtures/echo/Dockerfile | head -1)
-          sh e2e/as-member.sh "$KITBASH_E2E_ADMIN" podman pull "$image" \
-            || { sleep 10; sh e2e/as-member.sh "$KITBASH_E2E_ADMIN" podman pull "$image"; }
+          tag=$(sed -n 's/^FROM //p' deploy/org/import-cli/Dockerfile | head -1)
+          case "$tag" in */*) ;; *) tag="docker.io/library/$tag" ;; esac
+          for reference in "$image" "$tag"; do
+            sh e2e/as-member.sh "$KITBASH_E2E_ADMIN" podman pull "$reference" \
+              || { sleep 10; sh e2e/as-member.sh "$KITBASH_E2E_ADMIN" podman pull "$reference"; }
+          done
 
       - name: Drive the surface as two members
         env:
