@@ -17,6 +17,11 @@ fi
 # needs them to install kitbashd from the boot repository on the ISO.
 keysdir="${KITBASH_ISO_KEYSDIR:-$(dirname "$0")/kitbash-keys}"
 
+# The serial line this image's console is on, set by the mkimage profile from
+# the architecture it is building: an 8250 at ttyS0 on x86, a PL011 at ttyAMA0
+# on aarch64. The kernel command line names the same one.
+console="${KITBASH_ISO_CONSOLE:-ttyS0}"
+
 cleanup() {
 	rm -rf "$tmp"
 }
@@ -56,7 +61,7 @@ INTERFACES_EOF
 # glass path of PLAN.md 4.5 has to exist there. alpine-baselayout ships this
 # file with the serial getty commented out. tty1 stays for a VM that does have
 # a screen. No other tty: nobody logs in here but the operator.
-makefile root:root 0644 "$tmp"/etc/inittab <<'INITTAB_EOF'
+makefile root:root 0644 "$tmp"/etc/inittab <<INITTAB_EOF
 # /etc/inittab
 
 ::sysinit:/sbin/openrc sysinit
@@ -64,7 +69,7 @@ makefile root:root 0644 "$tmp"/etc/inittab <<'INITTAB_EOF'
 ::wait:/sbin/openrc default
 
 tty1::respawn:/sbin/getty 38400 tty1
-ttyS0::respawn:/sbin/getty -L 115200 ttyS0 vt100
+$console::respawn:/sbin/getty -L 115200 $console vt100
 
 # Stuff to do for the 3-finger salute
 ::ctrlaltdel:/sbin/reboot

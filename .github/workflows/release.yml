@@ -55,10 +55,25 @@ jobs:
   build:
     needs: version
     if: needs.version.outputs.build == 'true'
-    runs-on: ubuntu-latest
+    # Two native runners, no emulation: abuild, mkimage and qemu all run on
+    # the architecture they are building for. The arm runners are free for a
+    # public repository, which this became on 2026-09-13 (issue #102).
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+            goarch: amd64
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            goarch: arm64
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     env:
       VERSION: ${{ needs.version.outputs.version }}
+      ARCH: ${{ matrix.arch }}
+      BINARCH: ${{ matrix.goarch }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -69,19 +84,28 @@ jobs:
           go-version: "1.26"
           check-latest: true
 
-      - name: Lint, test, and build the two binaries
+      - name: Lint, test, and build the binaries
         run: |
           make lint test build-linux
-          bin/kitbashd-linux-amd64 -version | grep -x "v$VERSION"
+          # The native one, because this runner can only run that one.
+          "bin/kitbashd-linux-$BINARCH" -version | grep -x "v$VERSION"
 
       # An Alpine of the release's own version, as a chroot on this runner:
-      # the apk and the ISO are built by Alpine's tools, on Alpine.
+      # the apk and the ISO are built by Alpine's tools, on Alpine. syslinux
+      # and grub-bios are x86 only packages and an aarch64 image is UEFI only.
+      #
+      # apk.static runs on the runner and not in the chroot, so it has to be
+      # the runner's own architecture; the action's default is the x86_64 one.
       - uses: jirutka/setup-alpine@v1
         with:
           branch: v3.23
+          arch: ${{ matrix.arch }}
+          apk-tools-url: >-
+            https://gitlab.alpinelinux.org/api/v4/projects/5/packages/generic/v2.14.10/${{ matrix.arch }}/apk.static#!sha256!${{ matrix.arch == 'x86_64' && '34bb1a96f0258982377a289392d4ea9f3f4b767a4bb5806b1b87179b79ad8a1c' || 'e471d35aa221d031abe9b6288aede12a8e9f1a398954e5a2e1d1bce1727b4ef4' }}
           packages: >
-            alpine-sdk alpine-conf go xorriso squashfs-tools grub grub-efi grub-bios
-            syslinux mtools dosfstools
+            alpine-sdk alpine-conf go xorriso squashfs-tools grub grub-efi
+            mtools dosfstools
+            ${{ matrix.arch == 'x86_64' && 'syslinux grub-bios' || '' }}
 
       - name: Let the runner user build packages
         shell: alpine.sh --root {0}
@@ -113,26 +137,33 @@ jobs:
           git archive --format=tar.gz --prefix="kitbash-$VERSION/" -o "/tmp/kitbash-$VERSION.tar.gz" HEAD
           sh packaging/apk/build.sh "/tmp/kitbash-$VERSION.tar.gz"
           mkdir -p dist
-          cp ~/packages/*/*/kitbashd-"$VERSION"-r0.apk dist/
+          # abuild names every apk kitbashd-<ver>-r0.apk, so the two
+          # architectures would collide on one release. build.sh puts the
+          # canonical name back when it indexes the ISO's local repository.
+          cp ~/packages/*/*/kitbashd-"$VERSION"-r0.apk "dist/kitbashd-$VERSION-r0.$ARCH.apk"
           cp packaging/apk/keys/*.rsa.pub dist/
-          cp bin/kitbash-mcp-linux-amd64 bin/kitbashd-linux-amd64 dist/
+          cp "bin/kitbash-mcp-linux-$BINARCH" "bin/kitbashd-linux-$BINARCH" dist/
 
       - name: Build the ISO
         shell: alpine.sh {0}
-        run: sh packaging/iso/build.sh "dist/kitbashd-$VERSION-r0.apk" dist
+        run: sh packaging/iso/build.sh "dist/kitbashd-$VERSION-r0.$ARCH.apk" dist "$ARCH"
 
       - name: Boot the ISO once
         run: |
-          sudo apt-get update -q && sudo apt-get install -y -q qemu-system-x86 >/dev/null
-          sh packaging/iso/smoke.sh "dist/kitbash-$VERSION-x86_64.iso"
+          case "$ARCH" in
+            x86_64) pkgs="qemu-system-x86" ;;
+            # qemu-system-arm carries qemu-system-aarch64; the virt machine
+            # has no BIOS, so it needs AAVMF from qemu-efi-aarch64.
+            aarch64) pkgs="qemu-system-arm qemu-efi-aarch64" ;;
+          esac
+          sudo apt-get update -q && sudo apt-get install -y -q $pkgs >/dev/null
+          sh packaging/iso/smoke.sh "dist/kitbash-$VERSION-$ARCH.iso"
 
-      - name: Checksums
-        run: |
-          cd dist && rm -f SHA256SUMS && sha256sum * > SHA256SUMS && cat SHA256SUMS
-
+      # One SHA256SUMS for the whole release, so it is written where both
+      # halves are together: in publish, not here.
       - uses: actions/upload-artifact@v4
         with:
-          name: kitbash-${{ env.VERSION }}
+          name: dist-${{ matrix.arch }}
           path: dist/
           if-no-files-found: error
 
@@ -146,10 +177,17 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # Both architectures into one directory. The signing key is in both and
+      # is the same file, so the merge is a no-op for it.
       - uses: actions/download-artifact@v4
         with:
-          name: kitbash-${{ env.VERSION }}
+          pattern: dist-*
+          merge-multiple: true
           path: dist
+
+      - name: Checksums
+        run: |
+          cd dist && rm -f SHA256SUMS && sha256sum * > SHA256SUMS && cat SHA256SUMS
 
       - name: Tag and release
         run: |
@@ -160,10 +198,10 @@ jobs:
             echo
             echo '| File | What it is |'
             echo '|------|------------|'
-            echo "| \`kitbashd-$VERSION-r0.apk\` | The package: kitbashd, kitbash-mcp, the OpenRC service, install.sh |"
+            echo "| \`kitbashd-$VERSION-r0.x86_64.apk\`, \`kitbashd-$VERSION-r0.aarch64.apk\` | The package: kitbashd, kitbash-mcp, the OpenRC service, install.sh |"
             echo '| `*.rsa.pub` | The apk signing key, for `/etc/apk/keys` |'
-            echo "| \`kitbash-$VERSION-x86_64.iso\` | Alpine with the apk on it, boots to a kitbash host, unattended install with the answer file |"
-            echo '| `kitbashd-linux-amd64`, `kitbash-mcp-linux-amd64` | The two static binaries |'
+            echo "| \`kitbash-$VERSION-x86_64.iso\`, \`kitbash-$VERSION-aarch64.iso\` | Alpine with the apk on it, boots to a kitbash host, unattended install with the answer file |"
+            echo '| `kitbashd-linux-amd64`, `kitbash-mcp-linux-amd64`, `kitbashd-linux-arm64`, `kitbash-mcp-linux-arm64` | The four static binaries |'
             echo '| `SHA256SUMS` | Checksums of everything above |'
           } > notes.md
           gh release create "v$VERSION" dist/* \
