@@ -8,6 +8,12 @@
 // back with it is what lets a test validate the bytes rather than the object
 // they were written from.
 //
+// The plain scalar resolver is the part that matters most: a manifest is read
+// on the Go side by gopkg.in/yaml.v3, and a description such as
+// `0x00000000deadbeef` written as a plain scalar comes back from it as an
+// integer and fails the schema. resolvePlain answers what that reader answers,
+// so a generated manifest that would break on a real host breaks here first.
+//
 // validate is a JSON Schema 2020-12 subset: enough of it to run
 // spec/manifest.schema.json against a document, which is the check that says a
 // generated manifest would be visible on a real host. Unsupported keywords are
@@ -15,9 +21,72 @@
 
 // ---------------------------------------------------------------- YAML reading
 
+// What gopkg.in/yaml.v3 resolves a plain scalar to, which is the reader the Go
+// side of this repository uses. Faithful enough to catch a generated manifest
+// whose description a Go reader would hand back as a number:
+//
+//   resolve.go dispatches on the first byte. A letter other than the ones the
+//   word table holds is always a string. A digit or a sign is tried as a
+//   timestamp, then as an integer with strconv.ParseInt base 0, which reads
+//   0x, 0o, 0b and a leading zero as octal and allows underscores between
+//   digits, then as a float. A leading dot is tried as a float.
+//
+// Anything it does not resolve is the string it was written as.
+const YAML_WORDS = new Map([
+  ["", null], ["~", null], ["null", null], ["Null", null], ["NULL", null],
+  ["true", true], ["True", true], ["TRUE", true],
+  ["false", false], ["False", false], ["FALSE", false],
+  [".nan", Number.NaN], [".NaN", Number.NaN], [".NAN", Number.NaN],
+  [".inf", Infinity], [".Inf", Infinity], [".INF", Infinity],
+  ["+.inf", Infinity], ["+.Inf", Infinity], ["+.INF", Infinity],
+  ["-.inf", -Infinity], ["-.Inf", -Infinity], ["-.INF", -Infinity],
+]);
+
+// yaml.v3's yamlStyleFloat.
+const YAML_FLOAT = /^[-+]?(\.[0-9]+|[0-9]+(\.[0-9]*)?)([eE][-+]?[0-9]+)?$/;
+// The timestamp layouts parseTimestamp accepts, as one pattern.
+const YAML_TIMESTAMP = /^[0-9]{4}-[0-9]{1,2}-[0-9]{1,2}([Tt ]+[0-9]{1,2}:[0-9]{2}:[0-9]{2}(\.[0-9]*)?\s*([Zz]|[-+][0-9]{1,2}(:?[0-9]{2})?)?)?$/;
+
+// strconv.ParseInt(text, 0, 64), which is what makes 0x, 0o, 0b and a leading
+// zero integers rather than strings.
+function goParseInt(text) {
+  let body = text;
+  let sign = 1;
+  if (body.startsWith("+")) body = body.slice(1);
+  else if (body.startsWith("-")) {
+    sign = -1;
+    body = body.slice(1);
+  }
+  if (body === "") return null;
+  let base = 10;
+  let digits = body;
+  if (/^0[xX]/.test(body)) [base, digits] = [16, body.slice(2)];
+  else if (/^0[oO]/.test(body)) [base, digits] = [8, body.slice(2)];
+  else if (/^0[bB]/.test(body)) [base, digits] = [2, body.slice(2)];
+  else if (/^0[0-7]+$/.test(body)) [base, digits] = [8, body.slice(1)];
+  const allowed = { 2: /^[01]+$/, 8: /^[0-7]+$/, 10: /^[0-9]+$/, 16: /^[0-9a-fA-F]+$/ }[base];
+  if (digits === "" || !allowed.test(digits)) return null;
+  return sign * Number.parseInt(digits, base);
+}
+
+export function resolvePlain(value) {
+  if (YAML_WORDS.has(value)) return YAML_WORDS.get(value);
+  const first = value[0];
+  if (first === ".") {
+    return YAML_FLOAT.test(value) ? Number.parseFloat(value) : value;
+  }
+  if (!/[0-9+-]/.test(first ?? "")) return value;
+  if (YAML_TIMESTAMP.test(value)) return new Date(value.replace(" ", "T"));
+  // yaml.v3 strips underscores before it tries a number.
+  const plain = value.replace(/_/g, "");
+  const integer = goParseInt(plain);
+  if (integer !== null) return integer;
+  if (YAML_FLOAT.test(plain)) return Number.parseFloat(plain);
+  return value;
+}
+
 function scalar(text) {
   const value = text.trim();
-  if (value === "") return "";
   if (value.startsWith('"')) return JSON.parse(value);
   // A flow sequence of plain scalars, which is how the hand written manifests
   // write their tags and their kit hooks.
@@ -25,8 +94,9 @@ function scalar(text) {
     return value
       .slice(1, -1)
       .split(",")
-      .map((item) => scalar(item))
-      .filter((item) => item !== "");
+      .map((item) => item.trim())
+      .filter((item) => item !== "")
+      .map((item) => scalar(item));
   }
   if (value === "[]") return [];
   // A flow mapping of plain scalars, which is how the hand written manifests
@@ -41,11 +111,7 @@ function scalar(text) {
     return map;
   }
   if (value === "{}") return {};
-  if (value === "true") return true;
-  if (value === "false") return false;
-  if (value === "null" || value === "~") return null;
-  if (/^-?(0|[1-9][0-9]*)(\.[0-9]+)?$/.test(value)) return Number(value);
-  return value;
+  return resolvePlain(value);
 }
 
 function significantLines(text) {
