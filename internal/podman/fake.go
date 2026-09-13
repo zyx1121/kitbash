@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
-	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -135,7 +134,8 @@ func (f *Fake) Build(_ context.Context, contextDir, containerfile, tag string, l
 	return id, f.Log, nil
 }
 
-// Images answers from the seeded and built images, newest first.
+// Images answers from the seeded and built images, newest first, in the same
+// order the CLI puts them in.
 func (f *Fake) Images(_ context.Context, filter Filter) ([]Image, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -145,7 +145,7 @@ func (f *Fake) Images(_ context.Context, filter Filter) ([]Image, error) {
 			out = append(out, image)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Created.After(out[j].Created) })
+	sortImages(out)
 	return out, nil
 }
 

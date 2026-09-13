@@ -225,10 +225,10 @@ func (s *Service) run(ctx context.Context, span *telemetry.Span, path, digest, n
 	// and not a third built in: the built in rootless podman runner below is
 	// still what runs every Package that names none, see PLAN.md section 3.
 	if unit.Runner != "" {
-		return s.runWithKit(ctx, m, folder, unit, digest, name)
+		return s.runWithKit(ctx, span, m, folder, unit, digest, name)
 	}
 
-	image, prob := s.image(ctx, folder, digest)
+	image, prob := s.image(ctx, span, folder, digest)
 	if prob != nil {
 		return nil, builtElsewhere(prob, unit)
 	}
@@ -749,7 +749,7 @@ func (s *Service) labels(folder, name, digest, expose string) map[string]string 
 // A digest the caller named and this member's store does not have may be one
 // another member built, which kitbashd copies over rather than leaving the
 // member to build the same commit again, see PLAN.md section 2.2.
-func (s *Service) image(ctx context.Context, folder, digest string) (*podman.Image, *problem.Problem) {
+func (s *Service) image(ctx context.Context, span *telemetry.Span, folder, digest string) (*podman.Image, *problem.Problem) {
 	images, err := s.runner.Images(ctx, podman.Filter{podman.LabelPath: folder})
 	if err != nil {
 		return nil, problem.Internal(folder, err.Error(), "")
@@ -759,7 +759,7 @@ func (s *Service) image(ctx context.Context, folder, digest string) (*podman.Ima
 			return nil, problem.NotFoundFix(folder, "this Package has not been built yet",
 				"Call pkg_build first, then run the digest it returns.")
 		}
-		return &images[0], nil
+		return s.latest(ctx, span, folder, images), nil
 	}
 	for i := range images {
 		if images[i].ID == digest {
@@ -776,6 +776,76 @@ func (s *Service) image(ctx context.Context, folder, digest string) (*podman.Ima
 	return nil, problem.NotFoundFix(folder,
 		fmt.Sprintf("no build of this Package has the digest %s", digest),
 		"Call pkg_inspect to see the digests this Package has been built to.")
+}
+
+// latest picks the build a caller who named no digest runs, and says out loud
+// which one it picked.
+//
+// The order is the image's own creation time. podman reports that at one
+// second resolution in a listing, so internal/podman refines the images that
+// share a second to nanoseconds, which is what tells two builds of one Package
+// inside the same second apart, see issue #113.
+//
+// Two images that still share an instant are decided by the build records
+// kitbashd keeps, the other thing that knows when a build happened, and a pair
+// neither can separate is decided by the digest. The last step decides nothing
+// about time, it only makes the answer the same one on every call: an
+// arbitrary pick that changes between calls is the bug this fixes.
+func (s *Service) latest(ctx context.Context, span *telemetry.Span, folder string, images []podman.Image) *podman.Image {
+	// The listing arrives newest first with the digest as the tie break, so
+	// the head is already the answer for everything but a shared instant.
+	chosen := 0
+	newest := images[0].Created
+	var tied []int
+	for i := range images {
+		if images[i].Created.Equal(newest) {
+			tied = append(tied, i)
+		}
+	}
+	how := "it is the newest image in this store, created " + newest.Format(time.RFC3339Nano)
+	if len(tied) > 1 {
+		how = fmt.Sprintf("%d images of this Package share the instant %s, and this one has the highest digest",
+			len(tied), newest.Format(time.RFC3339Nano))
+		if i, at, ok := s.recordedLast(ctx, folder, images, tied); ok {
+			chosen = i
+			how = fmt.Sprintf("%d images of this Package share the instant %s, and kitbashd recorded this one built last, at %s",
+				len(tied), newest.Format(time.RFC3339Nano), at)
+		}
+	}
+	image := &images[chosen]
+	line := fmt.Sprintf("proc_run on %s named no digest, so it runs the latest build %s: %s",
+		folder, image.ID, how)
+	s.logger.Printf("proc: %s", line)
+	if span != nil {
+		span.Info(line)
+	}
+	return image
+}
+
+// recordedLast asks kitbashd which of a set of images it recorded a build for
+// most recently, and answers the index of that image together with the time
+// the record carries. It answers false for a daemon that is not there, a path
+// it has no records of, and a set none of the records name: all three mean the
+// caller has to decide the tie without a build record.
+func (s *Service) recordedLast(ctx context.Context, folder string, images []podman.Image, tied []int) (int, string, bool) {
+	if s.registry == nil {
+		return 0, "", false
+	}
+	builds, prob := s.registry.Builds(ctx, folder, "", "")
+	if prob != nil {
+		s.logger.Printf("proc: kitbashd did not answer what it recorded about the builds of %s: %s", folder, prob.Detail)
+		return 0, "", false
+	}
+	// kitbashd answers newest first, so the first record naming one of these
+	// images is the one that was built last.
+	for _, build := range builds {
+		for _, i := range tied {
+			if images[i].ID == build.Digest {
+				return i, build.BuiltAt, true
+			}
+		}
+	}
+	return 0, "", false
 }
 
 // fetch asks kitbashd for an image another member built. It answers nil for

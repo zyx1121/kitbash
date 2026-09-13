@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The runtime is exercised end to end on a real host, where podman exists.
@@ -98,4 +99,67 @@ func TestExecArgvHoldsStdinOpen(t *testing.T) {
 			t.Error("ExecArgv passes a double dash, which podman hands to the runtime as the command")
 		}
 	}
+}
+
+// The image listing is what proc_run reads "the latest build" off, and podman
+// images reports one second resolution, so two builds of one Package inside
+// one second arrive with the same timestamp. The two tests below are the two
+// halves of the fix for issue #113: the nanosecond time is in the inspect, and
+// the order of the listing does not depend on the order podman printed it in.
+
+func TestInspectJSONDecodesTheNanosecondCreationTime(t *testing.T) {
+	const body = `[{"Id":"0123456789abcdef","Created":"2026-09-13T10:15:23.279892228Z",
+"Config":{"Labels":{"kitbash.path":"/srv/ffmpeg"}}}]`
+	var decoded []inspectJSON
+	if err := json.Unmarshal([]byte(body), &decoded); err != nil {
+		t.Fatalf("decoding podman image inspect: %v", err)
+	}
+	at, err := time.Parse(time.RFC3339Nano, decoded[0].Created)
+	if err != nil {
+		t.Fatalf("parsing the creation time %q: %v", decoded[0].Created, err)
+	}
+	if at.Nanosecond() != 279892228 {
+		t.Errorf("the creation time is %s, want the nanoseconds podman inspect reports", at.Format(time.RFC3339Nano))
+	}
+	if decoded[0].ID != "0123456789abcdef" {
+		t.Errorf("the id is %q, want the one the inspect answered with", decoded[0].ID)
+	}
+}
+
+func TestSortImagesIsTheSameWhateverOrderPodmanPrinted(t *testing.T) {
+	second := time.Date(2026, 9, 13, 10, 15, 23, 0, time.UTC)
+	earlier := Image{ID: "sha256:aa", Created: second.Add(279892228)}
+	later := Image{ID: "sha256:bb", Created: second.Add(615318587)}
+	same := Image{ID: "sha256:cc", Created: second.Add(615318587)}
+
+	for _, tc := range []struct {
+		name  string
+		given []Image
+	}{
+		{name: "as printed", given: []Image{earlier, later, same}},
+		{name: "reversed", given: []Image{same, later, earlier}},
+		{name: "oldest first", given: []Image{earlier, same, later}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			images := append([]Image(nil), tc.given...)
+			sortImages(images)
+			// The two images of the same nanosecond come first in digest
+			// order, and the earlier one of the same second comes last.
+			want := []string{"sha256:cc", "sha256:bb", "sha256:aa"}
+			for i := range want {
+				if images[i].ID != want[i] {
+					t.Fatalf("the listing is %s, want %s", ids(images), strings.Join(want, " "))
+				}
+			}
+		})
+	}
+}
+
+// ids names a listing for a failure message.
+func ids(images []Image) string {
+	out := make([]string, 0, len(images))
+	for _, image := range images {
+		out = append(out, image.ID)
+	}
+	return strings.Join(out, " ")
 }

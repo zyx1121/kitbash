@@ -511,6 +511,14 @@ families:
           Process whose manifest declares subscriptions: [telemetry] with
           expose: http and a port is registered as a fan out subscriber.
 
+          Without a digest the latest build of the Package runs, and latest is
+          the image with the newest creation time at nanosecond resolution.
+          Two images created in the same nanosecond are decided by the build
+          record kitbashd holds, newest first, and a pair neither can separate
+          is decided by the higher digest, so the same call picks the same
+          image every time. The digest that was picked is in the Process this
+          returns and in the registration kitbashd holds.
+
           A unit whose runner names a Package folder is started by that kit
           instead of by the built in runner, see $package_tools.run_hook. The
           kit has to be running as a Process of the caller: a runner that is
@@ -524,7 +532,7 @@ families:
           required: [package]
           properties:
             package: { type: string, description: "Package path" }
-            digest: { type: string, pattern: "^sha256:[a-f0-9]{64}$", description: "Defaults to the latest build" }
+            digest: { type: string, pattern: "^sha256:[a-f0-9]{64}$", description: "Defaults to the latest build, see the description for how latest is decided" }
             name: { type: string, pattern: "^[a-z0-9]+(-[a-z0-9]+)*$", maxLength: 64, description: "Defaults to the package name" }
         output:
           type: object

@@ -69,7 +69,7 @@ type runOutput struct {
 // its Telemetry token and carries the runner, and the runner is what keeps
 // boot restore and the daemon's own start, stop and remove off a container
 // this host does not have, see PLAN.md section 3.
-func (s *Service) runWithKit(ctx context.Context, m *manifest.Manifest, folder string, unit manifest.Unit, digest, name string) (*Process, *problem.Problem) {
+func (s *Service) runWithKit(ctx context.Context, span *telemetry.Span, m *manifest.Manifest, folder string, unit manifest.Unit, digest, name string) (*Process, *problem.Problem) {
 	if s.kits == nil {
 		return nil, problem.Internal(folder,
 			"this session has no MCP bridge, and a run kit is a Process reached over it",
@@ -82,7 +82,7 @@ func (s *Service) runWithKit(ctx context.Context, m *manifest.Manifest, folder s
 	if name == "" {
 		name = m.Name
 	}
-	digest, prob = s.kitDigest(ctx, folder, digest)
+	digest, prob = s.kitDigest(ctx, span, folder, digest)
 	if prob != nil {
 		return nil, prob
 	}
@@ -345,11 +345,11 @@ func kitProcess(entry telemetry.Registered) Process {
 // wherever the kit runs it, and this member's own store is not the record of
 // what exists there. Without one the newest local build is the answer, which
 // is what the built in runner does.
-func (s *Service) kitDigest(ctx context.Context, folder, digest string) (string, *problem.Problem) {
+func (s *Service) kitDigest(ctx context.Context, span *telemetry.Span, folder, digest string) (string, *problem.Problem) {
 	if digest != "" {
 		return digest, nil
 	}
-	image, prob := s.image(ctx, folder, "")
+	image, prob := s.image(ctx, span, folder, "")
 	if prob != nil {
 		return "", prob
 	}
