@@ -1,22 +1,25 @@
 #!/bin/sh
 # Build the kitbashOS ISO from a kitbashd apk.
 #
-# usage: packaging/iso/build.sh <path to kitbashd apk> <outdir>
-# output: <outdir>/kitbash-<pkgver>-x86_64.iso
+# usage: packaging/iso/build.sh <path to kitbashd apk> <outdir> [arch]
+# output: <outdir>/kitbash-<pkgver>-<arch>.iso
+#
+# The architecture is the third argument, or $KITBASH_ARCH, or this host's.
+# It has to match the apk: the ISO is built natively, never under emulation.
 #
 # Runs on any Alpine 3.23 host, as a normal user or as root in an alpine:3.23
 # container. Needs: alpine-sdk alpine-conf xorriso squashfs-tools grub grub-efi
-# syslinux mtools dosfstools git.
+# mtools dosfstools git, plus syslinux and grub-bios on x86_64.
 #
 # The version is pkgver in packaging/apk/APKBUILD and nothing else.
 set -eu
 
 usage() {
-	echo "usage: $0 <kitbashd apk> <outdir>" >&2
+	echo "usage: $0 <kitbashd apk> <outdir> [arch]" >&2
 	exit 2
 }
 
-[ $# -eq 2 ] || usage
+[ $# -ge 2 ] && [ $# -le 3 ] || usage
 apkfile=$(realpath "$1")
 outdir=$2
 [ -f "$apkfile" ] || { echo "no such apk: $apkfile" >&2; exit 1; }
@@ -26,7 +29,14 @@ repo=$(dirname "$(dirname "$here")")
 pkgver=$(sed -n 's/^pkgver=//p' "$repo/packaging/apk/APKBUILD")
 [ -n "$pkgver" ] || { echo "could not read pkgver from packaging/apk/APKBUILD" >&2; exit 1; }
 
-arch=x86_64
+# Alpine's name for the architecture. uname -m already says x86_64 and
+# aarch64 on Linux; arm64 is what macOS and Go call the same thing.
+arch=${3:-${KITBASH_ARCH:-$(uname -m)}}
+case "$arch" in
+	arm64|aarch64) arch=aarch64 ;;
+	amd64|x86_64)  arch=x86_64 ;;
+	*) echo "unsupported arch: $arch (kitbash releases x86_64 and aarch64)" >&2; exit 1 ;;
+esac
 
 # apk verifies the kitbashd apk against the keys in mkimage's apk root, and
 # mkimage fills that root from /etc/apk/keys plus the build key. Unless the
@@ -68,7 +78,7 @@ if [ "$(id -u)" = 0 ] && [ -z "${KITBASH_ISO_DEMOTED:-}" ]; then
 	fi
 	echo ">>> running as $user: apk refuses mkimage's --no-chown as root"
 	exec su -s /bin/sh "$user" -c \
-		"KITBASH_ISO_DEMOTED=1 KITBASH_ISO_WORK='$work' PACKAGER_PRIVKEY='${PACKAGER_PRIVKEY:-}' sh '$0' '$apkfile' '$outdir'"
+		"KITBASH_ISO_DEMOTED=1 KITBASH_ISO_WORK='$work' PACKAGER_PRIVKEY='${PACKAGER_PRIVKEY:-}' sh '$0' '$apkfile' '$outdir' '$arch'"
 fi
 
 work=${KITBASH_ISO_WORK:-$HOME/iso-work}
@@ -99,7 +109,12 @@ echo ">>> signing with $PACKAGER_PRIVKEY"
 #    package out of it like any other, so the ISO carries kitbashd and every
 #    dependency it pulls in.
 rm -f "$localrepo/$arch"/*.apk
-cp "$apkfile" "$localrepo/$arch/"
+# apk asks the repository for <pkgname>-<pkgver>-r<pkgrel>.apk, whatever the
+# file was called when it got here: the release names the two apks
+# kitbashd-<ver>-r0.x86_64.apk and kitbashd-<ver>-r0.aarch64.apk so they can
+# share one release, and apk would never find either under that name.
+pkgrel=$(sed -n 's/^pkgrel=//p' "$repo/packaging/apk/APKBUILD")
+cp "$apkfile" "$localrepo/$arch/kitbashd-$pkgver-r${pkgrel:-0}.apk"
 apk index --description "kitbash-$pkgver" \
 	--rewrite-arch "$arch" \
 	--output "$localrepo/$arch/APKINDEX.tar.gz" \
@@ -137,7 +152,9 @@ export KITBASH_ISO_KEYSDIR="$aports/scripts/kitbash-keys"
 export KITBASH_ISO_ANSWERS="$aports/scripts/kitbash-answers"
 
 # 5. Build. --tag is the release string mkimage puts in the file name, so the
-#    ISO is kitbash-<pkgver>-x86_64.iso and never carries a build date.
+#    ISO is kitbash-<pkgver>-<arch>.iso and never carries a build date. The
+#    mkimage cache is per architecture: only the kernel and apks sections
+#    carry $ARCH in their key, and the apk overlay differs between the two.
 iso="kitbash-$pkgver-$arch.iso"
 rm -f "$outdir/$iso"
 echo ">>> mkimage $iso"
@@ -149,7 +166,7 @@ cd "$aports/scripts"
 	--tag "$pkgver" \
 	--hostkeys \
 	--outdir "$outdir" \
-	--workdir "$work/mkimage" \
+	--workdir "$work/mkimage-$arch" \
 	--arch "$arch" \
 	--repository https://dl-cdn.alpinelinux.org/alpine/v3.23/main \
 	--repository https://dl-cdn.alpinelinux.org/alpine/v3.23/community \

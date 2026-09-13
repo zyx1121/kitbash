@@ -1,4 +1,7 @@
 BINARIES := kitbash-mcp kitbashd
+# The architectures a kitbash host runs on, GOARCH names. Alpine calls the
+# same two x86_64 and aarch64, which is what the apk and the ISO are named for.
+GOARCHES := amd64 arm64
 # The one version source is pkgver in packaging/apk/APKBUILD (PLAN.md 4.8).
 PKGVER := $(shell sed -n 's/^pkgver=//p' packaging/apk/APKBUILD)
 VERSION := v$(PKGVER)
@@ -30,10 +33,12 @@ lint:
 	fi
 	go vet ./...
 
-## build-linux: the binaries kitbash hosts run
+## build-linux: the binaries kitbash hosts run, both architectures
 build-linux:
-	@for b in $(BINARIES); do \
-		CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "$(LDFLAGS)" -o bin/$$b-linux-amd64 ./cmd/$$b || exit 1; \
+	@for a in $(GOARCHES); do \
+		for b in $(BINARIES); do \
+			CGO_ENABLED=0 GOOS=linux GOARCH=$$a go build -trimpath -ldflags "$(LDFLAGS)" -o bin/$$b-linux-$$a ./cmd/$$b || exit 1; \
+		done; \
 	done
 
 ## check-version: every version mention in the repo equals pkgver

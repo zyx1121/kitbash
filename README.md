@@ -27,16 +27,35 @@ Process runs (PLAN.md 5.4). The Alpine cloud image install.sh was written for,
 else is installed on the host: install.sh puts components 2 to 6 of PLAN.md 4.2
 there and everything third party arrives as a Package.
 
-**1. Get the release.** Every release carries the apk, the signing public key,
-the ISO and `SHA256SUMS`. The repository is private, so download with `gh`:
+**1. Get the release.** Every release carries, for x86_64 and for aarch64, the
+apk, the ISO and the two static binaries, plus the one signing public key and
+one `SHA256SUMS`. Each asset is named for its architecture. The repository is
+public, so plain `curl` is enough:
 
 ```sh
-gh release download v0.3.0 --repo zyx1121/kitbash --pattern 'kitbashd-*.apk' --pattern '*.rsa.pub'
-scp kitbashd-0.3.0-r0.apk *.rsa.pub root@kitbash.example.org:
+# This runs on the workstation, not on the kitbash host. A Mac's uname -m
+# says arm64 and the release says aarch64; set arch by hand when the host is
+# not the architecture of the machine doing the downloading.
+case $(uname -m) in arm64) arch=aarch64 ;; *) arch=$(uname -m) ;; esac
+base=https://github.com/zyx1121/kitbash/releases/download/v0.3.0
+apk=kitbashd-0.3.0-r0.$arch.apk
+pub=builder-6a9c3ef1.rsa.pub
+curl -fLO "$base/$apk"
+curl -fLO "$base/$pub"
+curl -fLO "$base/SHA256SUMS"
+grep -F -e "$apk" -e "$pub" SHA256SUMS | sha256sum -c
+scp "$apk" "$pub" root@kitbash.example.org:
 ```
 
-To build the apk yourself instead, on any Alpine host with `alpine-sdk` and
-`go`, as a non root user: `git archive --format=tar.gz --prefix=kitbash-0.3.0/ -o kitbash-0.3.0.tar.gz v0.3.0`
+`SHA256SUMS` covers every file on the release, so the `grep` narrows it to the
+two that were downloaded. That is what makes the check portable: busybox
+`sha256sum`, which is the one on an Alpine host, has no `--ignore-missing` and
+plain `-c` fails on the seven files that are not there. Two lines ending in
+`OK` is the whole check. Anything else means the download is not what CI built,
+and the apk is the wrong thing to install.
+
+To build the apk yourself instead, on an Alpine host of the architecture you
+want, with `alpine-sdk` and `go`, as a non root user: `git archive --format=tar.gz --prefix=kitbash-0.3.0/ -o kitbash-0.3.0.tar.gz v0.3.0`
 then `sh packaging/apk/build.sh kitbash-0.3.0.tar.gz`. The package lands in
 `~/packages/`, signed with the key build.sh creates on its first run.
 
@@ -45,7 +64,7 @@ so apk verifies the signature it was built with:
 
 ```sh
 cp *.rsa.pub /etc/apk/keys/
-apk add kitbashd-0.3.0-r0.apk
+apk add kitbashd-0.3.0-r0."$(uname -m)".apk
 KITBASH_DNS=1.1.1.1 sh /usr/share/kitbash/install.sh
 ```
 
@@ -72,11 +91,12 @@ that skipped it has the receiver open; operator rules belong in
 `/etc/nftables.d/<name>.nft`, which that file includes after kitbash's own table
 and `install.sh` never touches.
 
-**Or boot the ISO.** `kitbash-0.3.0-x86_64.iso` on the release is Alpine's own
-image with the kitbashd apk and its dependencies on it. Booted from a VM's CD
-drive it comes up as a working kitbash host in memory; `setup-alpine -f
-/media/cdrom/kitbash/answers` on its console installs it to `/dev/vda`
-unattended. See [`packaging/iso/README.md`](packaging/iso/README.md).
+**Or boot the ISO.** `kitbash-0.3.0-x86_64.iso` and `kitbash-0.3.0-aarch64.iso`
+on the release are Alpine's own image with the kitbashd apk and its
+dependencies on it. Booted from a VM's CD drive either comes up as a working
+kitbash host in memory; `setup-alpine -f /media/cdrom/kitbash/answers` on its
+console installs it to `/dev/vda` unattended. The aarch64 image is UEFI only.
+See [`packaging/iso/README.md`](packaging/iso/README.md).
 
 **3. Create the first admin.** On the console, as root:
 
@@ -119,7 +139,7 @@ whose stdin closes first is a session that ends before it replies.
 **Upgrade.** Download the new release's apk, install it and run install.sh again:
 
 ```sh
-apk add kitbashd-<newver>-r0.apk
+apk add kitbashd-<newver>-r0.<arch>.apk
 sh /usr/share/kitbash/install.sh
 ```
 
@@ -157,7 +177,7 @@ binaries: `bin/kitbash-mcp`, which sshd runs as the connecting user through
 | `make build` | Static binaries for this host in `bin/kitbash-mcp` and `bin/kitbashd` |
 | `make test` | `go test ./...`, including the MCP surface over an in memory transport |
 | `make lint` | `gofmt -l` and `go vet ./...` |
-| `make build-linux` | `bin/kitbash-mcp-linux-amd64` and `bin/kitbashd-linux-amd64`, the binaries a kitbash host runs |
+| `make build-linux` | `bin/kitbash-mcp-linux-<goarch>` and `bin/kitbashd-linux-<goarch>` for `amd64` and `arm64`, the binaries a kitbash host runs |
 
 The server serves the roots `/org` and `/home/<user>`. Set `KITBASH_ROOTS` to a
 colon separated list of absolute paths to point it somewhere else, which is how
@@ -196,9 +216,11 @@ git push -u origin release/0.2.0 && gh pr create --fill
 ```
 
 Merging that pull request is the release. `release.yml` builds the apk and the
-ISO on Alpine, boots the ISO in QEMU, then creates the tag and the GitHub
-release with `kitbashd-<ver>-r0.apk`, the signing public key, both binaries,
-`kitbash-<ver>-x86_64.iso` and `SHA256SUMS`. A push to `main` whose version
+ISO on Alpine, once on an x86_64 runner and once on an arm64 one, boots each ISO
+in QEMU on the runner that built it, then creates the tag and the GitHub release
+with `kitbashd-<ver>-r0.<arch>.apk`, the signing public key, the four binaries,
+`kitbash-<ver>-<arch>.iso` and one `SHA256SUMS`. Neither architecture is
+emulated and neither is cross built by abuild. A push to `main` whose version
 already has a tag releases nothing. `make check-version` is the guard CI runs on
 every push: every version the README names must be `pkgver`.
 
