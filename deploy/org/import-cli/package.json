@@ -1,0 +1,11 @@
+{
+  "name": "import-cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "kitbash import kit that wraps a command line tool from an Alpine package as a Package.",
+  "main": "index.js",
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\""
+  }
+}
