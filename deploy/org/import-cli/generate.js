@@ -61,8 +61,13 @@ import { propertyName } from "./parse.js";
 // A description, of a folder or of a tool, is at most 280 characters.
 const MAX_DESCRIPTION = 280;
 const MIN_DESCRIPTION = 10;
-// stdout, stderr and every file the adapter carries are capped at this.
+// stdout, stderr and every file the adapter carries are capped at this, and so
+// is the sum of everything one call sends in. It is MAX_BYTES in adapter.js.
 const MAX_PAYLOAD = 8 * 1024 * 1024;
+// How many files one call may carry. The total cap is what really bounds a
+// call, so this is a count the total can actually accommodate rather than a
+// number large enough to suggest the total is not there.
+const MAX_FILES = 8;
 // A Package whose name equals a built in tool family cannot be run, PLAN.md 2.3.
 const RESERVED_NAMES = new Set(["fs", "pkg", "proc", "tel", "users", "approvals"]);
 // The source syntax this kit routes on. The same pattern is in kitbash.yaml.
@@ -260,22 +265,26 @@ export function parseSource(source) {
 
 const filesProperty = () => ({
   type: "array",
-  description: "Files to place beside the command before it runs. A positional whose format is kitbash-file names one of these by its name.",
-  maxItems: 32,
+  description: `Files to place beside the command before it runs. A positional whose format is kitbash-file names one of these by its name. These and stdin together are at most ${MAX_PAYLOAD} bytes for one call, and a call over that is refused as too-large rather than truncated.`,
+  maxItems: MAX_FILES,
   items: {
     type: "object",
     additionalProperties: false,
     required: ["name", "contentBase64"],
     properties: {
       name: { type: "string", description: "The name a kitbash-file positional refers to. No slash, no dot component." },
-      contentBase64: { type: "string", contentEncoding: "base64", description: `The file's bytes, at most ${MAX_PAYLOAD} bytes decoded.` },
+      contentBase64: {
+        type: "string",
+        contentEncoding: "base64",
+        description: `The file's bytes, at most ${MAX_PAYLOAD} bytes decoded, and counted against the same total as every other file and stdin.`,
+      },
     },
   },
 });
 
 const stdinProperty = (binary) => ({
   type: "string",
-  description: `Text written to ${binary} on standard input and then closed. At most ${MAX_PAYLOAD} bytes.`,
+  description: `Text written to ${binary} on standard input and then closed. At most ${MAX_PAYLOAD} bytes, counted together with everything in files against one total for the call.`,
   maxLength: MAX_PAYLOAD,
 });
 
@@ -288,12 +297,17 @@ const runOutput = (binary) => ({
     stderr: { type: "string", description: `What ${binary} wrote to standard error, truncated at ${MAX_PAYLOAD} bytes.` },
     files: {
       type: "array",
-      description: "The files named by this tool's outputs, read back after the run.",
+      description: "The files named by this tool's outputs, read back after the run. An output the run did not produce is absent rather than empty.",
       items: {
         type: "object",
         required: ["name", "contentBase64"],
         properties: { name: { type: "string" }, contentBase64: { type: "string", contentEncoding: "base64" } },
       },
+    },
+    notes: {
+      type: "array",
+      description: "Present only when an output was named and deliberately not read back, one sentence per output, such as a symbolic link or something that is not a regular file. An empty result with a note here is not a failed run.",
+      items: { type: "string" },
     },
   },
 });
@@ -570,6 +584,21 @@ function callingContract(binary, toolNames) {
     "tool writes to is read back and returned in `files` under the same name.",
     "",
     "`stdin` is written to the command and then closed.",
+    "",
+    "### The two things a schema cannot say",
+    "",
+    `Everything one call sends in shares one budget. \`stdin\` and every entry of`,
+    `\`files\` are added together, and a call whose total is over ${MAX_PAYLOAD} bytes is`,
+    "refused with a `too-large` problem before the command runs. Nothing is",
+    "truncated to fit. `maxItems` on `files` is 8 for the same reason: the total is",
+    "what bounds a call, not the count. Send fewer or smaller files, or split the",
+    "work across several calls.",
+    "",
+    "A result may also carry `notes`, an array of sentences. It appears when an",
+    "output was named and deliberately not read back, which happens when the path",
+    "the command wrote is a symbolic link or is not a regular file. The run",
+    "succeeded; the file is simply not in `files`, and the note says why. An output",
+    `larger than ${MAX_PAYLOAD} bytes is a \`too-large\` problem instead, not a note.`,
     "",
     `Tools: ${toolNames.map((tool) => `\`${tool}\``).join(", ")}.`,
     "",

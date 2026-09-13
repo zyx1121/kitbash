@@ -488,3 +488,39 @@ test("a one character binary and subcommand still get a description the schema a
   });
   assert.deepEqual(validate(manifestOf(short), schema), []);
 });
+
+test("the generated schemas say what the adapter actually enforces", () => {
+  // adapter.js caps one file at 8 MiB and the whole of one call, files plus
+  // stdin, at 8 MiB as well, and answers too-large rather than truncating. A
+  // maxItems of 32 said the opposite of that, so it is 8.
+  const files = refined({ source: "cli:apk:jq@1.8.2-r0", parsed: jqParsed, help: jqHelp });
+  const document = manifestOf(files);
+  assert.deepEqual(validate(document, schema), []);
+
+  for (const tool of document.provides.tools) {
+    if (tool.name === "probe") continue;
+    assert.equal(tool.input.properties.files.maxItems, 8, `${tool.name} allows the wrong number of files`);
+    assert.match(tool.input.properties.files.description, /together are at most 8388608 bytes for one call/);
+    assert.match(tool.input.properties.files.description, /refused as too-large/);
+    assert.match(tool.input.properties.stdin.description, /counted together with everything in files/);
+    // An output may be skipped deliberately, and the result says so in notes.
+    assert.equal(tool.output.properties.notes.type, "array");
+    assert.equal(tool.output.properties.notes.items.type, "string");
+    assert.match(tool.output.properties.notes.description, /not read back/);
+    // notes is not required: it is there only when something was skipped.
+    assert.ok(!(tool.output.required ?? []).includes("notes"));
+  }
+
+  // And the notes of every Package say both, because an agent reads the folder
+  // before it reads a schema.
+  for (const notes of [
+    fileNamed(files, "NOTES.md").content,
+    fileNamed(draft({ source: "cli:apk:jq@1.8.2-r0" }), "NOTES.md").content,
+  ]) {
+    assert.match(notes, /Everything one call sends in shares one budget/);
+    assert.match(notes, /over 8388608 bytes is\s+refused with a `too-large` problem/);
+    assert.match(notes, /`maxItems` on `files` is 8/);
+    assert.match(notes, /A result may also carry `notes`/);
+    assert.match(notes, /symbolic link or is not a regular file/);
+  }
+});
