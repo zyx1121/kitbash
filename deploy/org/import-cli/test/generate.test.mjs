@@ -16,7 +16,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { parseHelp } from "../parse.js";
-import { apkConstraint, draft, refined, parseSource, toYaml } from "../generate.js";
+import { apkConstraint, draft, refined, parseSource, toolNameBudget, toYaml } from "../generate.js";
 import { readYaml, validate } from "./support.mjs";
 
 const here = import.meta.dirname;
@@ -323,4 +323,168 @@ test("this kit's own manifest declares the tools its server answers", () => {
   assert.match(source, /name: "import"/);
   assert.match(source, /name: "refine"/);
   assert.ok(source.includes(pattern), "index.js and kitbash.yaml carry different source patterns");
+});
+
+// ---------------------------------------------------------------------------
+// What a help text can do to a manifest, issue #107. Everything below is a
+// string a binary could print and the generator had to survive.
+
+// The seven a blacklist let through. Each is a plain scalar gopkg.in/yaml.v3
+// resolves to a number, so the description of the tool that carried it came
+// back as an integer and the manifest failed its own schema on a real host.
+const NUMBER_LOOKING = [
+  "0x00000000deadbeef",
+  "1_000_000_000_000",
+  ".1234567890123",
+  "0o7777777777",
+  "0b1010101010101",
+  "0XABCDEF01234",
+  "+.12345678901",
+];
+
+// And the ones a reader resolves to something other than a number.
+const WORD_LOOKING = ["true", "TRUE", "False", "null", "~", "yes", "No", "on", "OFF", ".inf", ".NaN", "<<"];
+
+const withSubcommand = (description) => ({
+  style: "cobra",
+  version: null,
+  options: [],
+  positionals: [],
+  subcommands: [{ name: "go", description, options: [], positionals: [] }],
+});
+
+test("a description a YAML reader would resolve as a number stays a string", () => {
+  for (const description of NUMBER_LOOKING) {
+    const files = refined({ source: "cli:apk:tool", parsed: withSubcommand(description), help: "" });
+    const document = manifestOf(files);
+    const tool = document.provides.tools.find((entry) => entry.name === "tool_go");
+    assert.equal(typeof tool.description, "string", `${description} came back as ${typeof tool.description}`);
+    assert.equal(tool.description, description);
+    assert.deepEqual(validate(document, schema), [], `${description} made the manifest fail its schema`);
+    // The bytes themselves, so the check does not rest on the reader alone.
+    assert.ok(
+      fileNamed(files, "kitbash.yaml").content.includes(`description: ${JSON.stringify(description)}`),
+      `${description} was written as a plain scalar`,
+    );
+  }
+});
+
+test("a description a YAML reader would resolve as a word stays a string", () => {
+  for (const word of WORD_LOOKING) {
+    // Short on its own, so the generator pads it; the padded form still opens
+    // with the word and is the thing a reader would resolve.
+    const files = refined({ source: "cli:apk:tool", parsed: withSubcommand(word), help: "" });
+    const document = manifestOf(files);
+    const tool = document.provides.tools.find((entry) => entry.name === "tool_go");
+    assert.equal(typeof tool.description, "string", `${word} came back as ${typeof tool.description}`);
+    assert.deepEqual(validate(document, schema), []);
+  }
+  // A folder description is the same path, so it is checked at its own key.
+  const document = readYaml(`name: t\ndescription: ${JSON.stringify("0x00000000deadbeef")}\n`);
+  assert.equal(document.description, "0x00000000deadbeef");
+});
+
+test("the reader resolves a plain scalar the way gopkg.in/yaml.v3 does", () => {
+  // The reader is what makes the two tests above real, so it is checked on its
+  // own: every string here is plain in the YAML, and what it resolves to is
+  // what a Go reader answers.
+  for (const [written, expected] of [
+    ["0x00000000deadbeef", 3735928559],
+    ["1_000_000_000_000", 1000000000000],
+    [".1234567890123", 0.1234567890123],
+    ["0o7777777777", 1073741823],
+    ["0b1010101010101", 5461],
+    ["0XABCDEF01234", 11806310404660],
+    ["+.12345678901", 0.12345678901],
+    ["0755", 493],
+    ["8388608", 8388608],
+  ]) {
+    assert.equal(readYaml(`value: ${written}\n`).value, expected, `${written} resolved wrongly`);
+  }
+  for (const written of ["512Mi", "container", "kitbash-file", "base64", "-r0", "mcp"]) {
+    assert.equal(readYaml(`value: ${written}\n`).value, written, `${written} should stay a string`);
+  }
+  assert.equal(readYaml("value: true\n").value, true);
+  assert.equal(readYaml("value: null\n").value, null);
+});
+
+test("a tool name leaves room for the package name the surface adds", () => {
+  // A surface tool name is <package>_<tool> and is capped at 63 characters,
+  // internal/manifest/permits.go. The package name is inside the tool name as
+  // well, so a long apk name with a long subcommand published a 128 character
+  // name no permit could be written for.
+  const pkg = "a-very-long-alpine-package-name-for-test";
+  assert.equal(pkg.length, 40);
+  const subcommand = "an-equally-long-subcommand-name-for-test";
+  assert.equal(subcommand.length, 40);
+  assert.equal(toolNameBudget(pkg), 63 - (pkg.length + 1));
+
+  const parsed = {
+    style: "cobra",
+    version: null,
+    options: [],
+    positionals: [],
+    subcommands: [
+      { name: subcommand, description: "The first long one.", options: [], positionals: [] },
+      { name: `${subcommand}-two`, description: "The second long one.", options: [], positionals: [] },
+      { name: "short", description: "A name that fits as it is.", options: [], positionals: [] },
+    ],
+  };
+  const files = refined({ source: `cli:apk:${pkg}`, parsed, help: "" });
+  const document = manifestOf(files);
+  assert.deepEqual(validate(document, schema), []);
+
+  const derived = document.provides.tools.map((tool) => tool.name).filter((name) => name !== "run" && name !== "probe");
+  assert.equal(derived.length, 3);
+  for (const name of derived) {
+    assert.ok(name.length <= toolNameBudget(pkg), `${name} is ${name.length} characters, over the budget`);
+    assert.ok(`${pkg}_${name}`.length <= 63, `${pkg}_${name} is ${`${pkg}_${name}`.length} characters on the surface`);
+    assert.match(name, /^[A-Za-z0-9][A-Za-z0-9_-]*$/);
+  }
+  // Two subcommands sharing a long prefix do not truncate to the same name.
+  assert.equal(new Set(derived).size, 3);
+  // Every one of them is exactly the budget, because this package name leaves
+  // nothing over even for the short subcommand.
+  assert.deepEqual(
+    derived.map((name) => name.length),
+    [22, 22, 22],
+  );
+  // A name that fits is left alone, which a short package name shows.
+  const fits = manifestOf(refined({ source: "cli:apk:git", parsed, help: "" }));
+  const names = fits.provides.tools.map((tool) => tool.name);
+  assert.ok(names.includes("git_short"), `expected git_short, found ${names.join(", ")}`);
+  // Shortening is a hash and not a counter, so it is the same every time.
+  assert.deepEqual(manifestOf(refined({ source: `cli:apk:${pkg}`, parsed, help: "" })).provides.tools, document.provides.tools);
+  // tools.json still names the real subcommand in argv, whatever the tool is called.
+  const tools = toolsOf(files);
+  assert.deepEqual(tools.tools[derived[0]].argv, [pkg, subcommand]);
+  // And the notes say a name was shortened and why.
+  assert.match(fileNamed(files, "NOTES.md").content, /tool names were too long to publish/);
+  assert.match(fileNamed(files, "NOTES.md").content, /capped at 63 characters/);
+});
+
+test("a one character binary and subcommand still get a description the schema accepts", () => {
+  const parsed = {
+    style: "cobra",
+    version: null,
+    options: [],
+    positionals: [],
+    subcommands: [{ name: "y", description: "", options: [], positionals: [] }],
+  };
+  const files = refined({ source: "cli:apk:x", parsed, help: "" });
+  const document = manifestOf(files);
+  assert.deepEqual(validate(document, schema), []);
+
+  const tool = document.provides.tools.find((entry) => entry.name === "x_y");
+  assert.equal(tool.description, "Runs the x y command.");
+  for (const entry of document.provides.tools) {
+    assert.ok(entry.description.length >= 10, `${entry.name} has a ${entry.description.length} character description`);
+  }
+  // A description too short to keep and too short to pad is padded twice.
+  const short = refined({
+    source: "cli:apk:x",
+    parsed: { ...parsed, subcommands: [{ name: "y", description: "ok", options: [], positionals: [] }] },
+    help: "",
+  });
+  assert.deepEqual(validate(manifestOf(short), schema), []);
 });
