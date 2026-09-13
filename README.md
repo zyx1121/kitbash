@@ -33,18 +33,26 @@ one `SHA256SUMS`. Each asset is named for its architecture. The repository is
 public, so plain `curl` is enough:
 
 ```sh
+# This runs on the workstation, not on the kitbash host. A Mac's uname -m
+# says arm64 and the release says aarch64; set arch by hand when the host is
+# not the architecture of the machine doing the downloading.
+case $(uname -m) in arm64) arch=aarch64 ;; *) arch=$(uname -m) ;; esac
 base=https://github.com/zyx1121/kitbash/releases/download/v0.3.0
-arch=$(uname -m)   # x86_64 or aarch64
-curl -fLO "$base/kitbashd-0.3.0-r0.$arch.apk"
-curl -fLO "$base/builder-6a9c3ef1.rsa.pub"
+apk=kitbashd-0.3.0-r0.$arch.apk
+pub=builder-6a9c3ef1.rsa.pub
+curl -fLO "$base/$apk"
+curl -fLO "$base/$pub"
 curl -fLO "$base/SHA256SUMS"
-sha256sum -c --ignore-missing SHA256SUMS
-scp kitbashd-0.3.0-r0."$arch".apk builder-6a9c3ef1.rsa.pub root@kitbash.example.org:
+grep -F -e "$apk" -e "$pub" SHA256SUMS | sha256sum -c
+scp "$apk" "$pub" root@kitbash.example.org:
 ```
 
-`--ignore-missing` checks the files that were downloaded and says nothing about
-the rest of the release. A line that does not end in `OK` means the download is
-not what CI built, and the apk is the wrong thing to install.
+`SHA256SUMS` covers every file on the release, so the `grep` narrows it to the
+two that were downloaded. That is what makes the check portable: busybox
+`sha256sum`, which is the one on an Alpine host, has no `--ignore-missing` and
+plain `-c` fails on the seven files that are not there. Two lines ending in
+`OK` is the whole check. Anything else means the download is not what CI built,
+and the apk is the wrong thing to install.
 
 To build the apk yourself instead, on an Alpine host of the architecture you
 want, with `alpine-sdk` and `go`, as a non root user: `git archive --format=tar.gz --prefix=kitbash-0.3.0/ -o kitbash-0.3.0.tar.gz v0.3.0`

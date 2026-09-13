@@ -57,7 +57,11 @@ esac
 # the guest writes, so the store is copied somewhere writable first. Other
 # distributions ship one unpadded QEMU_EFI.fd that -bios takes instead.
 vars=
-firmware_args() {
+fw_args=
+# Sets fw_args, and vars when it made a copy of the variable store. Both are
+# globals on purpose: called in a $() the mktemp below would happen in a
+# subshell and the trap in this one would never delete the copy.
+find_firmware() {
 	local code= template=
 	for f in /usr/share/AAVMF/AAVMF_CODE.fd \
 		/usr/share/qemu-efi-aarch64/QEMU_EFI-pflash.raw \
@@ -77,8 +81,8 @@ firmware_args() {
 	if [ -n "$code" ] && [ -n "$template" ]; then
 		vars=$(mktemp -t kitbash-aavmf.XXXXXX)
 		cat "$template" > "$vars"
-		echo "-drive if=pflash,format=raw,unit=0,readonly=on,file=$code"
-		echo "-drive if=pflash,format=raw,unit=1,file=$vars"
+		fw_args="-drive if=pflash,format=raw,unit=0,readonly=on,file=$code
+			-drive if=pflash,format=raw,unit=1,file=$vars"
 		return 0
 	fi
 	for f in /usr/share/qemu-efi-aarch64/QEMU_EFI.fd \
@@ -86,7 +90,7 @@ firmware_args() {
 		/usr/share/AAVMF/AAVMF_CODE.fd \
 		/opt/homebrew/share/qemu/edk2-aarch64-code.fd; do
 		[ -f "$f" ] || continue
-		echo "-bios $f"
+		fw_args="-bios $f"
 		return 0
 	done
 	echo "no UEFI firmware for aarch64: install qemu-efi-aarch64" >&2
@@ -116,7 +120,8 @@ aarch64)
 	else
 		machine="-machine virt,accel=$accel -cpu host"
 	fi
-	machine="$machine $(firmware_args)"
+	find_firmware
+	machine="$machine $fw_args"
 	# The virt machine has no IDE, so the ISO arrives as a real cdrom on a
 	# virtio-scsi bus, which the initramfs already carries drivers for.
 	media="-drive if=none,id=cd0,file=$iso,format=raw,media=cdrom,readonly=on
