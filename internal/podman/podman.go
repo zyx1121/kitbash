@@ -58,6 +58,13 @@ const (
 type Filter map[string]string
 
 // Image is one image in the caller's store.
+//
+// Created is when the image was built. podman images reports it at one second
+// resolution, which is not enough to order two builds of one Package that
+// landed in the same second, so a listing refines the images that share a
+// second with an inspect, which reports nanoseconds. A runner that cannot
+// report more than a second leaves those images sharing an instant, and the
+// caller breaks the tie itself.
 type Image struct {
 	ID      string
 	Created time.Time

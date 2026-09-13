@@ -68,7 +68,10 @@ func RegisterProcesses(s *mcp.Server, processes *proc.Service, b *bridge.Bridge)
 		Name: "proc_run",
 		Description: "Start a Process from a Package digest, or converge an existing one with the same name " +
 			"to that digest. Idempotent: same name and digest returns the running Process, a different " +
-			"digest replaces it. The container is named kitbash-<package>-<name> and labelled kitbash.id, " +
+			"digest replaces it. Without a digest the latest build runs, which is the image with the newest " +
+			"creation time at nanosecond resolution, then the newest build record kitbashd holds, then the " +
+			"higher digest, so the same call picks the same image every time. " +
+			"The container is named kitbash-<package>-<name> and labelled kitbash.id, " +
 			"kitbash.user, kitbash.package, kitbash.name and kitbash.digest. With expose: mcp the manifest's " +
 			"tools join the caller's surface. A Process is identified by its Package path, so a name held " +
 			"by a Process of another Package is a conflict, and so is a tool name another running Process " +

@@ -139,13 +139,92 @@ func (c *CLI) Images(ctx context.Context, filter Filter) ([]Image, error) {
 			Labels:  labels,
 		})
 	}
-	sort.Slice(images, func(i, j int) bool { return images[i].Created.After(images[j].Created) })
+	c.refineCreated(ctx, images)
+	sortImages(images)
 	return images, nil
 }
 
-// inspectJSON is the part of podman image inspect kitbash reads.
+// refineCreated replaces the one second timestamp podman images reports with
+// the nanosecond one podman image inspect reports, for the images that share a
+// second with another image of the same listing.
+//
+// Only those images need it. The order of the rest is already decided by the
+// second alone, and inspecting every image would turn one listing into one
+// child process per image in the store. Two builds of one Package inside one
+// second is exactly the case that has no order without this, see issue #113.
+func (c *CLI) refineCreated(ctx context.Context, images []Image) {
+	bySecond := map[int64][]int{}
+	for i := range images {
+		second := images[i].Created.Unix()
+		bySecond[second] = append(bySecond[second], i)
+	}
+	for _, group := range bySecond {
+		if len(group) < 2 {
+			continue
+		}
+		refs := make([]string, 0, len(group))
+		for _, i := range group {
+			refs = append(refs, images[i].ID)
+		}
+		created, err := c.inspectCreated(ctx, refs)
+		if err != nil {
+			// The listing keeps the second it already has, and the caller
+			// breaks the tie the way it would have had to anyway. A refinement
+			// that failed for one group is still worth having for the others.
+			continue
+		}
+		for _, i := range group {
+			if at, ok := created[images[i].ID]; ok {
+				images[i].Created = at
+			}
+		}
+	}
+}
+
+// inspectCreated reads the nanosecond creation time of several images in one
+// call, keyed by the image id the inspect answered with rather than by the
+// reference asked for, so a runtime that answers in another order is still
+// read correctly.
+func (c *CLI) inspectCreated(ctx context.Context, refs []string) (map[string]time.Time, error) {
+	args := append([]string{"image", "inspect", "--format", "json"}, refs...)
+	out, err := c.run(ctx, args...)
+	if err != nil {
+		return nil, err
+	}
+	var decoded []inspectJSON
+	if err := json.Unmarshal([]byte(out), &decoded); err != nil {
+		return nil, fmt.Errorf("decoding podman image inspect: %w", err)
+	}
+	created := make(map[string]time.Time, len(decoded))
+	for _, d := range decoded {
+		at, err := time.Parse(time.RFC3339Nano, d.Created)
+		if err != nil {
+			continue
+		}
+		created[normalizeID(d.ID)] = at.UTC()
+	}
+	return created, nil
+}
+
+// sortImages orders a listing newest first, and orders two images of the same
+// instant by their digest. The second half is what makes the answer the same
+// every time: a caller that runs the head of this list has to get the same
+// image on every call, whatever order the runtime printed.
+func sortImages(images []Image) {
+	sort.Slice(images, func(i, j int) bool {
+		if !images[i].Created.Equal(images[j].Created) {
+			return images[i].Created.After(images[j].Created)
+		}
+		return images[i].ID > images[j].ID
+	})
+}
+
+// inspectJSON is the part of podman image inspect kitbash reads. Created is
+// the nanosecond creation time, which the image listing does not carry.
 type inspectJSON struct {
-	Config struct {
+	ID      string `json:"Id"`
+	Created string `json:"Created"`
+	Config  struct {
 		Entrypoint stringList        `json:"Entrypoint"`
 		Cmd        stringList        `json:"Cmd"`
 		Labels     map[string]string `json:"Labels"`

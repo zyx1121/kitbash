@@ -253,7 +253,7 @@ var (
   "required": ["package"],
   "properties": {
     "package": { "type": "string", "description": "Package path" },
-    "digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$", "description": "Defaults to the latest build" },
+    "digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$", "description": "Defaults to the latest build, see the description for how latest is decided" },
     "name": { "type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$", "maxLength": 64, "description": "Defaults to the package name" }
   }
 }`)

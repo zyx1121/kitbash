@@ -105,6 +105,15 @@ jobs:
           KITBASH_E2E_VERSION: ${{ env.CURRENT }}
         run: go test -v -count=1 -timeout 15m -run TestSurface ./e2e
 
+      - name: proc_run without a digest runs the second of two builds
+        # The regression of issue #113, on the same host as the step above: two
+        # builds of one Package inside one second, and a run that names no
+        # digest. It adds well under a minute to the budget, because the base
+        # image is warm and the Package is one small layer on top of it.
+        env:
+          KITBASH_E2E_VERSION: ${{ env.CURRENT }}
+        run: go test -v -count=1 -timeout 5m -run TestLatestBuild ./e2e
+
       # ------------------------------------------------------------------ the
       # upgrade half. The previous tag is built from source in this job rather
       # than downloaded, so the job needs no release credentials; the module

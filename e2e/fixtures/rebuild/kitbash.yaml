@@ -1,0 +1,16 @@
+name: rebuild
+description: >-
+  The fixture of the latest build regression. It is built twice inside one
+  second with a byte changed between the builds, and then run without a digest,
+  which has to answer with the second build, see issue #113.
+tags: [e2e, fixture]
+
+deploy:
+  units:
+    - type: container
+      build: .
+      # Nothing is called on this Process. What is proved is which image was
+      # picked, which is in the Process proc_run answers with, so the Package
+      # publishes no tools and joins no surface.
+      expose: none
+      limits: { memory: 128Mi }
