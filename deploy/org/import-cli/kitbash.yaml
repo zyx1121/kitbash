@@ -1,0 +1,118 @@
+name: import-cli
+description: >-
+  Wraps a command line tool from an Alpine package as a Package. Use it through
+  pkg_import with source cli:apk:<pkg>@<version>: it drafts a Package that runs
+  the binary, and its refine tool turns the binary's own help text into tool
+  schemas.
+tags: [kit, import, cli, apk]
+
+provides:
+  kit: [import]
+  tools:
+    - name: import
+      description: >-
+        Draft a Package around the Alpine package named by source. Returns the
+        files pkg_import writes: a Dockerfile that installs it, a manifest with a
+        run tool and a probe tool, an adapter and notes saying how to finish the
+        import with refine.
+      input:
+        type: object
+        additionalProperties: false
+        required: [source]
+        properties:
+          source:
+            type: string
+            pattern: "^cli:apk:[a-z0-9][a-z0-9_.+-]*(@[A-Za-z0-9._+-]+)?$"
+            maxLength: 256
+            description: >-
+              The tool to wrap, as cli:apk:<pkg> or cli:apk:<pkg>@<version>. The
+              package is an Alpine one, installed with apk into the Package's own
+              image, and the version is the release apk names, which is
+              <pkgver>-r<pkgrel>.
+      output:
+        type: object
+        required: [files]
+        properties:
+          files:
+            type: array
+            minItems: 1
+            items:
+              type: object
+              required: [path]
+              properties:
+                path:
+                  type: string
+                  description: Relative to the target folder, no leading slash, no dot component.
+                content:
+                  type: string
+                  description: UTF-8 text.
+                contentBase64:
+                  type: string
+                  contentEncoding: base64
+
+    - name: refine
+      description: >-
+        Rewrite the draft Package from what its probe tool reported. Reads the
+        help text, the version and the man page, and returns the same files with
+        one tool per subcommand, or one for the binary, each carrying a schema
+        built from the flags.
+      input:
+        type: object
+        additionalProperties: false
+        required: [source, help]
+        properties:
+          source:
+            type: string
+            pattern: "^cli:apk:[a-z0-9][a-z0-9_.+-]*(@[A-Za-z0-9._+-]+)?$"
+            maxLength: 256
+            description: >-
+              The same source the draft was imported from. It names the apk
+              package, and so the binary and the argv of every tool.
+          help:
+            type: string
+            maxLength: 524288
+            description: >-
+              What the Package's probe tool reported for help, which is the
+              binary's own --help output.
+          version:
+            type: string
+            maxLength: 16384
+            description: >-
+              What probe reported for version. Optional: without it the notes say
+              the binary reported none.
+          man:
+            type: string
+            maxLength: 4194304
+            description: >-
+              What probe reported for man. Optional: with it the synopsis and the
+              options section fill in what --help left out.
+      output:
+        type: object
+        required: [files]
+        properties:
+          files:
+            type: array
+            minItems: 1
+            items:
+              type: object
+              required: [path]
+              properties:
+                path:
+                  type: string
+                  description: Relative to the target folder, no leading slash, no dot component.
+                content:
+                  type: string
+                  description: UTF-8 text.
+                contentBase64:
+                  type: string
+                  contentEncoding: base64
+
+deploy:
+  units:
+    - type: container
+      build: .
+      expose: mcp
+      # This kit reaches nothing: it reads a source string and text the caller
+      # already holds, and answers with files. The ceiling is here because a man
+      # page a caller pastes in is the one input that can be large.
+      limits: { memory: 512Mi }

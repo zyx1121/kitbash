@@ -223,7 +223,7 @@ text is wrapped as `bad-request`. Never answer a bare string, and always write a
 
 ## Test before building
 
-Four of the five seeded Packages ship a driver under `test/` that runs the
+Five of the six seeded Packages ship a driver under `test/` that runs the
 Package as a plain process against fakes: a fake kitbashd receiver for a
 subscriber, a fake MCP surface for one that calls tools. Copy that shape. A
 driver finds a wrong schema or a missing header in a second, where a build and a
@@ -249,8 +249,11 @@ Repeating any of these is safe. They describe a state, they do not add one.
 
 ## The seeded Packages
 
-Worked examples under `/org`. Four declare a kit hook; `workflow` declares none.
+Worked examples under `/org`. Five declare a kit hook; `workflow` declares none.
 
+- `import-cli`: an import kit for a command line tool from an Alpine package. It
+  drafts a Package, and its `refine` tool turns the binary's own help text into
+  tool schemas.
 - `import-mcp`: an import kit for an npm MCP server. A pattern routed `source`.
 - `import-oci`: an import kit for an OCI image pinned by digest.
 - `observe-count`: the smallest observe kit. It counts the fan out.
