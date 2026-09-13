@@ -278,8 +278,9 @@ not decide: which apk release the constraint resolved to, whether an array
 option repeats its flag, and which positional was taken for a file.
 
 A Process sees none of your Files, so a file argument names an entry of the
-call's own `files` array, `{name, contentBase64}`, capped at 8 MiB each way. A
-name that was not sent is a `not-found`.
+call's own `files` array, `{name, contentBase64}`. One call carries 8 MiB of
+input in total, every file and `stdin` together, and a name that was not sent
+is a `not-found`.
 
 ## The seeded Packages
 
