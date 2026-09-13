@@ -73,6 +73,23 @@ const toolsDocument = () => ({
       stdin: null,
       outputs: ["output"],
     },
+    // The shape a variadic file positional is generated as, which is what a
+    // synopsis such as jq's [file...] becomes: an array whose items carry the
+    // format rather than the property itself.
+    concat: {
+      inputSchema: {
+        type: "object",
+        properties: {
+          filter: { type: "string" },
+          sources: { type: "array", items: { type: "string", format: "kitbash-file" } },
+        },
+      },
+      argv: [node, fakeCli, "dump"],
+      options: {},
+      positionals: ["filter", "sources"],
+      stdin: null,
+      outputs: [],
+    },
     flood: {
       inputSchema: { type: "object", properties: { mib: { type: "number" } } },
       argv: [node, fakeCli, "flood"],
@@ -237,7 +254,7 @@ test("initialize and tools/list answer with what tools.json declares", async () 
 
   const listed = await adapter.request("tools/list", {});
   const names = listed.result.tools.map((tool) => tool.name).sort();
-  assert.deepEqual(names, ["absent", "dump", "fail", "flood", "fork", "hang", "link", "probe", "run", "upper"]);
+  assert.deepEqual(names, ["absent", "concat", "dump", "fail", "flood", "fork", "hang", "link", "probe", "run", "upper"]);
   const dump = listed.result.tools.find((tool) => tool.name === "dump");
   assert.equal(dump.description, "Print the arguments the adapter built.");
   assert.equal(dump.inputSchema.properties.filter.type, "string");
@@ -302,6 +319,35 @@ test("an input file is written for the command and an output file comes back as 
   assert.equal(body.files.length, 1);
   assert.equal(body.files[0].name, "shouted.txt");
   assert.equal(Buffer.from(body.files[0].contentBase64, "base64").toString(), "HELLO KITBASH");
+});
+
+test("a variadic file positional becomes one path per name the caller sent", async () => {
+  const result = await adapter.call("concat", {
+    filter: ".",
+    sources: ["first.json", "second.json"],
+    files: [
+      { name: "first.json", contentBase64: Buffer.from('{"a":1}').toString("base64") },
+      { name: "second.json", contentBase64: Buffer.from('{"b":2}').toString("base64") },
+    ],
+  });
+  const args = JSON.parse(payload(result).stdout).args;
+  assert.equal(args.length, 3);
+  assert.equal(args[0], ".");
+  assert.match(args[1], /first\.json$/);
+  assert.match(args[2], /second\.json$/);
+});
+
+test("one name of a variadic file positional that nobody sent is a not-found problem", async () => {
+  const document = problem(
+    await adapter.call("concat", {
+      filter: ".",
+      sources: ["first.json", "absent.json"],
+      files: [{ name: "first.json", contentBase64: Buffer.from('{"a":1}').toString("base64") }],
+    }),
+  );
+  assert.equal(document.status, 404);
+  assert.equal(document.type, "https://kitbash.zyx.tw/errors/not-found");
+  assert.match(document.detail, /absent\.json/);
 });
 
 test("the temporary directory a call ran in is gone once the call has answered", async () => {

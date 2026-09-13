@@ -58,6 +58,37 @@ const (
 // order: the manifest first, because that is what makes the folder visible.
 var fixtures = []string{"kitbash.yaml", "Dockerfile", "server.js"}
 
+// The import-cli kit and the CLI Package it drafts, which is the acceptance
+// sentence of M7 in PLAN.md 5.3 driven end to end: the kit is a seeded folder
+// of /org, the source names an Alpine package and nothing else, and every tool
+// below is one the kit wrote.
+//
+// The source carries no version. Issue #107 names jq 1.7.1, and the Alpine
+// branch node:22-alpine points at carries 1.8.x, so a pin would fail the build
+// for a reason that has nothing to do with the import; the unpinned form
+// installs whatever the branch has. A version that is wanted is written
+// jq@1.8.2-r0 for one apk release, or jq@1.8.2 for the ~= form that resolves
+// to the newest release of that version.
+const (
+	importKitPath = "/org/import-cli"
+	cliName       = "jq"
+	cliSource     = "cli:apk:jq"
+	importTool    = "import-cli_import"
+	refineTool    = "import-cli_refine"
+	cliRunTool    = "jq_run"
+	cliProbeTool  = "jq_probe"
+	cliTool       = "jq_jq"
+)
+
+// The document the refined tool filters and what jq must answer for it. The
+// filter and the document go in as a schema validated tool call, not as a
+// command line, which is the whole point of the import.
+const (
+	cliDocument = `{"items":[{"name":"kitbash","stars":3},{"name":"jq","stars":1}]}`
+	cliFilter   = ".items | map(.name)"
+	cliStdout   = "[\"kitbash\",\"jq\"]\n"
+)
+
 // state is what one step of the job leaves for the next.
 type state struct {
 	admin      *session
@@ -74,6 +105,35 @@ type state struct {
 	elsewherePath  string
 	elsewhereID    string
 	elsewhereImage string
+	// The CLI Package import-cli drafted, and what its probe reported about
+	// the binary, which is what refine is called with.
+	cliPath string
+	probe   probeOutput
+}
+
+// probeOutput is what a drafted Package's probe tool reports about its binary,
+// and what the kit's refine tool is called with.
+type probeOutput struct {
+	Help    string `json:"help"`
+	Version string `json:"version"`
+	Man     string `json:"man"`
+}
+
+// cliResult is what a generated Package answers a tool call with. The adapter
+// returns it as one text block rather than as structured content, and the
+// bridge passes a Package's own content through, so it is decoded from the
+// text here.
+type cliResult struct {
+	ExitCode int    `json:"exitCode"`
+	Stdout   string `json:"stdout"`
+	Stderr   string `json:"stderr"`
+}
+
+// importedFile is one file the kit answers with, which is what pkg_import
+// writes for the draft and what fs_write writes for the refinement.
+type importedFile struct {
+	Path    string `json:"path"`
+	Content string `json:"content"`
 }
 
 // TestSurface is the job: one admin and one member driving the whole surface
@@ -84,6 +144,7 @@ func TestSurface(t *testing.T) {
 		pkgPath:       filepath.Join("/home", adminName(), packageName),
 		runnerPath:    filepath.Join("/home", adminName(), runnerName),
 		elsewherePath: filepath.Join("/home", adminName(), elsewhereName),
+		cliPath:       filepath.Join("/home", adminName(), cliName),
 		orgFile:       "/org/handbook/e2e.md",
 		echoText:      fmt.Sprintf("end to end at %s", time.Now().UTC().Format(time.RFC3339)),
 	}
@@ -107,6 +168,11 @@ func TestSurface(t *testing.T) {
 		{"a run kit is built and joins the surface", buildTheRunKit},
 		{"proc_run dispatches to the run kit", dispatchToTheRunKit},
 		{"proc_stop forwards to the run kit", stopThroughTheRunKit},
+		{"the import-cli kit is built and run from /org", runTheImportKit},
+		{"pkg_import drafts a Package around an Alpine CLI", importTheCLI},
+		{"the draft's probe reports what the binary says about itself", probeTheDraft},
+		{"refine turns that into a tool with a schema", refineTheDraft},
+		{"the refined tool filters a document and names a missing file", callTheRefinedTool},
 	}
 	// The steps are one story and share the host, so they run in order on one
 	// test rather than as subtests: the first failure ends the job, and the
@@ -646,6 +712,174 @@ func stopThroughTheRunKit(t *testing.T, s *state) {
 	}
 	if _, found := listed(t, s, s.elsewhereID); found {
 		t.Fatalf("proc_list still holds the stopped Process %s", s.elsewhereID)
+	}
+}
+
+// runTheImportKit builds and runs the import-cli kit out of /org, where
+// install.sh seeded it. It is a Package like any other: its manifest declares
+// provides.kit: [import] and an import tool whose source pattern is what
+// pkg_import routes on, and running it is what puts it within reach.
+func runTheImportKit(t *testing.T, s *state) {
+	var built struct {
+		Digest string `json:"digest"`
+	}
+	res := s.admin.callWithin(buildTimeout, "pkg_build", map[string]any{"path": importKitPath})
+	res.mustSucceed(t, "pkg_build")
+	if err := json.Unmarshal(res.Structured, &built); err != nil {
+		t.Fatalf("decoding pkg_build: %v", err)
+	}
+
+	var out struct {
+		State string   `json:"state"`
+		Tools []string `json:"tools"`
+	}
+	s.admin.ok("proc_run", map[string]any{"package": importKitPath}, &out)
+	if out.State != "running" {
+		t.Fatalf("proc_run answered %+v, want the import kit running", out)
+	}
+	names := append([]string{}, out.Tools...)
+	sort.Strings(names)
+	want := []string{importTool, refineTool}
+	if strings.Join(names, " ") != strings.Join(want, " ") {
+		t.Fatalf("the import kit published %v, want %v", names, want)
+	}
+}
+
+// importTheCLI is the first half of the two step import: pkg_import picks the
+// kit whose source pattern accepts cli:apk:jq, writes the draft as one commit,
+// and the draft builds and runs knowing nothing about the binary beyond its
+// name.
+func importTheCLI(t *testing.T, s *state) {
+	var imported struct {
+		Path   string `json:"path"`
+		Commit struct {
+			Sha    string `json:"sha"`
+			Author string `json:"author"`
+		} `json:"commit"`
+	}
+	s.admin.ok("pkg_import", map[string]any{"path": s.cliPath, "source": cliSource}, &imported)
+	if imported.Commit.Author != adminName() || len(imported.Commit.Sha) != 40 {
+		t.Fatalf("pkg_import committed %+v, want a commit by %s", imported.Commit, adminName())
+	}
+
+	// The source named no version, so the Dockerfile asks the Alpine branch
+	// for whatever it carries. This is read back rather than assumed: what the
+	// image installs is the one thing in the draft that the kit decided alone.
+	dockerfile := s.admin.call("fs_read", map[string]any{"path": filepath.Join(s.cliPath, "Dockerfile")})
+	dockerfile.mustSucceed(t, "fs_read")
+	if !strings.Contains(dockerfile.text(), "apk add --no-cache "+cliName+"\n") {
+		t.Fatalf("the drafted Dockerfile does not install %s unpinned:\n%s", cliName, truncate(dockerfile.text()))
+	}
+
+	res := s.admin.callWithin(buildTimeout, "pkg_build", map[string]any{"path": s.cliPath})
+	res.mustSucceed(t, "pkg_build")
+
+	var out struct {
+		State string   `json:"state"`
+		Tools []string `json:"tools"`
+	}
+	s.admin.ok("proc_run", map[string]any{"package": s.cliPath}, &out)
+	if out.State != "running" {
+		t.Fatalf("proc_run answered %+v, want the drafted Package running", out)
+	}
+	names := append([]string{}, out.Tools...)
+	sort.Strings(names)
+	want := []string{cliProbeTool, cliRunTool}
+	if strings.Join(names, " ") != strings.Join(want, " ") {
+		t.Fatalf("the drafted Package published %v, want %v", names, want)
+	}
+}
+
+// probeTheDraft reads the binary through the Package that wraps it. What the
+// binary says about itself is the input the refinement is made from, and it
+// comes from the running Process rather than from a fixture in this
+// repository.
+func probeTheDraft(t *testing.T, s *state) {
+	res := s.admin.call(cliProbeTool, map[string]any{})
+	res.mustSucceed(t, cliProbeTool)
+	if err := json.Unmarshal([]byte(res.text()), &s.probe); err != nil {
+		t.Fatalf("decoding what %s reported: %v\n%s", cliProbeTool, err, truncate(res.text()))
+	}
+	if !strings.Contains(s.probe.Help, "Usage:") || !strings.Contains(s.probe.Help, cliName) {
+		t.Fatalf("%s reported a help text that is not %s's:\n%s", cliProbeTool, cliName, truncate(s.probe.Help))
+	}
+	if !strings.Contains(s.probe.Version, cliName+"-") {
+		t.Fatalf("%s reported the version %q, want the one the binary prints", cliProbeTool, truncate(s.probe.Version))
+	}
+	t.Logf("%s reported %s, %d bytes of help and %d of man",
+		cliProbeTool, strings.TrimSpace(s.probe.Version), len(s.probe.Help), len(s.probe.Man))
+}
+
+// refineTheDraft is the second half: the kit is called with what probe
+// reported, the files it answers with are written over the folder, and the
+// Package is built and run again. The manifest that ends up running was
+// drafted by the kit and refined from the Package's own probe, which is the
+// acceptance sentence of issue #107.
+func refineTheDraft(t *testing.T, s *state) {
+	var refined struct {
+		Files []importedFile `json:"files"`
+	}
+	s.admin.ok(refineTool, map[string]any{
+		"source":  cliSource,
+		"help":    s.probe.Help,
+		"version": s.probe.Version,
+		"man":     s.probe.Man,
+	}, &refined)
+	if len(refined.Files) == 0 {
+		t.Fatalf("%s answered no files", refineTool)
+	}
+	for _, file := range refined.Files {
+		writeFile(t, s.admin, filepath.Join(s.cliPath, file.Path), file.Content)
+	}
+
+	res := s.admin.callWithin(buildTimeout, "pkg_build", map[string]any{"path": s.cliPath})
+	res.mustSucceed(t, "pkg_build")
+
+	var out struct {
+		State string   `json:"state"`
+		Tools []string `json:"tools"`
+	}
+	s.admin.ok("proc_run", map[string]any{"package": s.cliPath}, &out)
+	if out.State != "running" {
+		t.Fatalf("proc_run answered %+v, want the refined Package running", out)
+	}
+	names := append([]string{}, out.Tools...)
+	sort.Strings(names)
+	want := []string{cliProbeTool, cliRunTool, cliTool}
+	sort.Strings(want)
+	if strings.Join(names, " ") != strings.Join(want, " ") {
+		t.Fatalf("the refined Package published %v, want %v", names, want)
+	}
+}
+
+// callTheRefinedTool is what all of it was for: one schema validated call that
+// filters a document, and one that names a file nobody sent.
+func callTheRefinedTool(t *testing.T, s *state) {
+	res := s.admin.call(cliTool, map[string]any{
+		"filter":         cliFilter,
+		"stdin":          cliDocument,
+		"compact_output": true,
+	})
+	res.mustSucceed(t, cliTool)
+	var answer cliResult
+	if err := json.Unmarshal([]byte(res.text()), &answer); err != nil {
+		t.Fatalf("decoding what %s answered: %v\n%s", cliTool, err, truncate(res.text()))
+	}
+	if answer.ExitCode != 0 || answer.Stdout != cliStdout {
+		t.Fatalf("%s answered exit code %d and %q, want 0 and %q (stderr: %s)",
+			cliTool, answer.ExitCode, answer.Stdout, cliStdout, truncate(answer.Stderr))
+	}
+	t.Logf("%s filtered the document to %s", cliTool, strings.TrimSpace(answer.Stdout))
+
+	// A Process sees none of the caller's Files, so a file argument names an
+	// entry of the call's own files. One that was never sent is the Package's
+	// own not-found, and the bridge passes a Package's problem through in the
+	// surface's language, see PLAN.md 5.5 on the bind mount that is not
+	// decided.
+	missing := s.admin.call(cliTool, map[string]any{"filter": ".", "file": []string{"absent.json"}})
+	problem := missing.mustProblem(t, cliTool, "not-found")
+	if !strings.Contains(problem.Detail, "absent.json") {
+		t.Fatalf("%s answered the problem %+v, want one naming absent.json", cliTool, problem)
 	}
 }
 

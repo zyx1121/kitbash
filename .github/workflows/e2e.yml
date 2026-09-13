@@ -85,10 +85,21 @@ jobs:
         # a slow or unreachable registry fails this step by name instead of the
         # build. Once, then once more: a pull is the one thing in this job that
         # depends on somebody else's service.
+        #
+        # Twice, because there are two references. The fixtures pin the base by
+        # digest, and the import-cli kit and every Package it drafts name the
+        # same image by tag, which is a reference podman resolves separately
+        # even when it ends at the same digest. Pulling the tag here leaves it
+        # in the member's store under its fully qualified name, so the builds
+        # of those Packages reach no registry either.
         run: |
           image=$(sed -n 's/^FROM //p' e2e/fixtures/echo/Dockerfile | head -1)
-          sh e2e/as-member.sh "$KITBASH_E2E_ADMIN" podman pull "$image" \
-            || { sleep 10; sh e2e/as-member.sh "$KITBASH_E2E_ADMIN" podman pull "$image"; }
+          tag=$(sed -n 's/^FROM //p' deploy/org/import-cli/Dockerfile | head -1)
+          case "$tag" in */*) ;; *) tag="docker.io/library/$tag" ;; esac
+          for reference in "$image" "$tag"; do
+            sh e2e/as-member.sh "$KITBASH_E2E_ADMIN" podman pull "$reference" \
+              || { sleep 10; sh e2e/as-member.sh "$KITBASH_E2E_ADMIN" podman pull "$reference"; }
+          done
 
       - name: Drive the surface as two members
         env:

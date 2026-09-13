@@ -234,7 +234,7 @@ Both hooks fail the same way. A kit a manifest names and nobody is running is `n
 
 **The import hook.** An import kit is a running Process whose manifest declares `provides.kit: [import]` and a tool named `import`. The tool's input schema has a `source` string, constrained by a pattern to the source syntax the kit understands, and its output is a list of files, each a relative path with text or base64 content. `pkg_import` walks the caller's running kits, picks the one whose `import` input schema accepts the source string, calls the tool, and writes the returned files into the target folder as one commit. The choice binds on schemas, not on a registry of kit names. Two kits accepting the same source is a conflict the caller resolves by stopping one.
 
-**Import kits are the package manager.** A human runs `apt install ffmpeg` and reads `--help`. An agent asks import-cli to wrap ffmpeg, gets a Package with tools that carry schemas, and calls `ffmpeg.transcode` with a structured result. import-mcp is nearly automatic because MCP servers already declare tool schemas. import-cli is the hard one: it drafts a manifest from `--help` and man pages, runs the tool to validate the schema, and only then admits the Package. That validation loop is work an agent can do itself.
+**Import kits are the package manager.** A human runs `apt install ffmpeg` and reads `--help`. An agent asks import-cli to wrap ffmpeg, gets a Package with tools that carry schemas, and calls `ffmpeg.transcode` with a structured result. import-mcp is nearly automatic because MCP servers already declare tool schemas. import-cli is the hard one, and it is two steps rather than one. `import` drafts a Package that builds and runs knowing only the apk package name: it carries a `run` tool that takes an argv array and a `probe` tool that reports the binary's `--help`, `--version` and man text. The agent builds it, runs it, calls `probe`, hands what it answered to the kit's `refine` tool, and writes the files that come back over the folder. The Package then has one tool per subcommand, or one for the binary, each carrying a schema derived from the flags. No model is involved: the draft is a deterministic parser for the getopt, argparse, cobra and clap help styles, and a text it cannot read yields the `run` tool and notes saying so. Neither tool reaches the network and neither runs the binary, so the kit holds no permits. That validation loop is work an agent does itself.
 
 ## 4. kitbashOS
 
@@ -352,11 +352,12 @@ Each milestone is done when its acceptance sentence is true on a real machine, n
 
 **M6 Workflow kit.** A workflow engine Package reads a graph from Files, calls tools on two other Processes, and one workflow references another. The core did not change to make this work.
 
+**M7 import-cli.** The agent imports `cli:apk:jq`, builds it, runs it, calls its `probe` tool, calls the kit's `refine` with what probe reported, writes the files it answers with, builds and runs again, and calls the refined `jq` tool with a filter and a document and gets the filtered result. The manifest it ran was drafted by the kit and refined from the Package's own probe. A version in the source is an apk constraint: `jq@1.8.2-r0` pins one apk release with `=`, and `jq@1.8.2`, which names no release, asks for the newest release of that version with `~=`.
+
 ### 5.4 Risks
 
 - Rootless podman on Alpine needs cgroups v2, subuid ranges and fuse-overlayfs configured correctly. This is M1 work and is the first thing to verify on real hardware.
 - Development must happen in a VM, not an LXC container. Nested container runtimes inside LXC are unreliable.
-- import-cli is open ended. It is not in version 1 milestones on purpose. import-mcp and import-oci cover most real needs.
 - The progressive disclosure rule depends on people and agents writing good descriptions. The core enforces presence, not quality. An evaluation kit that flags never read folders is the intended feedback loop.
 
 ### 5.5 Open decisions
@@ -370,6 +371,7 @@ The MCP tool surface is decided in `spec/mcp-surface.yaml`: six families, `fs` i
 - Fan out is best effort. A subscriber that must not miss a record should read the store through `tel_query` and treat the push as a wake up.
 - Approvals cover `fs_write` and `pkg_import` into `/org`. Whether `proc_run` of an `/org` Package by a member should run as a shared Process rather than a private one is open; today it runs privately under the member.
 - A Process acting as an agent has its owner's full surface. Narrowing what a Process may call (a per Process allow list in the manifest) is deferred until a kit needs less than its owner has.
+- A Process sees no Files; passing a member's file to a CLI Package is inline base64 capped at 8 MiB; bind mounting the owner's home is a core change on a security boundary and is not decided.
 
 ## 6. Vocabulary
 

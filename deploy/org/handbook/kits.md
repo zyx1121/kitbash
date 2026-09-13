@@ -247,6 +247,40 @@ the surface has no tool that runs a command.
 
 Repeating any of these is safe. They describe a state, they do not add one.
 
+## Wrapping a command line tool
+
+`import-cli` turns an Alpine package into a Package with schemas. You call the
+kit twice, with a build and a run in between, because a schema drafted from a
+help text has to come from the binary that printed it, and reading that binary
+means running the Package first.
+
+1. `pkg_import` with `{"path": "/home/you/jq", "source": "cli:apk:jq"}`. The kit
+   answers with a Dockerfile that installs the apk package, a manifest with a
+   `run` tool and a `probe` tool, `tools.json`, an adapter and `NOTES.md`, and
+   kitbash writes them as one commit. A version is an apk constraint:
+   `cli:apk:jq@1.8.2-r0` pins one apk release, and `cli:apk:jq@1.8.2` asks for
+   the newest release of that version.
+2. `pkg_build` and `proc_run` the folder, then call `jq_probe` with `{}`. It
+   answers with the binary's own `--help`, `--version` and man text.
+3. Call the kit's `import-cli_refine` with `{source, help, version, man}`, the
+   same `source` as step 1. It answers with the same files, now carrying one
+   tool per subcommand, or one for the binary, each with a schema built from the
+   flags.
+4. `fs_write` those files over the folder, `pkg_build` again and `proc_run`
+   again. The new tool joins the surface beside `run` and `probe`.
+
+Then `jq_jq` with `{"filter": ".items | map(.name)", "stdin": "{...}",
+"compact_output": true}` answers `{"exitCode": 0, "stdout": "...", "stderr": "",
+"files": []}`. A non zero exit code is an answer and not an error.
+
+Read `NOTES.md` before trusting the schema. It lists what the generator could
+not decide: which apk release the constraint resolved to, whether an array
+option repeats its flag, and which positional was taken for a file.
+
+A Process sees none of your Files, so a file argument names an entry of the
+call's own `files` array, `{name, contentBase64}`, capped at 8 MiB each way. A
+name that was not sent is a `not-found`.
+
 ## The seeded Packages
 
 Worked examples under `/org`. Five declare a kit hook; `workflow` declares none.

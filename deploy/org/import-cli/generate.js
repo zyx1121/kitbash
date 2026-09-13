@@ -25,7 +25,7 @@
 //           "<prop>": {"flag": "--compact-output", "takesValue": false, "type": "boolean"},
 //           "<prop2>": {"flag": "--arg", "takesValue": true, "type": "string", "repeat": false}
 //         },
-//         "positionals": ["filter", "input"],  // input property names, in argv order; a property of type "file" is written from files[] to a tmp path and the path is passed
+//         "positionals": ["filter", "input"],  // input property names, in argv order; a property that names a file is written from files[] to a tmp path and the path is passed, and an array of them is one path per element
 //         "stdin": "stdin",                     // input property whose string goes to stdin, or null
 //         "outputs": ["output"]                 // positional property names naming files the adapter reads back after the run (base64 in result.files)
 //       },
@@ -36,7 +36,8 @@
 //
 // Input schema conventions the adapter relies on: `files` is
 // `[{name, contentBase64}]`; a positional whose schema has
-// `"format": "kitbash-file"` names a file from `files` by its `name`. Result
+// `"format": "kitbash-file"`, on the property or on its items, names files
+// from `files` by their `name`, and an array of them is one path each. Result
 // shape from the adapter: `{exitCode, stdout, stderr, files: [{name,
 // contentBase64}]}` with the 8 MiB caps.
 //
@@ -579,9 +580,10 @@ function callingContract(binary, toolNames) {
     `and every file are capped at ${MAX_PAYLOAD} bytes each way.`,
     "",
     "To pass a file in, put it in `files` as `{name, contentBase64}` and name it",
-    "from the positional whose schema carries `\"format\": \"kitbash-file\"`. The",
-    "adapter writes it to a temporary path and passes that path. A positional the",
-    "tool writes to is read back and returned in `files` under the same name.",
+    "from the positional whose schema carries `\"format\": \"kitbash-file\"`, on the",
+    "property itself or on its items when the positional takes several. The",
+    "adapter writes each to a temporary path and passes those paths. A positional",
+    "the tool writes to is read back and returned in `files` under the same name.",
     "",
     "`stdin` is written to the command and then closed.",
     "",
