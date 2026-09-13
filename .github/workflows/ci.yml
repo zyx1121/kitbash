@@ -31,3 +31,53 @@ jobs:
           name: kitbashd-linux-amd64
           path: bin/kitbashd-linux-amd64
           if-no-files-found: error
+
+  # The kits under deploy/org are JavaScript, so nothing in the Go job touches
+  # them and until now no kit test ran on a push at all, issue #107.
+  #
+  # Two runtimes are needed rather than one. The adapter tests and import-oci
+  # are node:test suites, and the three older drivers stand a fake kitbashd up
+  # with Bun.serve and only run under bun, deploy/org/handbook/kits.md. Which
+  # one a directory wants is read from the directory itself, so a kit chooses
+  # its runtime by what it imports and this loop never has a list to update.
+  kits:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Test every kit
+        run: |
+          set -u
+          status=0
+          for dir in deploy/org/*/test deploy/org/*/adapter-test; do
+            [ -d "$dir" ] || continue
+            kit=$(dirname "$dir")
+            # A kit with dependencies is installed before its tests run. There
+            # is no lockfile in the repository, .gitignore drops them, so
+            # npm install is the only form available here.
+            if [ -f "$kit/package.json" ] && [ ! -d "$kit/node_modules" ]; then
+              npm install --prefix "$kit" --no-audit --no-fund --loglevel=error
+            fi
+            if grep -rq "Bun\." "$dir"; then
+              # A driver reports itself and exits non zero on the first failed
+              # check. They bind the same port, so they run one at a time.
+              for file in "$dir"/*.test.mjs; do
+                echo "::group::bun run $file"
+                bun run "$file" || status=1
+                echo "::endgroup::"
+              done
+            else
+              echo "::group::node --test $dir"
+              ( cd "$dir" && node --test ) || status=1
+              echo "::endgroup::"
+            fi
+          done
+          exit $status
