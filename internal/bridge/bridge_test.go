@@ -488,6 +488,12 @@ func TestAPassedProblemBoundsEveryField(t *testing.T) {
 // queued is the surface's own answer to a call an admin has to approve. A
 // Package returning it would tell the agent that an admin is about to run
 // something that was never queued, with an approval id the agent could poll.
+// not-visible is the surface's own reading of a folder of Files, which a
+// Package is not the one doing.
+//
+// invalid-path used to be in this list and is not any more, see issue #122: a
+// Package can be given a path of its own through a mount, so answering about
+// that path is its business and not a claim on the surface's.
 func TestAPackageCannotSpoofTheSurfacesOwnClasses(t *testing.T) {
 	for _, c := range []struct {
 		name string
@@ -502,10 +508,6 @@ func TestAPackageCannotSpoofTheSurfacesOwnClasses(t *testing.T) {
 		{"not visible", &problem.Problem{
 			Type: problem.Base + problem.SlugNotVisible, Title: "Not visible", Status: 404,
 			Detail: "the folder carries no kitbash.yaml", Instance: "/org/media",
-		}},
-		{"invalid path", &problem.Problem{
-			Type: problem.Base + problem.SlugInvalidPath, Title: "Invalid path", Status: 400,
-			Detail: "/org/media is a symlink", Instance: "/org/media",
 		}},
 		{"a class with the wrong status", &problem.Problem{
 			Type: problem.Base + problem.SlugNotFound, Title: "Not found", Status: 202,
