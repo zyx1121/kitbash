@@ -315,6 +315,39 @@ func (s *Service) kitOwnedProcesses(known map[string]telemetry.Registered, liste
 	return out
 }
 
+// failedWithoutAContainer are the caller's registrations that kitbashd holds a
+// problem about and that the runtime no longer has. A container kitbashd took
+// apart, which is what it does to one whose mounts did not check out, leaves a
+// registration naming nothing: proc_list would drop it, and the member would
+// see the Process disappear rather than read why it is not running.
+//
+// A Process a run kit owns is not one of these; it is listed above and the
+// daemon has no container of it to take apart in the first place.
+func (s *Service) failedWithoutAContainer(known map[string]telemetry.Registered, listed []Process) []Process {
+	here := map[string]bool{}
+	for _, p := range listed {
+		here[p.ID] = true
+	}
+	var out []Process
+	for _, entry := range known {
+		if entry.Runner != "" || entry.Problem == "" || here[entry.ID] || !s.ownedByCaller(entry) {
+			continue
+		}
+		out = append(out, Process{
+			ID:      entry.ID,
+			Name:    entry.Name,
+			Package: entry.Package,
+			Digest:  entry.Digest,
+			State:   StateFailed,
+			Expose:  entry.Expose,
+			Problem: entry.Problem,
+			Fix:     entry.ProblemFix,
+			Mounts:  entry.Mounts,
+		})
+	}
+	return out
+}
+
 // ownedByCaller reports whether a registration is this member's. An admin's
 // list is the whole machine, and another member's Process is not one this
 // session may name.

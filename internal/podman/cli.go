@@ -303,8 +303,26 @@ func (c *CLI) Run(ctx context.Context, opts RunOptions) (string, error) {
 // where they are visible; they can only come from a manifest, and the
 // variables kitbash sets itself carry no line breaks.
 func RunArgs(opts RunOptions, inline []string) []string {
-	args := []string{"run", "--name", opts.Name}
-	if opts.Detach {
+	return containerArgs("run", opts, inline)
+}
+
+// CreateArgs is the same command line for podman create, which makes the
+// container without running anything in it. kitbashd uses it rather than run,
+// because a Process with mounts has to be checked in its own mount namespace
+// before its first instruction executes: create, then init, then the check,
+// then start, see PLAN.md section 2.3.
+//
+// There is no detach flag on it. A created container runs nothing to detach
+// from, and podman refuses the flag.
+func CreateArgs(opts RunOptions, inline []string) []string {
+	return containerArgs("create", opts, inline)
+}
+
+// containerArgs is the command line both verbs share, which is all of it apart
+// from detaching.
+func containerArgs(verb string, opts RunOptions, inline []string) []string {
+	args := []string{verb, "--name", opts.Name}
+	if opts.Detach && verb == "run" {
 		args = append(args, "--detach")
 	}
 	if opts.Interactive {
@@ -338,6 +356,9 @@ func RunArgs(opts RunOptions, inline []string) []string {
 	if opts.CgroupParent != "" {
 		args = append(args, "--cgroups=enabled", "--cgroup-parent="+opts.CgroupParent)
 	}
+	for _, mount := range opts.Mounts {
+		args = append(args, "--mount", MountSpec(mount))
+	}
 	for _, port := range opts.Publish {
 		// The loopback address only: a Process is reachable from this host,
 		// never from the network, until a reverse proxy fronts it. An empty
@@ -349,6 +370,30 @@ func RunArgs(opts RunOptions, inline []string) []string {
 		args = append(args, "--publish", "127.0.0.1:"+host+":"+strconv.Itoa(port.ContainerPort))
 	}
 	return append(args, opts.Image)
+}
+
+// MountSpec is one bind mount as podman spells it on a --mount flag.
+//
+// The five options after the pair of paths are the whole of what a mount of
+// someone's Files is allowed to be. ro says whether it may be written.
+// bind-nonrecursive keeps anything mounted below the source out of the
+// container, so a folder that happens to have a filesystem under it does not
+// carry it in. nosuid, nodev and noexec are the three a mount of a folder a
+// member can write has to have: without them a setuid binary or a device node
+// planted in that folder is one the container can use.
+//
+// The spelling is podman 5.7's, verified against the runtime rather than the
+// manual: podman takes nosuid, nodev and noexec as --mount options of a bind
+// mount and puts them in the container's /proc/self/mountinfo, and it refuses
+// an option it does not know rather than dropping it, so a release that stops
+// taking one of these fails the start loudly instead of mounting without it.
+func MountSpec(m Mount) string {
+	ro := "false"
+	if m.ReadOnly {
+		ro = "true"
+	}
+	return "type=bind,src=" + m.Source + ",dst=" + m.Target + ",ro=" + ro +
+		",bind-nonrecursive,nosuid,nodev,noexec"
 }
 
 // writeEnvFile writes the environment of one container into a file only the

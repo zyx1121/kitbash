@@ -665,3 +665,134 @@ func TestRunWithoutARegistryIsRefused(t *testing.T) {
 		t.Errorf("the runtime was asked to run %d containers, want none", len(f.runner.Runs))
 	}
 }
+
+// mountingManifest is a unit that asks to see two folders of Files: one of the
+// member's own read write, and one of /org read only, see PLAN.md section 2.3.
+const mountingManifest = `name: reader
+description: A Package whose Process reads and writes folders of Files.
+deploy:
+  units:
+    - type: container
+      build: .
+      expose: none
+      mounts:
+        - source: /home/tester/notes
+          target: /files/notes
+          mode: rw
+        - source: /org/handbook
+          target: /files/handbook
+`
+
+// The mounts a unit declares cross the socket with the registration, and they
+// cross it unresolved: kitbashd resolves them as root, because this session
+// runs as the member and what a member's process says about a path is a claim,
+// see mounts in spec/kitbashd-api.yaml.
+func TestRunRegistersTheMountsTheUnitDeclared(t *testing.T) {
+	f := newFixture(t)
+	folder := f.pack(t, "reader", mountingManifest)
+	f.build(folder, "reader")
+
+	if _, prob := f.processes.Run(context.Background(), folder, "", ""); prob != nil {
+		t.Fatalf("Run: %s", prob.Detail)
+	}
+	registrations := f.daemon.Registrations()
+	if len(registrations) != 1 {
+		t.Fatalf("kitbashd holds %d registrations, want 1", len(registrations))
+	}
+	got := registrations[0].Mounts
+	if len(got) != 2 {
+		t.Fatalf("the registration carries %+v, want the two mounts the unit declared", got)
+	}
+	if got[0].Source != "/home/tester/notes" || got[0].Target != "/files/notes" || got[0].Mode != "rw" {
+		t.Errorf("the first mount is %+v, want the notes folder read write", got[0])
+	}
+	// The second declares no mode, and the manifest's default is ro. It is
+	// sent as the manifest wrote it: filling it in here would be this session
+	// deciding what the daemon decides.
+	if got[1].Source != "/org/handbook" || got[1].Mode != "" {
+		t.Errorf("the second mount is %+v, want the handbook folder as the manifest wrote it", got[1])
+	}
+}
+
+// A Package that declares no mounts registers with none, which is every
+// Package written before mounts existed.
+func TestRunRegistersNoMountsForAUnitThatDeclaresNone(t *testing.T) {
+	f := newFixture(t)
+	folder := f.pack(t, "ffmpeg", mcpManifest)
+	f.build(folder, "ffmpeg")
+
+	if _, prob := f.processes.Run(context.Background(), folder, "", ""); prob != nil {
+		t.Fatalf("Run: %s", prob.Detail)
+	}
+	if got := f.daemon.Registrations()[0].Mounts; len(got) != 0 {
+		t.Errorf("the registration carries the mounts %+v, want none", got)
+	}
+}
+
+// proc_list reports the mounts kitbashd holds and not what the runtime has
+// bound: the registration is what kitbash agreed to, and it is what a member
+// reads to see which folders their Process can reach.
+func TestListReportsTheMountsTheRegistryHolds(t *testing.T) {
+	f := newFixture(t)
+	folder := f.pack(t, "reader", mountingManifest)
+	f.build(folder, "reader")
+
+	process, prob := f.processes.Run(context.Background(), folder, "", "")
+	if prob != nil {
+		t.Fatalf("Run: %s", prob.Detail)
+	}
+	list, prob := f.processes.List(context.Background())
+	if prob != nil {
+		t.Fatalf("List: %s", prob.Detail)
+	}
+	var found bool
+	for _, p := range list.Processes {
+		if p.ID != process.ID {
+			continue
+		}
+		found = true
+		if len(p.Mounts) != 2 || p.Mounts[0].Target != "/files/notes" ||
+			p.Mounts[1].Target != "/files/handbook" {
+			t.Errorf("proc_list reports the mounts %+v, want the two the registration holds", p.Mounts)
+		}
+	}
+	if !found {
+		t.Fatalf("proc_list does not hold %s", process.ID)
+	}
+}
+
+// A Process whose container kitbashd took apart still appears on proc_list,
+// failed and with the reason. kitbashd removes the container of a Process whose
+// mount turned out to be a folder it did not agree to, so there is nothing in
+// the runtime to list: without this the Process would simply stop being listed
+// and its owner would have no problem to read.
+func TestListReportsAProcessWhoseContainerWasTakenApart(t *testing.T) {
+	f := newFixture(t)
+	const id = "01930000-0000-7000-8000-0000000000d1"
+	f.daemon.AddProcess(teltest.Registration{
+		ID:         id,
+		Package:    "/home/tester/reader",
+		Name:       "reader",
+		Digest:     "sha256:" + strings.Repeat("a", 64),
+		Expose:     manifest.ExposeNone,
+		Problem:    "this Process declares a mount that is no longer legal, so kitbashd did not start it",
+		ProblemFix: "Check the folder deploy.units[0].mounts names.",
+	})
+	list, prob := f.processes.List(context.Background())
+	if prob != nil {
+		t.Fatalf("List: %s", prob.Detail)
+	}
+	var found bool
+	for _, p := range list.Processes {
+		if p.ID != id {
+			continue
+		}
+		found = true
+		if p.State != proc.StateFailed || p.Problem == "" || p.Fix == "" {
+			t.Errorf("proc_list reports %+v, want it failed with the reason and a fix", p)
+		}
+	}
+	if !found {
+		t.Fatalf("proc_list dropped the Process whose container was taken apart: %+v", list.Processes)
+	}
+}

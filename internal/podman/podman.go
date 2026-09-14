@@ -43,14 +43,19 @@ const (
 
 // Container states the runtime reports, lowercased.
 const (
-	StateRunning    = "running"
-	StateCreated    = "created"
-	StateConfigured = "configured"
-	StateExited     = "exited"
-	StateStopped    = "stopped"
-	StateStopping   = "stopping"
-	StateRemoving   = "removing"
-	StatePaused     = "paused"
+	StateRunning = "running"
+	StateCreated = "created"
+	// StateInitialized is a container podman init has prepared: crun has made
+	// its rootfs and its bind mounts and its init process exists, and the
+	// image's entrypoint has executed nothing. It is the state kitbashd checks
+	// a Process's mounts in, see PLAN.md section 2.3.
+	StateInitialized = "initialized"
+	StateConfigured  = "configured"
+	StateExited      = "exited"
+	StateStopped     = "stopped"
+	StateStopping    = "stopping"
+	StateRemoving    = "removing"
+	StatePaused      = "paused"
 )
 
 // Filter selects images or containers by label. An empty filter matches
@@ -77,6 +82,19 @@ type Port struct {
 	HostPort      int
 	ContainerPort int
 	Protocol      string
+}
+
+// Mount is one folder of the host a container sees, as the unit's
+// deploy.units[].mounts declared it and whoever validated it resolved it.
+//
+// Source is an absolute path on the host and is not checked here: this package
+// renders a command line, and deciding which folder a member may mount is
+// kitbashd's, as root, see internal/mounts. Target is where the container sees
+// it, ReadOnly whether it may be written.
+type Mount struct {
+	Source   string
+	Target   string
+	ReadOnly bool
 }
 
 // PortMapping is one port to publish. HostPort 0 leaves the choice to the
@@ -118,6 +136,8 @@ type RunOptions struct {
 	Publish     []PortMapping
 	Detach      bool
 	Interactive bool
+	// Mounts are the folders of Files this container sees, already resolved.
+	Mounts []Mount
 	// CgroupParent is the cgroup the container's own one is created under,
 	// as an absolute path below the mount point. Empty leaves the runtime's
 	// default in place, which is a host that enforces no limits.

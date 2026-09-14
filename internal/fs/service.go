@@ -282,17 +282,21 @@ func (s *Service) folderManifest(dir string) (*manifest.Manifest, *problem.Probl
 	if s.isRoot(dir) {
 		return nil, nil
 	}
-	m, ok := s.visible(dir)
-	if !ok {
-		return nil, notVisible(dir, "")
+	root, rel, err := s.relative(dir)
+	if err != nil {
+		return nil, problem.InvalidPath(dir, "the path is outside its root")
 	}
-	if prob := s.ancestorsVisible(dir); prob != nil {
-		return nil, prob
+	m, blocked, ok := manifest.VisibleChain(root, rel)
+	if !ok {
+		return nil, notVisible(filepath.Join(root, blocked), "")
 	}
 	return m, nil
 }
 
 // ancestorsVisible checks every folder between dir and its root, dir excluded.
+// It is the same rule as folderManifest without the folder itself, which is
+// what a write that creates a folder asks: the folder does not exist yet, so
+// what has to be visible is everything above it.
 func (s *Service) ancestorsVisible(dir string) *problem.Problem {
 	root, ok := s.rootOf(dir)
 	if !ok {

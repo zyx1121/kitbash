@@ -6,7 +6,9 @@ import (
 	"io/fs"
 	"os"
 	"path"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"sync"
 	"syscall"
 
@@ -32,10 +34,12 @@ type Fake struct {
 	AddKeyErr error
 	RemoveErr error
 	ListErr   error
-	// StartErr, RunErr, StopErr, RemoveContainerErr, RemoveAllErr and
-	// CopyErr make the runtime fail on demand.
+	// StartErr, RunErr, InitErr, StopErr, RemoveContainerErr, RemoveAllErr and
+	// CopyErr make the runtime fail on demand. RunErr is the create, which is
+	// the call that makes a container.
 	StartErr           error
 	RunErr             error
+	InitErr            error
 	StopErr            error
 	RemoveContainerErr error
 	RemoveAllErr       error
@@ -53,8 +57,23 @@ type Fake struct {
 	// the one failure a caller cannot see from the exit status of the two
 	// children: a save and a load that both said nothing and moved nothing.
 	LoseCopies bool
-	// RunID is the container id Run answers. Empty means a fixed one.
+	// RunID is the container id Create answers. Empty means a fixed one.
 	RunID string
+	// PIDs are the process ids Init gives a container, by name. A container
+	// with no entry is given NextPID, and a container mapped to zero is one
+	// whose init made no process, which is what a host answers when the
+	// runtime could not prepare it.
+	PIDs map[string]int
+	// NextPID is the pid every other container's init answers. Zero means a
+	// fixed one, which is enough for a test that only needs a pid that is not
+	// nothing.
+	NextPID int
+	// ProcRoot is the tree standing in for /proc. When it is set, preparing a
+	// container writes what its namespace holds under
+	// <ProcRoot>/<pid>/root/<target>, pointing at the source it was created
+	// with, which is what an honest host does. A test that wants a host that
+	// mounted something else writes over it afterwards.
+	ProcRoot string
 
 	// Missing are containers Start, Stop and Remove answer ErrNoContainer
 	// for, by name, and images Run answers ErrNoImage for.
@@ -62,6 +81,12 @@ type Fake struct {
 	// Running are containers Start answers ErrAlreadyRunning for, which is
 	// what a daemon that restarted without the host finds.
 	Running map[string]bool
+	// Pinned are configurations ContainerConfig answers whatever the container
+	// was run with, which Run never replaces. It is how a test stages a host
+	// that did something other than what it was asked: a runtime that mounted
+	// another folder than the one on its command line cannot be staged in
+	// Configs, because a run overwrites that with the options it was given.
+	Pinned map[string]ContainerConfig
 	// Configs are the configurations ContainerConfig answers, by container
 	// name. A container with no entry answers an empty configuration, which
 	// is one created under no cgroup parent of its own.
@@ -75,6 +100,7 @@ type Fake struct {
 	Removed           []string
 	Started           []StartCall
 	Ran               []RunCall
+	Inited            []StartCall
 	Stopped           []StopCall
 	Renamed           []RenameCall
 	RemovedContainers []StopCall
@@ -83,6 +109,9 @@ type Fake struct {
 
 	members map[string]*fakeMember
 	nextUID int
+	// made are the containers this fake created itself, which is what tells a
+	// container the heal made from the one it replaced, see Start.
+	made map[string]bool
 	// images is the image store of the fake host, one per member: which
 	// digests they hold, how big each one is and what its labels say it is a
 	// build of. A copy reads one member's and writes the other's, the way a
@@ -341,7 +370,12 @@ func (f *Fake) Start(_ context.Context, m Member, container, cgroup string) erro
 	if f.Running[container] {
 		return fmt.Errorf("%w: %s", ErrAlreadyRunning, container)
 	}
-	if f.StartErr != nil {
+	// StartErr is the host refusing a container this fake did not make, which
+	// is what a container created before kitbashd gave each Process a cgroup
+	// of its own does: its parent belongs to root and the member's runtime
+	// cannot start it there. One this fake created is one the heal made, and
+	// it starts.
+	if f.StartErr != nil && !f.made[container] {
 		return f.StartErr
 	}
 	f.Started = append(f.Started, StartCall{
@@ -350,16 +384,16 @@ func (f *Fake) Start(_ context.Context, m Member, container, cgroup string) erro
 	return nil
 }
 
-// Run records a container run as one member, reading the environment file
-// while it still exists. A container named in Missing is ErrNoImage: the fake
-// has no image store, so the one thing a caller stages is an image that is not
-// there.
-func (f *Fake) Run(_ context.Context, m Member, opts podman.RunOptions, cgroup string) (string, error) {
+// CreateContainer records a container being made as one member, reading the environment
+// file while it still exists. Nothing runs in it, which is what the real
+// runtime does too. An image named in Missing is ErrNoImage: the fake has no
+// image store, so the one thing a caller stages is an image that is not there.
+func (f *Fake) CreateContainer(_ context.Context, m Member, opts podman.RunOptions, cgroup string) (string, error) {
 	call := RunCall{
 		Member:  m.Name,
 		UID:     m.UID,
 		Options: opts,
-		Args:    podman.RunArgs(opts, nil),
+		Args:    podman.CreateArgs(opts, nil),
 		Cgroup:  cgroup,
 		EnvFile: opts.EnvFile,
 	}
@@ -384,23 +418,97 @@ func (f *Fake) Run(_ context.Context, m Member, opts podman.RunOptions, cgroup s
 		return "", f.RunErr
 	}
 	f.Ran = append(f.Ran, call)
+	if f.made == nil {
+		f.made = map[string]bool{}
+	}
+	f.made[opts.Name] = true
 	// The container exists now, with the configuration the run gave it, which
 	// is what ContainerConfig answers and what a health probe is checked
 	// against.
 	if f.Configs == nil {
 		f.Configs = map[string]ContainerConfig{}
 	}
+	// The container exists and nothing runs in it, which is a created
+	// container with no pid: Init is what gives it one.
 	f.Configs[opts.Name] = ContainerConfig{
 		CgroupParent: opts.CgroupParent,
 		Image:        opts.Image,
 		Labels:       opts.Labels,
 		Restart:      opts.Restart,
 		Publish:      opts.Publish,
+		Mounts:       opts.Mounts,
 	}
 	if f.RunID != "" {
 		return f.RunID, nil
 	}
 	return "container-" + opts.Name, nil
+}
+
+// InitContainer gives a created container the pid and the mount namespace the real
+// runtime gives it, which is what the caller reads its mounts through. A
+// container the fake has no configuration for is ErrNoContainer, because a
+// container that was never created cannot be prepared.
+func (f *Fake) InitContainer(_ context.Context, m Member, container, cgroup string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.Missing[container] {
+		return fmt.Errorf("%w: %s", ErrNoContainer, container)
+	}
+	f.Inited = append(f.Inited, StartCall{Member: m.Name, UID: m.UID, Container: container, Cgroup: cgroup})
+	if f.InitErr != nil {
+		return f.InitErr
+	}
+	config, held := f.Configs[container]
+	if !held {
+		return fmt.Errorf("%w: %s", ErrNoContainer, container)
+	}
+	config.PID = f.pidFor(container)
+	f.Configs[container] = config
+	if f.ProcRoot == "" {
+		return nil
+	}
+	// An honest host: what the container holds at each target is the folder it
+	// was created with. /proc/<pid>/root is a magic link the kernel resolves
+	// in the container's namespace, and a symlink is the nearest thing a test
+	// can write, so the caller's own stat resolves to the real folder.
+	//
+	// A target a test has already written is left alone: that test has said
+	// what the container holds, which is how a host that mounted something
+	// other than what it was asked for is staged.
+	for _, mount := range config.Mounts {
+		at := filepath.Join(f.ProcRoot, strconv.Itoa(config.PID), "root", mount.Target)
+		if _, err := os.Lstat(at); err == nil {
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(at), 0o755); err != nil {
+			return err
+		}
+		if err := os.Symlink(mount.Source, at); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// pidFor is the pid one container's init answers. It is not locked: every
+// caller of it holds the lock already.
+func (f *Fake) pidFor(container string) int {
+	if pid, ok := f.PIDs[container]; ok {
+		return pid
+	}
+	if f.NextPID > 0 {
+		return f.NextPID
+	}
+	return 4242
+}
+
+// Inits are the containers the runtime was asked to prepare, newest last.
+func (f *Fake) Inits() []StartCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]StartCall, len(f.Inited))
+	copy(out, f.Inited)
+	return out
 }
 
 // ContainerConfig answers what the fake host holds for one container. A
@@ -417,7 +525,21 @@ func (f *Fake) ContainerConfig(_ context.Context, _ Member, container string) (C
 	if f.ConfigErr != nil {
 		return ContainerConfig{}, f.ConfigErr
 	}
+	if config, ok := f.Pinned[container]; ok {
+		return config, nil
+	}
 	return f.Configs[container], nil
+}
+
+// PinConfig stages what the runtime answers about one container, whatever it is
+// later run with.
+func (f *Fake) PinConfig(container string, config ContainerConfig) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.Pinned == nil {
+		f.Pinned = map[string]ContainerConfig{}
+	}
+	f.Pinned[container] = config
 }
 
 // RenameContainer records a rename and moves what the fake host holds under

@@ -228,7 +228,7 @@ api:
   processes_register:
     method: POST
     path: /kitbash/v1/processes
-    request: { id: "UUIDv7", package: "/home/loki/echo", name: "echo", container: "kitbash-echo-echo", digest: "sha256:...", expose: "mcp|http|none", endpoint: "http://127.0.0.1:40275 when expose is http", subscriptions: ["telemetry"], runner: "/org/pve-runner when a run kit owns this Process", health: { http: "/healthz", interval: "30s" } }
+    request: { id: "UUIDv7", package: "/home/loki/echo", name: "echo", container: "kitbash-echo-echo", digest: "sha256:...", expose: "mcp|http|none", endpoint: "http://127.0.0.1:40275 when expose is http", subscriptions: ["telemetry"], runner: "/org/pve-runner when a run kit owns this Process", health: { http: "/healthz", interval: "30s" }, mounts: [{ source: "/home/loki/notes", target: "/files/notes", mode: "ro|rw" }] }
     response: { id: "UUIDv7", token: "opaque, at least 32 bytes of entropy, returned once", fanoutSecret: "opaque, 32 bytes, returned once; the bearer the fan out presents to this Process" }
     authorization: >
       The caller is the member the Process belongs to; kitbashd records the
@@ -254,7 +254,12 @@ api:
       health block naming no path is bad-request, and one on a registration
       that names a runner is not-permitted: a Process a run kit owns has no
       container here to check the endpoint against, see health_probes.
-    errors: [bad-request, conflict, internal]
+      mounts are the folders of Files the Process sees, at most four, and they
+      are resolved here rather than taken on trust, see mounts below. A
+      registration whose mounts do not check out is refused and nothing is
+      written, so a Process never holds a registration naming a folder it may
+      not see.
+    errors: [bad-request, not-permitted, not-visible, invalid-path, conflict, internal]
   processes_unregister:
     method: DELETE
     path: /kitbash/v1/processes/{id}
@@ -274,7 +279,9 @@ api:
       restart: "always|on-failure|no", cpu: "1", memory: "512Mi", pidsLimit:
       512, publish: [{ hostPort: 40275, containerPort: 8080 }] }. The unit's
       own environment only: kitbashd writes its own seven variables itself, so
-      no token and no secret is ever in a request body.
+      no token and no secret is ever in a request body. The mounts are not in
+      the request: they are the registration's, and the request would be a
+      second place they could be claimed from.
     response: { id: "UUIDv7", container: "kitbash-echo-echo", containerId: "the id the runtime gave it" }
     authorization: >
       The owner of the registration and nobody else, admins included: this runs
@@ -295,6 +302,19 @@ api:
       A host whose cgroup filesystem is not version 2 or not writable runs the
       Process without placing it, records the limits, and says so on that
       start. One action at a time is served per Process id.
+      The mounts of the registration are resolved again here, before anything
+      is created: the check at registration says what was true then, and a
+      folder can be removed, replaced by a symlink or lose its manifest in
+      between. A mount that no longer checks out fails the start with the same
+      problem the registration would have given, and the container is not
+      created.
+      A Process with mounts is then started in four steps rather than one, see
+      mount_swaps: podman create, podman init, the check, podman start. The
+      guarantee is that the bind mounts of a Process are held to what kitbashd
+      validated in the container's own mount namespace before its first
+      instruction runs, so a source swapped while podman was resolving it is
+      refused rather than detected: the container is removed having executed
+      nothing.
     timeouts: >
       The runtime gets 120 s for a run and 40 s for a stop or a forced removal,
       which is the ten second grace the container is given plus room to kill it
@@ -313,10 +333,12 @@ api:
       among them. An image that is not the registration's digest is refused
       rather than run.
     errors: >
-      [bad-request, not-permitted, not-found, internal]. A unit the runtime
+      [bad-request, not-permitted, not-visible, invalid-path, not-found,
+      internal]. A unit the runtime
       will not parse (exit 125) is bad-request naming deploy.units[0]; an image
       the member does not have is not-found naming pkg_build; an id nobody
-      registered is not-found.
+      registered is not-found; a mount that no longer checks out is whatever
+      the mount rules below make of it.
   processes_stop:
     method: POST
     path: /kitbash/v1/processes/{id}/stop
@@ -653,13 +675,78 @@ restore:
     The registration carries the container name and the digest from M5 on, so
     restore needs no manifest; the permits block of the Package's manifest, see
     mcp_for_processes.permits; the limits the Process was started with, so
-    restore writes its ceiling again; and the health probe it declares, so the
-    prober starts after a reboot without reading a manifest either. The limits
+    restore writes its ceiling again; the health probe it declares, so the
+    prober starts after a reboot without reading a manifest either; and the
+    mounts it declares, which are authoritative: a start and a restore mount
+    what the registration records and never what a request or a manifest says
+    today. The limits
     block carries ceiling: true
     from this release on, which says the ceiling cgroup was made and the container was
     created under it. A row with limits and no flag was written by a release
     that always did both, so it counts as placed; a row with neither is a
     registration from before either existed, and is the one restore heals.
+  mounts: >
+    A unit declares at most four mounts, each one a source folder of Files, a
+    target inside the container and a mode of ro or rw, see
+    deploy.units[].mounts in spec/manifest.schema.json. kitbashd resolves every
+    one of them as root, because root is the only party on this host that can
+    answer the question honestly: it opens the source beneath /home/<owner> or
+    /org with RESOLVE_BENEATH and RESOLVE_NO_SYMLINKS, so no component may be a
+    symlink, inside the root as well as out of it, and no resolution may leave
+    the root, fstats the descriptor it got, and requires a directory. A source
+    under a home has to be owned by that member, and the source and every
+    folder between it and its root have to carry a kitbash.yaml with a name and
+    a description, which is the same visibility rule the fs family reads by,
+    read from the same function: a folder no agent can list is a folder no
+    Process can mount. rw is refused anywhere under /org, for admins as well,
+    because the approval queue is the trail of every write there and a Process
+    with a rw mount would be a way past it. A target that is relative, that is
+    /, or that lands under /proc, /sys, /dev, /etc, /bin, /sbin, /usr, /lib or
+    /lib64 is refused. What podman is given is the resolved path:
+    --mount type=bind,src=<resolved>,dst=<target>,ro=<true|false>,bind-nonrecursive,nosuid,nodev,noexec.
+    kitbash-mcp runs the same check as the member before it calls, so a member
+    reads the problem in the session that made it; that check is a courtesy and
+    is not trusted, and the daemon's is the one that decides.
+  mount_swaps: >
+    podman resolves the source path itself, in its own process, after kitbashd
+    has looked at it. A source replaced by a symlink in between is followed by
+    podman and the container is given whatever it pointed at, which for a member
+    of kitbash-admin is a rw mount of /org with no approval behind it. Reporting
+    that afterwards is not enough: by then the entrypoint has run and a write
+    has landed. It is refused instead.
+    A Process is started in four steps. podman create makes the container with
+    its mounts. podman init has the runtime build its rootfs and its bind mounts
+    and leave its init process created, with the image's entrypoint not yet
+    executed: verified on podman 5.7.0, where the state after it is initialized,
+    State.Pid is not zero, the mounts are readable under /proc/<pid>/root, and a
+    fixture whose entrypoint writes a marker writes nothing until start. Then
+    kitbashd checks, as root. Then podman start.
+    The check asks two questions. Which source the runtime says is mounted at
+    each target, and in which mode, which catches a runtime that mounted
+    something other than what it was asked for. And what the container actually
+    has: a stat of each target through /proc/<pid>/root, which resolves in the
+    container's own mount namespace, held to the device and inode the validation
+    opened. The second is the ground truth, because podman reports the path it
+    was asked for and not what it resolved, verified against podman 5.7.0, so a
+    source swapped for a link, and one swapped and swapped back, are caught by
+    the inode at the target and by nothing else. kitbashd is root, so it needs
+    nothing inside the image to read it.
+    A mismatch, a container the runtime would not prepare, which is what a
+    source that stopped existing answers, and a container with no process after
+    it was prepared are all not-permitted with the detail "the mount source
+    changed between validation and start". The container is removed having
+    executed nothing, and it is logged. There is no fallback: a container
+    kitbashd cannot read is a container that does not start.
+    Restore is the same guarantee. A Process that is still running is verified
+    through the process it already has, because its namespace is the only
+    witness of what it holds and this daemon did not make that container. One
+    whose process is gone is not started by name, because a start makes the bind
+    mounts again and the entrypoint would be running before anything could read
+    them: it is made again through the same four steps, from the registration
+    and from what the old container was made with. The heal path is the same
+    four steps. A Process refused this way is reported through proc_list, which
+    keeps listing it because its container is gone. What this protects is the
+    /org approval trail and progressive disclosure.
   cgroups: >
     The cgroup of each Process is created again, with its ceiling, before its
     container starts: the cgroup filesystem does not survive a reboot, and a

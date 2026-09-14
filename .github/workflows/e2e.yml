@@ -91,13 +91,19 @@ jobs:
         # tag, which podman resolves separately even when it ends at the same
         # digest. Pulling the tag here leaves it in the member's store under
         # its fully qualified name, so those builds reach no registry either.
+        #
+        # Both members, because an image store is one member's alone: the
+        # Packages of the Files mounts are built by the member, so their store
+        # needs the base the fixtures pin as much as the admin's does.
         run: |
           image=$(sed -n 's/^FROM //p' e2e/fixtures/echo/Dockerfile | head -1)
           tag=$(sed -n 's/^FROM //p' deploy/org/import-cli/Dockerfile | head -1)
           case "$tag" in */*) ;; *) tag="docker.io/library/$tag" ;; esac
-          for reference in "$image" "$tag"; do
-            sh e2e/as-member.sh "$KITBASH_E2E_ADMIN" podman pull "$reference" \
-              || { sleep 10; sh e2e/as-member.sh "$KITBASH_E2E_ADMIN" podman pull "$reference"; }
+          for who in "$KITBASH_E2E_ADMIN" "$KITBASH_E2E_MEMBER"; do
+            for reference in "$image" "$tag"; do
+              sh e2e/as-member.sh "$who" podman pull "$reference" \
+                || { sleep 10; sh e2e/as-member.sh "$who" podman pull "$reference"; }
+            done
           done
 
       - name: Drive the surface as two members
@@ -129,7 +135,10 @@ jobs:
         if: env.PREVIOUS != ''
         run: |
           sudo sh e2e/daemon.sh stop
+          # Both members, because the surface half leaves containers in each of
+          # their runtimes and the upgrade half starts from a host with none.
           sh e2e/as-member.sh "$KITBASH_E2E_ADMIN" podman rm --all --force
+          sh e2e/as-member.sh "$KITBASH_E2E_MEMBER" podman rm --all --force
           sudo install -m 0755 "$PREVIOUS_TREE/bin/kitbash-mcp-linux-amd64" /usr/bin/kitbash-mcp
           sudo install -m 0755 "$PREVIOUS_TREE/bin/kitbashd-linux-amd64" /usr/bin/kitbashd
           sudo sh e2e/daemon.sh start /usr/bin/kitbashd "$KITBASH_E2E_STORE" "$KITBASH_E2E_LOGS/kitbashd-previous.log"
@@ -162,6 +171,7 @@ jobs:
           sudo chmod -R a+r "$KITBASH_E2E_LOGS" || true
           sh e2e/as-member.sh "$KITBASH_E2E_ADMIN" podman ps --all > "$KITBASH_E2E_LOGS/podman-ps.txt" 2>&1 || true
           sh e2e/as-member.sh "$KITBASH_E2E_ADMIN" podman logs kitbash-echo-echo > "$KITBASH_E2E_LOGS/echo-container.log" 2>&1 || true
+          sh e2e/as-member.sh "$KITBASH_E2E_MEMBER" podman ps --all > "$KITBASH_E2E_LOGS/podman-ps-member.txt" 2>&1 || true
 
       - uses: actions/upload-artifact@v4
         if: failure()
