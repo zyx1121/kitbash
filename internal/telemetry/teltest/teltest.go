@@ -97,6 +97,12 @@ type Registration struct {
 	// Health is the probe the Package declared, as the registration carries
 	// it, plus the reading a test seeds to stand in for a probe kitbashd ran.
 	Health *Health `json:"health,omitempty"`
+	// Problem is why kitbashd could not bring this Process back, and
+	// ProblemFix what its owner can do about it, as processes_list answers
+	// them. A client sends neither; a test seeds them to stand in for a boot
+	// that could not start this Process.
+	Problem    string `json:"problem,omitempty"`
+	ProblemFix string `json:"problemFix,omitempty"`
 	// Mounts are the folders of Files the unit declared. The real daemon
 	// resolves them as root and lists what it resolved; this fake stores and
 	// lists what it was sent, because the two have the same three fields on

@@ -474,6 +474,11 @@ func (s *Service) List(ctx context.Context) (*ListResult, *problem.Problem) {
 	// runtime here has nothing to report about them and the registry is what
 	// says they exist.
 	result.Processes = append(result.Processes, s.kitOwnedProcesses(known, result.Processes)...)
+	// And the Processes whose container kitbashd took apart, which is what it
+	// does to one whose mount turned out to be a folder it did not agree to.
+	// There is nothing in the runtime to read, so without this they would
+	// simply stop being listed and their owner would have no problem to read.
+	result.Processes = append(result.Processes, s.failedWithoutAContainer(known, result.Processes)...)
 	sort.Slice(result.Processes, func(i, j int) bool {
 		return result.Processes[i].Name < result.Processes[j].Name
 	})

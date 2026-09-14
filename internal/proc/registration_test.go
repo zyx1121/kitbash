@@ -760,3 +760,39 @@ func TestListReportsTheMountsTheRegistryHolds(t *testing.T) {
 		t.Fatalf("proc_list does not hold %s", process.ID)
 	}
 }
+
+// A Process whose container kitbashd took apart still appears on proc_list,
+// failed and with the reason. kitbashd removes the container of a Process whose
+// mount turned out to be a folder it did not agree to, so there is nothing in
+// the runtime to list: without this the Process would simply stop being listed
+// and its owner would have no problem to read.
+func TestListReportsAProcessWhoseContainerWasTakenApart(t *testing.T) {
+	f := newFixture(t)
+	const id = "01930000-0000-7000-8000-0000000000d1"
+	f.daemon.AddProcess(teltest.Registration{
+		ID:         id,
+		Package:    "/home/tester/reader",
+		Name:       "reader",
+		Digest:     "sha256:" + strings.Repeat("a", 64),
+		Expose:     manifest.ExposeNone,
+		Problem:    "this Process declares a mount that is no longer legal, so kitbashd did not start it",
+		ProblemFix: "Check the folder deploy.units[0].mounts names.",
+	})
+	list, prob := f.processes.List(context.Background())
+	if prob != nil {
+		t.Fatalf("List: %s", prob.Detail)
+	}
+	var found bool
+	for _, p := range list.Processes {
+		if p.ID != id {
+			continue
+		}
+		found = true
+		if p.State != proc.StateFailed || p.Problem == "" || p.Fix == "" {
+			t.Errorf("proc_list reports %+v, want it failed with the reason and a fix", p)
+		}
+	}
+	if !found {
+		t.Fatalf("proc_list dropped the Process whose container was taken apart: %+v", list.Processes)
+	}
+}
