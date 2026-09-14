@@ -199,6 +199,36 @@
           "type": "string",
           "enum": ["always", "on-failure", "never"],
           "default": "always"
+        },
+        "mounts": {
+          "type": "array",
+          "description": "Folders of Files this unit sees as bind mounts, at most four. source is a folder under the owner's own home or a top level folder of /org, and the folder it sits in has to carry a kitbash.yaml with a name and a description: a folder that is invisible to the surface is unmountable. target is where the container sees it. mode rw is allowed only under the owner's home; /org is read only for everyone, admins included, because an approval is the way a member writes there. kitbashd resolves every source as root at registration and again at every start, so a mount that stops being legal fails the start rather than being carried over. Mounts are independent of provides.permits: a permit governs what a Process may call over /mcp, a mount is a kernel fact. See PLAN.md section 2.3.",
+          "maxItems": 4,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["source", "target"],
+            "properties": {
+              "source": {
+                "type": "string",
+                "description": "Absolute path of the folder to mount, under /home/<owner> or /org.",
+                "pattern": "^(/[A-Za-z0-9._-]*[A-Za-z0-9_-][A-Za-z0-9._-]*)+$",
+                "maxLength": 4096
+              },
+              "target": {
+                "type": "string",
+                "description": "Absolute path the container sees it at. Nothing under /proc, /sys, /dev or /etc.",
+                "pattern": "^(/[A-Za-z0-9._-]*[A-Za-z0-9_-][A-Za-z0-9._-]*)+$",
+                "maxLength": 4096
+              },
+              "mode": {
+                "type": "string",
+                "description": "ro mounts the folder read only, rw read write. rw is refused outside the owner's own home.",
+                "enum": ["ro", "rw"],
+                "default": "ro"
+              }
+            }
+          }
         }
       },
       "oneOf": [
