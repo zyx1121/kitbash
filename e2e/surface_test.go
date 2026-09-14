@@ -112,6 +112,13 @@ type state struct {
 	probe        probeOutput
 	cliDigest    string
 	cliProcessID string
+	// The two Packages of the Files mounts, the member's folders they mount,
+	// and the text the member wrote for the read only one to read back.
+	readerPath string
+	writerPath string
+	notesPath  string
+	outPath    string
+	noteText   string
 }
 
 // probeOutput is what a drafted Package's probe tool reports about its binary,
@@ -144,6 +151,12 @@ type importedFile struct {
 func TestSurface(t *testing.T) {
 	requireHost(t)
 	s := &state{
+		readerPath: filepath.Join("/home", memberName(), readerName),
+		writerPath: filepath.Join("/home", memberName(), writerName),
+		notesPath:  filepath.Join("/home", memberName(), notesName),
+		outPath:    filepath.Join("/home", memberName(), outName),
+		noteText:   fmt.Sprintf("# notes\n\nWritten by a member at %s.\n", time.Now().UTC().Format(time.RFC3339)),
+
 		pkgPath:       filepath.Join("/home", adminName(), packageName),
 		runnerPath:    filepath.Join("/home", adminName(), runnerName),
 		elsewherePath: filepath.Join("/home", adminName(), elsewhereName),
@@ -176,6 +189,13 @@ func TestSurface(t *testing.T) {
 		{"the draft's probe reports what the binary says about itself", probeTheDraft},
 		{"refine turns that into a tool with a schema", refineTheDraft},
 		{"the refined tool filters a document and names a missing file", callTheRefinedTool},
+		{"a member writes the files a Process will read", memberWritesTheFiles},
+		{"a Package mounting that folder read only is built and run", runTheReader},
+		{"its tool reads the file the member wrote", readThroughTheMount},
+		{"a write into the read only mount is refused by the kernel", writeIntoTheReadOnlyMount},
+		{"a second Package mounted read write writes a file", runTheWriter},
+		{"fs_read answers with what the Process wrote", readWhatTheProcessWrote},
+		{"an illegal mount is refused at proc_run", illegalMounts},
 	}
 	// The steps are one story and share the host, so they run in order on one
 	// test rather than as subtests: the first failure ends the job, and the

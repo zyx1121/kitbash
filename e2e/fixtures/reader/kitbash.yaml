@@ -1,0 +1,61 @@
+# A template, not a finished manifest. The end to end job writes this file
+# twice with __NAME__, __SOURCE__, __TARGET__ and __MODE__ filled in: once as
+# the reader, which mounts a folder of the member's home read only, and once as
+# the writer, which mounts another one read write. The member's name is not
+# known until the job runs, so the source cannot be written here.
+name: __NAME__
+description: >-
+  The end to end fixture Package for Files mounts. Two tools, read and write,
+  which read and write a file inside the folder the unit mounts, so what a
+  Process can see of Files can be proved from an agent through the kernel and
+  back.
+tags: [e2e, fixture]
+
+provides:
+  # Nothing over /mcp. A mount is a kernel fact and needs no permit: this
+  # Package proves that by reaching its files with an empty surface, see
+  # PLAN.md section 2.3.
+  permits:
+    tools: []
+    paths: []
+  tools:
+    - name: read
+      description: >-
+        Answer with the content of a file the Process can see.
+      input:
+        type: object
+        additionalProperties: false
+        required: [path]
+        properties:
+          path: { type: string, maxLength: 4096 }
+      output:
+        type: object
+        required: [content]
+        properties:
+          content: { type: string }
+    - name: write
+      description: >-
+        Write a file where the Process can see it. A read only mount answers
+        with the kernel's own refusal rather than writing.
+      input:
+        type: object
+        additionalProperties: false
+        required: [path, content]
+        properties:
+          path: { type: string, maxLength: 4096 }
+          content: { type: string, maxLength: 4096 }
+      output:
+        type: object
+        required: [written]
+        properties:
+          written: { type: boolean }
+
+deploy:
+  units:
+    - type: container
+      build: .
+      expose: mcp
+      mounts:
+        - source: __SOURCE__
+          target: __TARGET__
+          mode: __MODE__
