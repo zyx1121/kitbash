@@ -208,8 +208,13 @@ Answer a failure as RFC 9457 problem details in one text block with
 `isError: true`: `type` (`https://kitbash.zyx.tw/errors/<slug>`), `title`,
 `status`, `detail`, `instance` and a `fix`. A problem of a kitbash type reaches
 the agent unchanged, so a kit's `not-found` stays a `not-found`; any other error
-text is wrapped as `bad-request`. Never answer a bare string, and always write a
-`fix` that says what to do next.
+text is wrapped as `bad-request`. The classes you may claim are `not-found`,
+`bad-request`, `not-permitted`, `invalid-path`, `invalid-manifest`,
+`unsupported-media-type`, `too-large`, `conflict` and `internal`, each with the
+status that class carries. `queued` is the approval queue's answer and
+`not-visible` is the surface's reading of a folder, so a Package claiming
+either is wrapped. Never answer a bare string, and always write a `fix` that
+says what to do next.
 
 ## Limits
 

@@ -95,7 +95,18 @@ $package_tools:
     When a Package tool answers isError with a single text block that parses
     as problem details of a kitbash type, the surface returns that problem
     unchanged, so a kit's own not-found or too-large reaches the agent as is.
-    Any other error text is wrapped as bad-request with the text as detail.
+    The classes a Package may claim are not-found, bad-request, not-permitted,
+    invalid-path, invalid-manifest, unsupported-media-type, too-large, conflict
+    and internal, each with the status that class carries; invalid-path is
+    there because a Package given a path of its own, such as an import-cli
+    Package whose unit mounts a folder of Files, answers about that path in the
+    same vocabulary the fs family does. The two a Package may not claim are
+    queued, which is the approval answer and would say an admin is about to run
+    a call that was never queued, and not-visible, which is the surface's own
+    reading of a folder. A problem of any other class, a status that does not
+    match its class, a document carrying a field the surface does not define,
+    and any other error text are wrapped as bad-request with the text as
+    detail.
   import_hook:
     description: >
       The contract an import kit implements. The kit's manifest declares

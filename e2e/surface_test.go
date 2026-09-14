@@ -885,6 +885,12 @@ func probeTheDraft(t *testing.T, s *state) {
 // holding the document a tool reads by path, and an empty one for a tool to
 // write into. Both carry a kitbash.yaml, because a folder the surface cannot
 // see is a folder a Process cannot be given, PLAN.md 2.3.
+//
+// They are the admin's folders and not the member's, which is the ownership
+// rule and not a shortcut: a mount source has to be under the home of whoever
+// owns the Process, and the Process here is the one the admin imported, built
+// and ran. A member's folder mounted into an admin's Process is not-permitted
+// at proc_run, which e2e/mounts_test.go proves from the member's side.
 func writeTheCLIFolders(t *testing.T, s *state) {
 	writeFile(t, s.admin, filepath.Join(s.cliDocsPath, "kitbash.yaml"),
 		folderManifest(cliDocsName, "Documents the imported CLI reads through a read only mount."))
@@ -1084,6 +1090,8 @@ func addTheCopyTool(t *testing.T, s *state, files []importedFile) {
 
 	// The tools list ends where the deploy block begins, which is the one place
 	// in a generated manifest another tool can be added without reindenting it.
+	// That line is written by manifest() in deploy/org/import-cli/generate.js,
+	// which is what to read if this insertion ever stops finding its place.
 	if !strings.Contains(manifest, "\ndeploy:\n") {
 		t.Fatalf("the refined manifest has no deploy block:\n%s", truncate(manifest))
 	}
@@ -1144,13 +1152,18 @@ func readThroughTheCLIMount(t *testing.T, s *state) {
 	}
 
 	// A path outside every mount is the Package's own refusal, which is what
-	// keeps a mounted Package from being a way to read the whole host.
+	// keeps a mounted Package from being a way to read the whole host. It
+	// reaches the caller as an invalid-path and not as a bad-request carrying
+	// JSON, because that class is one a Package may claim, see the passable
+	// list in internal/bridge/passthrough.go and package_errors in
+	// spec/mcp-surface.yaml.
 	outside := s.admin.call(cliTool, map[string]any{"filter": ".", "file": []string{"/etc/hosts"}})
-	if !outside.IsError {
-		t.Fatalf("%s read a path outside its mounts: %s", cliTool, truncate(outside.text()))
+	refusal := outside.mustProblem(t, cliTool, "invalid-path")
+	if !strings.Contains(refusal.Detail, "outside every folder this unit mounts") {
+		t.Fatalf("%s refused /etc/hosts with %q, want the adapter's own detail", cliTool, truncate(refusal.Detail))
 	}
-	if !strings.Contains(outside.text(), "outside every folder this unit mounts") {
-		t.Fatalf("%s refused /etc/hosts with %q, want the adapter's own invalid-path", cliTool, truncate(outside.text()))
+	if !strings.Contains(refusal.Fix, cliDocsMount) {
+		t.Fatalf("%s answered the fix %q, want one naming the mounts it has", cliTool, truncate(refusal.Fix))
 	}
 }
 

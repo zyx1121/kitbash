@@ -369,6 +369,27 @@ func TestAPackageProblemPassesThroughUnchanged(t *testing.T) {
 	}
 }
 
+// A Package that holds paths of its own answers about them in the surface's own
+// vocabulary: an import-cli Package whose unit mounts a folder of Files is
+// given a path by its caller, and a path that leaves every mount is the same
+// invalid-path the fs family answers, see issue #122. Wrapping it as a
+// bad-request would say the call was malformed when the path was.
+func TestAPackageInvalidPathPassesThroughUnchanged(t *testing.T) {
+	own := problem.InvalidPathFix("/etc/hosts",
+		"file names the path /etc/hosts, which resolves outside every folder this unit mounts",
+		"Use a path under /files/docs (ro) or /files/out (rw).")
+	p := problemOf(t, refusedWith(t, own.JSON()))
+	if p.Slug() != problem.SlugInvalidPath || p.Status != 400 {
+		t.Errorf("got %d %s, want the Package's own 400 invalid-path", p.Status, p.Slug())
+	}
+	if p.Type != problem.Base+problem.SlugInvalidPath {
+		t.Errorf("type is %s, want %s", p.Type, problem.Base+problem.SlugInvalidPath)
+	}
+	if p.Instance != "/etc/hosts" || p.Detail != own.Detail || p.Fix != own.Fix {
+		t.Errorf("the problem came back as %+v, want the Package's own", p)
+	}
+}
+
 // A problem is passed through, not trusted: it is text a Package wrote, so the
 // detail is clipped, the title is clipped and a fix too long to be advice is
 // dropped. Otherwise a hostile Package answers every call with a megabyte.
