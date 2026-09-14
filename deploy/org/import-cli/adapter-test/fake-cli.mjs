@@ -24,7 +24,7 @@ const readStdin = async () => {
 
 if (argv.length === 1 && argv[0] === "--help") {
   process.stdout.write(
-    "Usage: fake-cli [OPTIONS] COMMAND\n\nCommands:\n  dump   print the arguments and stdin as JSON\n  upper  write an upper case copy of a file\n",
+    "Usage: fake-cli [OPTIONS] COMMAND\n\nCommands:\n  dump   print the arguments and stdin as JSON\n  upper  write an upper case copy of a file\n  spill  write one file per argument\n",
   );
   process.exit(0);
 }
@@ -81,6 +81,13 @@ switch (command) {
     const [target, name] = rest;
     symlinkSync(target, name);
     process.stdout.write(`linked ${name}\n`);
+    break;
+  }
+  case "spill": {
+    // One file per argument, which is what a variadic output is: the caller
+    // named several places and the command writes all of them.
+    for (const target of rest) writeFileSync(target, `spilled into ${target}\n`);
+    process.stdout.write(`wrote ${rest.length} file(s)\n`);
     break;
   }
   case "fail": {

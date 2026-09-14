@@ -33,6 +33,10 @@ const toolsOf = (files) => JSON.parse(fileNamed(files, "tools.json").content);
 const jqHelp = read("jq.help.txt");
 const jqParsed = parseHelp({ binary: "jq", help: jqHelp, version: read("jq.version.txt") });
 
+// The ffmpeg fixture, which is the one help text of the set whose synopsis has a
+// file on each side of the command, so it is what the mount tests read.
+const ffmpegParsed = parseHelp({ binary: "ffmpeg", help: read("ffmpeg.help.txt"), version: read("ffmpeg.version.txt") });
+
 test("a source is read into its package and its version", () => {
   assert.deepEqual(parseSource("cli:apk:jq@1.7.1"), { pkg: "jq", version: "1.7.1", name: "jq" });
   assert.deepEqual(parseSource("cli:apk:ffmpeg"), { pkg: "ffmpeg", version: "", name: "ffmpeg" });
@@ -205,6 +209,109 @@ test("the refined NOTES.md carries the help text and the doubts", () => {
   assert.match(notes, /`file` was taken for a file the caller supplies/);
   // The raw help text is quoted back so the next reader can check the work.
   assert.match(notes, /jq - commandline JSON processor/);
+});
+
+test("mounts are written through to the unit and to tools.json", () => {
+  const mounts = [
+    { source: "/home/ada/docs", target: "/files/docs", mode: "ro" },
+    { source: "/home/ada/out", target: "/files/out", mode: "rw" },
+  ];
+  const files = refined({ source: "cli:apk:jq@1.8.2", parsed: jqParsed, help: jqHelp, mounts });
+  const document = manifestOf(files);
+  // The manifest is the one kitbashd validates, so a mount this kit writes has
+  // to be a mount the schema accepts.
+  assert.deepEqual(validate(document, schema), []);
+  assert.deepEqual(document.deploy.units[0].mounts, mounts);
+
+  // tools.json carries the target and the mode and not the source: the adapter
+  // needs to know where the container sees the folder, and the host path is
+  // none of its business.
+  const tools = toolsOf(files);
+  assert.deepEqual(tools.mounts, [
+    { target: "/files/docs", mode: "ro" },
+    { target: "/files/out", mode: "rw" },
+  ]);
+
+  // A mount with no mode is ro, which is the schema's default, and the unit
+  // keeps it as it was given.
+  const implicit = refined({
+    source: "cli:apk:jq",
+    parsed: jqParsed,
+    help: jqHelp,
+    mounts: [{ source: "/org/handbook", target: "/files/handbook" }],
+  });
+  assert.deepEqual(manifestOf(implicit).deploy.units[0].mounts, [{ source: "/org/handbook", target: "/files/handbook" }]);
+  assert.deepEqual(toolsOf(implicit).mounts, [{ target: "/files/handbook", mode: "ro" }]);
+
+  // And a Package that mounts nothing carries neither key, which is every
+  // import until one asks for a mount.
+  const plain = draft({ source: "cli:apk:jq" });
+  assert.equal(manifestOf(plain).deploy.units[0].mounts, undefined);
+  assert.equal(toolsOf(plain).mounts, undefined);
+  assert.deepEqual(validate(manifestOf(plain), schema), []);
+
+  // The draft writes them as well, because a mount is a fact of the unit and
+  // not of the schemas a refinement derives.
+  const drafted = draft({ source: "cli:apk:jq", mounts });
+  assert.deepEqual(manifestOf(drafted).deploy.units[0].mounts, mounts);
+  assert.deepEqual(toolsOf(drafted).mounts, toolsOf(files).mounts);
+});
+
+test("a refinement that sends no mounts writes a Package with none", () => {
+  // The kit holds nothing between calls and never reads the folder it is
+  // rewriting, so refine cannot inherit what import declared. This is the
+  // behaviour and not an oversight, which is why it is pinned here and said in
+  // the refine input description, in NOTES.md and in the handbook.
+  const mounts = [{ source: "/home/ada/docs", target: "/files/docs", mode: "ro" }];
+  const drafted = draft({ source: "cli:apk:jq", mounts });
+  assert.deepEqual(manifestOf(drafted).deploy.units[0].mounts, mounts);
+
+  const again = refined({ source: "cli:apk:jq", parsed: jqParsed, help: jqHelp });
+  assert.equal(manifestOf(again).deploy.units[0].mounts, undefined);
+  assert.equal(toolsOf(again).mounts, undefined);
+  const notes = fileNamed(again, "NOTES.md").content;
+  assert.match(notes, /send `mounts` again with every `refine`, or the refined Package has none/);
+  assert.match(notes, /This unit declares no `mounts`/);
+});
+
+test("a file argument says both forms and the notes say the rules", () => {
+  const mounts = [
+    { source: "/home/ada/docs", target: "/files/docs", mode: "ro" },
+    { source: "/home/ada/out", target: "/files/out", mode: "rw" },
+  ];
+  const files = refined({ source: "cli:apk:ffmpeg@8.0.1", parsed: ffmpegParsed, help: "" , mounts });
+  const tool = manifestOf(files).provides.tools.find((entry) => entry.name === "ffmpeg");
+  // An output positional carries the format too, because a path is how an
+  // output reaches a mount, and a bare name still means what it meant. This one
+  // is variadic, so the format is on its items, which is where the adapter
+  // reads it from either way.
+  assert.equal(tool.input.properties.outfile.items.format, "kitbash-file");
+  assert.match(tool.input.properties.outfile.description, /give an absolute path under a read write mount/);
+  assert.equal(tool.input.properties.infile.items.format, "kitbash-file");
+  assert.deepEqual(toolsOf(files).tools.ffmpeg.outputs, ["outfile"]);
+  assert.match(tool.input.properties.files.description, /absolute path under a folder this Package mounts/);
+  assert.match(tool.input.properties.files.description, /\/files\/docs \(ro\), \/files\/out \(rw\)/);
+
+  const notes = fileNamed(files, "NOTES.md").content;
+  assert.match(notes, /## Files through mounts/);
+  // Both forms, spelled out as a call rather than described.
+  assert.match(notes, /"files": \[\{ "name": "report.json"/);
+  assert.match(notes, /"file": \["\/files\/docs\/report.json"\]/);
+  assert.match(notes, /- `\/files\/docs` \(`ro`\)/);
+  assert.match(notes, /- `\/files\/out` \(`rw`\)/);
+  // The rules a caller needs before the first path is refused.
+  assert.match(notes, /resolved with `realpath`/);
+  assert.match(notes, /reported as `\{name, path\}` with no contents/);
+  assert.match(notes, /Nothing that travels through a mount counts against the 8 MiB/);
+  assert.match(notes, /An input path that names nothing under the mount is `not-found`/);
+  assert.match(tool.input.properties.files.description, /not in that budget at all/);
+  assert.match(notes, /An output given as a path under a `ro` mount is `not-permitted`/);
+
+  // A Package with no mounts says so, and says what to add.
+  const without = fileNamed(refined({ source: "cli:apk:ffmpeg", parsed: ffmpegParsed, help: "" }), "NOTES.md").content;
+  assert.match(without, /## Files through mounts/);
+  assert.match(without, /This unit declares no `mounts`, so every path is refused with `invalid-path`/);
+  assert.match(without, /target: \/files\/docs/);
 });
 
 test("a binary with subcommands gets one tool per subcommand", () => {

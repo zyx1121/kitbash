@@ -369,6 +369,27 @@ func TestAPackageProblemPassesThroughUnchanged(t *testing.T) {
 	}
 }
 
+// A Package that holds paths of its own answers about them in the surface's own
+// vocabulary: an import-cli Package whose unit mounts a folder of Files is
+// given a path by its caller, and a path that leaves every mount is the same
+// invalid-path the fs family answers, see issue #122. Wrapping it as a
+// bad-request would say the call was malformed when the path was.
+func TestAPackageInvalidPathPassesThroughUnchanged(t *testing.T) {
+	own := problem.InvalidPathFix("/etc/hosts",
+		"file names the path /etc/hosts, which resolves outside every folder this unit mounts",
+		"Use a path under /files/docs (ro) or /files/out (rw).")
+	p := problemOf(t, refusedWith(t, own.JSON()))
+	if p.Slug() != problem.SlugInvalidPath || p.Status != 400 {
+		t.Errorf("got %d %s, want the Package's own 400 invalid-path", p.Status, p.Slug())
+	}
+	if p.Type != problem.Base+problem.SlugInvalidPath {
+		t.Errorf("type is %s, want %s", p.Type, problem.Base+problem.SlugInvalidPath)
+	}
+	if p.Instance != "/etc/hosts" || p.Detail != own.Detail || p.Fix != own.Fix {
+		t.Errorf("the problem came back as %+v, want the Package's own", p)
+	}
+}
+
 // A problem is passed through, not trusted: it is text a Package wrote, so the
 // detail is clipped, the title is clipped and a fix too long to be advice is
 // dropped. Otherwise a hostile Package answers every call with a megabyte.
@@ -467,6 +488,12 @@ func TestAPassedProblemBoundsEveryField(t *testing.T) {
 // queued is the surface's own answer to a call an admin has to approve. A
 // Package returning it would tell the agent that an admin is about to run
 // something that was never queued, with an approval id the agent could poll.
+// not-visible is the surface's own reading of a folder of Files, which a
+// Package is not the one doing.
+//
+// invalid-path used to be in this list and is not any more, see issue #122: a
+// Package can be given a path of its own through a mount, so answering about
+// that path is its business and not a claim on the surface's.
 func TestAPackageCannotSpoofTheSurfacesOwnClasses(t *testing.T) {
 	for _, c := range []struct {
 		name string
@@ -481,10 +508,6 @@ func TestAPackageCannotSpoofTheSurfacesOwnClasses(t *testing.T) {
 		{"not visible", &problem.Problem{
 			Type: problem.Base + problem.SlugNotVisible, Title: "Not visible", Status: 404,
 			Detail: "the folder carries no kitbash.yaml", Instance: "/org/media",
-		}},
-		{"invalid path", &problem.Problem{
-			Type: problem.Base + problem.SlugInvalidPath, Title: "Invalid path", Status: 400,
-			Detail: "/org/media is a symlink", Instance: "/org/media",
 		}},
 		{"a class with the wrong status", &problem.Problem{
 			Type: problem.Base + problem.SlugNotFound, Title: "Not found", Status: 202,

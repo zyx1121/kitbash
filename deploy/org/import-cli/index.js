@@ -66,6 +66,47 @@ const filesOutput = {
   },
 };
 
+// The folders of Files the generated unit mounts, PLAN.md 2.3. The shape is the
+// manifest's own, and this kit checks nothing else about it: whether a member
+// may mount a source, and whether a target is one a container may be given, is
+// kitbashd's answer at proc_run, and a kit that answered it here would be a
+// second copy of that rule drifting from the first.
+const mountsDescription =
+  "Folders of Files the generated unit mounts, written into the manifest as they are given. A kitbash-file argument of the generated tools then takes an absolute path under one of the targets instead of a name from files. At most four, and kitbashd decides at proc_run whether each is legal.";
+
+// refine gets the same input with one sentence more. The kit holds nothing
+// between calls and reads nothing of the folder it is rewriting, so a refine
+// that sends no mounts writes a manifest that has none, which is the rewrite
+// working as written rather than an inheritance that failed.
+const refineMountsDescription =
+  `${mountsDescription} refine writes the manifest from scratch and inherits nothing, so send mounts again here even when the import already declared them, or the refined Package has none.`;
+
+const mountItems = {
+  type: "object",
+  additionalProperties: false,
+  required: ["source", "target"],
+  properties: {
+    source: {
+      type: "string",
+      maxLength: 4096,
+      description: "Absolute path of the folder on this host, under the owner's own home or /org. It and every folder above it carry a kitbash.yaml, because a folder the surface cannot see cannot be mounted.",
+    },
+    target: {
+      type: "string",
+      maxLength: 4096,
+      description: "Absolute path the container sees the folder at, such as /files/docs. Not / and nothing under /proc, /sys, /dev, /etc, /bin, /sbin, /usr, /lib or /lib64.",
+    },
+    mode: {
+      type: "string",
+      enum: ["ro", "rw"],
+      description: "ro mounts the folder read only, rw read write. rw is refused outside the owner's own home, so a folder of /org is always ro.",
+    },
+  },
+};
+
+const mountsProperty = { type: "array", maxItems: 4, description: mountsDescription, items: mountItems };
+const refineMountsProperty = { type: "array", maxItems: 4, description: refineMountsDescription, items: mountItems };
+
 const sourceProperty = {
   type: "string",
   pattern: SOURCE_PATTERN,
@@ -85,7 +126,7 @@ const TOOLS = [
       type: "object",
       additionalProperties: false,
       required: ["source"],
-      properties: { source: sourceProperty },
+      properties: { source: sourceProperty, mounts: mountsProperty },
     },
     outputSchema: filesOutput,
   },
@@ -114,6 +155,7 @@ const TOOLS = [
           maxLength: MAX_MAN,
           description: "What probe reported for man. Optional: with it the synopsis and the options section fill in what --help left out.",
         },
+        mounts: refineMountsProperty,
       },
     },
     outputSchema: filesOutput,
@@ -197,6 +239,51 @@ function requireString(value, name, max, { optional = false } = {}) {
   return value;
 }
 
+// The mounts a caller asked for, checked for their shape and for nothing else.
+// A source that is not this member's to mount, and a target no container may be
+// given, are refused by kitbashd at proc_run against the rules in PLAN.md 2.3;
+// what is refused here is only the value that could not be written into a
+// manifest at all, so the caller hears it from this call rather than from a
+// folder that does not parse.
+function requireMounts(value) {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) {
+    throw badRequest("mounts is not an array.", "Pass mounts as an array of {source, target, mode} objects.", undefined, "Argument rejected");
+  }
+  if (value.length > 4) {
+    throw badRequest(
+      `mounts carries ${value.length} entries, and a unit may mount four folders.`,
+      "Mount at most four folders, which is the maxItems of deploy.units[].mounts in the manifest schema.",
+      undefined,
+      "Argument rejected",
+    );
+  }
+  for (const mount of value) {
+    if (mount === null || typeof mount !== "object" || Array.isArray(mount)) {
+      throw badRequest("every entry of mounts is an object.", "Write each mount as {source, target, mode}.", undefined, "Argument rejected");
+    }
+    for (const key of ["source", "target"]) {
+      if (typeof mount[key] !== "string" || !mount[key].startsWith("/")) {
+        throw badRequest(
+          `every mount carries a ${key}, as an absolute path.`,
+          "Write each mount as {source, target, mode}, with both paths absolute.",
+          typeof mount[key] === "string" ? mount[key].slice(0, 256) : undefined,
+          "Argument rejected",
+        );
+      }
+    }
+    if (mount.mode !== undefined && mount.mode !== "ro" && mount.mode !== "rw") {
+      throw badRequest(
+        `a mount mode is ro or rw, not ${String(mount.mode).slice(0, 32)}.`,
+        "Leave mode out for a read only mount, or write rw for one the Process may write through.",
+        mount.target.slice(0, 256),
+        "Argument rejected",
+      );
+    }
+  }
+  return value;
+}
+
 // generate.js refuses a source with a plain Error whose message is the detail.
 function asBadSource(error, source) {
   return badRequest(
@@ -210,14 +297,15 @@ function asBadSource(error, source) {
 
 async function runImport(args) {
   const source = requireString(args?.source, "source", 256);
+  const mounts = requireMounts(args?.mounts);
   let files;
   try {
-    files = draft({ source });
+    files = draft({ source, mounts });
   } catch (error) {
     throw asBadSource(error, source);
   }
   files.push({ path: "adapter.js", content: await adapter() });
-  console.error(`[import-cli] drafted ${source} as ${files.length} files`);
+  console.error(`[import-cli] drafted ${source} as ${files.length} files with ${mounts.length} mount(s)`);
   return { files };
 }
 
@@ -226,6 +314,7 @@ async function runRefine(args) {
   const help = requireString(args?.help, "help", MAX_HELP);
   const version = requireString(args?.version, "version", MAX_VERSION, { optional: true });
   const man = requireString(args?.man, "man", MAX_MAN, { optional: true });
+  const mounts = requireMounts(args?.mounts);
 
   let files;
   let parsed;
@@ -234,15 +323,24 @@ async function runRefine(args) {
     // what its Dockerfile and its argv already name.
     const binary = source.slice("cli:apk:".length).split("@")[0];
     parsed = parseHelp({ binary, help, version, man });
-    files = refined({ source, parsed, help: help.slice(0, MAX_NOTES_HELP) });
+    files = refined({ source, parsed, help: help.slice(0, MAX_NOTES_HELP), mounts });
   } catch (error) {
     if (error instanceof ImportError) throw error;
     throw asBadSource(error, source);
   }
   files.push({ path: "adapter.js", content: await adapter() });
   console.error(
-    `[import-cli] refined ${source}: style ${parsed.style}, ${parsed.options.length} flags, ${parsed.subcommands.length} subcommands, ${parsed.positionals.length} positionals`,
+    `[import-cli] refined ${source}: style ${parsed.style}, ${parsed.options.length} flags, ${parsed.subcommands.length} subcommands, ${parsed.positionals.length} positionals, ${mounts.length} mount(s)`,
   );
+  // The rewrite is a whole manifest, so a refine with no mounts writes a
+  // Package with none whatever the import declared. It is the documented
+  // behaviour and it is also the easy mistake, so it is said once per call in
+  // the Process log rather than left to be found in the generated folder.
+  if (mounts.length === 0) {
+    console.error(
+      `[import-cli] ${source} was refined with no mounts: the refined manifest declares none, and a kitbash-file argument takes a path only under a mount. Send mounts again to keep them.`,
+    );
+  }
   return { files };
 }
 

@@ -13,7 +13,7 @@
 
 import { strict as assert } from "node:assert";
 import { spawn } from "node:child_process";
-import { copyFileSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
@@ -25,11 +25,26 @@ const fakeCli = path.join(here, "fake-cli.mjs");
 const node = process.execPath;
 const MEBIBYTE = 1024 * 1024;
 
+// The folders the mounted adapter is told it has, made on this machine because
+// the check resolves them: realpath is the whole point of it, so a mount target
+// that is not a real directory would be testing a string comparison. They are
+// realpath'd here as well, because /tmp is a link to /private/tmp on macOS and a
+// target that was not resolved would never match a path that was.
+let mountRoot = "";
+let docsMount = "";
+let outMount = "";
+let awayFile = "";
+// A folder whose name begins with the mounted one's, which is what the
+// separator in the containment check is for.
+let siblingFile = "";
+
 // The tools.json the tests serve, in the contract the kit generates: a fixed
 // argv prefix per tool, options mapped to flags, positionals in argv order and
-// the two reserved inputs stdin and files.
-const toolsDocument = () => ({
+// the two reserved inputs stdin and files. With mounts it carries the targets
+// the adapter reads a path argument against; without them every path is refused.
+const toolsDocument = ({ mounts = [] } = {}) => ({
   binary: fakeCli,
+  ...(mounts.length > 0 ? { mounts } : {}),
   tools: {
     dump: {
       description: "Print the arguments the adapter built.",
@@ -89,6 +104,61 @@ const toolsDocument = () => ({
       positionals: ["filter", "sources"],
       stdin: null,
       outputs: [],
+    },
+    // A file argument on its own, which is the shape a path reaches an input
+    // through, and a pair of them where the second is an output, which is the
+    // shape a path reaches a mount through.
+    read: {
+      inputSchema: {
+        type: "object",
+        properties: { source: { type: "string", format: "kitbash-file" } },
+      },
+      argv: [node, fakeCli, "dump"],
+      options: {},
+      positionals: ["source"],
+      stdin: null,
+      outputs: [],
+    },
+    convert: {
+      inputSchema: {
+        type: "object",
+        properties: {
+          source: { type: "string", format: "kitbash-file" },
+          dest: { type: "string", format: "kitbash-file" },
+        },
+        required: ["source", "dest"],
+      },
+      argv: [node, fakeCli, "upper"],
+      options: {},
+      positionals: ["source", "dest"],
+      stdin: null,
+      outputs: ["dest"],
+    },
+    // A variadic output, which is how a tool that writes several files is
+    // generated: the format is on the items and each element takes either form.
+    spill: {
+      inputSchema: {
+        type: "object",
+        properties: { dests: { type: "array", items: { type: "string", format: "kitbash-file" } } },
+      },
+      argv: [node, fakeCli, "spill"],
+      options: {},
+      positionals: ["dests"],
+      stdin: null,
+      outputs: ["dests"],
+    },
+    // An output the command is told to write and does not, which is what a
+    // failed run leaves behind.
+    skip: {
+      inputSchema: {
+        type: "object",
+        properties: { dest: { type: "string", format: "kitbash-file" } },
+      },
+      argv: [node, fakeCli, "dump"],
+      options: {},
+      positionals: ["dest"],
+      stdin: null,
+      outputs: ["dest"],
     },
     flood: {
       inputSchema: { type: "object", properties: { mib: { type: "number" } } },
@@ -159,10 +229,10 @@ const toolsDocument = () => ({
 
 // startAdapter lays out one generated Package in a temporary directory and
 // runs it, and answers with the two calls a client makes and a way to stop it.
-function startAdapter(env = {}) {
+function startAdapter(env = {}, document = toolsDocument()) {
   const dir = mkdtempSync(path.join(tmpdir(), "kitbash-adapter-test-"));
   copyFileSync(adapterSource, path.join(dir, "adapter.js"));
-  writeFileSync(path.join(dir, "tools.json"), JSON.stringify(toolsDocument()));
+  writeFileSync(path.join(dir, "tools.json"), JSON.stringify(document));
   // The package.json is what makes node read adapter.js as an ES module, which
   // is the generated Package's own package.json in production.
   writeFileSync(
@@ -238,13 +308,43 @@ function problem(result) {
 }
 
 let adapter;
+// The second adapter of this file: the same Package with two folders mounted,
+// one read only and one read write, which is what a unit with mounts ships as.
+let mounted;
 
 before(() => {
   adapter = startAdapter();
+
+  mountRoot = realpathSync(mkdtempSync(path.join(tmpdir(), "kitbash-adapter-mounts-")));
+  docsMount = path.join(mountRoot, "docs");
+  outMount = path.join(mountRoot, "out");
+  mkdirSync(docsMount);
+  mkdirSync(outMount);
+  writeFileSync(path.join(docsMount, "doc.txt"), "hello kitbash");
+  // A folder beside the mounted one whose name starts with the same letters,
+  // so a containment check that forgot the separator would let it in.
+  mkdirSync(`${docsMount}2`);
+  siblingFile = path.join(`${docsMount}2`, "doc.txt");
+  writeFileSync(siblingFile, "next door");
+  // A file beside the mounts rather than inside either of them, and a link
+  // inside one that points at it: the two ways of naming it from within a
+  // mount, which realpath is what refuses.
+  awayFile = path.join(mountRoot, "away.txt");
+  writeFileSync(awayFile, "not in a mount");
+  symlinkSync(awayFile, path.join(docsMount, "escape.txt"));
+
+  mounted = startAdapter({}, toolsDocument({
+    mounts: [
+      { target: docsMount, mode: "ro" },
+      { target: outMount, mode: "rw" },
+    ],
+  }));
 });
 
 after(() => {
   adapter.stop();
+  mounted.stop();
+  rmSync(mountRoot, { recursive: true, force: true });
 });
 
 test("initialize and tools/list answer with what tools.json declares", async () => {
@@ -254,7 +354,10 @@ test("initialize and tools/list answer with what tools.json declares", async () 
 
   const listed = await adapter.request("tools/list", {});
   const names = listed.result.tools.map((tool) => tool.name).sort();
-  assert.deepEqual(names, ["absent", "concat", "dump", "fail", "flood", "fork", "hang", "link", "probe", "run", "upper"]);
+  assert.deepEqual(names, [
+    "absent", "concat", "convert", "dump", "fail", "flood", "fork", "hang", "link", "probe", "read", "run", "skip",
+    "spill", "upper",
+  ]);
   const dump = listed.result.tools.find((tool) => tool.name === "dump");
   assert.equal(dump.description, "Print the arguments the adapter built.");
   assert.equal(dump.inputSchema.properties.filter.type, "string");
@@ -335,6 +438,180 @@ test("a variadic file positional becomes one path per name the caller sent", asy
   assert.equal(args[0], ".");
   assert.match(args[1], /first\.json$/);
   assert.match(args[2], /second\.json$/);
+});
+
+// ---------------------------------------------------------------------------
+// Files through a mount, issue #122. A kitbash-file argument takes a name of
+// the files input, as above, or an absolute path under a folder the unit
+// mounts, and the second form is what every test below drives.
+
+test("a path under a read only mount reaches the command as it was written", async () => {
+  const document = path.join(docsMount, "doc.txt");
+  const result = await mounted.call("read", { source: document });
+  const body = payload(result);
+  assert.equal(body.exitCode, 0);
+  // The path the command is given is the caller's, not the resolved one, and
+  // no temporary copy of the file was made.
+  assert.deepEqual(JSON.parse(body.stdout).args, [document]);
+  assert.deepEqual(body.files, []);
+});
+
+test("an output path under a read write mount is left in place and reported without content", async () => {
+  const source = path.join(docsMount, "doc.txt");
+  const dest = path.join(outMount, "shouted.txt");
+  const body = payload(await mounted.call("convert", { source, dest }));
+  assert.equal(body.exitCode, 0);
+  // The result names the file and where it is, and carries none of it: the
+  // adapter never reads a file back out of a mount.
+  assert.deepEqual(body.files, [{ name: "shouted.txt", path: dest }]);
+  assert.equal(body.files[0].contentBase64, undefined);
+  // And the file really is there, which is what the owner reads with fs_read.
+  assert.equal(readFileSync(dest, "utf8"), "HELLO KITBASH");
+});
+
+test("a path outside every mount is an invalid-path problem naming the mounts", async () => {
+  const document = problem(await mounted.call("read", { source: awayFile }));
+  assert.equal(document.status, 400);
+  assert.equal(document.type, "https://kitbash.zyx.tw/errors/invalid-path");
+  assert.match(document.detail, /outside every folder this unit mounts/);
+  assert.ok(document.fix.includes(docsMount) && document.fix.includes(outMount), document.fix);
+});
+
+test("a path that climbs out of its mount with .. is an invalid-path problem", async () => {
+  const climbing = path.join(docsMount, "..", "away.txt");
+  const document = problem(await mounted.call("read", { source: climbing }));
+  assert.equal(document.type, "https://kitbash.zyx.tw/errors/invalid-path");
+  // The resolved path is what the refusal is about, which is the whole reason
+  // the check runs realpath before it compares anything.
+  assert.match(document.detail, new RegExp(`resolves to ${awayFile}`));
+});
+
+test("a symbolic link inside a mount that points outside it is an invalid-path problem", async () => {
+  const link = path.join(docsMount, "escape.txt");
+  const document = problem(await mounted.call("read", { source: link }));
+  assert.equal(document.type, "https://kitbash.zyx.tw/errors/invalid-path");
+  assert.match(document.detail, new RegExp(`resolves to ${awayFile}`));
+});
+
+test("an output path under a read only mount is a not-permitted problem", async () => {
+  const document = problem(await mounted.call("convert", {
+    source: path.join(docsMount, "doc.txt"),
+    dest: path.join(docsMount, "written.txt"),
+  }));
+  assert.equal(document.status, 403);
+  assert.equal(document.type, "https://kitbash.zyx.tw/errors/not-permitted");
+  assert.match(document.detail, /mounts read only/);
+  assert.equal(existsSync(path.join(docsMount, "written.txt")), false, "the refused output was written anyway");
+});
+
+test("a path form when the unit declares no mounts is an invalid-path problem", async () => {
+  // The adapter the rest of this file drives carries no mounts at all, which is
+  // every generated Package until one declares some.
+  const document = problem(await adapter.call("read", { source: "/etc/hosts" }));
+  assert.equal(document.status, 400);
+  assert.equal(document.type, "https://kitbash.zyx.tw/errors/invalid-path");
+  assert.match(document.detail, /this unit declares no mounts/);
+  assert.match(document.fix, /declare mounts on the unit/);
+});
+
+test("a folder whose name begins with a mount target is not under it", async () => {
+  // The containment check compares on a separator and not on a string prefix,
+  // so the sibling folder next to the mounted one stays outside it. Without the
+  // separator this file would be read.
+  for (const outside of [siblingFile, `${docsMount}X/doc.txt`, `${docsMount}2`]) {
+    const document = problem(await mounted.call("read", { source: outside }));
+    assert.equal(document.type, "https://kitbash.zyx.tw/errors/invalid-path", `${outside} was accepted`);
+  }
+});
+
+test("a mount inside a mount is read by its own mode, whichever order they are declared", async () => {
+  // A unit may mount a folder and a folder inside it. The inner target is the
+  // one that governs a path inside it, so the read only folder stays read only
+  // even though the read write one contains it.
+  const nested = [
+    { target: mountRoot, mode: "rw" },
+    { target: docsMount, mode: "ro" },
+  ];
+  for (const order of [nested, [...nested].reverse()]) {
+    const adapterWithNesting = startAdapter({}, toolsDocument({ mounts: order }));
+    try {
+      const refused = problem(await adapterWithNesting.call("convert", {
+        source: path.join(docsMount, "doc.txt"),
+        dest: path.join(docsMount, "nested.txt"),
+      }));
+      assert.equal(refused.type, "https://kitbash.zyx.tw/errors/not-permitted",
+        `declared as ${JSON.stringify(order)} the inner mount lost its mode`);
+      // And the outer folder is still writable, which is the other half of the
+      // longest match being the one that decides.
+      const body = payload(await adapterWithNesting.call("convert", {
+        source: path.join(docsMount, "doc.txt"),
+        dest: path.join(outMount, "nested.txt"),
+      }));
+      assert.equal(body.exitCode, 0);
+    } finally {
+      adapterWithNesting.stop();
+    }
+  }
+});
+
+test("an input path under a mount that names nothing is a not-found problem", async () => {
+  // The same answer a name that was never sent in files gets, because it is the
+  // same sentence about the same thing.
+  const document = problem(await mounted.call("read", { source: path.join(docsMount, "absent.txt") }));
+  assert.equal(document.status, 404);
+  assert.equal(document.type, "https://kitbash.zyx.tw/errors/not-found");
+  assert.match(document.detail, /is not there/);
+
+  // A path whose folder does not exist at all is the path being wrong rather
+  // than the file being missing.
+  const noFolder = problem(await mounted.call("read", { source: path.join(docsMount, "nowhere", "absent.txt") }));
+  assert.equal(noFolder.type, "https://kitbash.zyx.tw/errors/invalid-path");
+});
+
+test("an output path the command did not write is absent from the result", async () => {
+  const dest = path.join(outMount, "never.txt");
+  const body = payload(await mounted.call("skip", { dest }));
+  assert.equal(body.exitCode, 0);
+  // The tool ran and wrote nothing, so there is nothing to report: the entry is
+  // absent rather than a name pointing at a file that is not there.
+  assert.deepEqual(body.files, []);
+  assert.equal(existsSync(dest), false);
+
+  // A path that is a folder is not an output either, and says so.
+  const folder = payload(await mounted.call("skip", { dest: outMount }));
+  assert.deepEqual(folder.files, []);
+  assert.deepEqual(folder.notes, [`${outMount} is not a regular file and was not reported as an output.`]);
+});
+
+test("a variadic output takes a name and a path in one call", async () => {
+  const inMount = path.join(outMount, "spilled.txt");
+  const body = payload(await mounted.call("spill", { dests: ["local.txt", inMount] }));
+  assert.equal(body.exitCode, 0);
+  // The path is reported where it was left and the name is read back as base64,
+  // which is one property answering in both forms.
+  const byName = Object.fromEntries(body.files.map((file) => [file.name, file]));
+  assert.deepEqual(Object.keys(byName).sort(), ["local.txt", "spilled.txt"]);
+  assert.equal(byName["spilled.txt"].path, inMount);
+  assert.equal(byName["spilled.txt"].contentBase64, undefined);
+  assert.equal(byName["local.txt"].path, undefined);
+  assert.match(Buffer.from(byName["local.txt"].contentBase64, "base64").toString(), /^spilled into /);
+  assert.equal(readFileSync(inMount, "utf8"), `spilled into ${inMount}\n`);
+});
+
+test("a variadic file positional takes a name and a path in one call", async () => {
+  const document = path.join(docsMount, "doc.txt");
+  const body = payload(await mounted.call("concat", {
+    filter: ".",
+    sources: ["first.json", document],
+    files: [{ name: "first.json", contentBase64: Buffer.from('{"a":1}').toString("base64") }],
+  }));
+  const args = JSON.parse(body.stdout).args;
+  assert.equal(args.length, 3);
+  assert.equal(args[0], ".");
+  // The name became a path in the call's own temporary directory, and the path
+  // stayed the path.
+  assert.match(args[1], /kitbash-cli-.*first\.json$/);
+  assert.equal(args[2], document);
 });
 
 test("one name of a variadic file positional that nobody sent is a not-found problem", async () => {

@@ -45,12 +45,20 @@ const (
 // that was never queued. A slug outside this set is a Package reaching for a
 // meaning that is not its to give, so its text is wrapped instead.
 //
+// invalid-path is here because a Package can hold paths of its own: an
+// import-cli Package whose unit mounts a folder of Files is given a path by its
+// caller and has to answer what the fs family answers for a path that leaves
+// the tree it may read, see issue #122. A bad-request with that document in its
+// detail would tell the agent the call was malformed when the call was well
+// formed and the path was not.
+//
 // The value is the status that class carries. A Package that pairs a class
 // with another status is describing something else, and is wrapped too.
 var passable = map[string]int{
 	problem.SlugNotFound:        http.StatusNotFound,
 	problem.SlugBadRequest:      http.StatusBadRequest,
 	problem.SlugNotPermitted:    http.StatusForbidden,
+	problem.SlugInvalidPath:     http.StatusBadRequest,
 	problem.SlugInvalidManifest: http.StatusUnprocessableEntity,
 	problem.SlugUnsupported:     http.StatusUnsupportedMediaType,
 	problem.SlugTooLarge:        http.StatusRequestEntityTooLarge,
