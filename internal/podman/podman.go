@@ -79,6 +79,19 @@ type Port struct {
 	Protocol      string
 }
 
+// Mount is one folder of the host a container sees, as the unit's
+// deploy.units[].mounts declared it and whoever validated it resolved it.
+//
+// Source is an absolute path on the host and is not checked here: this package
+// renders a command line, and deciding which folder a member may mount is
+// kitbashd's, as root, see internal/mounts. Target is where the container sees
+// it, ReadOnly whether it may be written.
+type Mount struct {
+	Source   string
+	Target   string
+	ReadOnly bool
+}
+
 // PortMapping is one port to publish. HostPort 0 leaves the choice to the
 // runtime; a caller that has to know the endpoint before the container exists
 // names the host port itself.
@@ -118,6 +131,8 @@ type RunOptions struct {
 	Publish     []PortMapping
 	Detach      bool
 	Interactive bool
+	// Mounts are the folders of Files this container sees, already resolved.
+	Mounts []Mount
 	// CgroupParent is the cgroup the container's own one is created under,
 	// as an absolute path below the mount point. Empty leaves the runtime's
 	// default in place, which is a host that enforces no limits.
