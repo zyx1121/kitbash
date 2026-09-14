@@ -497,12 +497,24 @@ func (c *RestoreCounts) add(outcome int) {
 // restoreMounted brings back one Process that declares mounts. It answers
 // whether it handled the Process and, if it did, what it came to.
 //
-// A container that is still running is read where it stands: its own namespace
-// is the only thing that says what it is holding, and this daemon did not make
-// it. One that is not running is not started by name, because a start makes the
-// bind mounts again and the entrypoint would be running before anything could
-// be read: it is made again, from the registration and from its own
-// configuration, through the same four steps a start takes.
+// Three things a container can be, and one answer each.
+//
+// Running: it is read where it stands. Its own namespace is the only thing that
+// says what it is holding, and this daemon did not make that container.
+//
+// Initialized: the runtime has built its rootfs and its bind mounts and its
+// init process exists, and the image's entrypoint has executed nothing. That is
+// where a start pauses to read the mounts, so a container found in it is one a
+// daemon was killed in the middle of, or one whose start failed. It is read the
+// same way and then started, which runs the entrypoint in the namespace that
+// was just read: verified on podman 5.7.0, where start after init keeps the
+// same pid and the same namespace and resolves no path again.
+//
+// Anything else: it is not started by name, because a start of a container that
+// has no namespace yet makes the bind mounts again and the entrypoint would be
+// running before anything could read them. It is made again, from the
+// registration and from its own configuration, through the same four steps a
+// start takes.
 //
 // It hands the Process back unhandled only when the runtime has no container of
 // it at all, which is the case restore answers by unregistering it.
@@ -522,16 +534,37 @@ func (s *Server) restoreMounted(ctx context.Context, m sysusers.Member, p store.
 		logger.Printf("restore: reading %s of %s: %v", p.Container, p.Owner, err)
 		return failed(problem.Internal("", err.Error(), ""))
 	}
-	// A container that is running has a process, and that process is the only
-	// witness of what it holds. A pid that is gone is a container that is not
-	// running, whatever its recorded state says, so it is made again.
-	if config.PID > 0 {
+	// A pid is not enough on its own: a container podman init prepared has one
+	// and has run nothing. What it is doing is the state, and the pid is what
+	// makes that state readable.
+	live := config.PID > 0
+	switch {
+	case live && (config.State == podman.StateRunning || config.State == podman.StatePaused):
 		if prob := s.verifyConfig("", p, config, mounted); prob != nil {
 			s.tearDownAfterSwap(ctx, p, m)
 			return failed(prob)
 		}
 		s.clearProcessProblem(p.ID)
 		return true, restoredRunning
+	case live && config.State == podman.StateInitialized:
+		// A daemon that was killed between the check and the start leaves one
+		// of these, and so does a start the runtime refused. The namespace is
+		// there and nothing has run in it, which is exactly where a start
+		// pauses, so it is read and then started rather than made again.
+		if prob := s.verifyConfig("", p, config, mounted); prob != nil {
+			s.tearDownAfterSwap(ctx, p, m)
+			return failed(prob)
+		}
+		start, cancel := context.WithTimeout(ctx, RestoreTimeout)
+		err := s.runner.Start(start, m, p.Container, leaf)
+		cancel()
+		if err != nil {
+			logger.Printf("restore: starting the prepared %s of %s: %v", p.Container, p.Owner, err)
+			s.tearDownAfterSwap(ctx, p, m)
+			return failed(problem.Internal("", err.Error(), ""))
+		}
+		s.clearProcessProblem(p.ID)
+		return true, restoredPlaced
 	}
 	if err := s.remakeMounted(ctx, m, p, config, leaf, mounted); err != nil {
 		logger.Printf("restore: making %s of %s again: %v", p.Container, p.Owner, err)
