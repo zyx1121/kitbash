@@ -29,6 +29,42 @@ provides:
               package is an Alpine one, installed with apk into the Package's own
               image, and the version is the release apk names, which is
               <pkgver>-r<pkgrel>.
+          mounts:
+            type: array
+            maxItems: 4
+            description: >-
+              Folders of Files the generated unit mounts, written into the
+              manifest as they are given. A kitbash-file argument of the
+              generated tools then takes an absolute path under one of the
+              targets instead of a name from files. At most four, and kitbashd
+              decides at proc_run whether each is legal.
+            items:
+              type: object
+              additionalProperties: false
+              required: [source, target]
+              properties:
+                source:
+                  type: string
+                  maxLength: 4096
+                  description: >-
+                    Absolute path of the folder on this host, under the owner's
+                    own home or /org. It and every folder above it carry a
+                    kitbash.yaml, because a folder the surface cannot see cannot
+                    be mounted.
+                target:
+                  type: string
+                  maxLength: 4096
+                  description: >-
+                    Absolute path the container sees the folder at, such as
+                    /files/docs. Not / and nothing under /proc, /sys, /dev, /etc,
+                    /bin, /sbin, /usr, /lib or /lib64.
+                mode:
+                  type: string
+                  enum: [ro, rw]
+                  description: >-
+                    ro mounts the folder read only, rw read write. rw is refused
+                    outside the owner's own home, so a folder of /org is always
+                    ro.
       output:
         type: object
         required: [files]
@@ -86,6 +122,42 @@ provides:
             description: >-
               What probe reported for man. Optional: with it the synopsis and the
               options section fill in what --help left out.
+          mounts:
+            type: array
+            maxItems: 4
+            description: >-
+              Folders of Files the generated unit mounts, written into the
+              manifest as they are given. A kitbash-file argument of the
+              generated tools then takes an absolute path under one of the
+              targets instead of a name from files. At most four, and kitbashd
+              decides at proc_run whether each is legal.
+            items:
+              type: object
+              additionalProperties: false
+              required: [source, target]
+              properties:
+                source:
+                  type: string
+                  maxLength: 4096
+                  description: >-
+                    Absolute path of the folder on this host, under the owner's
+                    own home or /org. It and every folder above it carry a
+                    kitbash.yaml, because a folder the surface cannot see cannot
+                    be mounted.
+                target:
+                  type: string
+                  maxLength: 4096
+                  description: >-
+                    Absolute path the container sees the folder at, such as
+                    /files/docs. Not / and nothing under /proc, /sys, /dev, /etc,
+                    /bin, /sbin, /usr, /lib or /lib64.
+                mode:
+                  type: string
+                  enum: [ro, rw]
+                  description: >-
+                    ro mounts the folder read only, rw read write. rw is refused
+                    outside the owner's own home, so a folder of /org is always
+                    ro.
       output:
         type: object
         required: [files]

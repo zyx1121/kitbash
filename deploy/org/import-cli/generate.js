@@ -18,6 +18,7 @@
 //
 //   {
 //     "binary": "jq",
+//     "mounts": [{"target": "/files/docs", "mode": "ro"}],  // the folders of Files the unit mounts, target and mode only, absent when it mounts none
 //     "tools": {
 //       "<toolName>": {
 //         "argv": ["jq"],                       // fixed prefix, binary then subcommand words
@@ -36,10 +37,14 @@
 //
 // Input schema conventions the adapter relies on: `files` is
 // `[{name, contentBase64}]`; a positional whose schema has
-// `"format": "kitbash-file"`, on the property or on its items, names files
-// from `files` by their `name`, and an array of them is one path each. Result
-// shape from the adapter: `{exitCode, stdout, stderr, files: [{name,
-// contentBase64}]}` with the 8 MiB caps.
+// `"format": "kitbash-file"`, on the property or on its items, takes either a
+// name from `files` or an absolute path under one of the mount targets above,
+// and an array of them is one argv word each. A path is resolved with realpath
+// and refused as `invalid-path` when it leaves every mount target, and an
+// output whose path is under a `ro` mount is refused as `not-permitted`.
+// Result shape from the adapter: `{exitCode, stdout, stderr, files: [{name,
+// contentBase64}]}` with the 8 MiB caps, and an output given as a path is left
+// where the command wrote it and reported as `{name, path}` with no content.
 //
 // Two details this generator adds on top of that shape, neither of which
 // changes a key.
@@ -69,6 +74,9 @@ const MAX_PAYLOAD = 8 * 1024 * 1024;
 // call, so this is a count the total can actually accommodate rather than a
 // number large enough to suggest the total is not there.
 const MAX_FILES = 8;
+// How many folders of Files one unit may mount, the maxItems of
+// deploy.units[].mounts in spec/manifest.schema.json.
+const MAX_MOUNTS = 4;
 // A Package whose name equals a built in tool family cannot be run, PLAN.md 2.3.
 const RESERVED_NAMES = new Set(["fs", "pkg", "proc", "tel", "users", "approvals"]);
 // The source syntax this kit routes on. The same pattern is in kitbash.yaml.
@@ -262,11 +270,58 @@ export function parseSource(source) {
   return { pkg, version, name };
 }
 
+// ---------------------------------------------------------------- the mounts
+
+/**
+ * The mounts a caller declared, as the unit records them. They are written
+ * verbatim, because the manifest schema is what says which of them is legal and
+ * kitbashd is what enforces it at proc_run: a kit that decided here would be a
+ * second rule to keep in step with the first. What this does is read the shape,
+ * so that a value that is not a list of objects becomes an empty list rather
+ * than a manifest nobody can parse.
+ *
+ * @param {unknown} mounts
+ * @returns {Array<{source: string, target: string, mode?: string}>}
+ */
+export function unitMounts(mounts) {
+  if (!Array.isArray(mounts)) return [];
+  const declared = [];
+  for (const mount of mounts.slice(0, MAX_MOUNTS)) {
+    if (!isPlainObject(mount)) continue;
+    if (typeof mount.source !== "string" || typeof mount.target !== "string") continue;
+    if (mount.source === "" || mount.target === "") continue;
+    const entry = { source: mount.source, target: mount.target };
+    if (typeof mount.mode === "string" && mount.mode !== "") entry.mode = mount.mode;
+    declared.push(entry);
+  }
+  return declared;
+}
+
+// What tools.json carries of a mount: where the container sees the folder and
+// whether it may write there. The source is the host's business and the adapter
+// has no use for it, so it is not copied into the image. An absent mode is ro,
+// which is the manifest schema's default and the safe end of the two.
+function toolsMounts(mounts) {
+  return unitMounts(mounts).map((mount) => ({ target: mount.target, mode: mount.mode === "rw" ? "rw" : "ro" }));
+}
+
+// The sentence every description that mentions a path ends with, listing the
+// targets this Package was generated with so that an agent reading one tool's
+// schema does not have to read the manifest to learn where it may write.
+function mountSentence(mounts) {
+  const declared = toolsMounts(mounts);
+  if (declared.length === 0) {
+    return "This Package mounts no folder of Files, so a path is refused with invalid-path and a file has to travel in files.";
+  }
+  const targets = declared.map((mount) => `${mount.target} (${mount.mode})`).join(", ");
+  return `The folders this Package mounts are ${targets}; a path outside them is refused with invalid-path.`;
+}
+
 // ---------------------------------------------------------------- schema parts
 
-const filesProperty = () => ({
+const filesProperty = (mounts) => ({
   type: "array",
-  description: `Files to place beside the command before it runs. A positional whose format is kitbash-file names one of these by its name. These and stdin together are at most ${MAX_PAYLOAD} bytes for one call, and a call over that is refused as too-large rather than truncated.`,
+  description: `Files to place beside the command before it runs. A positional whose format is kitbash-file names one of these by its name, or gives an absolute path under a folder this Package mounts instead. ${mountSentence(mounts)} These and stdin together are at most ${MAX_PAYLOAD} bytes for one call, and a call over that is refused as too-large rather than truncated.`,
   maxItems: MAX_FILES,
   items: {
     type: "object",
@@ -298,11 +353,15 @@ const runOutput = (binary) => ({
     stderr: { type: "string", description: `What ${binary} wrote to standard error, truncated at ${MAX_PAYLOAD} bytes.` },
     files: {
       type: "array",
-      description: "The files named by this tool's outputs, read back after the run. An output the run did not produce is absent rather than empty.",
+      description: "The files named by this tool's outputs. An output named as a bare name is read back after the run and carries contentBase64; an output named as a path under a read write mount is left where the command wrote it and carries path instead, because the adapter never reads a file back out of a mount. An output the run did not produce is absent rather than empty.",
       items: {
         type: "object",
-        required: ["name", "contentBase64"],
-        properties: { name: { type: "string" }, contentBase64: { type: "string", contentEncoding: "base64" } },
+        required: ["name"],
+        properties: {
+          name: { type: "string" },
+          contentBase64: { type: "string", contentEncoding: "base64" },
+          path: { type: "string", description: "Where the file was left, for an output given as a path under a mount. Read it with fs_read on the folder that mount's source names." },
+        },
       },
     },
     notes: {
@@ -349,10 +408,11 @@ function optionProperty(option, taken) {
   return { name, schema, wiring };
 }
 
-// The schema property one positional becomes. A positional named like an input
-// file carries format kitbash-file, which tells the adapter to write the named
-// entry of files to a temporary path and pass that path instead.
-function positionalProperty(positional, taken) {
+// The schema property one positional becomes. A positional named like a file,
+// on either side of the command, carries format kitbash-file: the adapter takes
+// a name from files and writes that entry to a temporary path, or an absolute
+// path under a folder this Package mounts and passes it through as it stands.
+function positionalProperty(positional, taken, mounts) {
   let name = propertyName(positional.name);
   if (name === "") return null;
   if (taken.has(name)) {
@@ -364,13 +424,19 @@ function positionalProperty(positional, taken) {
 
   const isInputFile = INPUT_FILE_NAMES.has(positional.name);
   const isOutputFile = OUTPUT_FILE_NAMES.has(positional.name);
+  // A file argument has two forms and the description says both, because the
+  // schema itself can only say that the string is a file. The clipped
+  // description a help text gave keeps its place; the two forms are spelled out
+  // only when the generator had nothing better to say about the argument.
   const description = describe(
     positional.description,
     isInputFile
-      ? `The ${positional.name} argument. Name an entry of files here rather than a path on the host.`
-      : `The ${positional.name} argument of the command.`,
+      ? `The ${positional.name} argument. Name an entry of files here, or give an absolute path under a folder this Package mounts. ${mountSentence(mounts)}`
+      : isOutputFile
+        ? `The ${positional.name} argument. Name a file to be read back into the result, or give an absolute path under a read write mount to leave it there. ${mountSentence(mounts)}`
+        : `The ${positional.name} argument of the command.`,
   );
-  const item = { type: "string", ...(isInputFile ? { format: "kitbash-file" } : {}) };
+  const item = { type: "string", ...(isInputFile || isOutputFile ? { format: "kitbash-file" } : {}) };
   const schema = positional.variadic
     ? { type: "array", items: item, description }
     : { ...item, description };
@@ -378,7 +444,7 @@ function positionalProperty(positional, taken) {
 }
 
 // One tool: the schema the manifest declares and the tools.json entry beside it.
-function buildTool({ toolName, description, binary, argv, options, positionals }) {
+function buildTool({ toolName, description, binary, argv, options, positionals, mounts }) {
   const taken = new Set(["stdin", "files"]);
   const properties = {};
   const wiring = {};
@@ -387,7 +453,7 @@ function buildTool({ toolName, description, binary, argv, options, positionals }
   const required = [];
 
   for (const positional of positionals) {
-    const built = positionalProperty(positional, taken);
+    const built = positionalProperty(positional, taken, mounts);
     if (!built) continue;
     properties[built.name] = built.schema;
     order.push(built.name);
@@ -402,7 +468,7 @@ function buildTool({ toolName, description, binary, argv, options, positionals }
   }
 
   properties.stdin = stdinProperty(binary);
-  properties.files = filesProperty();
+  properties.files = filesProperty(mounts);
 
   const input = {
     type: "object",
@@ -428,7 +494,7 @@ function buildTool({ toolName, description, binary, argv, options, positionals }
 // The two tools every Package this kit writes carries, drafted or refined. run
 // is the escape hatch that works whatever the help said, and probe is what the
 // agent calls between the two builds.
-function baseTools(binary) {
+function baseTools(binary, mounts) {
   const runInput = {
     type: "object",
     additionalProperties: false,
@@ -441,7 +507,7 @@ function baseTools(binary) {
         maxItems: 256,
       },
       stdin: stdinProperty(binary),
-      files: filesProperty(),
+      files: filesProperty(mounts),
     },
   };
   const probeInput = { type: "object", additionalProperties: false, properties: {} };
@@ -535,31 +601,40 @@ function packageJson(name) {
   )}\n`;
 }
 
-function manifest({ name, description, tools, source }) {
+function manifest({ name, description, tools, source, mounts }) {
+  const declared = unitMounts(mounts);
+  const unit = {
+    type: "container",
+    build: ".",
+    expose: "mcp",
+    // The Package runs a binary a caller chose with arguments a caller
+    // chose, so it gets the bound the import kits get rather than the
+    // machine's.
+    limits: { memory: "512Mi" },
+  };
+  // The mounts the caller asked for, as they were given. Whether a source is
+  // one this member may mount is kitbashd's to answer at proc_run, and a kit
+  // that answered it here would be a second copy of that rule.
+  if (declared.length > 0) unit.mounts = declared;
   const document = {
     name,
     description: clip(description),
     tags: ["cli", "imported", "apk"],
     provides: { tools },
-    deploy: {
-      units: [
-        {
-          type: "container",
-          build: ".",
-          expose: "mcp",
-          // The Package runs a binary a caller chose with arguments a caller
-          // chose, so it gets the bound the import kits get rather than the
-          // machine's.
-          limits: { memory: "512Mi" },
-        },
-      ],
-    },
+    deploy: { units: [unit] },
   };
   return `# Generated by import-cli from ${source}. Edit it: the generator read a\n# help text, and a help text is not a specification.\n${toYaml(document)}`;
 }
 
-function toolsJson({ binary, entries }) {
-  return `${JSON.stringify({ binary, tools: entries }, null, 2)}\n`;
+function toolsJson({ binary, entries, mounts }) {
+  const declared = toolsMounts(mounts);
+  const document = { binary };
+  // The adapter reads this file and nothing else, so what the unit mounts has
+  // to be in it: without the targets it could not tell a path under a mount
+  // from a path anywhere else on the host.
+  if (declared.length > 0) document.mounts = declared;
+  document.tools = entries;
+  return `${JSON.stringify(document, null, 2)}\n`;
 }
 
 // The calling contract, repeated in every Package so that an agent that found
@@ -607,6 +682,69 @@ function callingContract(binary, toolNames) {
   ].join("\n");
 }
 
+// The other way a file reaches this Package, which is the one that does not go
+// through base64. It is written for both cases: a Package with mounts says
+// where they are, and one without says what to add to get them, because a
+// reader who found the folder is the one deciding whether to declare any.
+function mountsNote(mounts) {
+  const declared = toolsMounts(mounts);
+  const lines = [
+    "## Files through mounts",
+    "",
+    "A `kitbash-file` positional takes two forms.",
+    "",
+    "```json",
+    '{ "file": ["report.json"], "files": [{ "name": "report.json", "contentBase64": "..." }] }',
+    '{ "file": ["/files/docs/report.json"] }',
+    "```",
+    "",
+    "The first is the inline form: the bytes travel in the call and the adapter",
+    "writes them to a temporary directory. The second is a path inside a folder of",
+    "Files this Package's unit mounts, and nothing travels at all.",
+    "",
+  ];
+  if (declared.length === 0) {
+    lines.push(
+      "This unit declares no `mounts`, so every path is refused with `invalid-path`.",
+      "To use the path form, add `mounts` to the unit in `kitbash.yaml` and the same",
+      "targets to `mounts` in `tools.json`, then build and run the Package again:",
+      "",
+      "```yaml",
+      "deploy:",
+      "  units:",
+      "    - type: container",
+      "      mounts:",
+      "        - { source: /home/you/docs, target: /files/docs, mode: ro }",
+      "```",
+      "",
+    );
+  } else {
+    lines.push("This unit mounts:", "");
+    for (const mount of declared) lines.push(`- \`${mount.target}\` (\`${mount.mode}\`)`);
+    lines.push("");
+  }
+  lines.push(
+    "The rules, PLAN.md 2.3 and `spec/manifest.schema.json`:",
+    "",
+    "- A path is absolute and is resolved with `realpath` before it is checked, so a",
+    "  `..` or a symbolic link that leaves the mount is `invalid-path` rather than a",
+    "  way out of it. The path the command is given is the one that was sent.",
+    "- A path that stays under a mount target is passed to the command unchanged.",
+    "  Everything else is `invalid-path` naming the targets this Package has.",
+    "- An output given as a path under a `rw` mount is left where the command wrote",
+    "  it and reported as `{name, path}` with no contents: the adapter never reads a",
+    "  file back out of a mount. Read it with `fs_read` on the mount's source.",
+    "- An output given as a path under a `ro` mount is `not-permitted`, and an output",
+    "  given as a bare name is read back into `files` as base64, as before.",
+    "- A mount source is a folder of Files under the owner's own home, or of `/org`,",
+    "  which is read only for everyone. Every folder between it and its root carries",
+    "  a `kitbash.yaml`, because a folder the surface cannot see cannot be mounted.",
+    "  At most four, and kitbashd resolves them again at every start.",
+    "",
+  );
+  return lines.join("\n");
+}
+
 // ---------------------------------------------------------------- draft
 
 /**
@@ -614,13 +752,13 @@ function callingContract(binary, toolNames) {
  * package name and version. Two tools, run and probe, and no schemas derived
  * from anything, because nothing has been read yet.
  *
- * @param {{source: string}} input
+ * @param {{source: string, mounts?: Array<object>}} input
  * @returns {Array<{path: string, content: string}>}
  */
-export function draft({ source }) {
+export function draft({ source, mounts }) {
   const { pkg, version, name } = parseSource(source);
   const binary = pkg;
-  const base = baseTools(binary);
+  const base = baseTools(binary, mounts);
 
   const description = describe(
     `Runs the Alpine package ${pkg}${version === "" ? "" : ` ${version}`} as a Package. This is the draft import: call probe, pass what it answers to the import-cli kit's refine tool, and write the refined files over these.`,
@@ -645,6 +783,7 @@ export function draft({ source }) {
     "Until then the only structured tool is `run`, which takes an argv array.",
     "",
     callingContract(binary, [`${name}_run`, `${name}_probe`]),
+    mountsNote(mounts),
     "## What the generator could not decide",
     "",
     "- Everything about the binary's flags. No help text has been read, so no",
@@ -656,8 +795,8 @@ export function draft({ source }) {
 
   return [
     { path: "Dockerfile", content: dockerfile({ pkg, version, source }) },
-    { path: "kitbash.yaml", content: manifest({ name, description, tools: base.manifestTools, source }) },
-    { path: "tools.json", content: toolsJson({ binary, entries: base.entries }) },
+    { path: "kitbash.yaml", content: manifest({ name, description, tools: base.manifestTools, source, mounts }) },
+    { path: "tools.json", content: toolsJson({ binary, entries: base.entries, mounts }) },
     { path: "package.json", content: packageJson(name) },
     { path: "NOTES.md", content: notes },
   ];
@@ -670,10 +809,10 @@ export function draft({ source }) {
  * help text. One tool per subcommand when the help listed any, one for the
  * binary when it did not, plus run and probe.
  *
- * @param {{source: string, parsed: object, help?: string}} input
+ * @param {{source: string, parsed: object, help?: string, mounts?: Array<object>}} input
  * @returns {Array<{path: string, content: string}>}
  */
-export function refined({ source, parsed, help = "" }) {
+export function refined({ source, parsed, help = "", mounts }) {
   const { pkg, version, name } = parseSource(source);
   const binary = pkg;
   const reading = parsed ?? { style: "unknown", options: [], positionals: [], subcommands: [], version: null };
@@ -682,7 +821,7 @@ export function refined({ source, parsed, help = "" }) {
   const positionals = Array.isArray(reading.positionals) ? reading.positionals : [];
   const subcommands = Array.isArray(reading.subcommands) ? reading.subcommands : [];
 
-  const base = baseTools(binary);
+  const base = baseTools(binary, mounts);
   const manifestTools = [...base.manifestTools];
   const entries = { ...base.entries };
   const derived = [];
@@ -699,6 +838,7 @@ export function refined({ source, parsed, help = "" }) {
       argv: [binary],
       options,
       positionals,
+      mounts,
     });
     manifestTools.push(built.manifestTool);
     entries[built.manifestTool.name] = built.entry;
@@ -718,6 +858,7 @@ export function refined({ source, parsed, help = "" }) {
         // subcommand's own flags arrive when its own help is refined.
         options: Array.isArray(subcommand.options) && subcommand.options.length > 0 ? subcommand.options : [],
         positionals: Array.isArray(subcommand.positionals) ? subcommand.positionals : [],
+        mounts,
       });
       manifestTools.push(built.manifestTool);
       entries[built.manifestTool.name] = built.entry;
@@ -749,7 +890,7 @@ export function refined({ source, parsed, help = "" }) {
       undecided.push(`- \`${positional.name}\` was taken for a file the caller supplies, so it carries \`format: kitbash-file\`. If it is really a plain string, drop the format.`);
     }
     if (OUTPUT_FILE_NAMES.has(positional.name)) {
-      undecided.push(`- \`${positional.name}\` was taken for a file the command writes, so the adapter reads it back into \`files\`. If the command writes to standard output instead, drop it from \`outputs\` in tools.json.`);
+      undecided.push(`- \`${positional.name}\` was taken for a file the command writes, so it carries \`format: kitbash-file\` and the adapter reads it back into \`files\`, unless it was given as a path under a \`rw\` mount, which is left where it was written. If the command writes to standard output instead, drop it from \`outputs\` in tools.json.`);
     }
   }
   if (shortened.length > 0) {
@@ -775,6 +916,7 @@ export function refined({ source, parsed, help = "" }) {
     `Flags read: ${options.length}. Subcommands read: ${subcommands.length}. Positional arguments read: ${positionals.length}.`,
     "",
     callingContract(binary, [`${name}_run`, `${name}_probe`, ...derived.map((tool) => `${name}_${tool}`)]),
+    mountsNote(mounts),
     "## What the generator could not decide",
     "",
     ...undecided,
@@ -789,8 +931,8 @@ export function refined({ source, parsed, help = "" }) {
 
   return [
     { path: "Dockerfile", content: dockerfile({ pkg, version, source }) },
-    { path: "kitbash.yaml", content: manifest({ name, description, tools: manifestTools, source }) },
-    { path: "tools.json", content: toolsJson({ binary, entries }) },
+    { path: "kitbash.yaml", content: manifest({ name, description, tools: manifestTools, source, mounts }) },
+    { path: "tools.json", content: toolsJson({ binary, entries, mounts }) },
     { path: "package.json", content: packageJson(name) },
     { path: "NOTES.md", content: notes },
   ];

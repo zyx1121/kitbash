@@ -16,6 +16,7 @@
 //
 //   {
 //     "binary": "jq",
+//     "mounts": [{"target": "/files/docs", "mode": "ro"}],  // the folders of Files the unit mounts, target and mode only, absent when it mounts none
 //     "tools": {
 //       "<toolName>": {
 //         "inputSchema": {...},                 // JSON schema for tools/list
@@ -24,9 +25,9 @@
 //           "<prop>": {"flag": "--compact-output", "takesValue": false, "type": "boolean"},
 //           "<prop2>": {"flag": "--arg", "takesValue": true, "type": "string", "repeat": false}
 //         },                                    // an array value with repeat true writes the flag before every element, and with repeat false writes the flag once followed by every element
-//         "positionals": ["filter", "input"],  // input property names, in argv order; a property whose schema has "format": "kitbash-file", on itself or on its items, names entries of the reserved input `files` by name, the adapter writes each to a tmp dir and passes the paths
+//         "positionals": ["filter", "input"],  // input property names, in argv order; a property whose schema has "format": "kitbash-file", on itself or on its items, takes a name of the reserved input `files`, which the adapter writes to a tmp dir and passes the path of, or an absolute path under one of the mount targets above, which it passes unchanged
 //         "stdin": "stdin",                     // input property whose string goes to stdin, or null
-//         "outputs": ["output"]                 // positional property names that name files the adapter reads back after the run (base64 in result.files)
+//         "outputs": ["output"]                 // positional property names that name files the adapter reads back after the run (base64 in result.files), or leaves in place when they were given as a path under a rw mount
 //       },
 //       "run":   {"inputSchema": {...}, "argv": ["jq"], "options": {}, "positionals": ["args"], "spread": "args", "stdin": "stdin", "outputs": []},
 //       "probe": {"inputSchema": {"type":"object","properties":{}}, "probe": true}
@@ -38,6 +39,15 @@
 // {name, contentBase64} that the adapter decodes into a fresh temporary
 // directory which is also the command's working directory. The directory is
 // removed after every call, so one call never sees another call's files.
+//
+// The other way a file reaches the command is a mount, PLAN.md 2.3 and issue
+// #122: a `kitbash-file` argument given as an absolute path is resolved with
+// realpath and has to stay under one of the targets in `mounts`, otherwise it
+// is `invalid-path`, and with no `mounts` at all every path is. The path the
+// command is given is the one that was sent, not the resolved one. An output
+// given as a path under a `ro` mount is `not-permitted`; one under a `rw`
+// mount is left where the command wrote it and reported as {name, path} with
+// no contents, because the adapter never reads a file back out of a mount.
 //
 // One call may carry 8 MiB of input in total, counting every file and the
 // standard input together rather than each of them on its own, and it is
@@ -61,6 +71,7 @@
 // unknown tool, a file entry that was never sent, or a size cap exceeded.
 
 import { spawn } from "node:child_process";
+import { realpathSync } from "node:fs";
 import { lstat, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -128,6 +139,15 @@ const notFound = (detail, fix, instance) =>
 const tooLarge = (detail, fix, instance) =>
   new AdapterError({ slug: "too-large", status: 413, title: "Too large", detail, fix, instance });
 
+// The two classes a path argument is refused with. invalid-path is the path
+// itself: it resolves somewhere this Package was not given. not-permitted is
+// the mode: the folder is mounted, and it is mounted read only.
+const invalidPath = (detail, fix, instance) =>
+  new AdapterError({ slug: "invalid-path", status: 400, title: "Invalid path", detail, fix, instance });
+
+const notPermitted = (detail, fix, instance) =>
+  new AdapterError({ slug: "not-permitted", status: 403, title: "Not permitted", detail, fix, instance });
+
 const internal = (detail, fix, instance) =>
   new AdapterError({ slug: "internal", status: 500, title: "Internal error", detail, fix, instance });
 
@@ -151,6 +171,19 @@ if (typeof doc.binary !== "string" || doc.binary === "") {
   console.error("adapter: tools.json must name the binary it wraps");
   process.exit(1);
 }
+
+// The folders of Files the unit mounts, as this Package sees them: where the
+// container has them and whether it may write there. They are read once, here,
+// because they are a fact of the image and not of a call. An entry that is not
+// an absolute target is dropped rather than guessed at: a mount the adapter
+// cannot read is a mount it does not have, and a path under it is refused with
+// the rest.
+const mounts = (Array.isArray(doc.mounts) ? doc.mounts : [])
+  .filter((mount) => mount && typeof mount === "object" && typeof mount.target === "string" && mount.target.startsWith("/"))
+  .map((mount) => ({ target: path.resolve(mount.target), readOnly: mount.mode !== "rw" }));
+// What the fix of a refused path names, so that a caller who sent the wrong one
+// is told where the right ones are without reading the manifest.
+const mountList = mounts.map((mount) => `${mount.target} (${mount.readOnly ? "ro" : "rw"})`).join(", ");
 
 // ---------------------------------------------------------------- helpers
 
@@ -183,6 +216,83 @@ function word(prop, value) {
 function namesAFile(spec, prop) {
   const schema = spec.inputSchema?.properties?.[prop];
   return schema?.format === "kitbash-file" || schema?.items?.format === "kitbash-file";
+}
+
+// Whether a caller wrote the path form of a file argument rather than the name
+// of an entry of `files`. A name has no slash in it at all, internal/fs and the
+// generated schema both say so, and a path is absolute, so the two forms cannot
+// be confused for one another.
+const isPathForm = (value) => value.startsWith("/");
+
+// Whether a resolved path is the folder a mount put in the container, or
+// something inside it. The separator is what makes it a containment test and
+// not a string prefix: without it /files/outside would be inside /files/out.
+function within(resolved, target) {
+  return resolved === target || resolved.startsWith(`${target}${path.sep}`);
+}
+
+// mountFor answers which mount a path argument lands in, having resolved it the
+// way the kernel would. Resolving is the point: a `..` component and a symbolic
+// link are both ways of naming a file outside the mount with a path that reads
+// as though it were inside it, and realpath is what makes the check about the
+// file the command would open rather than about the string the caller wrote.
+//
+// A path whose last component does not exist yet is an output being named
+// before the command has written it, so for an output the parent is resolved
+// instead and the name is put back on. Everything else has to exist: an input
+// that does not is refused here rather than by the command, and a directory
+// that does not is a caller who has not written the folder yet.
+function mountFor(prop, value, isOutput) {
+  if (mounts.length === 0) {
+    throw invalidPath(
+      `${prop} names the path ${value}, and this unit declares no mounts, so a path is not a form it accepts.`,
+      "Send the file in files and name it by its name, or declare mounts on the unit in kitbash.yaml and in tools.json and run the Process again.",
+      value,
+    );
+  }
+  let resolved;
+  try {
+    resolved = realpathSync(value);
+  } catch (err) {
+    if (!isOutput || err.code !== "ENOENT") {
+      throw invalidPath(
+        `${prop} names the path ${value}, which could not be resolved: ${err.code ?? err.message}.`,
+        `Name a file that exists under one of this unit's mounts: ${mountList}.`,
+        value,
+      );
+    }
+    // The file is not there yet, which is what an output is. The folder it is
+    // to be written in has to be, because a mount is a folder and a path under
+    // one whose parent is missing is not under it.
+    const parent = path.dirname(value);
+    let resolvedParent;
+    try {
+      resolvedParent = realpathSync(parent);
+    } catch (parentError) {
+      throw invalidPath(
+        `${prop} names the path ${value}, and its folder ${parent} could not be resolved: ${parentError.code ?? parentError.message}.`,
+        `Write the output into a folder that exists under one of this unit's mounts: ${mountList}.`,
+        value,
+      );
+    }
+    resolved = path.join(resolvedParent, path.basename(value));
+  }
+  const mount = mounts.find((candidate) => within(resolved, candidate.target));
+  if (mount === undefined) {
+    throw invalidPath(
+      `${prop} names the path ${value}, which resolves to ${resolved}, outside every folder this unit mounts.`,
+      `Use a path under one of this unit's mounts: ${mountList}. A file from anywhere else travels in files instead.`,
+      value,
+    );
+  }
+  if (isOutput && mount.readOnly) {
+    throw notPermitted(
+      `${prop} is an output and ${value} is under ${mount.target}, which this unit mounts read only.`,
+      "Write the output under a mount declared rw, or name it as a plain name and read it back from the result.",
+      value,
+    );
+  }
+  return mount;
 }
 
 // Cap collects one output stream and stops at the cap rather than growing the
@@ -383,7 +493,13 @@ async function writeFiles(planned, dir) {
 // buildArgv turns one tool call's arguments into the command line the tools.json
 // entry describes: the fixed prefix, then every option the input carries, then
 // the positionals in the order the kit recorded.
+//
+// It answers with the argv and with the outputs that were given as paths under
+// a mount, because those are the ones the run leaves where they are: what is
+// decided here is what collectOutputs must not go looking for in the temporary
+// directory.
 function buildArgv(spec, args, files, outputs) {
+  const mounted = [];
   if (!Array.isArray(spec.argv) || spec.argv.length === 0 || spec.argv.some((w) => typeof w !== "string")) {
     throw internal("this tool's argv prefix in tools.json is not a non empty array of strings.", "Fix tools.json.");
   }
@@ -433,13 +549,26 @@ function buildArgv(spec, args, files, outputs) {
       for (const element of value) argv.push(word(prop, element));
       continue;
     }
-    // A property that names an input file is replaced by the path that file
-    // was written to, and a name nobody sent is a missing file rather than a
-    // literal argument. An array names several files and becomes one argv word
-    // each, in the order the caller wrote them.
+    // A property that names a file takes either form, element by element: an
+    // absolute path under one of this unit's mounts, which reaches the command
+    // as it was written, or the name of an entry of files, which is replaced by
+    // the path that entry was written to. A name nobody sent is a missing file
+    // rather than a literal argument, and an output named that way is a file
+    // the command is about to write in the temporary directory.
     if (namesAFile(spec, prop)) {
+      const isOutput = outputs.has(prop);
       for (const element of Array.isArray(value) ? value : [value]) {
         const name = word(prop, element);
+        if (isPathForm(name)) {
+          mountFor(prop, name, isOutput);
+          if (isOutput) mounted.push({ prop, name: path.basename(name), path: name });
+          argv.push(name);
+          continue;
+        }
+        if (isOutput) {
+          argv.push(safeName(name));
+          continue;
+        }
         const file = files.get(name);
         if (file === undefined) {
           throw notFound(`${prop} names the file ${name}, which was not sent in files.`, "Send that file in files.", name);
@@ -457,7 +586,7 @@ function buildArgv(spec, args, files, outputs) {
     argv.push(word(prop, value));
   }
 
-  return argv;
+  return { argv, mounted };
 }
 
 // stdinFor is the string the tool sends to the command's standard input, which
@@ -483,10 +612,19 @@ function stdinFor(spec, args) {
 // command is free to write a symbolic link where its output was meant to go,
 // and following one would read a file outside the temporary directory back to
 // the caller, so `out -> /etc/passwd` returns a note instead of the file.
-async function collectOutputs(spec, args, dir) {
+//
+// An output given as a path under a rw mount is not read at all. It is already
+// where its owner wanted it, the caller reads it with fs_read on the folder
+// that mount's source names, and an adapter that read it back would be turning
+// a mount into the base64 path the mount exists to avoid. Those are reported as
+// {name, path} and nothing else, mounted, in the order they were named.
+async function collectOutputs(spec, args, dir, mounted) {
   const files = [];
   const notes = [];
+  const left = new Set(mounted.map((entry) => entry.prop));
+  for (const entry of mounted) files.push({ name: entry.name, path: entry.path });
   for (const prop of spec.outputs ?? []) {
+    if (left.has(prop)) continue;
     const value = args[prop];
     if (typeof value !== "string" || value === "") continue;
     const name = safeName(value);
@@ -538,7 +676,7 @@ async function callTool(name, args) {
   try {
     const files = await writeFiles(planned, dir);
     const outputs = new Set(spec.outputs ?? []);
-    const argv = buildArgv(spec, args, files, outputs);
+    const { argv, mounted } = buildArgv(spec, args, files, outputs);
     let result;
     try {
       result = await runCommand(argv[0], argv.slice(1), {
@@ -549,7 +687,7 @@ async function callTool(name, args) {
     } catch (err) {
       throw internal(`${argv[0]} could not be started: ${err.message}`, "Check that the binary is in the image.", argv[0]);
     }
-    const collected = await collectOutputs(spec, args, dir);
+    const collected = await collectOutputs(spec, args, dir, mounted);
     const payload = {
       exitCode: result.exitCode,
       stdout: result.stdout,
