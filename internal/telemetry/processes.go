@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/zyx1121/kitbash/internal/manifest"
+	"github.com/zyx1121/kitbash/internal/mounts"
 	"github.com/zyx1121/kitbash/internal/problem"
 )
 
@@ -117,6 +118,12 @@ type Registration struct {
 	// that path on the Process's endpoint and records what it saw, see
 	// PLAN.md section 2.4. A Process a run kit owns is not probed.
 	Health *Health `json:"health,omitempty"`
+	// Mounts are the folders of Files this unit declared, as the manifest
+	// wrote them. They are sent unresolved: kitbashd resolves them as root and
+	// records what it resolved, because this process runs as the member and
+	// what a member's process says about a path is a claim, see PLAN.md
+	// section 2.3.
+	Mounts []mounts.Declared `json:"mounts,omitempty"`
 }
 
 // Health is one Process's probe as kitbashd carries it: the declaration, and
@@ -188,6 +195,10 @@ type Registered struct {
 	// recent one kitbashd ran, which is what proc_list publishes. A daemon of
 	// an earlier release answers none.
 	Health *Health `json:"health,omitempty"`
+	// Mounts are the folders of Files this Process sees, as kitbashd resolved
+	// them at registration. A daemon of an earlier release answers none, and
+	// so does a Process that declared none.
+	Mounts []mounts.Resolved `json:"mounts,omitempty"`
 }
 
 // UnmarshalJSON reads a listed Process, accepting user as a spelling of owner.

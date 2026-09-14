@@ -97,6 +97,11 @@ type Registration struct {
 	// Health is the probe the Package declared, as the registration carries
 	// it, plus the reading a test seeds to stand in for a probe kitbashd ran.
 	Health *Health `json:"health,omitempty"`
+	// Mounts are the folders of Files the unit declared. The real daemon
+	// resolves them as root and lists what it resolved; this fake stores and
+	// lists what it was sent, because the two have the same three fields on
+	// the wire and what a proc test asks is whether they crossed the socket.
+	Mounts []manifest.Mount `json:"mounts,omitempty"`
 }
 
 // Health is one Process's probe on the wire: the declaration a registration

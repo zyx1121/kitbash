@@ -66,6 +66,21 @@ type Limits struct {
 	Memory string
 }
 
+// Mount is one entry of deploy.units[].mounts: a folder of Files the unit
+// asks to see, where the container sees it, and whether it may be written. An
+// empty mode is ro, which is the schema's default.
+//
+// It lives here because it is what a manifest declares, the same reason
+// Permits does. Deciding whether a member may have it is somebody else's, see
+// internal/mounts: that package resolves this one as root and answers a
+// resolved mount, and it reads this type rather than declaring its own so a
+// manifest and a registration cannot drift apart.
+type Mount struct {
+	Source string `json:"source"`
+	Target string `json:"target"`
+	Mode   string `json:"mode,omitempty"`
+}
+
 // Unit is one entry of deploy.units, read as a container unit. Version 1 runs
 // the first unit of a Package.
 //
@@ -91,7 +106,11 @@ type Unit struct {
 	Health  map[string]any
 	Limits  Limits
 	Restart string
-	Raw     map[string]any
+	// Mounts are the folders of Files this unit asks to see, at most four,
+	// see PLAN.md section 2.3. They are read as the manifest wrote them:
+	// kitbashd resolves them as root and is the one that decides.
+	Mounts []Mount
+	Raw    map[string]any
 }
 
 // HealthProbe is the HTTP probe this unit declares: the path kitbashd requests
@@ -238,6 +257,19 @@ func (m *Manifest) Unit() (Unit, bool) {
 		}
 	}
 	unit.Health, _ = raw["health"].(map[string]any)
+	if list, ok := raw["mounts"].([]any); ok {
+		for _, entry := range list {
+			declared, ok := entry.(map[string]any)
+			if !ok {
+				continue
+			}
+			mount := Mount{}
+			mount.Source, _ = declared["source"].(string)
+			mount.Target, _ = declared["target"].(string)
+			mount.Mode, _ = declared["mode"].(string)
+			unit.Mounts = append(unit.Mounts, mount)
+		}
+	}
 	if limits, ok := raw["limits"].(map[string]any); ok {
 		unit.Limits.CPU, _ = limits["cpu"].(string)
 		unit.Limits.Memory, _ = limits["memory"].(string)

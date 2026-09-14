@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/zyx1121/kitbash/internal/cgroups"
+	"github.com/zyx1121/kitbash/internal/mounts"
 	"github.com/zyx1121/kitbash/internal/podman"
 	"github.com/zyx1121/kitbash/internal/store"
 	"github.com/zyx1121/kitbash/internal/sysusers"
@@ -155,6 +156,18 @@ func (s *Server) restoreOwner(ctx context.Context, owner string, processes []sto
 
 	s.memberCgroup(ctx, m)
 	for _, p := range processes {
+		// A Process whose mount is no longer legal is not started. Its
+		// container was created with that folder bound into it, so starting it
+		// again would mount it again: the check has to happen before podman is
+		// asked, and its answer is what proc_list reports about this Process,
+		// see mounts.go.
+		if _, prob := s.revalidateMounts("", p, m); prob != nil {
+			counts.Failed++
+			logger.Printf("restore: not starting %s of %s: %s", p.Container, owner, prob.Detail)
+			failed := mountProblem(prob)
+			s.processFailed(p.ID, failed.Detail, failed.Fix)
+			continue
+		}
 		// The Process's cgroup is created again, with its ceiling, before the
 		// container starts: the cgroup filesystem does not survive a reboot,
 		// and a container whose cgroup parent is gone does not start at all.
@@ -319,6 +332,16 @@ func (s *Server) healCeiling(ctx context.Context, m sysusers.Member, p store.Pro
 	if image == "" {
 		return false, fmt.Errorf("daemon: %s names no image to create %s from", p.ID, p.Container)
 	}
+	// This creates the container again, so the mounts go on the new command
+	// line and are resolved once more first: the registration is what says
+	// which folders this Process sees, and the container's own configuration
+	// is only read for what the registration does not carry. A mount that no
+	// longer checks out fails the heal rather than recreating a container
+	// bound to a folder the member may not see.
+	mounted, prob := s.revalidateMounts("", p, m)
+	if prob != nil {
+		return false, fmt.Errorf("daemon: the mounts of %s: %s", p.ID, prob.Detail)
+	}
 	parent := cgroups.Parent(m.Name, p.ID)
 	opts := podman.RunOptions{
 		Name:  p.Container,
@@ -329,15 +352,16 @@ func (s *Server) healCeiling(ctx context.Context, m sysusers.Member, p store.Pro
 		Interactive:  true,
 		Restart:      config.Restart,
 		Publish:      config.Publish,
+		Mounts:       mounts.Podman(mounted),
 		CgroupParent: parent,
 	}
 	// No limits are put on the command line and none are written into the
 	// ceiling: this Process was registered without any, so what it gains here
 	// is a cgroup of its own and not a bound it never had. The ceiling is
 	// where a limit would go once the Process is run again.
-	labels, prob := labelsOf("", p, healedLabels(config.Labels))
-	if prob != nil {
-		return false, fmt.Errorf("daemon: the labels of %s: %s", p.Container, prob.Detail)
+	labels, labelProb := labelsOf("", p, healedLabels(config.Labels))
+	if labelProb != nil {
+		return false, fmt.Errorf("daemon: the labels of %s: %s", p.Container, labelProb.Detail)
 	}
 	opts.Labels = labels
 

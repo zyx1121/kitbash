@@ -15,6 +15,7 @@ import (
 	_ "modernc.org/sqlite" // these tests read a store file directly
 
 	"github.com/zyx1121/kitbash/internal/manifest"
+	"github.com/zyx1121/kitbash/internal/mounts"
 	"github.com/zyx1121/kitbash/internal/store"
 )
 
@@ -239,6 +240,12 @@ func TestFixtureProcessesListWithTheNewColumnsDefaulted(t *testing.T) {
 				if len(p.Permits.Tools) != 0 || len(p.Permits.Paths) != 0 {
 					t.Errorf("%s carries the permits %+v, want none: no release wrote them", p.ID, p.Permits)
 				}
+				// The mounts column arrives with M8, so every fixture reads
+				// back with none: that Process sees no Files until it is run
+				// again, which is how every Process ran before.
+				if len(p.Mounts) != 0 {
+					t.Errorf("%s carries the mounts %+v, want none: no release wrote them", p.ID, p.Mounts)
+				}
 			}
 
 			alpha, found, err := s.ProcessByToken(ctx, "fixture-token-alpha")
@@ -339,8 +346,12 @@ func TestMigratedStoreTakesNewWork(t *testing.T) {
 				Digest: "sha256:cccc", Expose: "mcp", Endpoint: "http://127.0.0.1:8082",
 				Subscriptions: []string{store.SubscriptionTelemetry},
 				Permits:       manifest.Permits{Tools: []string{"fs_read"}, Paths: []string{"/org"}},
-				FanoutSecret:  secret,
-				RegisteredAt:  fixtureBase,
+				Mounts: []mounts.Resolved{
+					{Source: "/home/loki/notes", Target: "/files/notes", Mode: mounts.ModeRO},
+					{Source: "/home/loki/out", Target: "/files/out", Mode: mounts.ModeRW},
+				},
+				FanoutSecret: secret,
+				RegisteredAt: fixtureBase,
 			}
 			if err := s.RegisterProcess(ctx, want, hash, 0); err != nil {
 				t.Fatalf("RegisterProcess: %v", err)
@@ -352,6 +363,13 @@ func TestMigratedStoreTakesNewWork(t *testing.T) {
 			if got.Container != want.Container || got.Digest != want.Digest ||
 				got.FanoutSecret != secret || strings.Join(got.Permits.Tools, ",") != "fs_read" {
 				t.Errorf("the new registration reads back as %+v, want the columns it was written with", got)
+			}
+			// The mounts are the column an upgraded store gained last, and a
+			// Process that reads back without them is one that would come
+			// back after a reboot seeing no Files.
+			if len(got.Mounts) != 2 || got.Mounts[0].Source != "/home/loki/notes" ||
+				got.Mounts[1].Mode != mounts.ModeRW {
+				t.Errorf("the new registration holds the mounts %+v, want the two it was written with", got.Mounts)
 			}
 
 			id := "01930000-0000-7000-8000-0000000000c2"

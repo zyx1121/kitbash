@@ -19,6 +19,7 @@ import (
 
 	"github.com/zyx1121/kitbash/internal/fs"
 	"github.com/zyx1121/kitbash/internal/manifest"
+	"github.com/zyx1121/kitbash/internal/mounts"
 	"github.com/zyx1121/kitbash/internal/podman"
 	"github.com/zyx1121/kitbash/internal/problem"
 	"github.com/zyx1121/kitbash/internal/telemetry"
@@ -73,6 +74,11 @@ type Process struct {
 	// readings, like the problems above, so proc_list reads both back from the
 	// registry rather than from the runtime, see PLAN.md section 2.4.
 	Health *Health `json:"health,omitempty"`
+	// Mounts are the folders of Files this Process sees, as kitbashd resolved
+	// them at registration, so a member reads what their Process can reach
+	// rather than what the manifest asked for. Absent for a Process that
+	// declared none, which is every Process written before mounts existed.
+	Mounts []mounts.Resolved `json:"mounts,omitempty"`
 
 	// Container is the runtime name the bridge execs into. It is not part of
 	// the tool's output: the surface names a Process by its id.
@@ -280,6 +286,16 @@ func (s *Service) run(ctx context.Context, span *telemetry.Span, path, digest, n
 	if prob := checkOptions(folder, opts); prob != nil {
 		return nil, prob
 	}
+	// The mounts are checked here as the member, before anything is removed,
+	// so a manifest that names a folder this member cannot mount is refused
+	// with the folder named rather than as whatever the daemon answers. This
+	// check cannot be trusted and is not meant to be: it runs as the member,
+	// who can change the tree under it, and the registration below sends the
+	// declaration rather than what this resolved. kitbashd runs the same check
+	// as root and its answer is the one that decides, see PLAN.md section 2.3.
+	if prob := s.checkMounts(folder, unit.Mounts); prob != nil {
+		return nil, prob
+	}
 
 	existing, prob := s.byName(ctx, container)
 	if prob != nil {
@@ -336,6 +352,11 @@ func (s *Service) run(ctx context.Context, span *telemetry.Span, path, digest, n
 		// the container name does: kitbashd probes it, and after a reboot the
 		// registration is the only thing that remembers what to request.
 		Health: s.health(folder, unit),
+		// The mounts travel with the registration unresolved: kitbashd
+		// resolves them as root, records what it resolved, and mounts that on
+		// every start and every restore, see mounts in
+		// spec/kitbashd-api.yaml.
+		Mounts: unit.Mounts,
 	})
 	if prob != nil {
 		return nil, prob
@@ -368,7 +389,31 @@ func (s *Service) run(ctx context.Context, span *telemetry.Span, path, digest, n
 	}
 	process := s.describe(*started, unit)
 	process.Replaced = replaced
+	// The mounts on the answer are kitbashd's, not the manifest's: what the
+	// member wants to read is which folders this Process ended up with, and
+	// the daemon is the one that resolved them.
+	if held, ok := s.registered(ctx)[process.ID]; ok {
+		process.Mounts = held.Mounts
+	}
 	return &process, nil
+}
+
+// checkMounts is the member's own run of the check kitbashd makes as root. It
+// exists for the problem alone: a member who names another member's home reads
+// that in the session that named it, instead of a refusal from a daemon they
+// cannot see the roots of. A member this session cannot look up is not a
+// refusal here, because kitbashd can look them up and will.
+func (s *Service) checkMounts(folder string, declared []manifest.Mount) *problem.Problem {
+	if len(declared) == 0 {
+		return nil
+	}
+	checker, err := mounts.NewChecker(s.files.User())
+	if err != nil {
+		s.logger.Printf("proc: not checking the mounts of %s here: %v", folder, err)
+		return nil
+	}
+	_, prob := checker.Resolve(folder, declared)
+	return prob
 }
 
 // builtElsewhere says what a Package that names a builder and no runner is
@@ -418,6 +463,10 @@ func (s *Service) List(ctx context.Context) (*ListResult, *problem.Problem) {
 			if reading := reported.Health; reading != nil && reading.Last != "" && reading.Healthy != nil {
 				process.Health = &Health{Last: reading.Last, Healthy: *reading.Healthy}
 			}
+			// The runtime knows what is bound into a container; the
+			// registration knows what kitbash agreed to bind, which is the
+			// one a member reads.
+			process.Mounts = reported.Mounts
 		}
 		result.Processes = append(result.Processes, process)
 	}

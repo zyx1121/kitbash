@@ -396,6 +396,7 @@ func (f *Fake) Run(_ context.Context, m Member, opts podman.RunOptions, cgroup s
 		Labels:       opts.Labels,
 		Restart:      opts.Restart,
 		Publish:      opts.Publish,
+		Mounts:       opts.Mounts,
 	}
 	if f.RunID != "" {
 		return f.RunID, nil

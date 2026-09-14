@@ -65,15 +65,11 @@ const HomesRoot = "/home"
 var forbiddenTargets = []string{"/proc", "/sys", "/dev", "/etc"}
 
 // Declared is one mount as deploy.units[].mounts writes it, and as it crosses
-// the daemon socket on a registration.
-type Declared struct {
-	Source string `json:"source"`
-	Target string `json:"target"`
-	Mode   string `json:"mode,omitempty"`
-}
-
-// ReadOnly reports whether this mount is read only, which an empty mode is.
-func (d Declared) ReadOnly() bool { return d.Mode != ModeRW }
+// the daemon socket on a registration. It is the manifest's own type rather
+// than a copy of it: a manifest and a registration that disagreed about the
+// shape of a mount would be a Process running with something other than what
+// its Package declared.
+type Declared = manifest.Mount
 
 // Resolved is one mount as this package answers it: the source as the kernel
 // resolved it, which is the path that goes to podman, and nothing a caller
@@ -243,6 +239,22 @@ func (c *Checker) ResolveOne(instance string, d Declared) (Resolved, *problem.Pr
 		}
 	}
 	return Resolved{Source: filepath.Join(root, rel), Target: filepath.Clean(d.Target), Mode: mode}, nil
+}
+
+// Redeclare turns what a registration holds back into the declaration it came
+// from, which is what a start resolves again. The source is already the
+// resolved path, so this is the same question asked a second time and not a
+// second reading of the manifest: what it catches is a folder that has changed
+// since the registration, see spec/kitbashd-api.yaml.
+func Redeclare(resolved []Resolved) []Declared {
+	if len(resolved) == 0 {
+		return nil
+	}
+	out := make([]Declared, 0, len(resolved))
+	for _, r := range resolved {
+		out = append(out, Declared{Source: r.Source, Target: r.Target, Mode: r.Mode})
+	}
+	return out
 }
 
 // Podman is the runtime's spelling of a resolved mount, which is the one form

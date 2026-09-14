@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/zyx1121/kitbash/internal/manifest"
+	"github.com/zyx1121/kitbash/internal/mounts"
 	"github.com/zyx1121/kitbash/internal/problem"
 	"github.com/zyx1121/kitbash/internal/store"
 )
@@ -90,6 +91,11 @@ type processRequest struct {
 	// section 3.
 	Runner string         `json:"runner,omitempty"`
 	Health *healthRequest `json:"health,omitempty"`
+	// Mounts are the folders of Files this unit declared, as the manifest
+	// wrote them. They arrive unresolved and are resolved here, as root: the
+	// session that sent them runs as the member, so what it says about a path
+	// is a claim, see mounts.go.
+	Mounts []mounts.Declared `json:"mounts,omitempty"`
 }
 
 // healthRequest is the probe a registration declares, which is the part of
@@ -177,6 +183,16 @@ func (s *Server) registerProcess(w http.ResponseWriter, r *http.Request, caller 
 		writeProblem(w, problem.Internal(r.URL.Path, err.Error(), ""))
 		return
 	}
+	// The mounts are resolved before the row is written, so a registration
+	// that names a folder this member may not see is refused rather than
+	// stored: a Process never holds a registration naming a folder the daemon
+	// would refuse to mount, see mounts.go.
+	resolved, prob := s.resolveMounts(r.Context(), r.URL.Path, caller.User, req.Mounts)
+	if prob != nil {
+		writeProblem(w, prob)
+		return
+	}
+
 	p := store.Process{
 		ID:            req.ID,
 		Owner:         caller.User,
@@ -191,6 +207,7 @@ func (s *Server) registerProcess(w http.ResponseWriter, r *http.Request, caller 
 		Runner:        req.Runner,
 		Permits:       req.Permits,
 		Health:        declaredHealth(req.Health),
+		Mounts:        resolved,
 		FanoutSecret:  secret,
 		RegisteredAt:  s.now().UTC(),
 	}
@@ -198,6 +215,7 @@ func (s *Server) registerProcess(w http.ResponseWriter, r *http.Request, caller 
 	// written, so a registration kitbashd would not probe is refused rather
 	// than stored as a declaration nothing acts on, see verifyProbe.
 	verified, prob := s.checkedProbe(r, caller, p)
+
 	if prob != nil {
 		writeProblem(w, prob)
 		return
@@ -444,6 +462,13 @@ func validateProcess(instance string, req processRequest) *problem.Problem {
 	}
 	if prob := validateHealth(instance, req.Health); prob != nil {
 		return prob
+	}
+	// The count is held here rather than in the resolution, so a registration
+	// declaring a hundred mounts is one refusal and not a hundred opens.
+	if len(req.Mounts) > mounts.Max {
+		return problem.BadRequest(instance,
+			fmt.Sprintf("a Process may mount at most %d folders, not %d", mounts.Max, len(req.Mounts)),
+			fmt.Sprintf("Declare at most %d entries in deploy.units[0].mounts.", mounts.Max))
 	}
 	// A permits block kitbashd cannot honour is refused here rather than
 	// stored: a glob nobody can read would otherwise sit in the registry

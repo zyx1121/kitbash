@@ -169,6 +169,14 @@ type ContainerConfig struct {
 	Restart string
 	// Publish is what the container publishes on the host.
 	Publish []podman.PortMapping
+	// Mounts are the folders of the host bound into the container, as the
+	// runtime reports them. They are read back for the same reason the ports
+	// are, so a container that has to be created again is described by what it
+	// is rather than by what a caller remembers. What a Process is created
+	// again with is still the registration's mounts, which are the
+	// authoritative record and the only one kitbashd resolved itself, see
+	// mounts in spec/kitbashd-api.yaml.
+	Mounts []podman.Mount
 }
 
 // ContainerConfig reads one container's configuration back as the member who
@@ -203,6 +211,16 @@ type containerInspect struct {
 			HostPort string `json:"HostPort"`
 		} `json:"PortBindings"`
 	} `json:"HostConfig"`
+	// Mounts is the structured form podman reports a bind mount in.
+	// HostConfig.Binds carries the same mounts as one string each, options and
+	// all, which would have to be parsed back apart; this one is already the
+	// three fields kitbash cares about. Verified against podman 5.7.0.
+	Mounts []struct {
+		Type        string `json:"Type"`
+		Source      string `json:"Source"`
+		Destination string `json:"Destination"`
+		RW          bool   `json:"RW"`
+	} `json:"Mounts"`
 }
 
 // containerConfig reads one podman container inspect. It is a function of its
@@ -252,6 +270,16 @@ func containerConfig(out string) (ContainerConfig, error) {
 	sort.Slice(config.Publish, func(i, j int) bool {
 		return config.Publish[i].ContainerPort < config.Publish[j].ContainerPort
 	})
+	for _, mount := range first.Mounts {
+		// Only bind mounts are Files. A volume or a tmpfs is the runtime's own
+		// and has no folder of Files behind it.
+		if mount.Type != "bind" || mount.Source == "" || mount.Destination == "" {
+			continue
+		}
+		config.Mounts = append(config.Mounts, podman.Mount{
+			Source: mount.Source, Target: mount.Destination, ReadOnly: !mount.RW,
+		})
+	}
 	return config, nil
 }
 

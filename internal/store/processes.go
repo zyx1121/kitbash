@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/zyx1121/kitbash/internal/manifest"
+	"github.com/zyx1121/kitbash/internal/mounts"
 )
 
 // SubscriptionTelemetry is the one subscription a manifest can declare, see
@@ -90,6 +91,14 @@ type Process struct {
 	// declaration is stored, because a probe is a reading of a moment and
 	// this table is the registration.
 	Health Health `json:"health"`
+	// Mounts is the folders of Files this Process sees, as kitbashd resolved
+	// them when the Process was registered. The registration is authoritative:
+	// a start and a restore mount what is recorded here and never what a
+	// request or a manifest claims today, see PLAN.md section 2.3. They are
+	// listed like the rest of the record, because what a Process can read is
+	// not a secret from its owner. A registration written before mounts
+	// existed carries none, which is a Process that sees no Files.
+	Mounts []mounts.Resolved `json:"mounts,omitempty"`
 	// FanoutSecret is the bearer kitbashd puts on every fan out request to
 	// this Process. It is minted with the token at registration and handed to
 	// the container once. The tag keeps it out of processes_list, which is the
@@ -170,6 +179,20 @@ func (l Limits) JSON() string {
 		return ""
 	}
 	body, err := json.Marshal(l)
+	if err != nil {
+		return ""
+	}
+	return string(body)
+}
+
+// mountsJSON renders the mounts for the column. A Process that declared none
+// is an empty string rather than an empty array, so a legacy row and a Process
+// with no mounts read back the same.
+func mountsJSON(list []mounts.Resolved) string {
+	if len(list) == 0 {
+		return ""
+	}
+	body, err := json.Marshal(list)
 	if err != nil {
 		return ""
 	}
@@ -271,12 +294,16 @@ func (s *Store) RegisterProcess(ctx context.Context, p Process, tokenHash string
 	// do: after a reboot nothing else remembers what a Process declared, and
 	// the prober starts from the registrations kitbashd holds.
 	health := p.Health.JSON()
+	// The mounts are written as kitbashd resolved them, not as the manifest
+	// declared them: a start and a restore mount the resolved path, so nothing
+	// between here and podman has to resolve anything again.
+	mounted := mountsJSON(p.Mounts)
 	// The fan out secret is replaced with the token, because the two are minted
 	// together: a container holding the old token holds the old secret.
 	if _, err := tx.ExecContext(ctx, `INSERT INTO processes
 		(id, owner, admin, package, name, container, digest, expose, endpoint,
-		 subscriptions, runner, permits, limits, health, token_hash, fanout_secret, registered_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		 subscriptions, runner, permits, limits, health, mounts, token_hash, fanout_secret, registered_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 			owner = excluded.owner, admin = excluded.admin, package = excluded.package,
 			name = excluded.name, container = excluded.container, digest = excluded.digest,
@@ -284,10 +311,11 @@ func (s *Store) RegisterProcess(ctx context.Context, p Process, tokenHash string
 			subscriptions = excluded.subscriptions, runner = excluded.runner,
 			permits = excluded.permits,
 			limits = excluded.limits, health = excluded.health,
+			mounts = excluded.mounts,
 			token_hash = excluded.token_hash,
 			fanout_secret = excluded.fanout_secret, registered_at = excluded.registered_at`,
 		p.ID, p.Owner, p.Admin, p.Package, p.Name, p.Container, p.Digest, p.Expose, p.Endpoint,
-		string(subscriptions), p.Runner, string(permits), limits, health, tokenHash, p.FanoutSecret,
+		string(subscriptions), p.Runner, string(permits), limits, health, mounted, tokenHash, p.FanoutSecret,
 		p.RegisteredAt.UnixNano()); err != nil {
 		return fmt.Errorf("store: register the Process %s: %w", p.ID, err)
 	}
@@ -421,7 +449,7 @@ func (s *Store) Processes(ctx context.Context, owner string) ([]Process, error) 
 
 // processColumns is the one select every read of this table shares.
 const processColumns = `SELECT id, owner, admin, package, name, container, digest,
-	expose, endpoint, subscriptions, runner, permits, limits, health, fanout_secret, registered_at`
+	expose, endpoint, subscriptions, runner, permits, limits, health, mounts, fanout_secret, registered_at`
 
 // scanner is what both a single row and a row of a result set satisfy.
 type scanner interface {
@@ -430,10 +458,10 @@ type scanner interface {
 
 func scanProcess(row scanner) (Process, error) {
 	var p Process
-	var subscriptions, permits, limits, health string
+	var subscriptions, permits, limits, health, mounted string
 	var registered int64
 	if err := row.Scan(&p.ID, &p.Owner, &p.Admin, &p.Package, &p.Name, &p.Container, &p.Digest,
-		&p.Expose, &p.Endpoint, &subscriptions, &p.Runner, &permits, &limits, &health,
+		&p.Expose, &p.Endpoint, &subscriptions, &p.Runner, &permits, &limits, &health, &mounted,
 		&p.FanoutSecret,
 		&registered); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -459,6 +487,11 @@ func scanProcess(row scanner) (Process, error) {
 	if health != "" {
 		if err := json.Unmarshal([]byte(health), &p.Health); err != nil {
 			return Process{}, fmt.Errorf("store: read the health probe of %s: %w", p.ID, err)
+		}
+	}
+	if mounted != "" {
+		if err := json.Unmarshal([]byte(mounted), &p.Mounts); err != nil {
+			return Process{}, fmt.Errorf("store: read the mounts of %s: %w", p.ID, err)
 		}
 	}
 	if permits != "" {
@@ -521,8 +554,11 @@ func migrate(db *sql.DB) error {
 	// The health probe arrives with the probe loop: the path a Process
 	// declares and how often it is requested. A registration written before it
 	// declares none, so that Process is not probed until it is run again.
+	// The mounts arrive with M8: the folders of Files the Process sees, as
+	// kitbashd resolved them. A registration written before them carries none,
+	// which is a Process that sees no Files, the way every Process did.
 	for _, column := range []string{
-		"container", "digest", "fanout_secret", "permits", "limits", "runner", "health",
+		"container", "digest", "fanout_secret", "permits", "limits", "runner", "health", "mounts",
 	} {
 		if err := addTextColumn(db, "processes", column); err != nil {
 			return err

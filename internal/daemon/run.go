@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/zyx1121/kitbash/internal/cgroups"
+	"github.com/zyx1121/kitbash/internal/mounts"
 	"github.com/zyx1121/kitbash/internal/podman"
 	"github.com/zyx1121/kitbash/internal/problem"
 	"github.com/zyx1121/kitbash/internal/store"
@@ -236,6 +237,17 @@ func (s *Server) startProcess(w http.ResponseWriter, r *http.Request, p store.Pr
 		writeProblem(w, prob)
 		return
 	}
+	// The mounts of the registration are resolved again, before anything is
+	// created: the check at registration says what was true then, and a folder
+	// can be removed, replaced by a symlink or lose its manifest in between.
+	// The container is not created when one of them no longer checks out, see
+	// mounts.go.
+	mounted, prob := s.revalidateMounts(r.URL.Path, p, m)
+	if prob != nil {
+		writeProblem(w, prob)
+		return
+	}
+	opts.Mounts = mounts.Podman(mounted)
 
 	// The Process gets a cgroup of its own, with its ceiling written by root,
 	// and the container is created under it. A host that cannot place it runs
