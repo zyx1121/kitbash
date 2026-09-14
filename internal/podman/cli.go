@@ -303,8 +303,26 @@ func (c *CLI) Run(ctx context.Context, opts RunOptions) (string, error) {
 // where they are visible; they can only come from a manifest, and the
 // variables kitbash sets itself carry no line breaks.
 func RunArgs(opts RunOptions, inline []string) []string {
-	args := []string{"run", "--name", opts.Name}
-	if opts.Detach {
+	return containerArgs("run", opts, inline)
+}
+
+// CreateArgs is the same command line for podman create, which makes the
+// container without running anything in it. kitbashd uses it rather than run,
+// because a Process with mounts has to be checked in its own mount namespace
+// before its first instruction executes: create, then init, then the check,
+// then start, see PLAN.md section 2.3.
+//
+// There is no detach flag on it. A created container runs nothing to detach
+// from, and podman refuses the flag.
+func CreateArgs(opts RunOptions, inline []string) []string {
+	return containerArgs("create", opts, inline)
+}
+
+// containerArgs is the command line both verbs share, which is all of it apart
+// from detaching.
+func containerArgs(verb string, opts RunOptions, inline []string) []string {
+	args := []string{verb, "--name", opts.Name}
+	if opts.Detach && verb == "run" {
 		args = append(args, "--detach")
 	}
 	if opts.Interactive {

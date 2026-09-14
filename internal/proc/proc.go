@@ -981,7 +981,7 @@ func State(container podman.Container) string {
 	switch container.State {
 	case podman.StateRunning:
 		return StateRunning
-	case podman.StateCreated, podman.StateConfigured:
+	case podman.StateCreated, podman.StateConfigured, podman.StateInitialized:
 		return StateStarting
 	case podman.StateStopped, podman.StateStopping, podman.StateRemoving:
 		return StateStopped

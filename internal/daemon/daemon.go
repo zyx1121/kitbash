@@ -161,6 +161,11 @@ type Options struct {
 	// host. Empty means mounts.OrgRoot. It exists for tests, which have no
 	// /org of their own to put a folder in.
 	OrgRoot string
+	// ProcRoot is the process table kitbashd reads a container's own mount
+	// namespace through, /proc on a kitbash host. Empty means
+	// DefaultProcRoot. It exists for tests, which run no containers and stage
+	// a tree of their own in its shape.
+	ProcRoot string
 	// NoRestore stops the daemon from starting the registered Processes,
 	// which an operator sets with KITBASH_NO_RESTORE to bring a host up
 	// without its Processes, and a test sets to keep the runtime out of it.
@@ -196,6 +201,10 @@ type Server struct {
 	// orgRoot is the shared root a mount source may name, see mounts in
 	// spec/kitbashd-api.yaml.
 	orgRoot string
+	// procRoot is where this host's process table is mounted, which is how
+	// kitbashd reads what a container has in its own mount namespace, see
+	// mounts.go.
+	procRoot string
 	// actions serialises the start, stop and remove of one Process, see
 	// run.go. Two of them at once on one id race on its environment file and
 	// on its cgroup.
@@ -273,6 +282,7 @@ func New(st *store.Store, opts Options) *Server {
 		envDir:   opts.EnvDir,
 		endpoint: opts.ProcessEndpoint,
 		orgRoot:  opts.OrgRoot,
+		procRoot: opts.ProcRoot,
 		actions:  newActionLock(),
 		fetches:  newFetchLock(),
 		probes:   newProber(opts.HealthMinInterval),
@@ -300,6 +310,9 @@ func New(st *store.Store, opts Options) *Server {
 	}
 	if s.orgRoot == "" {
 		s.orgRoot = mounts.OrgRoot
+	}
+	if s.procRoot == "" {
+		s.procRoot = DefaultProcRoot
 	}
 	if s.sessions == nil {
 		s.sessions = mcpSessionsOf(s.runner)

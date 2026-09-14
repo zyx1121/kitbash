@@ -13,6 +13,7 @@ import (
 	"github.com/zyx1121/kitbash/internal/cgroups"
 	"github.com/zyx1121/kitbash/internal/mounts"
 	"github.com/zyx1121/kitbash/internal/podman"
+	"github.com/zyx1121/kitbash/internal/problem"
 	"github.com/zyx1121/kitbash/internal/store"
 	"github.com/zyx1121/kitbash/internal/sysusers"
 )
@@ -178,21 +179,28 @@ func (s *Server) restoreOwner(ctx context.Context, owner string, processes []sto
 		// container that has to be created again is created under.
 		limits := limitsOf(p.Limits.Memory, p.Limits.CPU, p.Limits.Pids)
 		leaf := s.processCgroup(ctx, m, p, limits)
+		// A Process with mounts that is still running is verified through the
+		// process it already has: its namespace is the only place that says
+		// what it is holding, and this daemon did not make that container.
+		// One that is not running is not started again by name, because a
+		// start makes the bind mounts anew and the entrypoint would run before
+		// anything could be read: it is made again through create, prepare,
+		// verify, start, the same four steps a start takes, see mounts.go.
+		if len(mounted) > 0 {
+			done, counted := s.restoreMounted(ctx, m, p, leaf, mounted)
+			if done {
+				counts.add(counted)
+				if counted == restoredPlaced && !p.Limits.Written() {
+					unplaced++
+				}
+				continue
+			}
+		}
 		start, cancel := context.WithTimeout(ctx, RestoreTimeout)
 		err := s.runner.Start(start, m, p.Container, leaf)
 		cancel()
 		switch {
 		case err == nil:
-			// The container is up, so what it holds is read back the way a
-			// start reads it: a source replaced while the host was booting is
-			// a Process that does not come back, see mounts.go.
-			if prob := s.verifyMounts(ctx, "", p, m, mounted); prob != nil {
-				counts.Failed++
-				s.tearDownAfterSwap(ctx, p, m)
-				failed := mountProblem(prob)
-				s.processFailed(p.ID, failed.Detail, failed.Fix)
-				continue
-			}
 			counts.Started++
 			s.clearProcessProblem(p.ID)
 			if !p.Limits.Written() {
@@ -202,15 +210,6 @@ func (s *Server) restoreOwner(ctx context.Context, owner string, processes []sto
 			// The daemon restarted and the host did not: the Process never
 			// stopped. It is running, which is what restore is for, so it is
 			// counted with the rest and named only in the one line at the end.
-			// Its mounts are still read back: this daemon did not make that
-			// container and has only the registration's word for what it holds.
-			if prob := s.verifyMounts(ctx, "", p, m, mounted); prob != nil {
-				counts.Failed++
-				s.tearDownAfterSwap(ctx, p, m)
-				failed := mountProblem(prob)
-				s.processFailed(p.ID, failed.Detail, failed.Fix)
-				continue
-			}
 			counts.Started++
 			counts.Running++
 			s.clearProcessProblem(p.ID)
@@ -422,17 +421,10 @@ func (s *Server) healCeiling(ctx context.Context, m sysusers.Member, p store.Pro
 	}
 	run, cancel := context.WithTimeout(ctx, RestoreTimeout)
 	defer cancel()
-	runErr := func() error {
-		if _, err := s.runner.Run(run, m, opts, leaf); err != nil {
-			return err
-		}
-		// The container this heal created is checked like any other start.
-		if prob := s.verifyMounts(ctx, "", p, m, mounted); prob != nil {
-			s.tearDownAfterSwap(ctx, p, m)
-			return errors.New(prob.Detail)
-		}
-		return nil
-	}()
+	// The container this heal makes goes through the same four steps a start
+	// does: create, prepare, verify, start. Nothing in it runs before its
+	// mounts have been read in its own namespace.
+	runErr := s.createVerifiedContainer(run, m, p, opts, leaf, mounted)
 	if runErr != nil {
 		// The name goes back to the container that holds this Process, so the
 		// registration still names something the next boot can find and this
@@ -459,6 +451,161 @@ func (s *Server) healCeiling(ctx context.Context, m sysusers.Member, p store.Pro
 		logger.Printf("restore: removing %s, which %s replaced: %v", aside, p.Container, err)
 	}
 	return true, nil
+}
+
+// createVerifiedContainer is the four steps every container of a Process with
+// mounts is made by: the runtime makes it, the runtime prepares it, which is
+// where the bind mounts appear, kitbashd reads them in the container's own
+// mount namespace, and only then is it started. A container that does not check
+// out is removed here, having executed nothing, see mounts.go.
+func (s *Server) createVerifiedContainer(ctx context.Context, m sysusers.Member, p store.Process,
+	opts podman.RunOptions, leaf string, mounted []mounts.Resolved) error {
+	if _, err := s.runner.CreateContainer(ctx, m, opts, leaf); err != nil {
+		return err
+	}
+	if prob := s.prepareAndVerify(ctx, "", p, m, leaf, mounted); prob != nil {
+		return errors.New(prob.Detail)
+	}
+	if err := s.runner.Start(ctx, m, p.Container, leaf); err != nil {
+		s.tearDownAfterSwap(ctx, p, m)
+		return err
+	}
+	return nil
+}
+
+// restoredPlaced and restoredFailed are what one Process of the verified
+// restore path came to, which the caller adds to its counts.
+const (
+	restoredPlaced = iota
+	restoredRunning
+	restoredFailed
+)
+
+// add records one Process of the verified restore path in the counts.
+func (c *RestoreCounts) add(outcome int) {
+	switch outcome {
+	case restoredPlaced:
+		c.Started++
+	case restoredRunning:
+		c.Started++
+		c.Running++
+	case restoredFailed:
+		c.Failed++
+	}
+}
+
+// restoreMounted brings back one Process that declares mounts. It answers
+// whether it handled the Process and, if it did, what it came to.
+//
+// A container that is still running is read where it stands: its own namespace
+// is the only thing that says what it is holding, and this daemon did not make
+// it. One that is not running is not started by name, because a start makes the
+// bind mounts again and the entrypoint would be running before anything could
+// be read: it is made again, from the registration and from its own
+// configuration, through the same four steps a start takes.
+//
+// It hands the Process back unhandled only when the runtime has no container of
+// it at all, which is the case restore answers by unregistering it.
+func (s *Server) restoreMounted(ctx context.Context, m sysusers.Member, p store.Process,
+	leaf string, mounted []mounts.Resolved) (handled bool, outcome int) {
+	failed := func(prob *problem.Problem) (bool, int) {
+		logger.Printf("restore: not bringing %s of %s back: %s", p.Container, p.Owner, prob.Detail)
+		report := mountProblem(prob)
+		s.processFailed(p.ID, report.Detail, report.Fix)
+		return true, restoredFailed
+	}
+	config, err := s.runner.ContainerConfig(ctx, m, p.Container)
+	if err != nil {
+		if errors.Is(err, sysusers.ErrNoContainer) {
+			return false, 0
+		}
+		logger.Printf("restore: reading %s of %s: %v", p.Container, p.Owner, err)
+		return failed(problem.Internal("", err.Error(), ""))
+	}
+	// A container that is running has a process, and that process is the only
+	// witness of what it holds. A pid that is gone is a container that is not
+	// running, whatever its recorded state says, so it is made again.
+	if config.PID > 0 {
+		if prob := s.verifyConfig("", p, config, mounted); prob != nil {
+			s.tearDownAfterSwap(ctx, p, m)
+			return failed(prob)
+		}
+		s.clearProcessProblem(p.ID)
+		return true, restoredRunning
+	}
+	if err := s.remakeMounted(ctx, m, p, config, leaf, mounted); err != nil {
+		logger.Printf("restore: making %s of %s again: %v", p.Container, p.Owner, err)
+		return failed(problem.NotPermitted("", err.Error(), ""))
+	}
+	s.clearProcessProblem(p.ID)
+	return true, restoredPlaced
+}
+
+// remakeMounted makes the container of one Process again from the registration
+// and from what the old one was made with, and starts it only once its mounts
+// have been read in its own namespace. The old container is removed first: it
+// is not running, its name is what the registration holds, and a start of it
+// would put the bind mounts back without anything reading them.
+func (s *Server) remakeMounted(ctx context.Context, m sysusers.Member, p store.Process,
+	config sysusers.ContainerConfig, leaf string, mounted []mounts.Resolved) error {
+	image := p.Digest
+	if image == "" {
+		image = config.Image
+	}
+	if image == "" {
+		return fmt.Errorf("daemon: %s names no image to make %s from", p.ID, p.Container)
+	}
+	opts := podman.RunOptions{
+		Name:         p.Container,
+		Image:        image,
+		Detach:       true,
+		Interactive:  true,
+		Restart:      config.Restart,
+		Publish:      config.Publish,
+		Mounts:       mounts.Podman(mounted),
+		CgroupParent: config.CgroupParent,
+		Memory:       podman.MemoryLimit(p.Limits.Memory),
+		CPUs:         p.Limits.CPU,
+		PidsLimit:    p.Limits.Pids,
+	}
+	if leaf != "" {
+		opts.CgroupParent = cgroups.Parent(m.Name, p.ID)
+	}
+	labels, prob := labelsOf("", p, healedLabels(config.Labels))
+	if prob != nil {
+		return fmt.Errorf("daemon: the labels of %s: %s", p.Container, prob.Detail)
+	}
+	opts.Labels = labels
+	// The token is minted again, because the container that held the previous
+	// one is about to be removed and the store keeps only its hash.
+	token, hash, err := store.NewToken()
+	if err != nil {
+		return err
+	}
+	envFile, err := s.writeEnvFile(p, m, healedEnv(config.Env), token)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := os.Remove(envFile); err != nil && !errors.Is(err, os.ErrNotExist) {
+			logger.Printf("restore: removing the environment file of %s: %v", p.ID, err)
+		}
+	}()
+	opts.EnvFile = envFile
+
+	if err := s.runner.RemoveContainer(ctx, m, p.Container, true); err != nil &&
+		!errors.Is(err, sysusers.ErrNoContainer) {
+		return err
+	}
+	make, cancel := context.WithTimeout(ctx, RestoreTimeout)
+	defer cancel()
+	if err := s.createVerifiedContainer(make, m, p, opts, leaf, mounted); err != nil {
+		return err
+	}
+	if err := s.store.RegisterProcess(ctx, p, hash, 0); err != nil {
+		logger.Printf("restore: recording the token of %s: %v", p.ID, err)
+	}
+	return nil
 }
 
 // ceilingWritten is the registration as it stands once the Process has a

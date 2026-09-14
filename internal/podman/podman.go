@@ -43,14 +43,19 @@ const (
 
 // Container states the runtime reports, lowercased.
 const (
-	StateRunning    = "running"
-	StateCreated    = "created"
-	StateConfigured = "configured"
-	StateExited     = "exited"
-	StateStopped    = "stopped"
-	StateStopping   = "stopping"
-	StateRemoving   = "removing"
-	StatePaused     = "paused"
+	StateRunning = "running"
+	StateCreated = "created"
+	// StateInitialized is a container podman init has prepared: crun has made
+	// its rootfs and its bind mounts and its init process exists, and the
+	// image's entrypoint has executed nothing. It is the state kitbashd checks
+	// a Process's mounts in, see PLAN.md section 2.3.
+	StateInitialized = "initialized"
+	StateConfigured  = "configured"
+	StateExited      = "exited"
+	StateStopped     = "stopped"
+	StateStopping    = "stopping"
+	StateRemoving    = "removing"
+	StatePaused      = "paused"
 )
 
 // Filter selects images or containers by label. An empty filter matches

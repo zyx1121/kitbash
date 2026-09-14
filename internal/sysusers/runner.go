@@ -79,15 +79,16 @@ type Podman struct {
 // NewPodman returns the Runner kitbashd uses on a kitbash host.
 func NewPodman() *Podman { return &Podman{Binary: podman.Binary, RunUser: DefaultRunUser} }
 
-// Run starts one container as the member, inside their cgroup leaf, and
-// returns the runtime id it printed. The options are the whole command line:
-// kitbashd built them, wrote the env file the member can read, and named the
-// cgroup parent the container's own cgroup goes under.
+// CreateContainer makes one container as the member, inside their cgroup leaf, and
+// returns the runtime id it printed. Nothing runs in it: the image's
+// entrypoint has executed nothing when this returns. The options are the whole
+// command line: kitbashd built them, wrote the env file the member can read,
+// and named the cgroup parent the container's own cgroup goes under.
 //
 // The image is checked first, because an image the member does not have and a
 // command line the runtime will not parse are the same exit status, and only
 // the first of the two is worth telling the caller to build.
-func (p *Podman) Run(ctx context.Context, m Member, opts podman.RunOptions, cgroup string) (string, error) {
+func (p *Podman) CreateContainer(ctx context.Context, m Member, opts podman.RunOptions, cgroup string) (string, error) {
 	if err := ensureRuntimeDir(p.runUser(), m); err != nil {
 		return "", err
 	}
@@ -100,7 +101,7 @@ func (p *Podman) Run(ctx context.Context, m Member, opts podman.RunOptions, cgro
 	// Nothing of the environment is on this command line: the values are in
 	// the file opts.EnvFile names, which the daemon wrote 0600 for this
 	// member, see internal/daemon/run.go.
-	out, err := p.runFor(ctx, m, cgroup, RunTimeout, podman.RunArgs(opts, nil)...)
+	out, err := p.runFor(ctx, m, cgroup, RunTimeout, podman.CreateArgs(opts, nil)...)
 	if err != nil {
 		if exitCode(err, usageExit) {
 			return "", fmt.Errorf("%w: %v", ErrUsage, err)
@@ -108,6 +109,29 @@ func (p *Podman) Run(ctx context.Context, m Member, opts podman.RunOptions, cgro
 		return "", err
 	}
 	return strings.TrimSpace(out), nil
+}
+
+// InitContainer prepares a created container without running it: the runtime makes its
+// rootfs and every bind mount it was created with and leaves its init process
+// created, so the container has a pid and a mount namespace and the image's
+// entrypoint has executed nothing. It is verified on podman 5.7.0, where the
+// state after it is initialized and the pid is not zero.
+//
+// It runs in the member's cgroup leaf like a start, because this is where the
+// container's own cgroup is made.
+//
+// A source that has stopped existing between the create and here fails this
+// call rather than the start, and the container is left created with no pid,
+// which the caller answers the same way it answers a mount that changed.
+func (p *Podman) InitContainer(ctx context.Context, m Member, container, cgroup string) error {
+	if err := ensureRuntimeDir(p.runUser(), m); err != nil {
+		return err
+	}
+	if err := p.exists(ctx, m, container); err != nil {
+		return err
+	}
+	_, err := p.runFor(ctx, m, cgroup, RunTimeout, "init", container)
+	return err
 }
 
 // Start creates the member's runtime directory and starts one container as

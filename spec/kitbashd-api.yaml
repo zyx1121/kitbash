@@ -307,9 +307,14 @@ api:
       folder can be removed, replaced by a symlink or lose its manifest in
       between. A mount that no longer checks out fails the start with the same
       problem the registration would have given, and the container is not
-      created. Once the container exists it is read back, see mount_swaps: a
-      source that changed while podman was resolving it is not-permitted and
-      the container is stopped and removed.
+      created.
+      A Process with mounts is then started in four steps rather than one, see
+      mount_swaps: podman create, podman init, the check, podman start. The
+      guarantee is that the bind mounts of a Process are held to what kitbashd
+      validated in the container's own mount namespace before its first
+      instruction runs, so a source swapped while podman was resolving it is
+      refused rather than detected: the container is removed having executed
+      nothing.
     timeouts: >
       The runtime gets 120 s for a run and 40 s for a stop or a forced removal,
       which is the ten second grace the container is given plus room to kill it
@@ -706,28 +711,42 @@ restore:
     podman resolves the source path itself, in its own process, after kitbashd
     has looked at it. A source replaced by a symlink in between is followed by
     podman and the container is given whatever it pointed at, which for a member
-    of kitbash-admin is a rw mount of /org with no approval behind it. The
-    window is closed after the start rather than written down.
-    As soon as the container exists, kitbashd reads it back as the member, the
-    same way it reads a configuration for the heal path. It asks the runtime
-    which source is mounted at each target and in which mode, which catches a
-    runtime that mounted something other than what it was asked for, and it
-    stats each target through /proc/<pid>/root, which resolves in the
-    container's own mount namespace, and holds the device and inode it finds
-    there to the ones the validation opened. The second is the ground truth:
-    podman reports the path it was asked for and not what it resolved, verified
-    against podman 5.7.0, so a source swapped for a link, and one swapped and
-    swapped back, are caught by the inode at the target and by nothing else.
-    kitbashd is root, so it needs nothing inside the image to read it. A
-    container that is no longer running has no namespace to look into, so its
-    sources are resolved once more instead, which catches a swap that was not
-    put back.
-    A mismatch is not-permitted with the detail "the mount source changed
-    between validation and start". The container is stopped and removed rather
-    than left running with a folder kitbashd did not agree to, it is logged, and
-    the boot restore and the heal path do the same, with the restore reporting
-    it through proc_list. What this protects is the /org approval trail and
-    progressive disclosure.
+    of kitbash-admin is a rw mount of /org with no approval behind it. Reporting
+    that afterwards is not enough: by then the entrypoint has run and a write
+    has landed. It is refused instead.
+    A Process is started in four steps. podman create makes the container with
+    its mounts. podman init has the runtime build its rootfs and its bind mounts
+    and leave its init process created, with the image's entrypoint not yet
+    executed: verified on podman 5.7.0, where the state after it is initialized,
+    State.Pid is not zero, the mounts are readable under /proc/<pid>/root, and a
+    fixture whose entrypoint writes a marker writes nothing until start. Then
+    kitbashd checks, as root. Then podman start.
+    The check asks two questions. Which source the runtime says is mounted at
+    each target, and in which mode, which catches a runtime that mounted
+    something other than what it was asked for. And what the container actually
+    has: a stat of each target through /proc/<pid>/root, which resolves in the
+    container's own mount namespace, held to the device and inode the validation
+    opened. The second is the ground truth, because podman reports the path it
+    was asked for and not what it resolved, verified against podman 5.7.0, so a
+    source swapped for a link, and one swapped and swapped back, are caught by
+    the inode at the target and by nothing else. kitbashd is root, so it needs
+    nothing inside the image to read it.
+    A mismatch, a container the runtime would not prepare, which is what a
+    source that stopped existing answers, and a container with no process after
+    it was prepared are all not-permitted with the detail "the mount source
+    changed between validation and start". The container is removed having
+    executed nothing, and it is logged. There is no fallback: a container
+    kitbashd cannot read is a container that does not start.
+    Restore is the same guarantee. A Process that is still running is verified
+    through the process it already has, because its namespace is the only
+    witness of what it holds and this daemon did not make that container. One
+    whose process is gone is not started by name, because a start makes the bind
+    mounts again and the entrypoint would be running before anything could read
+    them: it is made again through the same four steps, from the registration
+    and from what the old container was made with. The heal path is the same
+    four steps. A Process refused this way is reported through proc_list, which
+    keeps listing it because its container is gone. What this protects is the
+    /org approval trail and progressive disclosure.
   cgroups: >
     The cgroup of each Process is created again, with its ceiling, before its
     container starts: the cgroup filesystem does not survive a reboot, and a

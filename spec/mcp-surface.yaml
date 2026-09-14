@@ -555,11 +555,13 @@ families:
           the restore, and proc_list reports that Process failed with the
           reason.
 
-          The container is read back as soon as it exists, because podman
-          resolves the source itself after kitbashd checked it: a source
-          replaced in between is not-permitted with the detail "the mount
-          source changed between validation and start", and that container is
-          stopped and removed rather than left running.
+          The bind mounts are held to what kitbashd validated in the
+          container's own mount namespace before its first instruction runs:
+          the container is made, the runtime prepares it, kitbashd reads it,
+          and only then is it started. A source replaced while podman was
+          resolving it is refused, not reported: not-permitted with the detail
+          "the mount source changed between validation and start", and that
+          container is removed having executed nothing.
         input:
           type: object
           additionalProperties: false

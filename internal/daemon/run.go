@@ -289,18 +289,24 @@ func (s *Server) startProcess(w http.ResponseWriter, r *http.Request, p store.Pr
 	}()
 	opts.EnvFile = envFile
 
-	id, err := s.runner.Run(r.Context(), m, opts, leaf)
+	// The container is made, prepared and only then started. Preparing it is
+	// where the runtime makes its bind mounts, and between that and the start
+	// kitbashd reads what the container actually got, in its own mount
+	// namespace, before the image's entrypoint has executed anything. A
+	// source replaced between the check above and podman resolving it is
+	// refused there, and the container is removed having run nothing, see
+	// mounts.go.
+	id, err := s.runner.CreateContainer(r.Context(), m, opts, leaf)
 	if err != nil {
 		writeProblem(w, s.runProblem(r, err, p, opts))
 		return
 	}
-	// The container exists, so what it actually holds can be read rather than
-	// assumed. A source replaced between the check above and podman resolving
-	// it is caught here, and that container is taken apart rather than left
-	// running with a folder kitbashd did not agree to, see mounts.go.
-	if prob := s.verifyMounts(r.Context(), r.URL.Path, p, m, mounted); prob != nil {
-		s.tearDownAfterSwap(r.Context(), p, m)
+	if prob := s.prepareAndVerify(r.Context(), r.URL.Path, p, m, leaf, mounted); prob != nil {
 		writeProblem(w, prob)
+		return
+	}
+	if err := s.runner.Start(r.Context(), m, p.Container, leaf); err != nil {
+		writeProblem(w, s.runProblem(r, err, p, opts))
 		return
 	}
 	// The Process is running, so whatever the last boot could not do for it is

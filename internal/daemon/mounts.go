@@ -75,6 +75,11 @@ func (s *Server) revalidateMounts(instance string, p store.Process, m sysusers.M
 	return s.mountChecker(m).Resolve(instance, mounts.Redeclare(p.Mounts))
 }
 
+// DefaultProcRoot is this host's process table, which is how kitbashd reads
+// what a container has in its own mount namespace: /proc/<pid>/root resolves
+// inside that namespace, and root needs nothing in the image to read it.
+const DefaultProcRoot = "/proc"
+
 // MountSwapped is the detail of the one refusal this file exists for. It is
 // spelled once because three callers answer with it and a test matches on it.
 const MountSwapped = "the mount source changed between validation and start"
@@ -83,17 +88,23 @@ const MountSwapped = "the mount source changed between validation and start"
 // look at the folder rather than at kitbash.
 const mountSwapFix = "Check the folder deploy.units[0].mounts names: it was replaced while the Process was starting. Run the Package again once it is the folder you meant."
 
-// verifyMounts checks, after the container exists, that what was mounted is
-// what was validated, and answers a problem when it is not. The caller stops
-// and removes the container: a Process holding a folder kitbashd did not agree
-// to is not left running while its owner reads a problem.
+// verifyMounts holds a prepared container to what was validated, and answers a
+// problem when it does not match. There is no fallback: a container kitbashd
+// cannot read is a container that does not start.
 //
-// The check at validation says what was true then. podman resolves the source
-// path itself, in its own process, after that: a source replaced by a symlink
-// in between is followed by podman and the container gets whatever it pointed
-// at. For a member of kitbash-admin that would be a rw mount of /org, which is
-// the one thing the approval queue exists to be the trail of, so the window is
-// closed here rather than written down.
+// It is called between podman init and podman start. The bind mounts of a
+// container are made by init, which leaves its init process created and the
+// image's entrypoint not yet executed, so this reads what the container
+// actually got before its first instruction runs. Verified on podman 5.7.0: the
+// state after init is initialized, the pid is not zero, the mounts are there,
+// and a fixture whose entrypoint writes a marker writes nothing until start.
+//
+// The check at validation says what was true then, and podman resolves the
+// source path itself, in its own process, afterwards: a source replaced by a
+// symlink in between is followed by podman and the container gets whatever it
+// pointed at. For a member of kitbash-admin that would be a rw mount of /org,
+// which is the one thing the approval queue exists to be the trail of, so this
+// refuses the start rather than reporting it after the fact.
 //
 // Two questions are asked, because one of them alone is not enough.
 //
@@ -111,10 +122,10 @@ const mountSwapFix = "Check the folder deploy.units[0].mounts names: it was repl
 // swapped back, are both a different inode at the target. kitbashd is root, so
 // it needs nothing inside the image to read this.
 //
-// A container with no PID is one that is not running, which is a Process that
-// has exited already. There is no namespace left to look into, so the first
-// question stands alone and the source is resolved once more instead: that
-// catches a source that is a link now, which is the swap that was not put back.
+// A pid of zero is a container the runtime did not prepare, which is what a
+// source that stopped existing between the create and the init leaves behind.
+// It is refused with everything else: there is no namespace to read, so there
+// is nothing this can say about it.
 func (s *Server) verifyMounts(ctx context.Context, instance string, p store.Process, m sysusers.Member, expected []mounts.Resolved) *problem.Problem {
 	if len(expected) == 0 {
 		return nil
@@ -122,7 +133,17 @@ func (s *Server) verifyMounts(ctx context.Context, instance string, p store.Proc
 	config, err := s.runner.ContainerConfig(ctx, m, p.Container)
 	if err != nil {
 		return problem.Internal(instance,
-			fmt.Sprintf("reading back what %s was started with: %v", p.Container, err), "")
+			fmt.Sprintf("reading back what %s was prepared with: %v", p.Container, err), "")
+	}
+	return s.verifyConfig(instance, p, config, expected)
+}
+
+// verifyConfig is verifyMounts against a configuration the caller has already
+// read, which is what restore does: it asks the runtime once, for the state and
+// the pid as well as the mounts.
+func (s *Server) verifyConfig(instance string, p store.Process, config sysusers.ContainerConfig, expected []mounts.Resolved) *problem.Problem {
+	if len(expected) == 0 {
+		return nil
 	}
 	swapped := func(detail string) *problem.Problem {
 		logger.Printf("processes: %s of %s: %s: %s", p.ID, p.Owner, MountSwapped, detail)
@@ -146,36 +167,15 @@ func (s *Server) verifyMounts(ctx context.Context, instance string, p store.Proc
 		}
 	}
 	if config.PID <= 0 {
-		return s.verifyBySecondResolution(instance, p, m, expected, swapped)
+		return swapped(fmt.Sprintf("%s has no process to read its mounts through", p.Container))
 	}
 	for _, want := range expected {
-		device, inode, err := statIdentity(filepath.Join("/proc", strconv.Itoa(config.PID), "root", want.Target))
+		device, inode, err := statIdentity(filepath.Join(s.procRoot, strconv.Itoa(config.PID), "root", want.Target))
 		if err != nil {
 			return swapped(fmt.Sprintf("%s cannot be read inside %s: %v", want.Target, p.Container, err))
 		}
 		if device != want.Device || inode != want.Inode {
 			return swapped(fmt.Sprintf("%s holds another folder than the one %s was validated as", want.Target, want.Source))
-		}
-	}
-	return nil
-}
-
-// verifyBySecondResolution is the answer for a container that is no longer
-// running: the source is resolved again and held to the folder the validation
-// opened. It is weaker than reading the container's own namespace, because a
-// source put back after the container was created reads as unchanged, and it is
-// what there is once the namespace is gone.
-func (s *Server) verifyBySecondResolution(instance string, p store.Process, m sysusers.Member,
-	expected []mounts.Resolved, swapped func(string) *problem.Problem) *problem.Problem {
-	logger.Printf("processes: %s of %s is not running, so its mounts are checked by resolving them again rather than through its namespace",
-		p.ID, p.Owner)
-	again, prob := s.mountChecker(m).Resolve(instance, mounts.Redeclare(expected))
-	if prob != nil {
-		return swapped(prob.Detail)
-	}
-	for i, want := range expected {
-		if !mounts.SameFolder(want, again[i]) {
-			return swapped(fmt.Sprintf("%s is not the folder it was validated as", want.Source))
 		}
 	}
 	return nil
@@ -196,19 +196,45 @@ func statIdentity(path string) (device, inode uint64, err error) {
 }
 
 // tearDownAfterSwap removes the container of a Process whose mounts did not
-// check out. It is stopped first and then removed by force: what it holds is a
-// folder kitbashd did not agree to, so it does not get the ten seconds a
-// proc_stop gives, and a removal that fails is logged rather than returned,
-// because the answer to the caller is the refusal and not this.
+// check out. A container that was only prepared has run nothing, so this is
+// what makes the refusal true: it is removed by force, and a removal that fails
+// is logged rather than returned, because the answer to the caller is the
+// refusal and not this.
 func (s *Server) tearDownAfterSwap(ctx context.Context, p store.Process, m sysusers.Member) {
-	if err := s.runner.Stop(ctx, m, p.Container, 0); err != nil &&
-		!errors.Is(err, sysusers.ErrNoContainer) {
-		logger.Printf("processes: stopping %s after its mount changed: %v", p.Container, err)
-	}
 	if err := s.runner.RemoveContainer(ctx, m, p.Container, true); err != nil &&
 		!errors.Is(err, sysusers.ErrNoContainer) {
 		logger.Printf("processes: removing %s after its mount changed: %v", p.Container, err)
 	}
+}
+
+// prepareAndVerify is the whole of what a start does between making a container
+// and running it: the runtime prepares it, which is where the bind mounts are
+// made, kitbashd reads them in the container's own namespace, and only a
+// container that matches is handed back to be started. A container that does
+// not match is removed here, having run nothing.
+//
+// A Process with no mounts is prepared too. It costs one call and it means one
+// path rather than two, and the runtime does at start what it would have done
+// here anyway.
+func (s *Server) prepareAndVerify(ctx context.Context, instance string, p store.Process, m sysusers.Member,
+	leaf string, expected []mounts.Resolved) *problem.Problem {
+	if err := s.runner.InitContainer(ctx, m, p.Container, leaf); err != nil {
+		if len(expected) == 0 {
+			return problem.Internal(instance,
+				fmt.Sprintf("the container runtime could not prepare %s: %v", p.Container, err), "")
+		}
+		// A source that stopped existing between the create and here is what
+		// this failure usually is, and it is the same refusal: the container
+		// has run nothing and it does not get to.
+		logger.Printf("processes: %s of %s: %s: preparing %s: %v", p.ID, p.Owner, MountSwapped, p.Container, err)
+		s.tearDownAfterSwap(ctx, p, m)
+		return problem.NotPermitted(instance, MountSwapped, mountSwapFix)
+	}
+	if prob := s.verifyMounts(ctx, instance, p, m, expected); prob != nil {
+		s.tearDownAfterSwap(ctx, p, m)
+		return prob
+	}
+	return nil
 }
 
 // mountProblem is what restore records about a Process whose mount is no

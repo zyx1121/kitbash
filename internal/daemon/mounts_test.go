@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -19,16 +20,46 @@ import (
 	"github.com/zyx1121/kitbash/internal/uuid"
 )
 
+// testPID is the process id the fake runtime gives every prepared container,
+// which is what the daemon reads its mount namespace through.
+const testPID = 4242
+
+// stageNamespace writes what one container holds at one target into a tree
+// standing in for /proc. /proc/<pid>/root is a magic link the kernel resolves
+// in the container's own mount namespace; here it is an ordinary link to the
+// folder that is mounted there, so the daemon's own stat and its own comparison
+// of device and inode are what run, against a real folder on a real
+// filesystem.
+func stageNamespace(procRoot string, pid int, target, folder string) error {
+	at := filepath.Join(procRoot, strconv.Itoa(pid), "root", target)
+	if err := os.MkdirAll(filepath.Dir(at), 0o755); err != nil {
+		return err
+	}
+	if err := os.RemoveAll(at); err != nil {
+		return err
+	}
+	return os.Symlink(folder, at)
+}
+
 // filesHost is a daemon whose members are a fake host with real folders behind
 // them: the caller's home and an /org of the test's own, each holding one
 // visible folder, so the resolution kitbashd makes as root has a tree to make
 // it in. The caller's own uid is what the folders are owned by, which is what
 // makes "owned by the member" a question this test can answer.
+//
+// The fourth thing it answers is the tree standing in for /proc, which is where
+// a test says what a prepared container is actually holding.
 func filesHost(t *testing.T) (*harness, *sysusers.Fake, string, string) {
+	h, fake, home, org, _ := filesHostWithProc(t)
+	return h, fake, home, org
+}
+
+func filesHostWithProc(t *testing.T) (*harness, *sysusers.Fake, string, string, string) {
 	t.Helper()
 	dir := t.TempDir()
 	home := filepath.Join(dir, "home", "member")
 	org := filepath.Join(dir, "org")
+	procRoot := filepath.Join(dir, "proc")
 	visible := func(root, name string) {
 		t.Helper()
 		folder := filepath.Join(root, name)
@@ -44,14 +75,17 @@ func filesHost(t *testing.T) (*harness, *sysusers.Fake, string, string) {
 	visible(org, "handbook")
 
 	fake := sysusers.NewFake()
+	fake.NextPID = testPID
+	fake.ProcRoot = procRoot
 	h := serveWith(t, Options{
 		Users:           fake,
 		Runner:          fake,
 		OrgRoot:         org,
+		ProcRoot:        procRoot,
 		ProcessEndpoint: "http://127.0.0.1:4318",
 	})
 	fake.Add(sysusers.Member{Name: h.user, UID: os.Getuid(), GID: os.Getgid(), Home: home})
-	return h, fake, home, org
+	return h, fake, home, org, procRoot
 }
 
 // registerWithMounts sends one registration carrying the mounts given and
@@ -282,52 +316,54 @@ func TestRestoreStartsAProcessWhoseMountsAreStillLegal(t *testing.T) {
 	}
 }
 
-// TestHealCreatesTheContainerAgainWithTheRegistrationsMounts is the heal path:
-// the container is created again, so its mounts come from the registration,
-// which is the record kitbashd resolved itself, and not from whatever the old
-// container happened to carry.
-func TestHealCreatesTheContainerAgainWithTheRegistrationsMounts(t *testing.T) {
+// TestRestoreMakesAStoppedProcessAgainWithTheRegistrationsMounts is what a boot
+// does with a Process that declares mounts and is not running: it is not
+// started by name, because a start makes the bind mounts again and the
+// entrypoint would be running before anything could read them. It is made
+// again, with the mounts the registration holds and not with whatever the old
+// container happened to carry, and it is read before it runs.
+func TestRestoreMakesAStoppedProcessAgainWithTheRegistrationsMounts(t *testing.T) {
 	h, fake, home, _ := filesHost(t)
 	const container = "kitbash-reader-reader"
 	id := h.superviseWithMounts(container, []mounts.Resolved{
 		{Source: filepath.Join(home, "notes"), Target: "/files/notes", Mode: mounts.ModeRO},
 	})
-	// The container of a Process registered before kitbashd wrote a ceiling
-	// per Process names its member's own cgroup, which is what the heal is
-	// for, and it carries a mount nobody resolved.
+	// The container the host holds is not running, so it has no pid, and it
+	// carries a mount nobody resolved. Neither survives: the registration is
+	// the record, and the cgroup parent of a container made before kitbashd
+	// gave each Process one of its own is replaced with the ceiling.
 	fake.Configs = map[string]sysusers.ContainerConfig{
 		container: {
 			CgroupParent: cgroups.MemberParent(h.user),
 			Image:        testDigest,
-			// A mount the old container carries that nobody resolved, which
-			// the heal must not carry over: the registration is the record.
-			Mounts: []podman.Mount{{Source: "/etc", Target: "/etc", ReadOnly: true}},
+			Mounts:       []podman.Mount{{Source: "/etc", Target: "/etc", ReadOnly: true}},
 		},
 	}
 	fake.AddImage(h.user, testDigest, 1, nil)
-	// What the host does today: the member's runtime cannot make the
-	// container's cgroup under a directory that belongs to root.
-	fake.StartErr = errors.New(
-		"crun: create `/sys/fs/cgroup/kitbash/member/libpod-fd4b88f9`: Permission denied: OCI permission denied")
 
 	counts := h.server.Restore(context.Background())
-	if counts.Healed != 1 {
-		t.Fatalf("the restore is %+v, want one heal", counts)
+	if counts.Started != 1 || counts.Failed != 0 {
+		t.Fatalf("the restore is %+v, want the Process made again and started", counts)
 	}
 	runs := fake.Runs()
 	if len(runs) != 1 {
-		t.Fatalf("the runtime was asked to run %d containers, want the healed one", len(runs))
+		t.Fatalf("the runtime was asked to make %d containers, want the one", len(runs))
 	}
 	line := strings.Join(runs[0].Args, " ")
 	want := "--mount type=bind,src=" + filepath.Join(home, "notes") + ",dst=/files/notes,ro=true"
 	if !strings.Contains(line, want) {
-		t.Errorf("the healed command line is\n%s\nwant it to carry\n%s", line, want)
+		t.Errorf("the command line is\n%s\nwant it to carry\n%s", line, want)
 	}
 	if strings.Contains(line, "src=/etc") {
-		t.Errorf("the healed command line carries the old container's own mount:\n%s", line)
+		t.Errorf("the command line carries the mount of the container it replaced:\n%s", line)
+	}
+	// Made, prepared, read, then started, in that order.
+	if len(fake.Inits()) != 1 || len(fake.Calls()) != 1 {
+		t.Errorf("the container was prepared %d times and started %d, want one of each",
+			len(fake.Inits()), len(fake.Calls()))
 	}
 	if _, found, err := h.store.Process(context.Background(), id); err != nil || !found {
-		t.Fatalf("the healed registration is gone: found %v, %v", found, err)
+		t.Fatalf("the registration is gone: found %v, %v", found, err)
 	}
 }
 
@@ -353,10 +389,10 @@ func TestStartRefusesWhenTheRuntimeMountedAnotherFolder(t *testing.T) {
 	if prob.Slug() != problem.SlugNotPermitted || prob.Detail != MountSwapped {
 		t.Fatalf("the start answered %s (%s), want not-permitted with %q", prob.Slug(), prob.Detail, MountSwapped)
 	}
-	// The container is not left running with a folder kitbashd did not agree
-	// to: it is stopped and removed.
-	if stops := fake.Stops(); len(stops) != 1 || stops[0].Container != "kitbash-reader-reader" {
-		t.Errorf("the stops are %+v, want the container stopped", stops)
+	// Nothing ran. The container was made and prepared, never started, and
+	// then removed, so the image's entrypoint executed no instruction at all.
+	if calls := fake.Calls(); len(calls) != 0 {
+		t.Errorf("the runtime was asked to start %+v, want nothing started", calls)
 	}
 	removals := fake.Removals()
 	if len(removals) != 1 || removals[0].Container != "kitbash-reader-reader" || !removals[0].Force {
@@ -404,7 +440,10 @@ func TestRestoreFailsAProcessWhoseContainerHoldsAnotherFolder(t *testing.T) {
 	id := h.superviseWithMounts("kitbash-reader-reader", []mounts.Resolved{
 		{Source: filepath.Join(home, "notes"), Target: "/files/notes", Mode: mounts.ModeRO},
 	})
+	// A container that is running has a pid, and that pid is the only witness
+	// of what it holds. This one is holding the shared root.
 	fake.PinConfig("kitbash-reader-reader", sysusers.ContainerConfig{
+		PID:    testPID,
 		Mounts: []podman.Mount{{Source: filepath.Join(org, "handbook"), Target: "/files/notes"}},
 	})
 	counts := h.server.Restore(context.Background())
@@ -414,45 +453,66 @@ func TestRestoreFailsAProcessWhoseContainerHoldsAnotherFolder(t *testing.T) {
 	if removals := fake.Removals(); len(removals) != 1 {
 		t.Errorf("the removals are %+v, want the container removed", removals)
 	}
+	if calls := fake.Calls(); len(calls) != 0 {
+		t.Errorf("the runtime was asked to start %+v, want nothing started", calls)
+	}
 	if got := h.server.processProblem(id); !strings.Contains(got.Detail, MountSwapped) {
 		t.Errorf("proc_list would report %q, want it to carry %q", got.Detail, MountSwapped)
 	}
 }
 
 // swappingRunner is the race itself, made repeatable: it replaces the source
-// folder with a symlink to somewhere else at the moment podman would be
-// resolving it, and then runs the container the way the fake always does.
+// folder with a symlink to somewhere else at the moment the real runtime would
+// be resolving it, which is when it prepares the container, and points the
+// container's own namespace at what the link pointed to.
 //
 // It is what happens on a real host between kitbashd validating a source and
-// podman resolving it in its own process: podman follows the link and the
-// container is given whatever it pointed at, while the runtime still reports
-// the path it was asked for. The Fake reports the same, so the mount this
-// answers with looks right and only the second check catches it.
+// podman resolving it: podman follows the link and the container is given
+// whatever it pointed at, while the runtime still reports the path it was asked
+// for. The Fake reports the same, so the mount it answers with looks right and
+// only the reading of the namespace catches it.
 type swappingRunner struct {
 	*sysusers.Fake
 	source string
 	to     string
+	// procRoot is the tree standing in for /proc, where this runner writes
+	// what the container's namespace holds.
+	procRoot string
+	pid      int
 }
 
-func (r *swappingRunner) Run(ctx context.Context, m sysusers.Member, opts podman.RunOptions, cgroup string) (string, error) {
+func (r *swappingRunner) InitContainer(ctx context.Context, m sysusers.Member, container, cgroup string) error {
 	if err := os.RemoveAll(r.source); err != nil {
-		return "", err
+		return err
 	}
 	if err := os.Symlink(r.to, r.source); err != nil {
-		return "", err
+		return err
 	}
-	return r.Fake.Run(ctx, m, opts, cgroup)
+	if err := r.Fake.InitContainer(ctx, m, container, cgroup); err != nil {
+		return err
+	}
+	// What the container holds at each target is what the source pointed at
+	// when the runtime resolved it, which is the folder the link names.
+	config, _ := r.Fake.ContainerConfig(ctx, m, container)
+	for _, mount := range config.Mounts {
+		if err := stageNamespace(r.procRoot, r.pid, mount.Target, r.to); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// TestStartRefusesASourceSwappedWhileTheContainerWasCreated is the window this
+// TestStartRefusesASourceSwappedWhileTheContainerWasPrepared is the window this
 // check exists for, with a real swap on a real filesystem: the folder is a
 // folder when kitbashd validates it and a link to the shared root by the time
-// the container exists. The runtime reports the path it was asked for, so what
-// catches it is the second reading of the source.
-func TestStartRefusesASourceSwappedWhileTheContainerWasCreated(t *testing.T) {
+// the runtime resolves it, which is when it prepares the container. The runtime
+// reports the path it was asked for, so what catches it is the reading of the
+// container's own namespace, and nothing had run when it did.
+func TestStartRefusesASourceSwappedWhileTheContainerWasPrepared(t *testing.T) {
 	dir := t.TempDir()
 	home := filepath.Join(dir, "home", "member")
 	org := filepath.Join(dir, "org")
+	procRoot := filepath.Join(dir, "proc")
 	for _, folder := range []struct{ root, name string }{{home, "notes"}, {org, "handbook"}} {
 		path := filepath.Join(folder.root, folder.name)
 		if err := os.MkdirAll(path, 0o755); err != nil {
@@ -465,11 +525,16 @@ func TestStartRefusesASourceSwappedWhileTheContainerWasCreated(t *testing.T) {
 	}
 	notes := filepath.Join(home, "notes")
 	fake := sysusers.NewFake()
-	runner := &swappingRunner{Fake: fake, source: notes, to: filepath.Join(org, "handbook")}
+	fake.NextPID = testPID
+	runner := &swappingRunner{
+		Fake: fake, source: notes, to: filepath.Join(org, "handbook"),
+		procRoot: procRoot, pid: testPID,
+	}
 	h := serveWith(t, Options{
 		Users:           fake,
 		Runner:          runner,
 		OrgRoot:         org,
+		ProcRoot:        procRoot,
 		ProcessEndpoint: "http://127.0.0.1:4318",
 	})
 	fake.Add(sysusers.Member{Name: h.user, UID: os.Getuid(), GID: os.Getgid(), Home: home})
@@ -484,6 +549,11 @@ func TestStartRefusesASourceSwappedWhileTheContainerWasCreated(t *testing.T) {
 	if prob.Slug() != problem.SlugNotPermitted || prob.Detail != MountSwapped {
 		t.Fatalf("the start answered %s (%s), want not-permitted with %q", prob.Slug(), prob.Detail, MountSwapped)
 	}
+	// Nothing ever ran: the container was made and prepared, never started,
+	// and removed.
+	if calls := fake.Calls(); len(calls) != 0 {
+		t.Fatalf("the runtime was asked to start %+v, want nothing started", calls)
+	}
 	if removals := fake.Removals(); len(removals) != 1 || !removals[0].Force {
 		t.Errorf("the removals are %+v, want the container removed by force", removals)
 	}
@@ -491,5 +561,123 @@ func TestStartRefusesASourceSwappedWhileTheContainerWasCreated(t *testing.T) {
 	// runs it again once it is a folder they meant.
 	if _, found, err := h.store.Process(context.Background(), id); err != nil || !found {
 		t.Fatalf("the registration is gone: found %v, %v", found, err)
+	}
+}
+
+// TestStartRefusesWhenTheNamespaceHoldsAnotherFolder is the comparison of
+// device and inode on its own. Everything the runtime says is right: it reports
+// the source the registration names, at the target it names, read only. What is
+// wrong is what the container actually has at that target, which is the only
+// question the mount spec cannot answer, because podman reports the path it was
+// asked for and not what it resolved.
+func TestStartRefusesWhenTheNamespaceHoldsAnotherFolder(t *testing.T) {
+	h, fake, home, org, procRoot := filesHostWithProc(t)
+	notes := filepath.Join(home, "notes")
+	id := h.superviseWithMounts("kitbash-reader-reader", []mounts.Resolved{
+		{Source: notes, Target: "/files/notes", Mode: mounts.ModeRO},
+	})
+	// The runtime is honest about its command line and the container holds
+	// something else, which is what following a swapped link produces.
+	fake.PinConfig("kitbash-reader-reader", sysusers.ContainerConfig{
+		PID:    testPID,
+		Mounts: []podman.Mount{{Source: notes, Target: "/files/notes", ReadOnly: true}},
+	})
+	if err := stageNamespace(procRoot, testPID, "/files/notes", filepath.Join(org, "handbook")); err != nil {
+		t.Fatalf("staging the namespace: %v", err)
+	}
+	res, body := h.start(id, startRequest{Image: testDigest})
+	if prob := h.problemOf(res, body); prob.Detail != MountSwapped {
+		t.Fatalf("the start answered %q, want %q: the mount spec was right and the folder was not",
+			prob.Detail, MountSwapped)
+	}
+	if calls := fake.Calls(); len(calls) != 0 {
+		t.Errorf("the runtime was asked to start %+v, want nothing started", calls)
+	}
+}
+
+// TestStartAcceptsWhenTheNamespaceHoldsTheValidatedFolder is the other half of
+// that comparison, so a check that always refused would fail here: the same
+// container, with the target holding the folder the validation opened, starts.
+func TestStartAcceptsWhenTheNamespaceHoldsTheValidatedFolder(t *testing.T) {
+	h, fake, home, _, procRoot := filesHostWithProc(t)
+	notes := filepath.Join(home, "notes")
+	id := h.superviseWithMounts("kitbash-reader-reader", []mounts.Resolved{
+		{Source: notes, Target: "/files/notes", Mode: mounts.ModeRO},
+	})
+	fake.PinConfig("kitbash-reader-reader", sysusers.ContainerConfig{
+		PID:    testPID,
+		Mounts: []podman.Mount{{Source: notes, Target: "/files/notes", ReadOnly: true}},
+	})
+	if err := stageNamespace(procRoot, testPID, "/files/notes", notes); err != nil {
+		t.Fatalf("staging the namespace: %v", err)
+	}
+	res, body := h.start(id, startRequest{Image: testDigest})
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("the start answered %d: %s", res.StatusCode, body)
+	}
+	if calls := fake.Calls(); len(calls) != 1 || calls[0].Container != "kitbash-reader-reader" {
+		t.Fatalf("the containers started are %+v, want the one", calls)
+	}
+}
+
+// TestStartRefusesWhenTheContainerHasNoProcessAfterItWasPrepared is a container
+// the runtime did not prepare: there is no namespace to read, so there is
+// nothing kitbashd can say about what it holds, and a Process it cannot verify
+// does not start. There is no weaker check to fall back to.
+func TestStartRefusesWhenTheContainerHasNoProcessAfterItWasPrepared(t *testing.T) {
+	h, fake, home, _ := filesHost(t)
+	id := h.superviseWithMounts("kitbash-reader-reader", []mounts.Resolved{
+		{Source: filepath.Join(home, "notes"), Target: "/files/notes", Mode: mounts.ModeRO},
+	})
+	fake.PIDs = map[string]int{"kitbash-reader-reader": 0}
+	res, body := h.start(id, startRequest{Image: testDigest})
+	if prob := h.problemOf(res, body); prob.Detail != MountSwapped {
+		t.Fatalf("the start answered %q, want %q", prob.Detail, MountSwapped)
+	}
+	if calls := fake.Calls(); len(calls) != 0 {
+		t.Errorf("the runtime was asked to start %+v, want nothing started", calls)
+	}
+	if removals := fake.Removals(); len(removals) != 1 {
+		t.Errorf("the removals are %+v, want the container removed", removals)
+	}
+}
+
+// TestStartRefusesWhenThePreparationFails is the source that stopped existing
+// between the create and the preparation, which is what podman init answers
+// with an error. Verified on podman 5.7.0: the container is left created with
+// no process. It is the same refusal, and nothing ran.
+func TestStartRefusesWhenThePreparationFails(t *testing.T) {
+	h, fake, home, _ := filesHost(t)
+	id := h.superviseWithMounts("kitbash-reader-reader", []mounts.Resolved{
+		{Source: filepath.Join(home, "notes"), Target: "/files/notes", Mode: mounts.ModeRO},
+	})
+	fake.InitErr = errors.New("crun: mount: No such file or directory")
+	res, body := h.start(id, startRequest{Image: testDigest})
+	if prob := h.problemOf(res, body); prob.Detail != MountSwapped {
+		t.Fatalf("the start answered %q, want %q", prob.Detail, MountSwapped)
+	}
+	if calls := fake.Calls(); len(calls) != 0 {
+		t.Errorf("the runtime was asked to start %+v, want nothing started", calls)
+	}
+}
+
+// TestStartPreparesBeforeItStarts is the order itself, which is the whole
+// guarantee: the container is made, then prepared, then started, and the check
+// sits between the last two.
+func TestStartPreparesBeforeItStarts(t *testing.T) {
+	h, fake, home, _ := filesHost(t)
+	id := h.superviseWithMounts("kitbash-reader-reader", []mounts.Resolved{
+		{Source: filepath.Join(home, "notes"), Target: "/files/notes", Mode: mounts.ModeRO},
+	})
+	res, body := h.start(id, startRequest{Image: testDigest})
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("the start answered %d: %s", res.StatusCode, body)
+	}
+	if len(fake.Runs()) != 1 || len(fake.Inits()) != 1 || len(fake.Calls()) != 1 {
+		t.Fatalf("the runtime was asked for %d creates, %d preparations and %d starts, want one of each",
+			len(fake.Runs()), len(fake.Inits()), len(fake.Calls()))
+	}
+	if args := fake.Runs()[0].Args; len(args) == 0 || args[0] != "create" {
+		t.Errorf("the command line is %v, want a podman create", args)
 	}
 }

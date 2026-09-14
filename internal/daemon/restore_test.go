@@ -585,9 +585,17 @@ func TestRestoreTakesTheOrdinaryPathAfterAHeal(t *testing.T) {
 		t.Errorf("the second boot made the container again (%d runs, %d renames), want the first boot's only",
 			len(fake.Runs()), len(fake.Renames()))
 	}
+	// Two starts, one per boot: the heal starts the container it made, once it
+	// has read what that container holds, and the second boot starts the same
+	// one again. Neither made it a second time.
 	started := fake.Calls()
-	if len(started) != 1 || started[0].Container != "kitbash-echo-legacy" {
-		t.Errorf("the containers started are %+v, want the healed one started once", started)
+	if len(started) != 2 {
+		t.Errorf("the containers started are %+v, want one start per boot", started)
+	}
+	for _, call := range started {
+		if call.Container != "kitbash-echo-legacy" {
+			t.Errorf("the containers started are %+v, want the healed one", started)
+		}
 	}
 }
 

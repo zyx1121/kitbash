@@ -134,11 +134,24 @@ type System interface {
 // answers per member. An empty one runs the child where the daemon is, which
 // is a host that records limits rather than enforcing them.
 type Runner interface {
-	// Run starts one container as the member and returns its runtime id. The
-	// options carry the whole command line, env file included; nothing here
-	// reads a manifest. An image the member does not have is ErrNoImage, and
-	// a command the runtime refused to parse is ErrUsage.
-	Run(ctx context.Context, m Member, opts podman.RunOptions, cgroup string) (string, error)
+	// Create makes one container as the member and returns its runtime id,
+	// running nothing in it. The options carry the whole command line, env
+	// file included; nothing here reads a manifest. An image the member does
+	// not have is ErrNoImage, and a command the runtime refused to parse is
+	// ErrUsage.
+	//
+	// Creating and starting are two calls rather than one because a Process
+	// with mounts has to be checked between them: the bind mounts are made by
+	// InitContainer, and what a container actually got can only be read once
+	// they exist, see internal/daemon/mounts.go.
+	CreateContainer(ctx context.Context, m Member, opts podman.RunOptions, cgroup string) (string, error)
+	// Init prepares a created container: the runtime makes its rootfs and its
+	// bind mounts and leaves its init process created, with the image's
+	// entrypoint not yet executed. After it the container has a pid and a
+	// mount namespace to read, which is the moment kitbashd checks what it
+	// was actually given. A container the runtime does not have is
+	// ErrNoContainer.
+	InitContainer(ctx context.Context, m Member, container, cgroup string) error
 	// Start creates the member's runtime directory and starts one container
 	// as them. A container the runtime does not have is ErrNoContainer, which
 	// restore answers by unregistering the Process, and one that is up

@@ -93,23 +93,23 @@ func TestFakeRunner(t *testing.T) {
 	// The three the daemon added with the supervisor: a run, a stop and a
 	// removal, each as the member.
 	image := "sha256:" + strings.Repeat("a", 64)
-	id, err := f.Run(ctx, m, podman.RunOptions{Name: "kitbash-echo", Image: image}, leaf)
+	id, err := f.CreateContainer(ctx, m, podman.RunOptions{Name: "kitbash-echo", Image: image}, leaf)
 	if err != nil {
-		t.Fatalf("Run: %v", err)
+		t.Fatalf("CreateContainer: %v", err)
 	}
 	if id == "" {
-		t.Error("Run answered no container id")
+		t.Error("CreateContainer answered no container id")
 	}
 	runs := f.Runs()
 	if len(runs) != 1 || runs[0].Cgroup != leaf || runs[0].Member != "alice" {
-		t.Fatalf("runs = %+v, want one run as alice in the leaf", runs)
+		t.Fatalf("runs = %+v, want one container made as alice in the leaf", runs)
 	}
-	if len(runs[0].Args) == 0 || runs[0].Args[0] != "run" {
-		t.Errorf("the command line is %v, want a podman run", runs[0].Args)
+	if len(runs[0].Args) == 0 || runs[0].Args[0] != "create" {
+		t.Errorf("the command line is %v, want a podman create", runs[0].Args)
 	}
 	f.Missing[image] = true
-	if _, err := f.Run(ctx, m, podman.RunOptions{Name: "kitbash-echo", Image: image}, leaf); !errors.Is(err, sysusers.ErrNoImage) {
-		t.Errorf("Run of a missing image = %v, want ErrNoImage", err)
+	if _, err := f.CreateContainer(ctx, m, podman.RunOptions{Name: "kitbash-echo", Image: image}, leaf); !errors.Is(err, sysusers.ErrNoImage) {
+		t.Errorf("CreateContainer of a missing image = %v, want ErrNoImage", err)
 	}
 	if err := f.Stop(ctx, m, "kitbash-echo", 10); err != nil {
 		t.Fatalf("Stop: %v", err)
