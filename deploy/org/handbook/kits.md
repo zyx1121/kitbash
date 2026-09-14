@@ -277,10 +277,36 @@ Read `NOTES.md` before trusting the schema. It lists what the generator could
 not decide: which apk release the constraint resolved to, whether an array
 option repeats its flag, and which positional was taken for a file.
 
-A Process sees none of your Files, so a file argument names an entry of the
-call's own `files` array, `{name, contentBase64}`. One call carries 8 MiB of
-input in total, every file and `stdin` together, and a name that was not sent
-is a `not-found`.
+A file argument has two forms. The first is inline: a name of the call's own
+`files` array, `{name, contentBase64}`. One call carries 8 MiB of input in
+total, every file and `stdin` together, and a name that was not sent is a
+`not-found`.
+
+The second is a path, and it is what a folder of your Files mounted into the
+Package makes possible. Pass `mounts` to `pkg_import` or to `import-cli_refine`
+and the kit writes them into the unit:
+
+```json
+{"source": "cli:apk:jq", "help": "...", "mounts": [
+  {"source": "/home/you/docs", "target": "/files/docs", "mode": "ro"},
+  {"source": "/home/you/out", "target": "/files/out", "mode": "rw"}
+]}
+```
+
+Then `jq_jq` with `{"filter": ".", "file": ["/files/docs/report.json"]}` reads a
+file that never travelled in the call, and a tool with an output argument given
+`/files/out/result.json` leaves the file there, reports `{name, path}` with no
+contents, and you read it with `fs_read` on `/home/you/out/result.json`. The
+adapter never reads a file back out of a mount.
+
+The rules are the ones every mount has, PLAN.md 2.3: a source is a folder of
+your own home or of `/org`, which is read only for everyone, every folder above
+it carries a `kitbash.yaml`, at most four, and a target may not be `/` or land
+under `/proc`, `/sys`, `/dev`, `/etc`, `/bin`, `/sbin`, `/usr`, `/lib` or
+`/lib64`. A path that resolves outside every mount is `invalid-path`, a path
+under a `ro` mount given as an output is `not-permitted`, and a Package that
+declares no mounts refuses every path. The kit writes what you asked for;
+kitbashd decides at `proc_run` whether it is legal.
 
 ## The seeded Packages
 

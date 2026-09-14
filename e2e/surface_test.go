@@ -78,6 +78,21 @@ const (
 	cliRunTool    = "jq_run"
 	cliProbeTool  = "jq_probe"
 	cliTool       = "jq_jq"
+	cliCopyTool   = "jq_copy"
+)
+
+// The mounts the refined Package is given, PLAN.md 2.3 and issue #122: one
+// folder of its owner's home read only, holding the document a tool reads by
+// path, and one read write, where a tool leaves a file its owner then reads
+// with fs_read. The owner is the admin who imported the Package, because a
+// mount source is a folder of the Process owner's own home.
+const (
+	cliDocsName  = "docs"
+	cliOutName   = "out"
+	cliDocsMount = "/files/docs"
+	cliOutMount  = "/files/out"
+	cliDocFile   = "doc.json"
+	cliCopyFile  = "copy.json"
 )
 
 // The document the refined tool filters and what jq must answer for it. The
@@ -112,6 +127,10 @@ type state struct {
 	probe        probeOutput
 	cliDigest    string
 	cliProcessID string
+	// The two folders of the admin's home the refined Package mounts, the
+	// first read only and the second read write.
+	cliDocsPath string
+	cliOutPath  string
 	// The two Packages of the Files mounts, the member's folders they mount,
 	// and the text the member wrote for the read only one to read back.
 	readerPath string
@@ -134,9 +153,20 @@ type probeOutput struct {
 // bridge passes a Package's own content through, so it is decoded from the
 // text here.
 type cliResult struct {
-	ExitCode int    `json:"exitCode"`
-	Stdout   string `json:"stdout"`
-	Stderr   string `json:"stderr"`
+	ExitCode int       `json:"exitCode"`
+	Stdout   string    `json:"stdout"`
+	Stderr   string    `json:"stderr"`
+	Files    []cliFile `json:"files"`
+}
+
+// cliFile is one entry of a result's files. An output named as a plain name
+// carries its bytes; one named as a path under a read write mount carries the
+// path it was left at and nothing else, because the adapter never reads a file
+// back out of a mount.
+type cliFile struct {
+	Name          string `json:"name"`
+	Path          string `json:"path"`
+	ContentBase64 string `json:"contentBase64"`
 }
 
 // importedFile is one file the kit answers with, which is what pkg_import
@@ -161,6 +191,8 @@ func TestSurface(t *testing.T) {
 		runnerPath:    filepath.Join("/home", adminName(), runnerName),
 		elsewherePath: filepath.Join("/home", adminName(), elsewhereName),
 		cliPath:       filepath.Join("/home", adminName(), cliName),
+		cliDocsPath:   filepath.Join("/home", adminName(), cliDocsName),
+		cliOutPath:    filepath.Join("/home", adminName(), cliOutName),
 		orgFile:       "/org/handbook/e2e.md",
 		echoText:      fmt.Sprintf("end to end at %s", time.Now().UTC().Format(time.RFC3339)),
 	}
@@ -187,8 +219,11 @@ func TestSurface(t *testing.T) {
 		{"the import-cli kit is built and run from /org", runTheImportKit},
 		{"pkg_import drafts a Package around an Alpine CLI", importTheCLI},
 		{"the draft's probe reports what the binary says about itself", probeTheDraft},
-		{"refine turns that into a tool with a schema", refineTheDraft},
+		{"the admin writes the folders the refined Package mounts", writeTheCLIFolders},
+		{"refine turns that into a tool with a schema and two mounts", refineTheDraft},
 		{"the refined tool filters a document and names a missing file", callTheRefinedTool},
+		{"the refined tool reads a document through the read only mount", readThroughTheCLIMount},
+		{"a copy tool leaves its output in the read write mount", writeThroughTheCLIMount},
 		{"a member writes the files a Process will read", memberWritesTheFiles},
 		{"a Package mounting that folder read only is built and run", runTheReader},
 		{"its tool reads the file the member wrote", readThroughTheMount},
@@ -846,11 +881,27 @@ func probeTheDraft(t *testing.T, s *state) {
 		cliProbeTool, strings.TrimSpace(s.probe.Version), len(s.probe.Help), len(s.probe.Man))
 }
 
+// writeTheCLIFolders is what the mounts of the refinement point at: a folder
+// holding the document a tool reads by path, and an empty one for a tool to
+// write into. Both carry a kitbash.yaml, because a folder the surface cannot
+// see is a folder a Process cannot be given, PLAN.md 2.3.
+func writeTheCLIFolders(t *testing.T, s *state) {
+	writeFile(t, s.admin, filepath.Join(s.cliDocsPath, "kitbash.yaml"),
+		folderManifest(cliDocsName, "Documents the imported CLI reads through a read only mount."))
+	writeFile(t, s.admin, filepath.Join(s.cliDocsPath, cliDocFile), cliDocument)
+	writeFile(t, s.admin, filepath.Join(s.cliOutPath, "kitbash.yaml"),
+		folderManifest(cliOutName, "Where the imported CLI leaves an output through a read write mount."))
+}
+
 // refineTheDraft is the second half: the kit is called with what probe
 // reported, the files it answers with are written over the folder, and the
 // Package is built and run again. The manifest that ends up running was
 // drafted by the kit and refined from the Package's own probe, which is the
 // acceptance sentence of issue #107.
+//
+// It is also where the two mounts of issue #122 are declared. They are an
+// argument of refine rather than an edit afterwards, so what runs is the
+// manifest the kit wrote, mounts and all.
 func refineTheDraft(t *testing.T, s *state) {
 	var refined struct {
 		Files []importedFile `json:"files"`
@@ -860,6 +911,10 @@ func refineTheDraft(t *testing.T, s *state) {
 		"help":    s.probe.Help,
 		"version": s.probe.Version,
 		"man":     s.probe.Man,
+		"mounts": []map[string]any{
+			{"source": s.cliDocsPath, "target": cliDocsMount, "mode": "ro"},
+			{"source": s.cliOutPath, "target": cliOutMount, "mode": "rw"},
+		},
 	}, &refined)
 	if len(refined.Files) == 0 {
 		t.Fatalf("%s answered no files", refineTool)
@@ -867,6 +922,7 @@ func refineTheDraft(t *testing.T, s *state) {
 	for _, file := range refined.Files {
 		writeFile(t, s.admin, filepath.Join(s.cliPath, file.Path), file.Content)
 	}
+	addTheCopyTool(t, s, refined.Files)
 
 	var built struct {
 		Digest string `json:"digest"`
@@ -889,17 +945,30 @@ func refineTheDraft(t *testing.T, s *state) {
 		State  string   `json:"state"`
 		Digest string   `json:"digest"`
 		Tools  []string `json:"tools"`
+		Mounts []struct {
+			Source string `json:"source"`
+			Target string `json:"target"`
+			Mode   string `json:"mode"`
+		} `json:"mounts"`
 	}
 	s.admin.ok("proc_run", map[string]any{"package": s.cliPath, "digest": built.Digest}, &out)
 	if out.State != "running" || out.Digest != built.Digest {
 		t.Fatalf("proc_run answered %+v, want the refined Package running at %s", out, built.Digest)
+	}
+	// The mounts the kit wrote into the manifest are the ones kitbashd resolved,
+	// which is what makes the paths below reach anything at all.
+	if len(out.Mounts) != 2 ||
+		out.Mounts[0].Source != s.cliDocsPath || out.Mounts[0].Target != cliDocsMount || out.Mounts[0].Mode != "ro" ||
+		out.Mounts[1].Source != s.cliOutPath || out.Mounts[1].Target != cliOutMount || out.Mounts[1].Mode != "rw" {
+		t.Fatalf("proc_run reported the mounts %+v, want %s read only and %s read write",
+			out.Mounts, cliDocsMount, cliOutMount)
 	}
 	if out.ID == s.cliProcessID {
 		t.Fatalf("proc_run answered the draft's Process %s, want the refined image to have replaced it", out.ID)
 	}
 	names := append([]string{}, out.Tools...)
 	sort.Strings(names)
-	want := []string{cliProbeTool, cliRunTool, cliTool}
+	want := []string{cliProbeTool, cliRunTool, cliTool, cliCopyTool}
 	sort.Strings(want)
 	if strings.Join(names, " ") != strings.Join(want, " ") {
 		t.Fatalf("the refined Package published %v, want %v", names, want)
@@ -934,6 +1003,187 @@ func callTheRefinedTool(t *testing.T, s *state) {
 	problem := missing.mustProblem(t, cliTool, "not-found")
 	if !strings.Contains(problem.Detail, "absent.json") {
 		t.Fatalf("%s answered the problem %+v, want one naming absent.json", cliTool, problem)
+	}
+}
+
+// copyToolYAML is the tool this job adds to the refined Package by hand. jq
+// takes its input from a file and writes to standard output, so nothing the kit
+// generates from jq's help text has an output argument, and the output half of
+// a mount needs one. cp is in the base image, its two arguments are a file each
+// and the second is what it writes, which is exactly the shape the adapter
+// treats as an output.
+//
+// It is written here rather than in a fixture folder because it belongs to the
+// Package the kit wrote: a fixture would be a second Package to build.
+const copyToolYAML = `    - name: copy
+      description: >-
+        Copies a file, both paths given under this Package's mounts. Added by the
+        end to end job, because jq has no output argument to prove the output
+        half of a mount with.
+      input:
+        type: object
+        additionalProperties: false
+        required: [src, dst]
+        properties:
+          src:
+            type: string
+            format: kitbash-file
+            description: >-
+              The file to copy, as an absolute path under a folder this Package
+              mounts, or the name of an entry of files.
+          dst:
+            type: string
+            format: kitbash-file
+            description: >-
+              Where to leave the copy, as an absolute path under a folder this
+              Package mounts read write.
+      output:
+        type: object
+        required: [exitCode, stdout, stderr]
+        properties:
+          exitCode:
+            type: integer
+            description: The status cp exited with.
+          stdout:
+            type: string
+            description: What cp wrote to standard output, which is nothing.
+          stderr:
+            type: string
+            description: What cp wrote to standard error.
+          files:
+            type: array
+            description: The output, named and located, carrying no contents.
+            items:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                path:
+                  type: string
+`
+
+// addTheCopyTool writes the copy tool into the refined Package, in the manifest
+// the surface validates against and in the tools.json the adapter builds argv
+// from. Both are the kit's own files, read back from what refine answered and
+// written again as one more commit each, before the build that makes the image.
+func addTheCopyTool(t *testing.T, s *state, files []importedFile) {
+	t.Helper()
+	var manifest, tools string
+	for _, file := range files {
+		switch file.Path {
+		case "kitbash.yaml":
+			manifest = file.Content
+		case "tools.json":
+			tools = file.Content
+		}
+	}
+	if manifest == "" || tools == "" {
+		t.Fatalf("%s answered no manifest or no tools.json", refineTool)
+	}
+
+	// The tools list ends where the deploy block begins, which is the one place
+	// in a generated manifest another tool can be added without reindenting it.
+	if !strings.Contains(manifest, "\ndeploy:\n") {
+		t.Fatalf("the refined manifest has no deploy block:\n%s", truncate(manifest))
+	}
+	manifest = strings.Replace(manifest, "\ndeploy:\n", "\n"+copyToolYAML+"deploy:\n", 1)
+	writeFile(t, s.admin, filepath.Join(s.cliPath, "kitbash.yaml"), manifest)
+
+	var document map[string]any
+	if err := json.Unmarshal([]byte(tools), &document); err != nil {
+		t.Fatalf("decoding the refined tools.json: %v", err)
+	}
+	entries, ok := document["tools"].(map[string]any)
+	if !ok {
+		t.Fatalf("the refined tools.json carries no tools object:\n%s", truncate(tools))
+	}
+	// The same schema the manifest declares, because the adapter answers
+	// tools/list from this file and never reads the manifest.
+	inputSchema := map[string]any{
+		"type":                 "object",
+		"additionalProperties": false,
+		"required":             []string{"src", "dst"},
+		"properties": map[string]any{
+			"src": map[string]any{"type": "string", "format": "kitbash-file"},
+			"dst": map[string]any{"type": "string", "format": "kitbash-file"},
+		},
+	}
+	entries["copy"] = map[string]any{
+		"argv":        []string{"cp"},
+		"options":     map[string]any{},
+		"positionals": []string{"src", "dst"},
+		"stdin":       nil,
+		"outputs":     []string{"dst"},
+		"inputSchema": inputSchema,
+	}
+	patched, err := json.MarshalIndent(document, "", "  ")
+	if err != nil {
+		t.Fatalf("encoding the patched tools.json: %v", err)
+	}
+	writeFile(t, s.admin, filepath.Join(s.cliPath, "tools.json"), string(patched)+"\n")
+}
+
+// readThroughTheCLIMount is the input half of issue #122: the document is not
+// in the call at all. It was written with fs_write, the Package mounts the
+// folder read only, and the tool is given the path the container sees it at.
+func readThroughTheCLIMount(t *testing.T, s *state) {
+	res := s.admin.call(cliTool, map[string]any{
+		"filter":         cliFilter,
+		"file":           []string{cliDocsMount + "/" + cliDocFile},
+		"compact_output": true,
+	})
+	res.mustSucceed(t, cliTool)
+	var answer cliResult
+	if err := json.Unmarshal([]byte(res.text()), &answer); err != nil {
+		t.Fatalf("decoding what %s answered: %v\n%s", cliTool, err, truncate(res.text()))
+	}
+	if answer.ExitCode != 0 || answer.Stdout != cliStdout {
+		t.Fatalf("%s read %s and answered exit code %d and %q, want 0 and %q (stderr: %s)",
+			cliTool, cliDocFile, answer.ExitCode, answer.Stdout, cliStdout, truncate(answer.Stderr))
+	}
+
+	// A path outside every mount is the Package's own refusal, which is what
+	// keeps a mounted Package from being a way to read the whole host.
+	outside := s.admin.call(cliTool, map[string]any{"filter": ".", "file": []string{"/etc/hosts"}})
+	if !outside.IsError {
+		t.Fatalf("%s read a path outside its mounts: %s", cliTool, truncate(outside.text()))
+	}
+	if !strings.Contains(outside.text(), "outside every folder this unit mounts") {
+		t.Fatalf("%s refused /etc/hosts with %q, want the adapter's own invalid-path", cliTool, truncate(outside.text()))
+	}
+}
+
+// writeThroughTheCLIMount is the output half: the tool writes its file into the
+// read write mount, the result says where it is and carries none of it, and the
+// owner reads it with fs_read as an ordinary file of Files.
+func writeThroughTheCLIMount(t *testing.T, s *state) {
+	res := s.admin.call(cliCopyTool, map[string]any{
+		"src": cliDocsMount + "/" + cliDocFile,
+		"dst": cliOutMount + "/" + cliCopyFile,
+	})
+	res.mustSucceed(t, cliCopyTool)
+	var answer cliResult
+	if err := json.Unmarshal([]byte(res.text()), &answer); err != nil {
+		t.Fatalf("decoding what %s answered: %v\n%s", cliCopyTool, err, truncate(res.text()))
+	}
+	if answer.ExitCode != 0 {
+		t.Fatalf("%s answered exit code %d (stderr: %s)", cliCopyTool, answer.ExitCode, truncate(answer.Stderr))
+	}
+	if len(answer.Files) != 1 || answer.Files[0].Name != cliCopyFile ||
+		answer.Files[0].Path != cliOutMount+"/"+cliCopyFile || answer.Files[0].ContentBase64 != "" {
+		t.Fatalf("%s answered the files %+v, want %s at %s with no contents",
+			cliCopyTool, answer.Files, cliCopyFile, cliOutMount+"/"+cliCopyFile)
+	}
+
+	// The file is in the member's own home, where the mount source pointed, and
+	// it has no commit: a Process writing through a mount commits nothing, which
+	// is the known hole of PLAN.md 2.1.
+	read := s.admin.call("fs_read", map[string]any{"path": filepath.Join(s.cliOutPath, cliCopyFile)})
+	read.mustSucceed(t, "fs_read")
+	if len(read.Content) == 0 || read.Content[0].Text != cliDocument {
+		t.Fatalf("fs_read answered %q, want the document the tool copied, %q",
+			truncate(read.text()), cliDocument)
 	}
 }
 
