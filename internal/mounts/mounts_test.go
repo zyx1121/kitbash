@@ -52,10 +52,21 @@ func tree(t *testing.T) (home, org string) {
 	if err := os.WriteFile(filepath.Join(home, "notes", "today.md"), []byte("# today\n"), 0o644); err != nil {
 		t.Fatalf("writing a file in notes: %v", err)
 	}
-	// A folder inside a visible folder, so the top level rule is exercised by
-	// something deeper than the folder carrying the manifest.
-	if err := os.MkdirAll(filepath.Join(home, "notes", "week"), 0o755); err != nil {
-		t.Fatalf("creating a folder below notes: %v", err)
+	// A visible folder inside a visible one, so the rule is exercised deeper
+	// than the folder that carries the top level manifest.
+	visible(filepath.Join(home, "notes"), "week")
+	// And an invisible folder inside that same visible one, which is the whole
+	// point of the chain: fs_read refuses it, so a Process cannot be given it
+	// either. A check that looked only at the top level folder would allow it.
+	if err := os.MkdirAll(filepath.Join(home, "notes", "hidden-sub", "deeper"), 0o755); err != nil {
+		t.Fatalf("creating the invisible folder below notes: %v", err)
+	}
+	// A relative link to a visible folder beside it, which escapes nothing and
+	// resolves to something the surface would allow. RESOLVE_BENEATH has no
+	// opinion on it, because an absolute or upward link is what that flag
+	// refuses, so what refuses this one is RESOLVE_NO_SYMLINKS alone.
+	if err := os.Symlink("week", filepath.Join(home, "notes", "sideways")); err != nil {
+		t.Fatalf("creating the link inside the root: %v", err)
 	}
 	// A link out of the home, inside a visible folder: the escape this package
 	// exists to refuse.
@@ -115,9 +126,33 @@ func TestResolveOne(t *testing.T) {
 			source: filepath.Join(home, "out"),
 		},
 		{
-			name:   "a folder below a visible top level folder",
+			name:   "a visible folder below a visible top level folder",
 			mount:  mounts.Declared{Source: filepath.Join(home, "notes", "week"), Target: "/files/week"},
 			source: filepath.Join(home, "notes", "week"),
+		},
+		{
+			// The reproduction of the hole this rule closes: the top level
+			// folder is visible and this one is not, and fs_read of it is
+			// not-visible, so a mount of it has to be too.
+			name:  "an invisible folder below a visible top level folder",
+			mount: mounts.Declared{Source: filepath.Join(home, "notes", "hidden-sub"), Target: "/files/sub"},
+			slug:  problem.SlugNotVisible,
+		},
+		{
+			name:  "a folder below an invisible one",
+			mount: mounts.Declared{Source: filepath.Join(home, "notes", "hidden-sub", "deeper"), Target: "/files/deeper"},
+			slug:  problem.SlugNotVisible,
+		},
+		{
+			// A relative link to a visible folder beside it: nothing escapes
+			// the root, so RESOLVE_BENEATH has nothing to say about it, and
+			// what it resolves to is a folder a mount would otherwise be given.
+			// It is refused by RESOLVE_NO_SYMLINKS alone, which is the flag
+			// this case pins: kitbash follows no link, and the target of a link
+			// is not the folder the manifest named.
+			name:  "a link that stays inside the root",
+			mount: mounts.Declared{Source: filepath.Join(home, "notes", "sideways"), Target: "/files/sideways"},
+			slug:  problem.SlugInvalidPath,
 		},
 		{
 			name:   "a top level folder of /org read only",
@@ -175,6 +210,21 @@ func TestResolveOne(t *testing.T) {
 		{
 			name:  "a target under /proc",
 			mount: mounts.Declared{Source: filepath.Join(home, "notes"), Target: "/proc/self"},
+			slug:  problem.SlugBadRequest,
+		},
+		{
+			name:  "a target under /usr",
+			mount: mounts.Declared{Source: filepath.Join(home, "notes"), Target: "/usr/local/share"},
+			slug:  problem.SlugBadRequest,
+		},
+		{
+			name:  "a target of /bin",
+			mount: mounts.Declared{Source: filepath.Join(home, "notes"), Target: "/bin"},
+			slug:  problem.SlugBadRequest,
+		},
+		{
+			name:  "a target under /lib64",
+			mount: mounts.Declared{Source: filepath.Join(home, "notes"), Target: "/lib64/x"},
 			slug:  problem.SlugBadRequest,
 		},
 		{

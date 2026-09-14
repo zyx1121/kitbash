@@ -211,6 +211,40 @@ func LoadBelow(root, rel string) (*Manifest, error) {
 // returned when it is visible.
 func Visible(dir string) (*Manifest, bool) { return VisibleBelow(dir, ".") }
 
+// VisibleChain is the whole visibility rule: a folder is on the surface only
+// when it and every folder between it and its root carry a manifest with a
+// name and a description. Naming a folder deep inside an invisible one does not
+// defeat progressive disclosure, see PLAN.md section 2.1.
+//
+// It answers the manifest of the folder itself, and, when the chain is broken,
+// the folder that broke it, relative to the root, so the caller names that one
+// rather than the one that was asked for. The check starts at the folder and
+// walks upwards, so the answer is the innermost invisible folder.
+//
+// The root itself carries no manifest and is not part of the chain: a root is
+// a folder the host configured, not one a caller wrote. rel of "." therefore
+// names no folder at all, which is not visible and has nothing to blame.
+//
+// It is one function because it is one rule: the fs family reads by it and a
+// Process is given a folder by it, and two implementations of it would be two
+// rules, see internal/mounts.
+func VisibleChain(root, rel string) (m *Manifest, blocked string, ok bool) {
+	rel = filepath.Clean(rel)
+	if rel == "." || rel == "" || rel == string(filepath.Separator) {
+		return nil, ".", false
+	}
+	m, ok = VisibleBelow(root, rel)
+	if !ok {
+		return nil, rel, false
+	}
+	for current := filepath.Dir(rel); current != "." && current != string(filepath.Separator); current = filepath.Dir(current) {
+		if _, up := VisibleBelow(root, current); !up {
+			return nil, current, false
+		}
+	}
+	return m, "", true
+}
+
 // VisibleBelow is Visible for a folder named below a root, which is how the fs
 // family asks: the root is the folder the caller may not resolve out of.
 func VisibleBelow(root, rel string) (*Manifest, bool) {

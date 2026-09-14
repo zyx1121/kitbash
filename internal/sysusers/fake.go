@@ -62,6 +62,12 @@ type Fake struct {
 	// Running are containers Start answers ErrAlreadyRunning for, which is
 	// what a daemon that restarted without the host finds.
 	Running map[string]bool
+	// Pinned are configurations ContainerConfig answers whatever the container
+	// was run with, which Run never replaces. It is how a test stages a host
+	// that did something other than what it was asked: a runtime that mounted
+	// another folder than the one on its command line cannot be staged in
+	// Configs, because a run overwrites that with the options it was given.
+	Pinned map[string]ContainerConfig
 	// Configs are the configurations ContainerConfig answers, by container
 	// name. A container with no entry answers an empty configuration, which
 	// is one created under no cgroup parent of its own.
@@ -397,6 +403,9 @@ func (f *Fake) Run(_ context.Context, m Member, opts podman.RunOptions, cgroup s
 		Restart:      opts.Restart,
 		Publish:      opts.Publish,
 		Mounts:       opts.Mounts,
+		// A fake host runs no process, so the container has no PID and the
+		// mount check that looks into its namespace is skipped. A test that
+		// exercises that half stages a configuration of its own.
 	}
 	if f.RunID != "" {
 		return f.RunID, nil
@@ -418,7 +427,21 @@ func (f *Fake) ContainerConfig(_ context.Context, _ Member, container string) (C
 	if f.ConfigErr != nil {
 		return ContainerConfig{}, f.ConfigErr
 	}
+	if config, ok := f.Pinned[container]; ok {
+		return config, nil
+	}
 	return f.Configs[container], nil
+}
+
+// PinConfig stages what the runtime answers about one container, whatever it is
+// later run with.
+func (f *Fake) PinConfig(container string, config ContainerConfig) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.Pinned == nil {
+		f.Pinned = map[string]ContainerConfig{}
+	}
+	f.Pinned[container] = config
 }
 
 // RenameContainer records a rename and moves what the fake host holds under

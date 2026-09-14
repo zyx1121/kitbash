@@ -547,12 +547,19 @@ families:
           member's home, a source the caller does not own, or mode rw on /org
           are not-permitted; a source carrying .., one that resolves through a
           symlink, and one that is not a directory are invalid-path; a source
-          whose top level folder carries no manifest with a name and a
-          description is not-visible; a target that is relative or lands under
-          /proc, /sys, /dev or /etc, and more than four mounts, are
+          that carries no manifest with a name and a description, or that sits
+          below a folder that carries none, is not-visible; a target that is
+          relative, that is /, or that lands under /proc, /sys, /dev, /etc,
+          /bin, /sbin, /usr, /lib or /lib64, and more than four mounts, are
           bad-request. A mount that is no longer legal at the next boot fails
           the restore, and proc_list reports that Process failed with the
           reason.
+
+          The container is read back as soon as it exists, because podman
+          resolves the source itself after kitbashd checked it: a source
+          replaced in between is not-permitted with the detail "the mount
+          source changed between validation and start", and that container is
+          stopped and removed rather than left running.
         input:
           type: object
           additionalProperties: false

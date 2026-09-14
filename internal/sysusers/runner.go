@@ -169,6 +169,11 @@ type ContainerConfig struct {
 	Restart string
 	// Publish is what the container publishes on the host.
 	Publish []podman.PortMapping
+	// PID is the container's own PID 1 as this host numbers it, zero for a
+	// container that is not running. It is what lets kitbashd look into the
+	// container's mount namespace through /proc, which is how it checks that
+	// what was mounted is what it validated, see internal/daemon/mounts.go.
+	PID int
 	// Mounts are the folders of the host bound into the container, as the
 	// runtime reports them. They are read back for the same reason the ports
 	// are, so a container that has to be created again is described by what it
@@ -198,7 +203,10 @@ func (p *Podman) ContainerConfig(ctx context.Context, m Member, container string
 // containerInspect is the part of podman container inspect this package reads.
 type containerInspect struct {
 	ImageName string `json:"ImageName"`
-	Config    struct {
+	State     struct {
+		Pid int `json:"Pid"`
+	} `json:"State"`
+	Config struct {
 		Env    []string          `json:"Env"`
 		Labels map[string]string `json:"Labels"`
 	} `json:"Config"`
@@ -234,6 +242,7 @@ func containerConfig(out string) (ContainerConfig, error) {
 	config := ContainerConfig{
 		CgroupParent: first.HostConfig.CgroupParent,
 		Image:        first.ImageName,
+		PID:          first.State.Pid,
 		Env:          map[string]string{},
 		Labels:       first.Config.Labels,
 		Restart:      first.HostConfig.RestartPolicy.Name,

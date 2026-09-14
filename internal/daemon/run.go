@@ -294,6 +294,15 @@ func (s *Server) startProcess(w http.ResponseWriter, r *http.Request, p store.Pr
 		writeProblem(w, s.runProblem(r, err, p, opts))
 		return
 	}
+	// The container exists, so what it actually holds can be read rather than
+	// assumed. A source replaced between the check above and podman resolving
+	// it is caught here, and that container is taken apart rather than left
+	// running with a folder kitbashd did not agree to, see mounts.go.
+	if prob := s.verifyMounts(r.Context(), r.URL.Path, p, m, mounted); prob != nil {
+		s.tearDownAfterSwap(r.Context(), p, m)
+		writeProblem(w, prob)
+		return
+	}
 	// The Process is running, so whatever the last boot could not do for it is
 	// over and proc_list stops reporting it.
 	s.clearProcessProblem(p.ID)

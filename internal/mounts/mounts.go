@@ -59,10 +59,18 @@ const HomesRoot = "/home"
 // forbiddenTargets are the trees a container may not be given a folder of Files
 // at. Mounting over /etc replaces the container's own accounts and resolver
 // configuration, over /proc and /sys hides the kernel interfaces the runtime
-// itself set up, and over /dev takes away the devices podman created. None of
-// them is something a Package has a reason to do, and all four are ways to make
-// a container behave as something other than what its image says.
-var forbiddenTargets = []string{"/proc", "/sys", "/dev", "/etc"}
+// itself set up, and over /dev takes away the devices podman created. The rest
+// are where the image keeps the programs it runs: a read only mount over them
+// only breaks the Package, and refusing costs one line, so they are refused
+// rather than left to fail as something harder to read.
+//
+// None of these is something a Package has a reason to do, and every one of
+// them is a way to make a container behave as something other than what its
+// image says.
+var forbiddenTargets = []string{
+	"/proc", "/sys", "/dev", "/etc",
+	"/bin", "/sbin", "/usr", "/lib", "/lib64",
+}
 
 // Declared is one mount as deploy.units[].mounts writes it, and as it crosses
 // the daemon socket on a registration. It is the manifest's own type rather
@@ -79,6 +87,18 @@ type Resolved struct {
 	Source string `json:"source"`
 	Target string `json:"target"`
 	Mode   string `json:"mode"`
+	// Device and Inode name the folder this resolution actually opened, as the
+	// kernel reported it. They are how a caller asks, after the container
+	// exists, whether what was mounted is what was checked: a source swapped
+	// for a link or for another folder between the check and the mount is a
+	// different inode, see PLAN.md section 2.3.
+	//
+	// They are never stored and never listed. An inode is true of one moment,
+	// and a member who removes and writes a folder again has a new one; a
+	// registration holding the old one would refuse to start for a reason that
+	// is not a rule. Both ends of the comparison come from one start.
+	Device uint64 `json:"-"`
+	Inode  uint64 `json:"-"`
 }
 
 // ReadOnly reports whether this mount is read only.
@@ -187,26 +207,21 @@ func (c *Checker) ResolveOne(instance string, d Declared) (Resolved, *problem.Pr
 			fmt.Sprintf("%s is under %s, which is read only for every member, administrators included", d.Source, c.Org),
 			"Mount it with mode ro. A write to /org is an approval, so a Process cannot make one directly.")
 	}
-	// The top level folder has to be visible before anything below it is
-	// opened: an invisible folder does not exist as far as the surface is
-	// concerned, and a Process mounting one would be a way to read what
-	// fs_list refuses to name, see PLAN.md section 2.1.
-	top := topLevel(rel)
-	if top == "" {
+	// The kernel answers before the surface does. The source is opened rather
+	// than looked at: openat2 resolves the whole path in one syscall, refusing
+	// every symlink on the way, inside the root as well as out of it, and every
+	// resolution that would leave the root. What is fstatted afterwards is the
+	// folder that was opened and not the path that was asked for.
+	//
+	// This runs before the visibility rule so that a link and a file are told
+	// apart from a folder nobody made visible: all three would otherwise
+	// answer not-visible, because reading a manifest through a link fails for
+	// the same reason opening one does.
+	if rel == "." {
 		return Resolved{}, problem.NotVisible(instance,
 			fmt.Sprintf("%s is a root and not a folder inside one, so there is no folder carrying a manifest to mount", d.Source),
 			fmt.Sprintf("Mount a folder inside %s that carries a kitbash.yaml with a name and a description.", root))
 	}
-	if _, ok := manifest.VisibleBelow(root, top); !ok {
-		return Resolved{}, problem.NotVisible(instance,
-			fmt.Sprintf("%s carries no kitbash.yaml with a name and a description, so nothing inside it can be mounted",
-				filepath.Join(root, top)),
-			"Write a kitbash.yaml with name and description into the top level folder, then run the Package again.")
-	}
-	// The source is opened rather than looked at: openat2 resolves the whole
-	// path in one syscall, refusing every symlink on the way and every
-	// resolution that would leave the root, and what is fstatted afterwards is
-	// the folder that was opened rather than the path that was asked for.
 	f, err := safeopen.Open(root, rel, syscall.O_RDONLY|syscall.O_DIRECTORY, 0)
 	if err != nil {
 		return Resolved{}, c.openProblem(instance, d.Source, err)
@@ -222,23 +237,44 @@ func (c *Checker) ResolveOne(instance string, d Declared) (Resolved, *problem.Pr
 			fmt.Sprintf("%s is not a folder, and a mount is a folder", d.Source),
 			"Mount the folder the file is in, and read the file inside the container.")
 	}
+	sys, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return Resolved{}, problem.Internal(instance,
+			fmt.Sprintf("this host does not report what %s is", d.Source), "")
+	}
 	// Under a home, the folder has to belong to the member the Process runs
 	// as. A home holds folders another member shared through a Linux group,
 	// and mounting one of those would hand a Process what its owner was given
 	// to read rather than what they own.
-	if root == c.Home && c.UID >= 0 {
-		sys, ok := info.Sys().(*syscall.Stat_t)
-		if !ok {
-			return Resolved{}, problem.Internal(instance,
-				fmt.Sprintf("this host does not report who owns %s", d.Source), "")
-		}
-		if int(sys.Uid) != c.UID {
-			return Resolved{}, problem.NotPermitted(instance,
-				fmt.Sprintf("%s is not owned by %s, and a Process mounts its owner's own folders", d.Source, c.Owner),
-				"Mount a folder you own, or copy what the Process needs into one.")
-		}
+	if root == c.Home && c.UID >= 0 && int(sys.Uid) != c.UID {
+		return Resolved{}, problem.NotPermitted(instance,
+			fmt.Sprintf("%s is not owned by %s, and a Process mounts its owner's own folders", d.Source, c.Owner),
+			"Mount a folder you own, or copy what the Process needs into one.")
 	}
-	return Resolved{Source: filepath.Join(root, rel), Target: filepath.Clean(d.Target), Mode: mode}, nil
+	// The folder and every folder between it and its root have to be visible.
+	// It is the fs family's own rule, read from the same function, because a
+	// Process being given a folder an agent cannot list would be progressive
+	// disclosure with a way around it, see PLAN.md section 2.1.
+	if _, blocked, visible := manifest.VisibleChain(root, rel); !visible {
+		return Resolved{}, problem.NotVisible(instance,
+			fmt.Sprintf("%s carries no kitbash.yaml with a name and a description, so nothing inside it can be mounted",
+				filepath.Join(root, blocked)),
+			"Write a kitbash.yaml with name and description into that folder, then run the Package again.")
+	}
+	return Resolved{
+		Source: filepath.Join(root, rel),
+		Target: filepath.Clean(d.Target),
+		Mode:   mode,
+		Device: uint64(sys.Dev),
+		Inode:  sys.Ino,
+	}, nil
+}
+
+// SameFolder reports whether two resolutions of one mount found the same
+// folder: the same path, and the same inode on the same device. It is what a
+// caller asks after the container exists, see PLAN.md section 2.3.
+func SameFolder(a, b Resolved) bool {
+	return a.Source == b.Source && a.Device == b.Device && a.Inode == b.Inode
 }
 
 // Redeclare turns what a registration holds back into the declaration it came
@@ -333,16 +369,6 @@ func checkTarget(instance, target string) *problem.Problem {
 		}
 	}
 	return nil
-}
-
-// topLevel is the first segment of a path below a root, which is the folder
-// that carries the manifest. A path that names the root itself has none.
-func topLevel(rel string) string {
-	if rel == "" || rel == "." {
-		return ""
-	}
-	first, _, _ := strings.Cut(filepath.ToSlash(rel), "/")
-	return first
 }
 
 // openProblem turns what the kernel said about a source into what a member

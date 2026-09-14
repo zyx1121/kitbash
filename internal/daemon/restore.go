@@ -161,7 +161,8 @@ func (s *Server) restoreOwner(ctx context.Context, owner string, processes []sto
 		// again would mount it again: the check has to happen before podman is
 		// asked, and its answer is what proc_list reports about this Process,
 		// see mounts.go.
-		if _, prob := s.revalidateMounts("", p, m); prob != nil {
+		mounted, prob := s.revalidateMounts("", p, m)
+		if prob != nil {
 			counts.Failed++
 			logger.Printf("restore: not starting %s of %s: %s", p.Container, owner, prob.Detail)
 			failed := mountProblem(prob)
@@ -182,6 +183,16 @@ func (s *Server) restoreOwner(ctx context.Context, owner string, processes []sto
 		cancel()
 		switch {
 		case err == nil:
+			// The container is up, so what it holds is read back the way a
+			// start reads it: a source replaced while the host was booting is
+			// a Process that does not come back, see mounts.go.
+			if prob := s.verifyMounts(ctx, "", p, m, mounted); prob != nil {
+				counts.Failed++
+				s.tearDownAfterSwap(ctx, p, m)
+				failed := mountProblem(prob)
+				s.processFailed(p.ID, failed.Detail, failed.Fix)
+				continue
+			}
 			counts.Started++
 			s.clearProcessProblem(p.ID)
 			if !p.Limits.Written() {
@@ -191,6 +202,15 @@ func (s *Server) restoreOwner(ctx context.Context, owner string, processes []sto
 			// The daemon restarted and the host did not: the Process never
 			// stopped. It is running, which is what restore is for, so it is
 			// counted with the rest and named only in the one line at the end.
+			// Its mounts are still read back: this daemon did not make that
+			// container and has only the registration's word for what it holds.
+			if prob := s.verifyMounts(ctx, "", p, m, mounted); prob != nil {
+				counts.Failed++
+				s.tearDownAfterSwap(ctx, p, m)
+				failed := mountProblem(prob)
+				s.processFailed(p.ID, failed.Detail, failed.Fix)
+				continue
+			}
 			counts.Started++
 			counts.Running++
 			s.clearProcessProblem(p.ID)
@@ -402,14 +422,25 @@ func (s *Server) healCeiling(ctx context.Context, m sysusers.Member, p store.Pro
 	}
 	run, cancel := context.WithTimeout(ctx, RestoreTimeout)
 	defer cancel()
-	if _, err := s.runner.Run(run, m, opts, leaf); err != nil {
+	runErr := func() error {
+		if _, err := s.runner.Run(run, m, opts, leaf); err != nil {
+			return err
+		}
+		// The container this heal created is checked like any other start.
+		if prob := s.verifyMounts(ctx, "", p, m, mounted); prob != nil {
+			s.tearDownAfterSwap(ctx, p, m)
+			return errors.New(prob.Detail)
+		}
+		return nil
+	}()
+	if runErr != nil {
 		// The name goes back to the container that holds this Process, so the
 		// registration still names something the next boot can find and this
 		// Process is reported failed rather than unregistered.
 		if back := s.runner.RenameContainer(ctx, m, aside, p.Container); back != nil {
 			logger.Printf("restore: %s of %s is left under %s: %v", p.Container, m.Name, aside, back)
 		}
-		return false, err
+		return false, runErr
 	}
 	// The registration catches up only now: the ceiling is recorded, so the
 	// next boot takes the ordinary path, and the token is the one the new
