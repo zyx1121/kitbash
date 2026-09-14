@@ -443,6 +443,7 @@ func TestRestoreFailsAProcessWhoseContainerHoldsAnotherFolder(t *testing.T) {
 	// A container that is running has a pid, and that pid is the only witness
 	// of what it holds. This one is holding the shared root.
 	fake.PinConfig("kitbash-reader-reader", sysusers.ContainerConfig{
+		State:  podman.StateRunning,
 		PID:    testPID,
 		Mounts: []podman.Mount{{Source: filepath.Join(org, "handbook"), Target: "/files/notes"}},
 	})
@@ -679,5 +680,131 @@ func TestStartPreparesBeforeItStarts(t *testing.T) {
 	}
 	if args := fake.Runs()[0].Args; len(args) == 0 || args[0] != "create" {
 		t.Errorf("the command line is %v, want a podman create", args)
+	}
+}
+
+// TestRestoreStartsAContainerLeftInitialized is issue #119. A daemon killed
+// between preparing a container and starting it, and a start the runtime
+// refused, both leave a container that has a pid, a mount namespace and no
+// entrypoint running. A pid alone would read as running, and that Process would
+// be counted restored and never started, which proc_list reports as starting
+// for ever.
+//
+// It is the state a start pauses in, so it is read the same way and then
+// started: start after prepare runs the entrypoint in the namespace that was
+// just read, verified on podman 5.7.0.
+func TestRestoreStartsAContainerLeftInitialized(t *testing.T) {
+	h, fake, home, _, procRoot := filesHostWithProc(t)
+	notes := filepath.Join(home, "notes")
+	const container = "kitbash-reader-reader"
+	h.superviseWithMounts(container, []mounts.Resolved{
+		{Source: notes, Target: "/files/notes", Mode: mounts.ModeRO},
+	})
+	fake.Configs = map[string]sysusers.ContainerConfig{
+		container: {
+			State:  podman.StateInitialized,
+			PID:    testPID,
+			Mounts: []podman.Mount{{Source: notes, Target: "/files/notes", ReadOnly: true}},
+		},
+	}
+	if err := stageNamespace(procRoot, testPID, "/files/notes", notes); err != nil {
+		t.Fatalf("staging the namespace: %v", err)
+	}
+
+	counts := h.server.Restore(context.Background())
+	if counts.Started != 1 || counts.Running != 0 || counts.Failed != 0 {
+		t.Fatalf("the restore is %+v, want the prepared container started and not counted as already running", counts)
+	}
+	calls := fake.Calls()
+	if len(calls) != 1 || calls[0].Container != container {
+		t.Fatalf("the containers started are %+v, want the prepared one", calls)
+	}
+	// It was not made again: the container that was there is the one that runs.
+	if runs := fake.Runs(); len(runs) != 0 {
+		t.Errorf("the runtime made %+v, want the prepared container used as it stood", runs)
+	}
+}
+
+// TestRestoreRefusesAContainerLeftInitializedHoldingAnotherFolder is the same
+// state with the mount wrong: it is read before it is started, so it never runs.
+func TestRestoreRefusesAContainerLeftInitializedHoldingAnotherFolder(t *testing.T) {
+	h, fake, home, org, procRoot := filesHostWithProc(t)
+	notes := filepath.Join(home, "notes")
+	const container = "kitbash-reader-reader"
+	id := h.superviseWithMounts(container, []mounts.Resolved{
+		{Source: notes, Target: "/files/notes", Mode: mounts.ModeRO},
+	})
+	fake.Configs = map[string]sysusers.ContainerConfig{
+		container: {
+			State:  podman.StateInitialized,
+			PID:    testPID,
+			Mounts: []podman.Mount{{Source: notes, Target: "/files/notes", ReadOnly: true}},
+		},
+	}
+	if err := stageNamespace(procRoot, testPID, "/files/notes", filepath.Join(org, "handbook")); err != nil {
+		t.Fatalf("staging the namespace: %v", err)
+	}
+
+	counts := h.server.Restore(context.Background())
+	if counts.Failed != 1 || counts.Started != 0 {
+		t.Fatalf("the restore is %+v, want one failure and no start", counts)
+	}
+	if calls := fake.Calls(); len(calls) != 0 {
+		t.Fatalf("the runtime was asked to start %+v, want nothing started", calls)
+	}
+	if got := h.server.processProblem(id); !strings.Contains(got.Detail, MountSwapped) {
+		t.Errorf("proc_list would report %q, want it to carry %q", got.Detail, MountSwapped)
+	}
+}
+
+// TestRestoreMakesACreatedContainerAgain is the other half of the state: a
+// container that was made and never prepared has no namespace, so there is
+// nothing to read and starting it by name would build the bind mounts with the
+// entrypoint already running. It is made again instead.
+func TestRestoreMakesACreatedContainerAgain(t *testing.T) {
+	h, fake, home, _ := filesHost(t)
+	const container = "kitbash-reader-reader"
+	h.superviseWithMounts(container, []mounts.Resolved{
+		{Source: filepath.Join(home, "notes"), Target: "/files/notes", Mode: mounts.ModeRO},
+	})
+	fake.Configs = map[string]sysusers.ContainerConfig{
+		container: {State: podman.StateCreated, Image: testDigest},
+	}
+	fake.AddImage(h.user, testDigest, 1, nil)
+
+	counts := h.server.Restore(context.Background())
+	if counts.Started != 1 || counts.Failed != 0 {
+		t.Fatalf("the restore is %+v, want the container made again and started", counts)
+	}
+	if len(fake.Runs()) != 1 || len(fake.Inits()) != 1 || len(fake.Calls()) != 1 {
+		t.Errorf("the runtime was asked for %d creates, %d preparations and %d starts, want one of each",
+			len(fake.Runs()), len(fake.Inits()), len(fake.Calls()))
+	}
+}
+
+// TestStartRemovesTheContainerWhenTheStartFails is the other half of issue
+// #119. The container is made and prepared, its mounts check out, and the
+// runtime refuses to start it: leaving it there would leave a Process holding a
+// mount namespace and running nothing, which proc_list reports as starting.
+func TestStartRemovesTheContainerWhenTheStartFails(t *testing.T) {
+	h, fake, home, _ := filesHost(t)
+	id := h.superviseWithMounts("kitbash-reader-reader", []mounts.Resolved{
+		{Source: filepath.Join(home, "notes"), Target: "/files/notes", Mode: mounts.ModeRO},
+	})
+	fake.StartErrs = map[string]error{
+		"kitbash-reader-reader": errors.New("crun: starting container process caused: exec format error"),
+	}
+
+	res, body := h.start(id, startRequest{Image: testDigest})
+	if res.StatusCode == http.StatusOK {
+		t.Fatalf("the start answered %d: %s", res.StatusCode, body)
+	}
+	removals := fake.Removals()
+	if len(removals) != 1 || removals[0].Container != "kitbash-reader-reader" || !removals[0].Force {
+		t.Fatalf("the removals are %+v, want the prepared container removed by force", removals)
+	}
+	// The registration stays: the Process is what the member runs again.
+	if _, found, err := h.store.Process(context.Background(), id); err != nil || !found {
+		t.Fatalf("the registration is gone: found %v, %v", found, err)
 	}
 }

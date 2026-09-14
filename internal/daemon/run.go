@@ -306,6 +306,12 @@ func (s *Server) startProcess(w http.ResponseWriter, r *http.Request, p store.Pr
 		return
 	}
 	if err := s.runner.Start(r.Context(), m, p.Container, leaf); err != nil {
+		// The container is prepared and was not started, so it is left in the
+		// runtime holding a mount namespace and running nothing. Removing it
+		// is what keeps a failed start from leaving a Process that proc_list
+		// reports as starting for ever, and what makes the next attempt begin
+		// from a container this daemon made, see restoreMounted.
+		s.tearDownAfterSwap(r.Context(), p, m)
 		writeProblem(w, s.runProblem(r, err, p, opts))
 		return
 	}

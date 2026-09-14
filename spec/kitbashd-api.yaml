@@ -737,13 +737,23 @@ restore:
     changed between validation and start". The container is removed having
     executed nothing, and it is logged. There is no fallback: a container
     kitbashd cannot read is a container that does not start.
-    Restore is the same guarantee. A Process that is still running is verified
-    through the process it already has, because its namespace is the only
-    witness of what it holds and this daemon did not make that container. One
-    whose process is gone is not started by name, because a start makes the bind
-    mounts again and the entrypoint would be running before anything could read
-    them: it is made again through the same four steps, from the registration
-    and from what the old container was made with. The heal path is the same
+    Restore is the same guarantee, and it reads the state as well as the pid: a
+    container podman init prepared has a pid and has run nothing, so a pid on
+    its own does not say what a container is doing. A Process that is running is
+    verified through the process it already has, because its namespace is the
+    only witness of what it holds and this daemon did not make that container.
+    One found initialized is where a start pauses, which is what a daemon killed
+    between the check and the start leaves behind, and what a start the runtime
+    refused would leave if it were not removed: it is verified the same way and
+    then started, because start after init runs the entrypoint in the namespace
+    that was just read and resolves no path again. A container in any other
+    state is not started by name, because a start makes the bind mounts again
+    and the entrypoint would be running before anything could read them: it is
+    made again through the same four steps, from the registration and from what
+    the old container was made with.
+    A start that the runtime refuses after the check removes the container it
+    prepared, so a failed start leaves nothing holding a mount namespace and
+    running nothing. The heal path is the same
     four steps. A Process refused this way is reported through proc_list, which
     keeps listing it because its container is gone. What this protects is the
     /org approval trail and progressive disclosure.

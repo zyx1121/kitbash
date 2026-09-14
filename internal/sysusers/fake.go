@@ -37,9 +37,13 @@ type Fake struct {
 	// StartErr, RunErr, InitErr, StopErr, RemoveContainerErr, RemoveAllErr and
 	// CopyErr make the runtime fail on demand. RunErr is the create, which is
 	// the call that makes a container.
-	StartErr           error
-	RunErr             error
-	InitErr            error
+	StartErr error
+	RunErr   error
+	InitErr  error
+	// StartErrs are containers Start refuses by name, whatever made them,
+	// which StartErr does not cover: that one is about a container this fake
+	// did not make.
+	StartErrs          map[string]error
 	StopErr            error
 	RemoveContainerErr error
 	RemoveAllErr       error
@@ -370,6 +374,11 @@ func (f *Fake) Start(_ context.Context, m Member, container, cgroup string) erro
 	if f.Running[container] {
 		return fmt.Errorf("%w: %s", ErrAlreadyRunning, container)
 	}
+	// StartErrs is a container the host will not start whatever made it, which
+	// is an image the runtime cannot execute.
+	if err, named := f.StartErrs[container]; named {
+		return err
+	}
 	// StartErr is the host refusing a container this fake did not make, which
 	// is what a container created before kitbashd gave each Process a cgroup
 	// of its own does: its parent belongs to root and the member's runtime
@@ -381,6 +390,13 @@ func (f *Fake) Start(_ context.Context, m Member, container, cgroup string) erro
 	f.Started = append(f.Started, StartCall{
 		Member: m.Name, UID: m.UID, Container: container, Cgroup: cgroup,
 	})
+	if config, held := f.Configs[container]; held {
+		config.State = podman.StateRunning
+		if config.PID == 0 {
+			config.PID = f.pidFor(container)
+		}
+		f.Configs[container] = config
+	}
 	return nil
 }
 
@@ -429,10 +445,11 @@ func (f *Fake) CreateContainer(_ context.Context, m Member, opts podman.RunOptio
 		f.Configs = map[string]ContainerConfig{}
 	}
 	// The container exists and nothing runs in it, which is a created
-	// container with no pid: Init is what gives it one.
+	// container with no pid: InitContainer is what gives it one.
 	f.Configs[opts.Name] = ContainerConfig{
 		CgroupParent: opts.CgroupParent,
 		Image:        opts.Image,
+		State:        podman.StateCreated,
 		Labels:       opts.Labels,
 		Restart:      opts.Restart,
 		Publish:      opts.Publish,
@@ -463,6 +480,7 @@ func (f *Fake) InitContainer(_ context.Context, m Member, container, cgroup stri
 		return fmt.Errorf("%w: %s", ErrNoContainer, container)
 	}
 	config.PID = f.pidFor(container)
+	config.State = podman.StateInitialized
 	f.Configs[container] = config
 	if f.ProcRoot == "" {
 		return nil

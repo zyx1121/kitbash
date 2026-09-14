@@ -193,8 +193,13 @@ type ContainerConfig struct {
 	Restart string
 	// Publish is what the container publishes on the host.
 	Publish []podman.PortMapping
+	// State is what the runtime calls this container: running, initialized,
+	// created, exited and the rest, see internal/podman. A pid alone does not
+	// say whether a container is running, because a container podman init
+	// prepared has one and has executed nothing, so restore reads both.
+	State string
 	// PID is the container's own PID 1 as this host numbers it, zero for a
-	// container that is not running. It is what lets kitbashd look into the
+	// container that is not running or prepared. It is what lets kitbashd look into the
 	// container's mount namespace through /proc, which is how it checks that
 	// what was mounted is what it validated, see internal/daemon/mounts.go.
 	PID int
@@ -228,7 +233,8 @@ func (p *Podman) ContainerConfig(ctx context.Context, m Member, container string
 type containerInspect struct {
 	ImageName string `json:"ImageName"`
 	State     struct {
-		Pid int `json:"Pid"`
+		Status string `json:"Status"`
+		Pid    int    `json:"Pid"`
 	} `json:"State"`
 	Config struct {
 		Env    []string          `json:"Env"`
@@ -266,6 +272,7 @@ func containerConfig(out string) (ContainerConfig, error) {
 	config := ContainerConfig{
 		CgroupParent: first.HostConfig.CgroupParent,
 		Image:        first.ImageName,
+		State:        strings.ToLower(first.State.Status),
 		PID:          first.State.Pid,
 		Env:          map[string]string{},
 		Labels:       first.Config.Labels,
