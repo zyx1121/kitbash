@@ -307,7 +307,9 @@ api:
       folder can be removed, replaced by a symlink or lose its manifest in
       between. A mount that no longer checks out fails the start with the same
       problem the registration would have given, and the container is not
-      created.
+      created. Once the container exists it is read back, see mount_swaps: a
+      source that changed while podman was resolving it is not-permitted and
+      the container is stopped and removed.
     timeouts: >
       The runtime gets 120 s for a run and 40 s for a stop or a forced removal,
       which is the ten second grace the container is given plus room to kill it
@@ -685,24 +687,47 @@ restore:
     one of them as root, because root is the only party on this host that can
     answer the question honestly: it opens the source beneath /home/<owner> or
     /org with RESOLVE_BENEATH and RESOLVE_NO_SYMLINKS, so no component may be a
-    symlink and no resolution may leave the root, fstats the descriptor it got,
-    and requires a directory. A source under a home has to be owned by that
-    member, and the top level folder it sits in has to carry a kitbash.yaml
-    with a name and a description, which is the same visibility rule the fs
-    family reads by: a folder no agent can list is a folder no Process can
-    mount. rw is refused anywhere under /org, for admins as well, because the
-    approval queue is the trail of every write there and a Process with a rw
-    mount would be a way past it. A target that is relative or lands under
-    /proc, /sys, /dev or /etc is refused. What podman is given is the resolved
-    path:
+    symlink, inside the root as well as out of it, and no resolution may leave
+    the root, fstats the descriptor it got, and requires a directory. A source
+    under a home has to be owned by that member, and the source and every
+    folder between it and its root have to carry a kitbash.yaml with a name and
+    a description, which is the same visibility rule the fs family reads by,
+    read from the same function: a folder no agent can list is a folder no
+    Process can mount. rw is refused anywhere under /org, for admins as well,
+    because the approval queue is the trail of every write there and a Process
+    with a rw mount would be a way past it. A target that is relative, that is
+    /, or that lands under /proc, /sys, /dev, /etc, /bin, /sbin, /usr, /lib or
+    /lib64 is refused. What podman is given is the resolved path:
     --mount type=bind,src=<resolved>,dst=<target>,ro=<true|false>,bind-nonrecursive,nosuid,nodev,noexec.
     kitbash-mcp runs the same check as the member before it calls, so a member
     reads the problem in the session that made it; that check is a courtesy and
     is not trusted, and the daemon's is the one that decides.
-    The window between the check and the mount is real and is low severity: the
-    container runs as the member, who can already reach everything under their
-    own home through their own shell. What the check protects is the /org rule
-    and progressive disclosure, not the member from themselves.
+  mount_swaps: >
+    podman resolves the source path itself, in its own process, after kitbashd
+    has looked at it. A source replaced by a symlink in between is followed by
+    podman and the container is given whatever it pointed at, which for a member
+    of kitbash-admin is a rw mount of /org with no approval behind it. The
+    window is closed after the start rather than written down.
+    As soon as the container exists, kitbashd reads it back as the member, the
+    same way it reads a configuration for the heal path. It asks the runtime
+    which source is mounted at each target and in which mode, which catches a
+    runtime that mounted something other than what it was asked for, and it
+    stats each target through /proc/<pid>/root, which resolves in the
+    container's own mount namespace, and holds the device and inode it finds
+    there to the ones the validation opened. The second is the ground truth:
+    podman reports the path it was asked for and not what it resolved, verified
+    against podman 5.7.0, so a source swapped for a link, and one swapped and
+    swapped back, are caught by the inode at the target and by nothing else.
+    kitbashd is root, so it needs nothing inside the image to read it. A
+    container that is no longer running has no namespace to look into, so its
+    sources are resolved once more instead, which catches a swap that was not
+    put back.
+    A mismatch is not-permitted with the detail "the mount source changed
+    between validation and start". The container is stopped and removed rather
+    than left running with a folder kitbashd did not agree to, it is logged, and
+    the boot restore and the heal path do the same, with the restore reporting
+    it through proc_list. What this protects is the /org approval trail and
+    progressive disclosure.
   cgroups: >
     The cgroup of each Process is created again, with its ceiling, before its
     container starts: the cgroup filesystem does not survive a reboot, and a
