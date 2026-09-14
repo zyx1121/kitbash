@@ -130,7 +130,10 @@ provides:
               manifest as they are given. A kitbash-file argument of the
               generated tools then takes an absolute path under one of the
               targets instead of a name from files. At most four, and kitbashd
-              decides at proc_run whether each is legal.
+              decides at proc_run whether each is legal. refine writes the
+              manifest from scratch and inherits nothing, so send mounts again
+              here even when the import already declared them, or the refined
+              Package has none.
             items:
               type: object
               additionalProperties: false

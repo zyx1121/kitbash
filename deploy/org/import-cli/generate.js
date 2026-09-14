@@ -321,7 +321,7 @@ function mountSentence(mounts) {
 
 const filesProperty = (mounts) => ({
   type: "array",
-  description: `Files to place beside the command before it runs. A positional whose format is kitbash-file names one of these by its name, or gives an absolute path under a folder this Package mounts instead. ${mountSentence(mounts)} These and stdin together are at most ${MAX_PAYLOAD} bytes for one call, and a call over that is refused as too-large rather than truncated.`,
+  description: `Files to place beside the command before it runs. A positional whose format is kitbash-file names one of these by its name, or gives an absolute path under a folder this Package mounts instead. ${mountSentence(mounts)} These and stdin together are at most ${MAX_PAYLOAD} bytes for one call, and a call over that is refused as too-large rather than truncated. A file that travels through a mount is not in that budget at all, in either direction: it is never carried by the call, so an output left in a rw mount can be any size the folder holds.`,
   maxItems: MAX_FILES,
   items: {
     type: "object",
@@ -691,6 +691,10 @@ function mountsNote(mounts) {
   const lines = [
     "## Files through mounts",
     "",
+    "The kit writes this manifest from scratch on every call and inherits nothing,",
+    "so `refine` has the mounts of the call that made this folder and no others:",
+    "send `mounts` again with every `refine`, or the refined Package has none.",
+    "",
     "A `kitbash-file` positional takes two forms.",
     "",
     "```json",
@@ -733,7 +737,13 @@ function mountsNote(mounts) {
     "  Everything else is `invalid-path` naming the targets this Package has.",
     "- An output given as a path under a `rw` mount is left where the command wrote",
     "  it and reported as `{name, path}` with no contents: the adapter never reads a",
-    "  file back out of a mount. Read it with `fs_read` on the mount's source.",
+    "  file back out of a mount. Read it with `fs_read` on the mount's source. One",
+    "  the command did not write is absent from the result, as any other output is.",
+    "- Nothing that travels through a mount counts against the 8 MiB one call",
+    "  carries, in either direction, because it is not carried by the call. An",
+    "  output left in a `rw` mount can be any size the folder holds.",
+    "- An input path that names nothing under the mount is `not-found`, the same",
+    "  answer as a name that was never sent in `files`.",
     "- An output given as a path under a `ro` mount is `not-permitted`, and an output",
     "  given as a bare name is read back into `files` as base64, as before.",
     "- A mount source is a folder of Files under the owner's own home, or of `/org`,",

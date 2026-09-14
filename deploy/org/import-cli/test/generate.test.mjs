@@ -257,6 +257,23 @@ test("mounts are written through to the unit and to tools.json", () => {
   assert.deepEqual(toolsOf(drafted).mounts, toolsOf(files).mounts);
 });
 
+test("a refinement that sends no mounts writes a Package with none", () => {
+  // The kit holds nothing between calls and never reads the folder it is
+  // rewriting, so refine cannot inherit what import declared. This is the
+  // behaviour and not an oversight, which is why it is pinned here and said in
+  // the refine input description, in NOTES.md and in the handbook.
+  const mounts = [{ source: "/home/ada/docs", target: "/files/docs", mode: "ro" }];
+  const drafted = draft({ source: "cli:apk:jq", mounts });
+  assert.deepEqual(manifestOf(drafted).deploy.units[0].mounts, mounts);
+
+  const again = refined({ source: "cli:apk:jq", parsed: jqParsed, help: jqHelp });
+  assert.equal(manifestOf(again).deploy.units[0].mounts, undefined);
+  assert.equal(toolsOf(again).mounts, undefined);
+  const notes = fileNamed(again, "NOTES.md").content;
+  assert.match(notes, /send `mounts` again with every `refine`, or the refined Package has none/);
+  assert.match(notes, /This unit declares no `mounts`/);
+});
+
 test("a file argument says both forms and the notes say the rules", () => {
   const mounts = [
     { source: "/home/ada/docs", target: "/files/docs", mode: "ro" },
@@ -285,6 +302,9 @@ test("a file argument says both forms and the notes say the rules", () => {
   // The rules a caller needs before the first path is refused.
   assert.match(notes, /resolved with `realpath`/);
   assert.match(notes, /reported as `\{name, path\}` with no contents/);
+  assert.match(notes, /Nothing that travels through a mount counts against the 8 MiB/);
+  assert.match(notes, /An input path that names nothing under the mount is `not-found`/);
+  assert.match(tool.input.properties.files.description, /not in that budget at all/);
   assert.match(notes, /An output given as a path under a `ro` mount is `not-permitted`/);
 
   // A Package with no mounts says so, and says what to add.

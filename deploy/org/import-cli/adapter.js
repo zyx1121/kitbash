@@ -47,7 +47,18 @@
 // command is given is the one that was sent, not the resolved one. An output
 // given as a path under a `ro` mount is `not-permitted`; one under a `rw`
 // mount is left where the command wrote it and reported as {name, path} with
-// no contents, because the adapter never reads a file back out of a mount.
+// no contents, because the adapter never reads a file back out of a mount, and
+// it is bounded by the folder rather than by the 8 MiB cap, which is a cap on
+// what one call carries.
+//
+// That check is an intent check and not the boundary. The boundary is the
+// kernel's: what this container can reach is the bind mounts kitbashd made for
+// it, a `ro` mount refuses a write whatever this file decides, and everything
+// else on the image's own filesystem is the image's. What the check adds is
+// that a tool call says which of the mounted folders it meant, so a command
+// cannot be steered into the container's own `/tmp` or `/app` by a path that
+// reads like a document, and the refusal names the folders the Package has
+// rather than leaving the command to fail on its own.
 //
 // One call may carry 8 MiB of input in total, counting every file and the
 // standard input together rather than each of them on its own, and it is
@@ -226,7 +237,8 @@ const isPathForm = (value) => value.startsWith("/");
 
 // Whether a resolved path is the folder a mount put in the container, or
 // something inside it. The separator is what makes it a containment test and
-// not a string prefix: without it /files/outside would be inside /files/out.
+// not a string prefix: without it /files/outside would be inside /files/out and
+// /files/docs2 would be inside /files/docs.
 function within(resolved, target) {
   return resolved === target || resolved.startsWith(`${target}${path.sep}`);
 }
@@ -237,11 +249,15 @@ function within(resolved, target) {
 // as though it were inside it, and realpath is what makes the check about the
 // file the command would open rather than about the string the caller wrote.
 //
-// A path whose last component does not exist yet is an output being named
-// before the command has written it, so for an output the parent is resolved
-// instead and the name is put back on. Everything else has to exist: an input
-// that does not is refused here rather than by the command, and a directory
-// that does not is a caller who has not written the folder yet.
+// A path whose last component does not exist is resolved through its parent
+// instead, because a file that has not been written yet still has a folder, and
+// the folder is what says whether the path is under a mount. Which of the two
+// happened is answered as `exists`, so the caller can tell an output being
+// named before it is written from an input that is simply not there.
+//
+// The mount chosen is the longest target the path is under and not the first
+// declared: a unit may mount a folder and a folder inside it, and the mode that
+// governs the inner one is the inner one's.
 function mountFor(prop, value, isOutput) {
   if (mounts.length === 0) {
     throw invalidPath(
@@ -251,19 +267,20 @@ function mountFor(prop, value, isOutput) {
     );
   }
   let resolved;
+  let exists = true;
   try {
     resolved = realpathSync(value);
   } catch (err) {
-    if (!isOutput || err.code !== "ENOENT") {
+    if (err.code !== "ENOENT") {
       throw invalidPath(
         `${prop} names the path ${value}, which could not be resolved: ${err.code ?? err.message}.`,
-        `Name a file that exists under one of this unit's mounts: ${mountList}.`,
+        `Name a file under one of this unit's mounts: ${mountList}.`,
         value,
       );
     }
-    // The file is not there yet, which is what an output is. The folder it is
-    // to be written in has to be, because a mount is a folder and a path under
-    // one whose parent is missing is not under it.
+    exists = false;
+    // The folder has to resolve even when the file does not, because a mount is
+    // a folder and a path whose folder is missing is under no mount at all.
     const parent = path.dirname(value);
     let resolvedParent;
     try {
@@ -271,13 +288,17 @@ function mountFor(prop, value, isOutput) {
     } catch (parentError) {
       throw invalidPath(
         `${prop} names the path ${value}, and its folder ${parent} could not be resolved: ${parentError.code ?? parentError.message}.`,
-        `Write the output into a folder that exists under one of this unit's mounts: ${mountList}.`,
+        `Name a path whose folder exists under one of this unit's mounts: ${mountList}.`,
         value,
       );
     }
     resolved = path.join(resolvedParent, path.basename(value));
   }
-  const mount = mounts.find((candidate) => within(resolved, candidate.target));
+  let mount;
+  for (const candidate of mounts) {
+    if (!within(resolved, candidate.target)) continue;
+    if (mount === undefined || candidate.target.length > mount.target.length) mount = candidate;
+  }
   if (mount === undefined) {
     throw invalidPath(
       `${prop} names the path ${value}, which resolves to ${resolved}, outside every folder this unit mounts.`,
@@ -289,6 +310,16 @@ function mountFor(prop, value, isOutput) {
     throw notPermitted(
       `${prop} is an output and ${value} is under ${mount.target}, which this unit mounts read only.`,
       "Write the output under a mount declared rw, or name it as a plain name and read it back from the result.",
+      value,
+    );
+  }
+  // An input has to be there. A name of `files` that was never sent is a
+  // not-found, and a path under a mount that names nothing is the same
+  // sentence about the same thing, so it is the same class.
+  if (!isOutput && !exists) {
+    throw notFound(
+      `${prop} names the path ${value}, which is under ${mount.target} and is not there.`,
+      "Check the folder with fs_list on the Files folder that mount's source names, then call again with a path that exists.",
       value,
     );
   }
@@ -617,36 +648,66 @@ function stdinFor(spec, args) {
 // where its owner wanted it, the caller reads it with fs_read on the folder
 // that mount's source names, and an adapter that read it back would be turning
 // a mount into the base64 path the mount exists to avoid. Those are reported as
-// {name, path} and nothing else, mounted, in the order they were named.
+// {name, path} and nothing else. They are looked at with lstat all the same,
+// because "the command wrote it" is what the entry claims: a path the run left
+// empty is absent from the result like any other output that was not produced,
+// and one that is a folder or a link is a note rather than a claim. An lstat is
+// not a read.
+//
+// A variadic output takes both forms at once, so the elements are walked rather
+// than the property: the ones that were paths are already reported, and the
+// ones that were names are read back from the temporary directory.
 async function collectOutputs(spec, args, dir, mounted) {
   const files = [];
   const notes = [];
-  const left = new Set(mounted.map((entry) => entry.prop));
-  for (const entry of mounted) files.push({ name: entry.name, path: entry.path });
-  for (const prop of spec.outputs ?? []) {
-    if (left.has(prop)) continue;
-    const value = args[prop];
-    if (typeof value !== "string" || value === "") continue;
-    const name = safeName(value);
-    const target = path.join(dir, name);
+  for (const entry of mounted) {
     let info;
     try {
-      info = await lstat(target);
+      info = await lstat(entry.path);
     } catch {
+      // The command named it and did not write it, which is the same absence a
+      // name in the temporary directory reports by not being there.
       continue;
     }
     if (info.isSymbolicLink()) {
-      notes.push(`${name} is a symbolic link and was not read back.`);
+      notes.push(`${entry.path} is a symbolic link and was not reported as an output.`);
       continue;
     }
     if (!info.isFile()) {
-      notes.push(`${name} is not a regular file and was not read back.`);
+      notes.push(`${entry.path} is not a regular file and was not reported as an output.`);
       continue;
     }
-    if (info.size > MAX_BYTES) {
-      throw tooLarge(`the output file ${name} is larger than the 8 MiB limit.`, "Ask for less output.", name);
+    files.push({ name: entry.name, path: entry.path });
+  }
+  // The path elements of each output, so that a variadic output carrying a name
+  // and a path reports the first and reads the second.
+  const reported = new Set(mounted.map((entry) => `${entry.prop}\u0000${entry.path}`));
+  for (const prop of spec.outputs ?? []) {
+    const value = args[prop];
+    for (const element of Array.isArray(value) ? value : [value]) {
+      if (typeof element !== "string" || element === "") continue;
+      if (reported.has(`${prop}\u0000${element}`)) continue;
+      const name = safeName(element);
+      const target = path.join(dir, name);
+      let info;
+      try {
+        info = await lstat(target);
+      } catch {
+        continue;
+      }
+      if (info.isSymbolicLink()) {
+        notes.push(`${name} is a symbolic link and was not read back.`);
+        continue;
+      }
+      if (!info.isFile()) {
+        notes.push(`${name} is not a regular file and was not read back.`);
+        continue;
+      }
+      if (info.size > MAX_BYTES) {
+        throw tooLarge(`the output file ${name} is larger than the 8 MiB limit.`, "Ask for less output.", name);
+      }
+      files.push({ name, contentBase64: (await readFile(target)).toString("base64") });
     }
-    files.push({ name, contentBase64: (await readFile(target)).toString("base64") });
   }
   return { files, notes };
 }

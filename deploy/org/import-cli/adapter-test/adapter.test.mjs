@@ -34,6 +34,9 @@ let mountRoot = "";
 let docsMount = "";
 let outMount = "";
 let awayFile = "";
+// A folder whose name begins with the mounted one's, which is what the
+// separator in the containment check is for.
+let siblingFile = "";
 
 // The tools.json the tests serve, in the contract the kit generates: a fixed
 // argv prefix per tool, options mapped to flags, positionals in argv order and
@@ -128,6 +131,32 @@ const toolsDocument = ({ mounts = [] } = {}) => ({
       argv: [node, fakeCli, "upper"],
       options: {},
       positionals: ["source", "dest"],
+      stdin: null,
+      outputs: ["dest"],
+    },
+    // A variadic output, which is how a tool that writes several files is
+    // generated: the format is on the items and each element takes either form.
+    spill: {
+      inputSchema: {
+        type: "object",
+        properties: { dests: { type: "array", items: { type: "string", format: "kitbash-file" } } },
+      },
+      argv: [node, fakeCli, "spill"],
+      options: {},
+      positionals: ["dests"],
+      stdin: null,
+      outputs: ["dests"],
+    },
+    // An output the command is told to write and does not, which is what a
+    // failed run leaves behind.
+    skip: {
+      inputSchema: {
+        type: "object",
+        properties: { dest: { type: "string", format: "kitbash-file" } },
+      },
+      argv: [node, fakeCli, "dump"],
+      options: {},
+      positionals: ["dest"],
       stdin: null,
       outputs: ["dest"],
     },
@@ -292,6 +321,11 @@ before(() => {
   mkdirSync(docsMount);
   mkdirSync(outMount);
   writeFileSync(path.join(docsMount, "doc.txt"), "hello kitbash");
+  // A folder beside the mounted one whose name starts with the same letters,
+  // so a containment check that forgot the separator would let it in.
+  mkdirSync(`${docsMount}2`);
+  siblingFile = path.join(`${docsMount}2`, "doc.txt");
+  writeFileSync(siblingFile, "next door");
   // A file beside the mounts rather than inside either of them, and a link
   // inside one that points at it: the two ways of naming it from within a
   // mount, which realpath is what refuses.
@@ -321,7 +355,8 @@ test("initialize and tools/list answer with what tools.json declares", async () 
   const listed = await adapter.request("tools/list", {});
   const names = listed.result.tools.map((tool) => tool.name).sort();
   assert.deepEqual(names, [
-    "absent", "concat", "convert", "dump", "fail", "flood", "fork", "hang", "link", "probe", "read", "run", "upper",
+    "absent", "concat", "convert", "dump", "fail", "flood", "fork", "hang", "link", "probe", "read", "run", "skip",
+    "spill", "upper",
   ]);
   const dump = listed.result.tools.find((tool) => tool.name === "dump");
   assert.equal(dump.description, "Print the arguments the adapter built.");
@@ -477,6 +512,90 @@ test("a path form when the unit declares no mounts is an invalid-path problem", 
   assert.equal(document.type, "https://kitbash.zyx.tw/errors/invalid-path");
   assert.match(document.detail, /this unit declares no mounts/);
   assert.match(document.fix, /declare mounts on the unit/);
+});
+
+test("a folder whose name begins with a mount target is not under it", async () => {
+  // The containment check compares on a separator and not on a string prefix,
+  // so the sibling folder next to the mounted one stays outside it. Without the
+  // separator this file would be read.
+  for (const outside of [siblingFile, `${docsMount}X/doc.txt`, `${docsMount}2`]) {
+    const document = problem(await mounted.call("read", { source: outside }));
+    assert.equal(document.type, "https://kitbash.zyx.tw/errors/invalid-path", `${outside} was accepted`);
+  }
+});
+
+test("a mount inside a mount is read by its own mode, whichever order they are declared", async () => {
+  // A unit may mount a folder and a folder inside it. The inner target is the
+  // one that governs a path inside it, so the read only folder stays read only
+  // even though the read write one contains it.
+  const nested = [
+    { target: mountRoot, mode: "rw" },
+    { target: docsMount, mode: "ro" },
+  ];
+  for (const order of [nested, [...nested].reverse()]) {
+    const adapterWithNesting = startAdapter({}, toolsDocument({ mounts: order }));
+    try {
+      const refused = problem(await adapterWithNesting.call("convert", {
+        source: path.join(docsMount, "doc.txt"),
+        dest: path.join(docsMount, "nested.txt"),
+      }));
+      assert.equal(refused.type, "https://kitbash.zyx.tw/errors/not-permitted",
+        `declared as ${JSON.stringify(order)} the inner mount lost its mode`);
+      // And the outer folder is still writable, which is the other half of the
+      // longest match being the one that decides.
+      const body = payload(await adapterWithNesting.call("convert", {
+        source: path.join(docsMount, "doc.txt"),
+        dest: path.join(outMount, "nested.txt"),
+      }));
+      assert.equal(body.exitCode, 0);
+    } finally {
+      adapterWithNesting.stop();
+    }
+  }
+});
+
+test("an input path under a mount that names nothing is a not-found problem", async () => {
+  // The same answer a name that was never sent in files gets, because it is the
+  // same sentence about the same thing.
+  const document = problem(await mounted.call("read", { source: path.join(docsMount, "absent.txt") }));
+  assert.equal(document.status, 404);
+  assert.equal(document.type, "https://kitbash.zyx.tw/errors/not-found");
+  assert.match(document.detail, /is not there/);
+
+  // A path whose folder does not exist at all is the path being wrong rather
+  // than the file being missing.
+  const noFolder = problem(await mounted.call("read", { source: path.join(docsMount, "nowhere", "absent.txt") }));
+  assert.equal(noFolder.type, "https://kitbash.zyx.tw/errors/invalid-path");
+});
+
+test("an output path the command did not write is absent from the result", async () => {
+  const dest = path.join(outMount, "never.txt");
+  const body = payload(await mounted.call("skip", { dest }));
+  assert.equal(body.exitCode, 0);
+  // The tool ran and wrote nothing, so there is nothing to report: the entry is
+  // absent rather than a name pointing at a file that is not there.
+  assert.deepEqual(body.files, []);
+  assert.equal(existsSync(dest), false);
+
+  // A path that is a folder is not an output either, and says so.
+  const folder = payload(await mounted.call("skip", { dest: outMount }));
+  assert.deepEqual(folder.files, []);
+  assert.deepEqual(folder.notes, [`${outMount} is not a regular file and was not reported as an output.`]);
+});
+
+test("a variadic output takes a name and a path in one call", async () => {
+  const inMount = path.join(outMount, "spilled.txt");
+  const body = payload(await mounted.call("spill", { dests: ["local.txt", inMount] }));
+  assert.equal(body.exitCode, 0);
+  // The path is reported where it was left and the name is read back as base64,
+  // which is one property answering in both forms.
+  const byName = Object.fromEntries(body.files.map((file) => [file.name, file]));
+  assert.deepEqual(Object.keys(byName).sort(), ["local.txt", "spilled.txt"]);
+  assert.equal(byName["spilled.txt"].path, inMount);
+  assert.equal(byName["spilled.txt"].contentBase64, undefined);
+  assert.equal(byName["local.txt"].path, undefined);
+  assert.match(Buffer.from(byName["local.txt"].contentBase64, "base64").toString(), /^spilled into /);
+  assert.equal(readFileSync(inMount, "utf8"), `spilled into ${inMount}\n`);
 });
 
 test("a variadic file positional takes a name and a path in one call", async () => {

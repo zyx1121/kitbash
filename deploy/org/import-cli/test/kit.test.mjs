@@ -103,6 +103,20 @@ test("both tools publish the mounts input", async () => {
     assert.deepEqual(schema.items.required, ["source", "target"]);
     assert.deepEqual(schema.items.properties.mode.enum, ["ro", "rw"]);
   }
+  // refine rewrites the whole manifest and inherits nothing, so its own
+  // description is the one that says to send the mounts again.
+  const refine = listed.result.tools.find((tool) => tool.name === "refine");
+  assert.match(refine.inputSchema.properties.mounts.description, /send mounts again here/);
+});
+
+test("a refinement with no mounts answers a Package with none", async () => {
+  const result = await kitProcess.call("refine", { source: "cli:apk:jq", help: jqHelp, mounts });
+  assert.deepEqual(readYaml(fileNamed(result, "kitbash.yaml")).deploy.units[0].mounts, mounts);
+
+  const without = await kitProcess.call("refine", { source: "cli:apk:jq", help: jqHelp });
+  assert.equal(readYaml(fileNamed(without, "kitbash.yaml")).deploy.units[0].mounts, undefined);
+  assert.equal(JSON.parse(fileNamed(without, "tools.json")).mounts, undefined);
+  assert.match(fileNamed(without, "NOTES.md"), /send `mounts` again with every `refine`/);
 });
 
 test("refine with mounts round trips into the manifest and tools.json", async () => {

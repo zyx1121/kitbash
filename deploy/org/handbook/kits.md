@@ -298,19 +298,27 @@ and the kit writes them into the unit:
 ]}
 ```
 
+`refine` writes the manifest from scratch and the kit remembers nothing between
+calls, so send `mounts` again with every `refine`: a refinement that leaves them
+out produces a Package with no mounts, whatever the import declared.
+
 Then `jq_jq` with `{"filter": ".", "file": ["/files/docs/report.json"]}` reads a
 file that never travelled in the call, and a tool with an output argument given
 `/files/out/result.json` leaves the file there, reports `{name, path}` with no
 contents, and you read it with `fs_read` on `/home/you/out/result.json`. The
-adapter never reads a file back out of a mount.
+adapter never reads a file back out of a mount, so nothing that travels through
+one counts against the 8 MiB a call carries, in either direction, and an output
+left in a `rw` mount can be any size the folder holds. An output the command did
+not write is absent from the result, as any other output is.
 
 The rules are the ones every mount has, PLAN.md 2.3: a source is a folder of
 your own home or of `/org`, which is read only for everyone, every folder above
 it carries a `kitbash.yaml`, at most four, and a target may not be `/` or land
 under `/proc`, `/sys`, `/dev`, `/etc`, `/bin`, `/sbin`, `/usr`, `/lib` or
-`/lib64`. A path that resolves outside every mount is `invalid-path`, a path
-under a `ro` mount given as an output is `not-permitted`, and a Package that
-declares no mounts refuses every path. The kit writes what you asked for;
+`/lib64`. A path that resolves outside every mount is `invalid-path`, an input
+path that names nothing under one is `not-found`, a path under a `ro` mount
+given as an output is `not-permitted`, and a Package that declares no mounts
+refuses every path. The kit writes what you asked for;
 kitbashd decides at `proc_run` whether it is legal.
 
 ## The seeded Packages
