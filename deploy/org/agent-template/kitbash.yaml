@@ -1,0 +1,119 @@
+name: agent-template
+description: >-
+  A Process that is an agent: run takes a task in words and answers it by
+  driving a Claude tool use loop whose tools are this Process's own MCP
+  surface. Copy the folder into your home to change AGENT.md, the model or the
+  permits.
+tags: [kit, agent]
+
+provides:
+  prompt: AGENT.md
+  # What a Process of this kit may call back over /mcp, which is what the model
+  # in the loop is given as its tools. It reads and writes Files, sees Packages
+  # and Processes, reads Telemetry, and calls the tools of the owner's other
+  # Packages, which is what packages stands for. There is no proc_run, no
+  # pkg_build, no users, no approvals and no secrets: a template that could
+  # start Processes and approve its own writes to /org would be an admin by
+  # default. A member who wants any of those copies this folder and adds them.
+  permits:
+    tools:
+      [fs_list, fs_read, fs_write, fs_history, pkg_list, pkg_inspect, proc_list, proc_logs, tel_query, packages]
+    paths: [/org, /home/*]
+  tools:
+    - name: run
+      description: >-
+        Answer the task by calling the tools of this Process's surface until it
+        is done. Returns the agent's answer, why the loop stopped, one entry per
+        tool call and what the run cost.
+      input:
+        type: object
+        additionalProperties: false
+        required: [task]
+        properties:
+          task:
+            type: string
+            minLength: 1
+            maxLength: 65536
+            description: >-
+              What to do, in natural language. Name the Files paths and the
+              Packages involved: the agent reaches only what this kit's permits
+              allow, and it cannot ask you a question halfway through.
+          system:
+            type: string
+            maxLength: 16384
+            description: >-
+              Appended to the system prompt for this run. Standing instructions
+              belong in AGENT.md of your own copy of this folder; this is for
+              what changes call by call.
+      output:
+        type: object
+        additionalProperties: false
+        required: [answer, stopReason, steps, usage, model]
+        properties:
+          answer:
+            type: string
+            description: >-
+              The text of the agent's final message, which is its answer to the
+              task. Empty when the model refused.
+          stopReason:
+            type: string
+            description: >-
+              Why the loop ended: end_turn when the agent answered,
+              max_iterations when it ran out of turns, max_tokens when the final
+              message was cut short, refusal when the model declined, or
+              whatever else the API reported.
+          steps:
+            type: array
+            description: One entry per tool call the agent made, in the order they ran.
+            items:
+              type: object
+              additionalProperties: false
+              required: [tool, durationMs, ok]
+              properties:
+                tool:
+                  type: string
+                  description: The surface tool that was called, by the name the surface publishes.
+                durationMs:
+                  type: integer
+                  description: How long the call took.
+                ok:
+                  type: boolean
+                  description: >-
+                    False when the tool answered a problem or did not answer at
+                    all. The agent was told so and kept going, so a false here
+                    is not a failed run.
+          usage:
+            type: object
+            additionalProperties: false
+            required: [inputTokens, outputTokens]
+            properties:
+              inputTokens:
+                type: integer
+                description: Input tokens across every turn, cache reads and cache writes included.
+              outputTokens:
+                type: integer
+                description: Output tokens across every turn.
+          model:
+            type: string
+            description: The model that ran, which is AGENT_MODEL or this kit's default.
+
+deploy:
+  units:
+    - type: container
+      build: .
+      expose: mcp
+      # The key is the member's own and never travels in a manifest: they write
+      # it with secrets_set and kitbashd resolves it into this container's
+      # environment at every start, PLAN.md 2.3.
+      secrets: [ANTHROPIC_API_KEY]
+      # The three knobs a copy of this folder is meant to change. They are plain
+      # environment because none of them is a credential.
+      env:
+        AGENT_MODEL: "claude-opus-5"
+        AGENT_MAX_ITERATIONS: "32"
+        AGENT_EFFORT: "high"
+      # What one run holds: the conversation, which max_tokens and the iteration
+      # cap bound, plus one tool result at a time, clipped to 256 KiB as it is
+      # read. Every session of this Process runs one more instance, so the limit
+      # covers a few of them at once.
+      limits: { memory: 512Mi }
