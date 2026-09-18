@@ -770,7 +770,10 @@ func (s *Server) Prepare(ctx context.Context) {
 	// The secrets directory is the daemon's own, root owned and 0700. It is
 	// created here rather than by the installer so a host upgraded from a
 	// release without secrets gains it at the next start, the same way the
-	// store directory is created and narrowed, see internal/secrets.
+	// store directory is created and narrowed, see internal/secrets. cmd/
+	// kitbashd prepares it before it serves anything and refuses to start when
+	// it cannot, so what this catches is a tree that changed under a running
+	// daemon; every secrets call answers internal until it is put back.
 	if err := s.secrets.Prepare(); err != nil {
 		logger.Printf("secrets: the directory %s could not be prepared, so every secrets call will fail: %v",
 			s.secrets.Dir(), err)

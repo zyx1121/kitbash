@@ -47,8 +47,10 @@ tcp:
       Beside the names above, the environment a Process is given carries every
       name its unit declared in deploy.units[].secrets, resolved at this start
       to the owner's current value. kitbashd writes the environment file
-      itself, the same file the Telemetry token is written into, so a value
-      never crosses the request body of processes_register or
+      itself, the same file the Telemetry token is written into: it is created
+      root owned in a root owned directory, given to the member because their
+      podman is the one that reads it, and removed when the start returns, so
+      a value never crosses the request body of processes_register or
       processes_start and is never on podman's command line. A declared name
       the owner has not set is 404 not-found at the start, naming the secret;
       on a restore it is the problem processes_list reports for that Process,

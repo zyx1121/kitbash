@@ -5,11 +5,14 @@ import (
 	"encoding/json"
 	"net/http"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/zyx1121/kitbash/internal/cgroups"
+	"github.com/zyx1121/kitbash/internal/mounts"
 	"github.com/zyx1121/kitbash/internal/problem"
 	"github.com/zyx1121/kitbash/internal/secrets"
 	"github.com/zyx1121/kitbash/internal/store"
@@ -424,6 +427,153 @@ func TestSecretsNeverOverruleWhatKitbashdSpeaksFor(t *testing.T) {
 	_ = fake
 }
 
+// A restore that makes the container again writes the owner's current values
+// into the environment file it creates it with. This is the path a Process
+// that declares mounts and is not running takes: it cannot be started by name,
+// so it is made again, and a container made without its credentials is a
+// Process that starts and cannot work, see remakeMounted in restore.go.
+func TestRestoreMakesAMountedProcessAgainWithItsSecrets(t *testing.T) {
+	h, fake, home, _ := filesHost(t)
+	const container = "kitbash-reader-reader"
+	id := h.superviseWithMounts(container, []mounts.Resolved{
+		{Source: filepath.Join(home, "notes"), Target: "/files/notes", Mode: mounts.ModeRO},
+	})
+	h.declareSecrets(id, "ANTHROPIC_API_KEY")
+	h.seedSecret(h.user, "ANTHROPIC_API_KEY", secretValue)
+	// The container the host holds is not running, which is what sends this
+	// restore down the path that makes it again.
+	fake.Configs = map[string]sysusers.ContainerConfig{
+		container: {CgroupParent: cgroups.MemberParent(h.user), Image: testDigest},
+	}
+	fake.AddImage(h.user, testDigest, 1, nil)
+
+	counts := h.server.Restore(context.Background())
+	if counts.Started != 1 || counts.Failed != 0 {
+		t.Fatalf("the restore is %+v, want the Process made again and started", counts)
+	}
+	runs := fake.Runs()
+	if len(runs) != 1 {
+		t.Fatalf("the runtime was asked to make %d containers, want the one", len(runs))
+	}
+	if env := parseEnvFile(runs[0].Env); env["ANTHROPIC_API_KEY"] != secretValue {
+		t.Fatalf("the environment carries %q for the declared secret, want the value the member holds",
+			env["ANTHROPIC_API_KEY"])
+	}
+	for _, arg := range runs[0].Args {
+		if strings.Contains(arg, secretValue) {
+			t.Fatalf("the command line carries the value: %v", runs[0].Args)
+		}
+	}
+}
+
+// A heal writes them too. A Process registered before kitbashd gave each one a
+// cgroup of its own is created again under a ceiling, and the container it
+// replaces is removed: without the values it would come back without the
+// credentials it was running with, see healCeiling in restore.go.
+func TestRestoreHealsAProcessWithItsSecrets(t *testing.T) {
+	h, fake, owner, id := legacyHarness(t)
+	h.declareSecrets(id, "ANTHROPIC_API_KEY")
+	h.seedSecret(owner, "ANTHROPIC_API_KEY", secretValue)
+
+	counts := h.server.Restore(context.Background())
+	if counts.Started != 1 || counts.Healed != 1 || counts.Failed != 0 {
+		t.Fatalf("the restore is %+v, want one started and healed", counts)
+	}
+	runs := fake.Runs()
+	if len(runs) != 1 {
+		t.Fatalf("the heal made %d containers, want the one", len(runs))
+	}
+	if env := parseEnvFile(runs[0].Env); env["ANTHROPIC_API_KEY"] != secretValue {
+		t.Fatalf("the environment carries %q for the declared secret, want the value the member holds",
+			env["ANTHROPIC_API_KEY"])
+	}
+	for _, arg := range runs[0].Args {
+		if strings.Contains(arg, secretValue) {
+			t.Fatalf("the command line carries the value: %v", runs[0].Args)
+		}
+	}
+}
+
+// A heal of a Process whose declared secret is gone does not make the
+// container again: the old one is left holding its token and the owner reads
+// why, rather than a Process coming back without the credential it declared.
+func TestRestoreHealsNothingWhenTheSecretIsGone(t *testing.T) {
+	h, fake, _, id := legacyHarness(t)
+	h.declareSecrets(id, "ANTHROPIC_API_KEY")
+
+	counts := h.server.Restore(context.Background())
+	if counts.Failed != 1 || counts.Healed != 0 || counts.Started != 0 {
+		t.Fatalf("the restore is %+v, want the Process failed and nothing healed", counts)
+	}
+	if runs := fake.Runs(); len(runs) != 0 {
+		t.Fatalf("the heal made %+v, want nothing made without the credential", runs)
+	}
+	if renames := fake.Renames(); len(renames) != 0 {
+		t.Fatalf("the heal renamed %+v, want the old container left where it is", renames)
+	}
+	if problem := h.server.processProblem(id); !strings.Contains(problem.Detail, "ANTHROPIC_API_KEY") {
+		t.Errorf("the problem is %q, want the secret named", problem.Detail)
+	}
+}
+
+// The secrets are merged after the manifest's own environment, so a start
+// request that claims the same name does not decide what the container gets:
+// kitbash-mcp runs as the member, and what a member's process sends about a
+// variable is a claim. A manifest may not declare both, which is checked when
+// it is parsed; this is the request that goes around that, see environment in
+// run.go.
+func TestASecretOverrulesTheEnvironmentOfTheRequest(t *testing.T) {
+	h, fake := supervised(t)
+	h.seedSecret(h.user, "ANTHROPIC_API_KEY", secretValue)
+	id := h.superviseWithSecrets(h.user, "kitbash-echo-echo", "ANTHROPIC_API_KEY")
+
+	res, body := h.start(id, startRequest{
+		Image: testDigest,
+		Env: map[string]string{
+			"ANTHROPIC_API_KEY": "sk-claimed-by-the-request",
+			"LOG_LEVEL":         "debug",
+		},
+	})
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("start = %d %s, want 200", res.StatusCode, body)
+	}
+	env := parseEnvFile(fake.Runs()[0].Env)
+	if env["ANTHROPIC_API_KEY"] != secretValue {
+		t.Fatalf("the environment carries %q, want the value the member holds", env["ANTHROPIC_API_KEY"])
+	}
+	if env["LOG_LEVEL"] != "debug" {
+		t.Errorf("the environment is %v, want the rest of the request's own kept", env)
+	}
+}
+
+// A base directory kitbashd will not write into is not a thing a member can
+// work around, so every call of the family answers internal rather than
+// looking like it worked. cmd/kitbashd refuses to start on one; this is the
+// tree changing under a daemon that is already running.
+func TestSecretsCallsFailWhenTheBaseIsNotUsable(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "secrets")
+	if err := os.Symlink(filepath.Join(dir, "elsewhere"), base); err != nil {
+		t.Fatalf("planting the link: %v", err)
+	}
+	h := serveWith(t, Options{
+		Admin:      func(*user.User) (bool, error) { return false, nil },
+		SecretsDir: base,
+	})
+
+	res, body := h.setSecret("ANTHROPIC_API_KEY", secretValue)
+	if res.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("set = %d %s, want 500", res.StatusCode, body)
+	}
+	if prob := h.problemOf(res, body); strings.Contains(prob.Detail, secretValue) {
+		t.Errorf("the refusal is %+v, want no value in it", prob)
+	}
+	res, body = h.do(http.MethodGet, secretsPath, "", nil)
+	if res.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("list = %d %s, want 500", res.StatusCode, body)
+	}
+}
+
 // Removing a member takes their secrets with the account: the values are
 // theirs, and a directory left behind would hand them to the next account
 // created with that name, see PLAN.md section 2.3.
@@ -446,11 +596,12 @@ func TestUsersRemoveTakesTheMembersSecrets(t *testing.T) {
 	}
 }
 
-// superviseWithSecrets registers one Process of the caller that declares the
-// names given, the way proc_run would.
-func (h *harness) superviseWithSecrets(owner, container string, declared ...string) string {
+// declareSecrets writes the names one registration declares onto the record
+// that is already stored, which is what a proc_run of a unit that declares
+// them leaves behind. It is how every test here reaches a start, a restore or
+// a heal with a Process that needs a value.
+func (h *harness) declareSecrets(id string, declared ...string) {
 	h.t.Helper()
-	id := h.supervise(owner, container)
 	p, found, err := h.store.Process(context.Background(), id)
 	if err != nil || !found {
 		h.t.Fatalf("reading back the registration (%t, %v)", found, err)
@@ -463,6 +614,14 @@ func (h *harness) superviseWithSecrets(owner, container string, declared ...stri
 	if err := h.store.RegisterProcess(context.Background(), p, hash, 0); err != nil {
 		h.t.Fatalf("RegisterProcess: %v", err)
 	}
+}
+
+// superviseWithSecrets registers one Process of the caller that declares the
+// names given, the way proc_run would.
+func (h *harness) superviseWithSecrets(owner, container string, declared ...string) string {
+	h.t.Helper()
+	id := h.supervise(owner, container)
+	h.declareSecrets(id, declared...)
 	return id
 }
 
@@ -471,18 +630,7 @@ func (h *harness) superviseWithSecrets(owner, container string, declared ...stri
 func (h *harness) registeredWithSecrets(owner, container string, declared ...string) string {
 	h.t.Helper()
 	id := h.registered(owner, container)
-	p, found, err := h.store.Process(context.Background(), id)
-	if err != nil || !found {
-		h.t.Fatalf("reading back the registration (%t, %v)", found, err)
-	}
-	p.Secrets = declared
-	_, hash, err := store.NewToken()
-	if err != nil {
-		h.t.Fatalf("NewToken: %v", err)
-	}
-	if err := h.store.RegisterProcess(context.Background(), p, hash, 0); err != nil {
-		h.t.Fatalf("RegisterProcess: %v", err)
-	}
+	h.declareSecrets(id, declared...)
 	return id
 }
 

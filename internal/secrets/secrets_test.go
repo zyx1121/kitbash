@@ -374,3 +374,129 @@ func TestOnlyValuesAreListed(t *testing.T) {
 		t.Errorf("Get of a directory answered found %t, err %v, want a refusal", found, err)
 	}
 }
+
+// The base directory is the one path this package does not resolve below a
+// descriptor, so a symbolic link at that name is refused rather than followed:
+// the chmod would otherwise land on whatever it points at, and every call
+// after it would fail on a daemon that had already reported itself started.
+// kitbashd refuses to start on one, see cmd/kitbashd.
+func TestPrepareRefusesABaseThatIsNotADirectoryOfItsOwn(t *testing.T) {
+	dir := t.TempDir()
+	elsewhere := filepath.Join(dir, "elsewhere")
+	if err := os.Mkdir(elsewhere, 0o777); err != nil {
+		t.Fatalf("creating the link target: %v", err)
+	}
+	// The mode is read rather than assumed: the umask this test runs under
+	// decides what Mkdir left, and what is asserted is that Prepare changed
+	// nothing about it.
+	before, err := os.Stat(elsewhere)
+	if err != nil {
+		t.Fatalf("stat the link target: %v", err)
+	}
+	base := filepath.Join(dir, "secrets")
+	if err := os.Symlink(elsewhere, base); err != nil {
+		t.Fatalf("planting the link: %v", err)
+	}
+	if err := secrets.New(base).Prepare(); !errors.Is(err, secrets.ErrBase) {
+		t.Fatalf("Prepare = %v, want ErrBase", err)
+	}
+	// The link target is untouched: nothing was created in it and its mode is
+	// the one it had.
+	info, err := os.Stat(elsewhere)
+	if err != nil {
+		t.Fatalf("stat the link target: %v", err)
+	}
+	if info.Mode().Perm() != before.Mode().Perm() {
+		t.Errorf("the link target is %v and was %v: the chmod followed the link",
+			info.Mode().Perm(), before.Mode().Perm())
+	}
+	if entries, _ := os.ReadDir(elsewhere); len(entries) != 0 {
+		t.Errorf("the link target holds %d entries, want nothing written through the link", len(entries))
+	}
+
+	// A base that is a file is refused for the same reason.
+	file := filepath.Join(dir, "file")
+	if err := os.WriteFile(file, []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("writing the file: %v", err)
+	}
+	if err := secrets.New(file).Prepare(); !errors.Is(err, secrets.ErrBase) {
+		t.Errorf("Prepare on a file = %v, want ErrBase", err)
+	}
+}
+
+// The modes are enforced on every write and not only set at creation. A tree
+// an upgrade, a restored backup or an operator left open would otherwise stay
+// open, and every value in it is readable by whoever can reach the path.
+func TestSetNarrowsADirectoryAndAValueThatWereLeftOpen(t *testing.T) {
+	s, dir := store(t)
+	member := filepath.Join(dir, "alice")
+	if err := os.Mkdir(member, 0o777); err != nil {
+		t.Fatalf("creating the open directory: %v", err)
+	}
+	if err := os.Chmod(member, 0o777); err != nil {
+		t.Fatalf("opening the directory: %v", err)
+	}
+	value := filepath.Join(member, "KEY")
+	if err := os.WriteFile(value, []byte("old"), 0o666); err != nil {
+		t.Fatalf("writing the open value: %v", err)
+	}
+	if err := os.Chmod(value, 0o666); err != nil {
+		t.Fatalf("opening the value: %v", err)
+	}
+
+	if _, err := s.Set("alice", "KEY", "new"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	info, err := os.Stat(member)
+	if err != nil {
+		t.Fatalf("stat the directory: %v", err)
+	}
+	if info.Mode().Perm() != secrets.DirMode {
+		t.Errorf("the directory is %v after a write, want %v",
+			info.Mode().Perm(), os.FileMode(secrets.DirMode))
+	}
+	info, err = os.Stat(value)
+	if err != nil {
+		t.Fatalf("stat the value: %v", err)
+	}
+	if info.Mode().Perm() != secrets.FileMode {
+		t.Errorf("the value is %v after a write, want %v",
+			info.Mode().Perm(), os.FileMode(secrets.FileMode))
+	}
+	// And the write is the write: the new value is what a read answers.
+	if got, _, err := s.Get("alice", "KEY"); err != nil || got != "new" {
+		t.Errorf("Get answered %q (err %v), want the value that was set", got, err)
+	}
+}
+
+// A file larger than a value may be is refused rather than read as one. It is
+// not a value this package wrote, so answering the first 8 KiB of it would
+// hand a Process a credential nobody set.
+func TestGetRefusesAFileOverTheValueSize(t *testing.T) {
+	s, dir := store(t)
+	if _, err := s.Set("alice", "KEY", "value"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	body := strings.Repeat("x", secrets.MaxValueBytes+1)
+	if err := os.WriteFile(filepath.Join(dir, "alice", "KEY"), []byte(body), secrets.FileMode); err != nil {
+		t.Fatalf("writing the oversized file: %v", err)
+	}
+	got, found, err := s.Get("alice", "KEY")
+	if err == nil {
+		t.Fatalf("Get answered %d bytes (found %t), want a refusal", len(got), found)
+	}
+	if !errors.Is(err, secrets.ErrValue) {
+		t.Errorf("Get = %v, want ErrValue", err)
+	}
+	if got != "" {
+		t.Errorf("Get answered %d bytes beside the refusal, want none", len(got))
+	}
+	// A value of exactly the limit is still a value.
+	limit := strings.Repeat("y", secrets.MaxValueBytes)
+	if err := os.WriteFile(filepath.Join(dir, "alice", "KEY"), []byte(limit), secrets.FileMode); err != nil {
+		t.Fatalf("writing the value at the limit: %v", err)
+	}
+	if got, _, err := s.Get("alice", "KEY"); err != nil || got != limit {
+		t.Errorf("Get of a value at the limit answered %d bytes (err %v), want all of it", len(got), err)
+	}
+}

@@ -61,6 +61,11 @@ var (
 	ErrName   = errors.New("secrets: the name is not an environment variable name kitbash holds")
 	ErrMember = errors.New("secrets: the member name is not one kitbash creates")
 	ErrValue  = errors.New("secrets: the value is not one an environment file carries")
+	// ErrBase is the base directory being something this package will not
+	// write into: a symbolic link, or a path that is not a directory. It is
+	// the operator's to fix, and kitbashd refuses to start on it rather than
+	// serving a family that cannot work.
+	ErrBase = errors.New("secrets: the base directory is not one kitbashd will use")
 )
 
 // Entry is one name a member holds and when it was last written. It is what
@@ -95,12 +100,34 @@ func (s *Store) Dir() string { return s.dir }
 // to create it and a host that was installed before secrets existed gains it
 // on the next start.
 func (s *Store) Prepare() error {
+	// The base is the trust boundary and is the one path here that is not
+	// resolved below a descriptor, so it is checked before it is created or
+	// narrowed. A symlink at this name would otherwise be followed by both
+	// calls below: the chmod would land on whatever it points at, and every
+	// call after it would fail ELOOP on a daemon that had already reported
+	// itself started. This is the same lstat safeopen makes of a root.
+	info, err := os.Lstat(s.dir)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		// Nothing is there, which is a fresh host: MkdirAll below makes it.
+	case err != nil:
+		return fmt.Errorf("secrets: the directory %s: %w", s.dir, err)
+	case !info.Mode().IsDir():
+		// Lstat, so a symbolic link is not a directory here however its target
+		// looks. This is the one check: a link and a regular file are both
+		// something kitbashd will not write secrets into, and naming which one
+		// it is, is what the operator needs to fix it.
+		return fmt.Errorf("secrets: %s is %s and not a directory kitbashd made: %w",
+			s.dir, describe(info), ErrBase)
+	}
 	if err := os.MkdirAll(s.dir, DirMode); err != nil {
 		return fmt.Errorf("secrets: the directory %s: %w", s.dir, err)
 	}
 	// A directory an older release left group or world readable would leave
 	// every value readable by anyone who can reach the path, so the mode is
-	// set rather than assumed, the same way the store directory is.
+	// set rather than assumed, the same way the store directory is. The path
+	// is not a link, which the lstat above has just established, and the
+	// directory is root owned, so nothing can have made it one in between.
 	if err := os.Chmod(s.dir, DirMode); err != nil {
 		return fmt.Errorf("secrets: the directory %s: %w", s.dir, err)
 	}
@@ -132,6 +159,15 @@ func (s *Store) Set(member, name, value string) (time.Time, error) {
 		return time.Time{}, err
 	}
 	defer dir.Close()
+	// The mode is enforced and not only set at creation: a directory an
+	// upgrade, a restore of a backup or an operator left at 0777 would leave
+	// every value in it readable by anyone on the host. It is narrowed through
+	// the descriptor safeopen resolved rather than by path, so what is
+	// narrowed is the directory this call is writing into and not whatever
+	// that path names now.
+	if err := dir.Chmod(DirMode); err != nil {
+		return time.Time{}, fmt.Errorf("secrets: the directory of %s: %w", member, err)
+	}
 
 	// The temporary name carries a dot, which no name this package accepts
 	// can, so one left behind by a daemon that was killed mid write is never
@@ -141,8 +177,11 @@ func (s *Store) Set(member, name, value string) (time.Time, error) {
 	if err != nil {
 		return time.Time{}, fmt.Errorf("secrets: writing %s of %s: %w", name, member, err)
 	}
-	// The mode is set rather than left to the umask kitbashd happens to run
-	// with: 0600 is the promise, not a ceiling.
+	// The mode is set on the descriptor rather than left to the umask kitbashd
+	// happens to run with: 0600 is the promise, not a ceiling. The rename
+	// below replaces whatever was at the name, so a value file an upgrade or
+	// an operator left at 0666 is narrowed by being replaced rather than by a
+	// chmod of a path this call would have to resolve again.
 	if err := f.Chmod(FileMode); err != nil {
 		f.Close()
 		s.discard(dir, temp)
@@ -286,9 +325,12 @@ func (s *Store) RemoveMember(member string) error {
 }
 
 // memberDir opens one member's directory without following a symlink at any
-// component, which is the descriptor the rename and the unlink act against.
+// component, which is the descriptor the rename, the unlink and the chmod act
+// against. It is a read descriptor rather than an O_PATH one, because fchmod
+// is refused on O_PATH and narrowing the directory is part of what a write
+// does.
 func (s *Store) memberDir(member string) (*os.File, error) {
-	dir, err := safeopen.Open(s.dir, member, unix.O_DIRECTORY|unix.O_PATH, 0)
+	dir, err := safeopen.Open(s.dir, member, unix.O_DIRECTORY|os.O_RDONLY, 0)
 	if err != nil {
 		return nil, fmt.Errorf("secrets: the directory of %s: %w", member, err)
 	}
@@ -333,6 +375,19 @@ func CheckValue(value string) error {
 		return fmt.Errorf("%w: it carries a line break", ErrValue)
 	}
 	return nil
+}
+
+// describe names what is at a path, for the one refusal an operator reads
+// before they move it out of the way.
+func describe(info os.FileInfo) string {
+	switch {
+	case info.Mode()&os.ModeSymlink != 0:
+		return "a symbolic link"
+	case info.Mode().IsRegular():
+		return "a regular file"
+	default:
+		return "a " + info.Mode().Type().String()
+	}
 }
 
 // stamp is what makes one write's temporary file its own, so two writes of one

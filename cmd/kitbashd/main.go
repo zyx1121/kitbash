@@ -123,6 +123,15 @@ func run() error {
 	if err := os.Chmod(storeDir, store.DirMode); err != nil {
 		return fmt.Errorf("store directory %s: %w", storeDir, err)
 	}
+	// The values members set with secrets_set live beside the store and never
+	// in it. The tree is prepared here rather than only in Prepare, and a
+	// failure stops the daemon: a base directory kitbashd will not write into,
+	// such as a symbolic link somebody put there, would otherwise show up as
+	// every secrets call failing on a daemon that had reported itself started,
+	// see internal/secrets.
+	if err := secrets.New(*secretsDir).Prepare(); err != nil {
+		return err
+	}
 	st, err := store.Open(*storePath)
 	if err != nil {
 		return err
