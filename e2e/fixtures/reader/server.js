@@ -25,6 +25,16 @@ const TOOLS = [
     },
   },
   {
+    name: "env",
+    description: "Answer with the value of an environment variable the Process was given.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["name"],
+      properties: { name: { type: "string", maxLength: 64 } },
+    },
+  },
+  {
     name: "write",
     description: "Write a file where the Process can see it.",
     inputSchema: {
@@ -55,6 +65,17 @@ const call = (id, name, args) => {
       reply(id, {
         content: [{ type: "text", text: JSON.stringify({ content }) }],
         structuredContent: { content },
+      });
+      return;
+    }
+    case "env": {
+      // The environment of this container is what kitbashd wrote into the file
+      // it created the container with, so a declared secret is here and
+      // nowhere a member's own process could have read it.
+      const value = process.env[args.name] ?? "";
+      reply(id, {
+        content: [{ type: "text", text: JSON.stringify({ value }) }],
+        structuredContent: { value },
       });
       return;
     }

@@ -41,6 +41,9 @@ type harness struct {
 	// unit test writes no cgroup filesystem and nothing under /run.
 	cgroups *cgroups.Fake
 	envDir  string
+	// secretsDir is where this daemon keeps the values members set, which a
+	// test seeds and reads back, see secrets_test.go.
+	secretsDir string
 	// tokens are the Process tokens the test itself wrote, by Process id. The
 	// store keeps only their hashes, so a test that has to prove a token was
 	// not revoked keeps the token here.
@@ -83,6 +86,11 @@ func serveWith(t *testing.T, opts Options) *harness {
 	if opts.EnvDir == "" {
 		opts.EnvDir = filepath.Join(dir, "env")
 	}
+	// The secrets of a test are the test's own too: nothing here writes to
+	// /var/lib/kitbash, see internal/secrets.
+	if opts.SecretsDir == "" {
+		opts.SecretsDir = filepath.Join(dir, "secrets")
+	}
 	srv := New(st, opts)
 	t.Cleanup(srv.Close)
 
@@ -117,7 +125,7 @@ func serveWith(t *testing.T, opts Options) *harness {
 		}
 	})
 	h := &harness{t: t, client: client, store: st, server: srv, user: me.Username, socket: socket,
-		envDir: opts.EnvDir, tokens: map[string]string{}}
+		envDir: opts.EnvDir, secretsDir: opts.SecretsDir, tokens: map[string]string{}}
 	h.cgroups, _ = opts.Cgroups.(*cgroups.Fake)
 	return h
 }

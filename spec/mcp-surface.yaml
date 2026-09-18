@@ -4,7 +4,8 @@
 # <family>_<verb> because MCP tool names allow [A-Za-z0-9_-] only; the dot form
 # used in PLAN.md is the same tool spoken aloud.
 #
-# fs is implemented in M1, pkg and proc in M2, tel in M3, users and approvals in M5. All six families are declared
+# fs is implemented in M1, pkg and proc in M2, tel in M3, users and approvals in
+# M5, secrets in M9. All seven families are declared
 # here so the surface is designed as one piece and later milestones fill in the
 # implementation without renaming anything.
 #
@@ -72,7 +73,8 @@ $package_tools:
     schemas. Input is validated against the manifest before the call is
     forwarded to the container over podman exec. A tool the server offers but
     the manifest does not declare is not published. Package names equal to a
-    family name (fs, pkg, proc, tel, users, approvals) are refused at proc_run.
+    family name (fs, pkg, proc, tel, users, approvals, secrets) are refused at
+    proc_run.
     Tool names keep the server's spelling (MCP allows [A-Za-z0-9_-]); package names carry no underscore, so the first underscore in a surface name is the split.
     The set is read from the caller's running Processes when a session starts
     and kept current within the session; other sessions see changes when they
@@ -812,3 +814,59 @@ families:
         input: { type: object, additionalProperties: false, required: [id, reason], properties: { id: { type: string }, reason: { type: string, minLength: 3, maxLength: 500 } } }
         output: { type: object, required: [id, state], properties: { id: { type: string }, state: { type: string, enum: [rejected] } } }
         errors: [not-permitted, not-found, conflict, internal]
+
+  # ---------------------------------------------------------------- secrets (M9)
+  secrets:
+    description: >
+      The values a member gives their own Processes: an API key, a token for a
+      service outside this machine. A unit declares the names it needs in
+      deploy.units[].secrets and kitbashd resolves each one to the owner's
+      current value at every start, so rotation is one call and nothing is
+      rebuilt. Served by kitbashd over its socket, see
+      spec/kitbashd-api.yaml.
+
+      Secrets are the member's own, scoped by the socket's peer credentials
+      the same way their home is: an admin holds their own set and reads
+      nobody else's, and there is no shared set, because a Process runs under
+      one member and the value has to be that member's to give. kitbashd keeps
+      them as root owned files outside the database, so the daily backup copy
+      carries none of them, and removes a member's set with their account, see
+      PLAN.md sections 2.3 and 4.7.
+
+      A value crosses the wire once, on secrets_set. The span that call
+      records carries the name and no value, no problem detail quotes one,
+      and no value is ever on podman's command line or in the request body of
+      proc_run: kitbashd writes the environment file itself.
+    implemented_in: M9
+    tools:
+      secrets_set:
+        description: >
+          Set the value of one secret of the caller. Creating and replacing are
+          the same call, so rotation is one call: secrets_set writes the new
+          value and the next start of every Process that declares the name
+          reads it. It restarts nothing, as a health probe restarts nothing;
+          proc_stop followed by proc_run is how a member decides which
+          Processes take a new value. The value is one line: at most 8192
+          bytes, no NUL and no line break, because the environment file a
+          Process is given is line based. A multi line credential is encoded
+          by the member before it is set.
+        input: { type: object, additionalProperties: false, required: [name, value], properties: { name: { type: string, pattern: "^[A-Z][A-Z0-9_]{0,63}$" }, value: { type: string, minLength: 1, maxLength: 8192, description: "The value, 1 to 8192 bytes, without NUL and without a line break" } } }
+        output: { type: object, required: [name, updated], properties: { name: { type: string }, updated: { type: string, format: date-time } } }
+        errors: [bad-request, internal]
+      secrets_list:
+        description: >
+          The names the caller holds and when each was last written, sorted by
+          name. It never answers a value: what a listing is for is seeing
+          which names are there.
+        input: { type: object, additionalProperties: false, properties: {} }
+        output: { type: object, required: [secrets], properties: { secrets: { type: array, items: { type: object, required: [name, updated], properties: { name: { type: string }, updated: { type: string, format: date-time } } } } } }
+        errors: [internal]
+      secrets_remove:
+        description: >
+          Drop one secret of the caller. Idempotent: a name the caller does not
+          hold answers removed false rather than failing. A Process that
+          declares the name keeps running with the value it was started with,
+          and its next start is not-found until the name is set again.
+        input: { type: object, additionalProperties: false, required: [name], properties: { name: { type: string, pattern: "^[A-Z][A-Z0-9_]{0,63}$" } } }
+        output: { type: object, required: [name, removed], properties: { name: { type: string }, removed: { type: boolean } } }
+        errors: [bad-request, internal]

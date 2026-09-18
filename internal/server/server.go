@@ -76,6 +76,10 @@ func New(version string, deps Deps) *mcp.Server {
 		// The users and approvals families live in kitbashd, so they are on
 		// the surface only when this session has a socket to reach it on.
 		RegisterUsers(s, client)
+		// The secrets family lives in kitbashd too, for a stronger reason than
+		// the users family does: the values are root owned files, and this
+		// process is the member's.
+		RegisterSecrets(s, client)
 		// The approvals family takes the block as well: approving executes the
 		// queued tool inside its own handler, which the guard never sees, see
 		// permittedApproval.

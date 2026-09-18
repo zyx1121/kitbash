@@ -113,6 +113,13 @@ func Parse(data []byte) (*Manifest, error) {
 	if !ok {
 		return nil, &ErrInvalid{Messages: []string{"kitbash.yaml must be a mapping"}}
 	}
+	// The rules the schema cannot express are read here, so a manifest is
+	// invalid wherever it is parsed rather than only where a Process is run:
+	// fs_write validates before it commits, and a name a unit may not declare
+	// is refused there too, see checkSecrets.
+	if messages := checkSecrets(raw); len(messages) > 0 {
+		return nil, &ErrInvalid{Messages: messages}
+	}
 	m := &Manifest{Raw: raw}
 	m.Name, _ = raw["name"].(string)
 	m.Description, _ = raw["description"].(string)

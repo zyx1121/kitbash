@@ -796,3 +796,67 @@ func TestListReportsAProcessWhoseContainerWasTakenApart(t *testing.T) {
 		t.Fatalf("proc_list dropped the Process whose container was taken apart: %+v", list.Processes)
 	}
 }
+
+// secretsManifest is a unit that declares the names of two credentials it
+// needs and cannot get from its image, see PLAN.md section 2.3.
+const secretsManifest = `name: caller
+description: A Package whose Process calls a service outside this machine.
+deploy:
+  units:
+    - type: container
+      build: .
+      expose: none
+      env: { LOG_LEVEL: debug }
+      secrets: [ANTHROPIC_API_KEY, OPENAI_API_KEY]
+`
+
+// The names a unit declares cross the socket with the registration, and the
+// values never cross it at all: kitbashd reads them from root owned files at
+// every start and writes them into the environment file itself, which is why
+// the request body of proc_run carries names alone, see PLAN.md section 2.3.
+func TestRunRegistersTheSecretNamesTheUnitDeclared(t *testing.T) {
+	f := newFixture(t)
+	folder := f.pack(t, "caller", secretsManifest)
+	f.build(folder, "caller")
+
+	if _, prob := f.processes.Run(context.Background(), folder, "", ""); prob != nil {
+		t.Fatalf("Run: %s", prob.Detail)
+	}
+	registrations := f.daemon.Registrations()
+	if len(registrations) != 1 {
+		t.Fatalf("kitbashd holds %d registrations, want 1", len(registrations))
+	}
+	got := registrations[0].Secrets
+	if len(got) != 2 || got[0] != "ANTHROPIC_API_KEY" || got[1] != "OPENAI_API_KEY" {
+		t.Errorf("the registration carries %v, want the two names the unit declared", got)
+	}
+	// The start request carries the manifest's own environment and nothing of
+	// a secret: the daemon is the one that resolves a name to a value.
+	starts := f.daemon.Starts()
+	if len(starts) != 1 {
+		t.Fatalf("kitbashd served %d starts, want 1", len(starts))
+	}
+	if starts[0].Options.Env["LOG_LEVEL"] != "debug" {
+		t.Errorf("the start carries the environment %v, want the unit's own", starts[0].Options.Env)
+	}
+	for _, name := range got {
+		if _, sent := starts[0].Options.Env[name]; sent {
+			t.Errorf("the start request carries %s, want the secret written by the daemon alone", name)
+		}
+	}
+}
+
+// A Package that declares no secrets registers with none, which is every
+// Package written before secrets existed.
+func TestRunRegistersNoSecretsForAUnitThatDeclaresNone(t *testing.T) {
+	f := newFixture(t)
+	folder := f.pack(t, "ffmpeg", mcpManifest)
+	f.build(folder, "ffmpeg")
+
+	if _, prob := f.processes.Run(context.Background(), folder, "", ""); prob != nil {
+		t.Fatalf("Run: %s", prob.Detail)
+	}
+	if got := f.daemon.Registrations()[0].Secrets; len(got) != 0 {
+		t.Errorf("the registration carries the secrets %v, want none", got)
+	}
+}

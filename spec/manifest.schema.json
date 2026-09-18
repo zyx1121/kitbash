@@ -174,8 +174,19 @@
         },
         "env": {
           "type": "object",
-          "description": "Plain environment variables. Secrets are referenced as ${secret:NAME} and resolved at start.",
+          "description": "Plain environment variables, written into the container as the manifest spells them. A credential belongs in secrets instead, because everything here is readable by anyone who can read the manifest.",
           "additionalProperties": { "type": "string" }
+        },
+        "secrets": {
+          "type": "array",
+          "description": "Environment variable names this unit needs and does not get from the image, from env or from kitbashd: an API key, a token for a service outside this machine. Names only. The member sets the value with secrets_set, kitbashd keeps it as a root owned file outside the database, and every start resolves each name to the owner's current value and writes it into the environment file the container is created with, so a value never crosses a request body or a command line. A name env also sets, and a name kitbashd speaks for, which is every KITBASH_ name, are both invalid-manifest. A declared name the member has not set is not-found at proc_run. See PLAN.md section 2.3.",
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "description": "An environment variable name in the spelling a credential is written in.",
+            "pattern": "^[A-Z][A-Z0-9_]{0,63}$"
+          }
         },
         "health": {
           "type": "object",

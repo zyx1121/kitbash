@@ -334,6 +334,16 @@ func (s *Server) removeUser(w http.ResponseWriter, r *http.Request, caller Calle
 		writeProblem(w, problem.Internal(r.URL.Path, err.Error(), ""))
 		return
 	}
+	// The values they set with secrets_set go with the account. They are the
+	// member's own and nobody inherits them, and a directory left behind would
+	// hand them to the next account created with that name, see PLAN.md
+	// section 2.3.
+	if err := s.secrets.RemoveMember(name); err != nil {
+		// The account is already gone, so this is reported rather than
+		// returned: the member was removed, and a directory this daemon could
+		// not take away is the operator's to look at.
+		logger.Printf("secrets: the secrets of %s could not be removed: %v", name, err)
+	}
 	// Their containers are gone, so the cgroups those containers ran in go
 	// too. One that is still busy is left for the next boot rather than
 	// holding up an account that is already deleted.

@@ -1,6 +1,6 @@
 # The surface
 
-Everything on this machine is 22 built in tools in six families, plus the tools
+Everything on this machine is 25 built in tools in seven families, plus the tools
 of the Processes the member is running. Names are `<family>_<verb>`. Input and
 output are JSON Schema 2020-12, timestamps are RFC 3339, and identifiers are
 UUIDv7 unless they are git SHAs or OCI digests.
@@ -69,6 +69,26 @@ The replacement for sudo.
 | `approvals_list` | Approvals by state. Members see their own, admins see all |
 | `approvals_approve` | Approve and execute a queued call. Admin only |
 | `approvals_reject` | Reject a queued call with a reason the requester reads |
+
+## secrets
+
+The values a member gives their own Processes. A unit declares the names it
+needs in `deploy.units[].secrets`, and kitbashd resolves each one to the
+owner's current value at every start. They are the member's own: an admin holds
+their own set and reads nobody else's.
+
+| Tool | What it does |
+|------|-------------|
+| `secrets_set` | Set one value. Creating and replacing are the same call, so a rotation is one call; it restarts nothing |
+| `secrets_list` | The names the caller holds and when each was last written. Never a value |
+| `secrets_remove` | Drop one. Idempotent: a name the caller does not hold answers `removed: false` |
+
+A value is one line: at most 8192 bytes, no NUL and no line break, because the
+environment file a Process is given is line based. A name matches
+`^[A-Z][A-Z0-9_]{0,63}$`, may not be one the unit's `env` also sets and may not
+be a `KITBASH_` name, which kitbashd speaks for; a manifest that does either is
+`invalid-manifest`. A declared name the owner has not set is `not-found` at
+`proc_run`, naming the secret.
 
 ## Paths
 

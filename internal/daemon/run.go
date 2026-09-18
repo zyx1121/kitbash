@@ -249,6 +249,17 @@ func (s *Server) startProcess(w http.ResponseWriter, r *http.Request, p store.Pr
 	}
 	opts.Mounts = mounts.Podman(mounted)
 
+	// The secrets of the registration are resolved here, before the container
+	// is created: a declared name the owner has not set is not-found, and a
+	// Process missing its credential is refused rather than started without
+	// it. They are resolved again at every start, so the value this container
+	// is given is the owner's current one, see secrets.go.
+	held, prob := s.resolveSecrets(r.URL.Path, p)
+	if prob != nil {
+		writeProblem(w, prob)
+		return
+	}
+
 	// The Process gets a cgroup of its own, with its ceiling written by root,
 	// and the container is created under it. A host that cannot place it runs
 	// the Process anyway: the limits are recorded, not enforced, and that is
@@ -274,7 +285,7 @@ func (s *Server) startProcess(w http.ResponseWriter, r *http.Request, p store.Pr
 		writeProblem(w, problem.Internal(r.URL.Path, err.Error(), ""))
 		return
 	}
-	envFile, err := s.writeEnvFile(p, m, req.Env, token)
+	envFile, err := s.writeEnvFile(p, m, req.Env, token, held)
 	if err != nil {
 		writeProblem(w, problem.Internal(r.URL.Path, err.Error(), ""))
 		return
@@ -664,7 +675,8 @@ func (s *Server) mintToken(ctx context.Context, p store.Process) (string, error)
 // The file is named by the Process id, so two runs of one Process do not race
 // and two Processes never share a name. The caller removes it once the run has
 // returned.
-func (s *Server) writeEnvFile(p store.Process, m sysusers.Member, env map[string]string, token string) (string, error) {
+func (s *Server) writeEnvFile(p store.Process, m sysusers.Member, env map[string]string, token string,
+	held map[string]string) (string, error) {
 	dir := s.envDir
 	if err := os.MkdirAll(dir, envDirMode); err != nil {
 		return "", fmt.Errorf("daemon: the environment directory %s: %w", dir, err)
@@ -680,7 +692,7 @@ func (s *Server) writeEnvFile(p store.Process, m sysusers.Member, env map[string
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return "", fmt.Errorf("daemon: the environment file %s: %w", path, err)
 	}
-	body, _ := podman.EnvFileBody(s.environment(p, env, token))
+	body, _ := podman.EnvFileBody(s.environment(p, env, token, held))
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, envFileMode)
 	if err != nil {
 		return "", fmt.Errorf("daemon: the environment file %s: %w", path, err)
@@ -698,14 +710,30 @@ func (s *Server) writeEnvFile(p store.Process, m sysusers.Member, env map[string
 }
 
 // environment is what one container is started with: the manifest's own, minus
-// everything kitbashd speaks for, plus the Process's identity and its two
+// everything kitbashd speaks for, plus the secrets its owner holds for the
+// names the unit declared, plus the Process's identity and its two
 // credentials. Nothing here reaches a command line.
-func (s *Server) environment(p store.Process, env map[string]string, token string) map[string]string {
-	merged := make(map[string]string, len(env)+len(ownedEnv))
+//
+// held is what resolveSecrets answered for this start. The values go in after
+// the manifest's own environment and before kitbashd's own: a manifest may
+// declare neither a name kitbashd speaks for nor one its own env sets, and the
+// order here is what makes that true of a registration written before the rule
+// existed as well.
+func (s *Server) environment(p store.Process, env map[string]string, token string,
+	held map[string]string) map[string]string {
+	merged := make(map[string]string, len(env)+len(held)+len(ownedEnv))
 	for k, v := range env {
 		merged[k] = v
 	}
-	// The removal happens before anything is added back. A manifest that named
+	// The secrets are the member's own values for the names the unit declared,
+	// read from root owned files a moment ago. They are written into this file
+	// and nowhere else: not onto a command line, not into a request body and
+	// not into the span this start records, see PLAN.md section 2.3.
+	for name, value := range held {
+		merged[name] = value
+	}
+	// The removal happens before anything is added back, and after the secrets
+	// as well as after the manifest's own environment. A manifest that named
 	// its own fan out secret would otherwise keep it, and a container that
 	// knows its own secret takes records from whoever wrote the manifest
 	// rather than from kitbashd alone.
@@ -739,6 +767,14 @@ func (s *Server) processEndpoint() string {
 // that stopped mid start left behind.
 func (s *Server) Prepare(ctx context.Context) {
 	s.sweepEnvDir()
+	// The secrets directory is the daemon's own, root owned and 0700. It is
+	// created here rather than by the installer so a host upgraded from a
+	// release without secrets gains it at the next start, the same way the
+	// store directory is created and narrowed, see internal/secrets.
+	if err := s.secrets.Prepare(); err != nil {
+		logger.Printf("secrets: the directory %s could not be prepared, so every secrets call will fail: %v",
+			s.secrets.Dir(), err)
+	}
 	if err := s.cgroups.EnsureRoot(ctx); err != nil {
 		logger.Printf("cgroups: the kitbash cgroup could not be prepared, so the limits of every Process are recorded and not enforced: %v", err)
 		return

@@ -43,6 +43,13 @@ func problemGuard(next mcp.MethodHandler) mcp.MethodHandler {
 	}
 }
 
+// neverRepeated are the tools whose arguments must not be quoted back. The
+// SDK reports a schema violation by printing the value it refused, which for
+// secrets_set is the secret itself, and PLAN.md section 2.3 says no problem
+// detail ever quotes a value. The violation is still reported, in the shape
+// the schema publishes, and the caller is the one who sent the value.
+var neverRepeated = map[string]bool{"secrets_set": true}
+
 // rewriteBareError replaces an error result that is not already problem
 // details, which is how the SDK reports a schema violation.
 func rewriteBareError(name string, call *mcp.CallToolResult) *mcp.CallToolResult {
@@ -56,6 +63,9 @@ func rewriteBareError(name string, call *mcp.CallToolResult) *mcp.CallToolResult
 	detail := strings.TrimSpace(text.Text)
 	if detail == "" {
 		detail = "the arguments were rejected"
+	}
+	if neverRepeated[name] {
+		detail = "the arguments do not match the input schema of " + name
 	}
 	return errorResult(problem.BadRequest(name, detail,
 		"Send arguments that match the tool's input schema, which tools/list publishes."))

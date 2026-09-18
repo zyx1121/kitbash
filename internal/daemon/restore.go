@@ -170,6 +170,27 @@ func (s *Server) restoreOwner(ctx context.Context, owner string, processes []sto
 			s.processFailed(p.ID, failed.Detail, failed.Fix)
 			continue
 		}
+		// The secrets are resolved again too, for the same reason: a name the
+		// owner has removed since the Process was registered is one kitbashd
+		// cannot give the container, and a Process started without a
+		// credential it declared is worse than one that did not start. The
+		// owner reads it through proc_list, the same shape as a mount that
+		// stopped being legal, see secrets.go.
+		//
+		// A container that is started by name keeps the environment it was
+		// created with, so what a rotation changes reaches it at the next
+		// proc_run and not here; the resolution is what refuses to bring back
+		// a Process whose credential is gone. The two paths that make the
+		// container again, remakeMounted and healCeiling, write these values
+		// into the environment file they create it with.
+		held, prob := s.resolveSecrets("", p)
+		if prob != nil {
+			counts.Failed++
+			logger.Printf("restore: not starting %s of %s: %s", p.Container, owner, prob.Detail)
+			failed := unresolvedSecret(prob)
+			s.processFailed(p.ID, failed.Detail, failed.Fix)
+			continue
+		}
 		// The Process's cgroup is created again, with its ceiling, before the
 		// container starts: the cgroup filesystem does not survive a reboot,
 		// and a container whose cgroup parent is gone does not start at all.
@@ -187,7 +208,7 @@ func (s *Server) restoreOwner(ctx context.Context, owner string, processes []sto
 		// anything could be read: it is made again through create, prepare,
 		// verify, start, the same four steps a start takes, see mounts.go.
 		if len(mounted) > 0 {
-			done, counted := s.restoreMounted(ctx, m, p, leaf, mounted)
+			done, counted := s.restoreMounted(ctx, m, p, leaf, mounted, held)
 			if done {
 				counts.add(counted)
 				if counted == restoredPlaced && !p.Limits.Written() {
@@ -250,7 +271,7 @@ func (s *Server) restoreOwner(ctx context.Context, owner string, processes []sto
 				s.startFailed(p)
 				continue
 			}
-			healed, healErr := s.healCeiling(ctx, m, p, leaf)
+			healed, healErr := s.healCeiling(ctx, m, p, leaf, held)
 			switch {
 			case healed:
 				counts.Started++
@@ -329,7 +350,8 @@ const AsideSuffix = "-preceiling"
 //
 // A host that could not make the ceiling heals nothing either: leaf is empty
 // there, so there would be nothing to create the container under.
-func (s *Server) healCeiling(ctx context.Context, m sysusers.Member, p store.Process, leaf string) (bool, error) {
+func (s *Server) healCeiling(ctx context.Context, m sysusers.Member, p store.Process, leaf string,
+	held map[string]string) (bool, error) {
 	if leaf == "" {
 		return false, nil
 	}
@@ -404,7 +426,7 @@ func (s *Server) healCeiling(ctx context.Context, m sysusers.Member, p store.Pro
 	if err != nil {
 		return false, err
 	}
-	envFile, err := s.writeEnvFile(p, m, healedEnv(config.Env), token)
+	envFile, err := s.writeEnvFile(p, m, healedEnv(config.Env), token, held)
 	if err != nil {
 		return false, err
 	}
@@ -519,7 +541,7 @@ func (c *RestoreCounts) add(outcome int) {
 // It hands the Process back unhandled only when the runtime has no container of
 // it at all, which is the case restore answers by unregistering it.
 func (s *Server) restoreMounted(ctx context.Context, m sysusers.Member, p store.Process,
-	leaf string, mounted []mounts.Resolved) (handled bool, outcome int) {
+	leaf string, mounted []mounts.Resolved, held map[string]string) (handled bool, outcome int) {
 	failed := func(prob *problem.Problem) (bool, int) {
 		logger.Printf("restore: not bringing %s of %s back: %s", p.Container, p.Owner, prob.Detail)
 		report := mountProblem(prob)
@@ -566,7 +588,7 @@ func (s *Server) restoreMounted(ctx context.Context, m sysusers.Member, p store.
 		s.clearProcessProblem(p.ID)
 		return true, restoredPlaced
 	}
-	if err := s.remakeMounted(ctx, m, p, config, leaf, mounted); err != nil {
+	if err := s.remakeMounted(ctx, m, p, config, leaf, mounted, held); err != nil {
 		logger.Printf("restore: making %s of %s again: %v", p.Container, p.Owner, err)
 		return failed(problem.NotPermitted("", err.Error(), ""))
 	}
@@ -580,7 +602,7 @@ func (s *Server) restoreMounted(ctx context.Context, m sysusers.Member, p store.
 // is not running, its name is what the registration holds, and a start of it
 // would put the bind mounts back without anything reading them.
 func (s *Server) remakeMounted(ctx context.Context, m sysusers.Member, p store.Process,
-	config sysusers.ContainerConfig, leaf string, mounted []mounts.Resolved) error {
+	config sysusers.ContainerConfig, leaf string, mounted []mounts.Resolved, held map[string]string) error {
 	image := p.Digest
 	if image == "" {
 		image = config.Image
@@ -615,7 +637,7 @@ func (s *Server) remakeMounted(ctx context.Context, m sysusers.Member, p store.P
 	if err != nil {
 		return err
 	}
-	envFile, err := s.writeEnvFile(p, m, healedEnv(config.Env), token)
+	envFile, err := s.writeEnvFile(p, m, healedEnv(config.Env), token, held)
 	if err != nil {
 		return err
 	}

@@ -96,6 +96,10 @@ type processRequest struct {
 	// session that sent them runs as the member, so what it says about a path
 	// is a claim, see mounts.go.
 	Mounts []mounts.Declared `json:"mounts,omitempty"`
+	// Secrets are the names the unit declared, and only the names: the values
+	// are the owner's and are read from root owned files at every start, so
+	// none of them is ever in this body, see secrets.go.
+	Secrets []string `json:"secrets,omitempty"`
 }
 
 // healthRequest is the probe a registration declares, which is the part of
@@ -208,6 +212,7 @@ func (s *Server) registerProcess(w http.ResponseWriter, r *http.Request, caller 
 		Permits:       req.Permits,
 		Health:        declaredHealth(req.Health),
 		Mounts:        resolved,
+		Secrets:       req.Secrets,
 		FanoutSecret:  secret,
 		RegisteredAt:  s.now().UTC(),
 	}
@@ -470,6 +475,14 @@ func validateProcess(instance string, req processRequest) *problem.Problem {
 			fmt.Sprintf("a Process may mount at most %d folders, not %d", mounts.Max, len(req.Mounts)),
 			fmt.Sprintf("Declare at most %d entries in deploy.units[0].mounts.", mounts.Max))
 	}
+	// The declared secret names are held to their shape here, so a
+	// registration kitbashd could never resolve is refused rather than stored
+	// as a Process that fails every start. Whether the owner holds a value for
+	// each name is not asked: a name set between this call and the start is a
+	// value the start reads, and the start is what refuses, see secrets.go.
+	if prob := validateSecrets(instance, req.Secrets); prob != nil {
+		return prob
+	}
 	// A permits block kitbashd cannot honour is refused here rather than
 	// stored: a glob nobody can read would otherwise sit in the registry
 	// permitting nothing, and the member would look for the mistake in the
@@ -479,6 +492,38 @@ func validateProcess(instance string, req processRequest) *problem.Problem {
 			"Declare provides.permits.tools as tool name globs and provides.permits.paths as absolute path prefixes in the Package's kitbash.yaml.")
 	}
 	return validateEndpoint(instance, req.Endpoint)
+}
+
+// validateSecrets holds the declared names to the shape a manifest may carry:
+// at most manifest.MaxSecrets of them, each an environment variable name, none
+// of them one kitbashd speaks for and none of them declared twice. It is the
+// same rule spec/manifest.schema.json and internal/manifest read, checked again
+// here because a registration is a request and not a manifest: kitbash-mcp
+// runs as the member, so what it sends about a unit is a claim.
+func validateSecrets(instance string, names []string) *problem.Problem {
+	refuse := func(detail string) *problem.Problem {
+		return problem.BadRequest(instance, detail,
+			fmt.Sprintf("Declare at most %d names in deploy.units[0].secrets, each matching ^[A-Z][A-Z0-9_]{0,63}$ and none of them a %s name.",
+				manifest.MaxSecrets, manifest.OwnedEnvPrefix))
+	}
+	if len(names) > manifest.MaxSecrets {
+		return refuse(fmt.Sprintf("a Process may declare at most %d secrets, not %d",
+			manifest.MaxSecrets, len(names)))
+	}
+	seen := make(map[string]bool, len(names))
+	for _, name := range names {
+		if !manifest.ValidSecretName(name) {
+			return refuse(fmt.Sprintf("%q is not a secret name", name))
+		}
+		if strings.HasPrefix(name, manifest.OwnedEnvPrefix) {
+			return refuse(fmt.Sprintf("%s is a name kitbashd speaks for, so it is not one a member sets", name))
+		}
+		if seen[name] {
+			return refuse(fmt.Sprintf("%s is declared twice", name))
+		}
+		seen[name] = true
+	}
+	return nil
 }
 
 // validateHealth checks the declared probe. kitbashd requests this path on the

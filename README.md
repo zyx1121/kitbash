@@ -131,9 +131,9 @@ From the member's machine, one MCP session that lists the surface:
   | ssh alice@kitbash.example.org | grep -o '"name":"[a-z]*_[a-z_]*"' | wc -l
 ```
 
-22, the whole built in surface: 4 `fs`, 4 `pkg`, 4 `proc`, 2 `tel`, 5 `users`
-and 3 `approvals`. Each running Process with `expose: mcp` adds its own tools on
-top of those. The `sleep` holds stdin open long enough for the answer; a session
+25, the whole built in surface: 4 `fs`, 4 `pkg`, 4 `proc`, 2 `tel`, 5 `users`,
+3 `approvals` and 3 `secrets`. Each running Process with `expose: mcp` adds its
+own tools on top of those. The `sleep` holds stdin open long enough for the answer; a session
 whose stdin closes first is a session that ends before it replies.
 
 **Upgrade.** Download the new release's apk, install it and run install.sh again:
@@ -154,6 +154,7 @@ Processes back the way a reboot does.
 | `/org/<folder>` | Shared Files, one git repository per top level folder, group `kitbash-admin` |
 | `/home/<member>` | A member's Files, a git repository, mode 0700 |
 | `/var/lib/kitbash/kitbashd.db` | Telemetry, Process registrations, approvals and settings. Root only |
+| `/var/lib/kitbash/secrets/<member>/<NAME>` | The values a member set with `secrets_set`. Root only, 0700 and 0600, outside the database so the nightly backup carries none |
 | `/var/log/kitbashd.log` | The daemon's log, both streams of the OpenRC service |
 | `/org/.archive/<member>` | The home of a removed member, root only and invisible to the surface |
 
@@ -162,9 +163,9 @@ labels are the build history.
 
 **What needs the daemon.** `fs`, `pkg` and `proc` work without kitbashd: the
 Telemetry those calls record is dropped and one line goes to the session log.
-`tel_query`, `tel_retention`, the `users` family, the `approvals` family, a
-member's write to `/org`, the Process token and fan out secret, `/mcp` for
-Processes and boot restore all need it running.
+`tel_query`, `tel_retention`, the `users` family, the `approvals` family, the
+`secrets` family, a member's write to `/org`, the Process token and fan out
+secret, `/mcp` for Processes and boot restore all need it running.
 
 ## Development
 
