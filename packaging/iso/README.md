@@ -125,7 +125,7 @@ With QEMU, which is what `smoke.sh` drives:
 
 ```sh
 brew install qemu
-packaging/iso/smoke.sh kitbash-0.8.0-aarch64.iso
+packaging/iso/smoke.sh kitbash-0.9.0-aarch64.iso
 ```
 
 That takes the `hvf` path, so it runs at native speed. For scale, CI boots the
@@ -137,7 +137,7 @@ qemu-system-aarch64 \
   -machine virt,accel=hvf -cpu host -m 2048 -smp 2 \
   -nographic -no-reboot \
   -bios "$(brew --prefix qemu)"/share/qemu/edk2-aarch64-code.fd \
-  -drive if=none,id=cd0,file=kitbash-0.8.0-aarch64.iso,format=raw,media=cdrom,readonly=on \
+  -drive if=none,id=cd0,file=kitbash-0.9.0-aarch64.iso,format=raw,media=cdrom,readonly=on \
   -device virtio-scsi-pci,id=scsi0 -device scsi-cd,drive=cd0,bus=scsi0.0 \
   -nic user,model=virtio-net-pci
 ```
