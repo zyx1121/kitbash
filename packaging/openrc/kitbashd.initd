@@ -73,6 +73,11 @@ start_pre() {
 	# creates this directory too; doing it here also narrows one that an
 	# earlier layout left looser, see PLAN.md section 4.7.
 	checkpath --directory --mode 0700 --owner root:root /var/lib/kitbash/backup
+	# The values members set with secrets_set, one file per name under a
+	# directory per member. kitbashd creates and narrows this one too; doing it
+	# here as well means a host running an older binary still has it root owned
+	# and 0700, see PLAN.md section 2.3.
+	checkpath --directory --mode 0700 --owner root:root /var/lib/kitbash/secrets
 	checkpath --file --mode 0640 --owner root:root /var/log/kitbashd.log
 	# / rshared and one /run/user directory per member, both of which live in
 	# tmpfs and are gone after a reboot. Boot restore starts each registered

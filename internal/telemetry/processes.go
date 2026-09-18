@@ -124,6 +124,11 @@ type Registration struct {
 	// what a member's process says about a path is a claim, see PLAN.md
 	// section 2.3.
 	Mounts []mounts.Declared `json:"mounts,omitempty"`
+	// Secrets are the names the unit declared in deploy.units[].secrets. Only
+	// the names are sent, ever: kitbashd reads the owner's values from root
+	// owned files at every start and writes them into the environment file
+	// itself, so no value is in this body, see PLAN.md section 2.3.
+	Secrets []string `json:"secrets,omitempty"`
 }
 
 // Health is one Process's probe as kitbashd carries it: the declaration, and
@@ -199,6 +204,11 @@ type Registered struct {
 	// them at registration. A daemon of an earlier release answers none, and
 	// so does a Process that declared none.
 	Mounts []mounts.Resolved `json:"mounts,omitempty"`
+	// Secrets are the names this Process is given the owner's values under, as
+	// the registration carries them. Names only: which credentials a Process
+	// was given is not a secret from its owner, and a listing carries no value
+	// any more than it carries a token.
+	Secrets []string `json:"secrets,omitempty"`
 }
 
 // UnmarshalJSON reads a listed Process, accepting user as a spelling of owner.

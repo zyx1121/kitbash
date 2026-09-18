@@ -357,6 +357,12 @@ func (s *Service) run(ctx context.Context, span *telemetry.Span, path, digest, n
 		// every start and every restore, see mounts in
 		// spec/kitbashd-api.yaml.
 		Mounts: unit.Mounts,
+		// The secret names travel with the registration and the values never
+		// do: kitbashd resolves each name to the owner's current value at
+		// every start and writes it into the environment file itself, which
+		// is what makes rotation one call to secrets_set, see PLAN.md
+		// section 2.3.
+		Secrets: unit.Secrets,
 	})
 	if prob != nil {
 		return nil, prob

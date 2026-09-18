@@ -43,9 +43,9 @@ func TestTelSchemasMatchTheSurfaceSpecification(t *testing.T) {
 	}
 }
 
-// The users and approvals families are served by kitbashd, so these schemas
-// are the only description of them kitbash-mcp holds and nothing else would
-// notice if they drifted. Every tool is diffed on both sides, input and
+// The users, approvals and secrets families are served by kitbashd, so these
+// schemas are the only description of them kitbash-mcp holds and nothing else
+// would notice if they drifted. Every tool is diffed on both sides, input and
 // output, against spec/mcp-surface.yaml.
 func TestUsersAndApprovalsSchemasMatchTheSurfaceSpecification(t *testing.T) {
 	surface := readSurface(t)
@@ -71,6 +71,12 @@ func TestUsersAndApprovalsSchemasMatchTheSurfaceSpecification(t *testing.T) {
 		{"approvals", "approvals_approve", "output", string(approvalsApproveOutputSchema)},
 		{"approvals", "approvals_reject", "input", string(approvalsRejectInputSchema)},
 		{"approvals", "approvals_reject", "output", string(approvalsRejectOutputSchema)},
+		{"secrets", "secrets_set", "input", string(secretsSetInputSchema)},
+		{"secrets", "secrets_set", "output", string(secretsSetOutputSchema)},
+		{"secrets", "secrets_list", "input", string(secretsListInputSchema)},
+		{"secrets", "secrets_list", "output", string(secretsListOutputSchema)},
+		{"secrets", "secrets_remove", "input", string(secretsRemoveInputSchema)},
+		{"secrets", "secrets_remove", "output", string(secretsRemoveOutputSchema)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.tool+" "+tc.side, func(t *testing.T) {

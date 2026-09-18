@@ -585,6 +585,72 @@ var (
   }
 }`)
 
+	secretsSetInputSchema = json.RawMessage(`{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name", "value"],
+  "properties": {
+    "name": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]{0,63}$" },
+    "value": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 8192,
+      "description": "The value, 1 to 8192 bytes, without NUL and without a line break"
+    }
+  }
+}`)
+
+	secretsSetOutputSchema = json.RawMessage(`{
+  "type": "object",
+  "required": ["name", "updated"],
+  "properties": {
+    "name": { "type": "string" },
+    "updated": { "type": "string", "format": "date-time" }
+  }
+}`)
+
+	secretsListInputSchema = json.RawMessage(`{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {}
+}`)
+
+	secretsListOutputSchema = json.RawMessage(`{
+  "type": "object",
+  "required": ["secrets"],
+  "properties": {
+    "secrets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "updated"],
+        "properties": {
+          "name": { "type": "string" },
+          "updated": { "type": "string", "format": "date-time" }
+        }
+      }
+    }
+  }
+}`)
+
+	secretsRemoveInputSchema = json.RawMessage(`{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name"],
+  "properties": {
+    "name": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]{0,63}$" }
+  }
+}`)
+
+	secretsRemoveOutputSchema = json.RawMessage(`{
+  "type": "object",
+  "required": ["name", "removed"],
+  "properties": {
+    "name": { "type": "string" },
+    "removed": { "type": "boolean" }
+  }
+}`)
+
 	approvalsListInputSchema = json.RawMessage(`{
   "type": "object",
   "additionalProperties": false,

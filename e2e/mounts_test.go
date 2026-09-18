@@ -28,7 +28,12 @@ const (
 
 	readerRead  = "reader_read"
 	readerWrite = "reader_write"
+	readerEnv   = "reader_env"
 	writerWrite = "writer_write"
+
+	// noSecrets is the secrets block of a unit that declares none, which is
+	// what the mounts half of the job writes.
+	noSecrets = "[]"
 
 	// Where each Package sees its folder, and the files on either side of the
 	// mount: one the member wrote for the Process to read, one the Process
@@ -54,7 +59,7 @@ func folderManifest(name, description string) string {
 // filled in: the name, the folder it mounts, where the container sees it and
 // whether it may write there. The fixture carries a template rather than a
 // finished manifest because the member's name is not known until the job runs.
-func writeMountFixture(t *testing.T, session *session, target, name, source, mount, mode string) {
+func writeMountFixture(t *testing.T, session *session, target, name, source, mount, mode, declared string) {
 	t.Helper()
 	for _, file := range fixtures {
 		body, err := os.ReadFile(filepath.Join("fixtures", readerName, file))
@@ -68,6 +73,7 @@ func writeMountFixture(t *testing.T, session *session, target, name, source, mou
 				"__SOURCE__", source,
 				"__TARGET__", mount,
 				"__MODE__", mode,
+				"__SECRETS__", declared,
 			).Replace(content)
 		}
 		writeFile(t, session, filepath.Join(target, file), content)
@@ -80,6 +86,14 @@ func writeMountFixture(t *testing.T, session *session, target, name, source, mou
 // has never been built.
 func rewriteReaderMount(t *testing.T, s *state, source, mount, mode string) {
 	t.Helper()
+	rewriteReader(t, s, source, mount, mode, noSecrets)
+}
+
+// rewriteReader writes the reader Package's manifest again with its mount and
+// its declared secrets both given, which is how the secrets half drives the
+// same already built image, see secrets_test.go.
+func rewriteReader(t *testing.T, s *state, source, mount, mode, declared string) {
+	t.Helper()
 	body, err := os.ReadFile(filepath.Join("fixtures", readerName, "kitbash.yaml"))
 	if err != nil {
 		t.Fatalf("reading the reader manifest: %v", err)
@@ -89,6 +103,7 @@ func rewriteReaderMount(t *testing.T, s *state, source, mount, mode string) {
 		"__SOURCE__", source,
 		"__TARGET__", mount,
 		"__MODE__", mode,
+		"__SECRETS__", declared,
 	).Replace(string(body))
 	writeFile(t, s.member, filepath.Join(s.readerPath, "kitbash.yaml"), content)
 }
@@ -114,7 +129,7 @@ func memberWritesTheFiles(t *testing.T, s *state) {
 // read only. Its tools join the member's surface like any other Package with
 // expose: mcp.
 func runTheReader(t *testing.T, s *state) {
-	writeMountFixture(t, s.member, s.readerPath, readerName, s.notesPath, notesMount, "ro")
+	writeMountFixture(t, s.member, s.readerPath, readerName, s.notesPath, notesMount, "ro", noSecrets)
 
 	s.member.callWithin(buildTimeout, "pkg_build",
 		map[string]any{"path": s.readerPath}).mustSucceed(t, "pkg_build")
@@ -140,8 +155,8 @@ func runTheReader(t *testing.T, s *state) {
 		t.Fatalf("proc_run reported the mounts %+v, want the notes folder read only at %s",
 			out.Mounts, notesMount)
 	}
-	if !hasTool(out.Tools, readerRead) || !hasTool(out.Tools, readerWrite) {
-		t.Fatalf("proc_run published %v, want %s and %s", out.Tools, readerRead, readerWrite)
+	if !hasTool(out.Tools, readerRead) || !hasTool(out.Tools, readerWrite) || !hasTool(out.Tools, readerEnv) {
+		t.Fatalf("proc_run published %v, want %s, %s and %s", out.Tools, readerRead, readerWrite, readerEnv)
 	}
 }
 
@@ -182,7 +197,7 @@ func writeIntoTheReadOnlyMount(t *testing.T, s *state) {
 // runTheWriter is the other half of the acceptance sentence: a second Package,
 // mounted read write, writes a file into a folder of the member's home.
 func runTheWriter(t *testing.T, s *state) {
-	writeMountFixture(t, s.member, s.writerPath, writerName, s.outPath, outMount, "rw")
+	writeMountFixture(t, s.member, s.writerPath, writerName, s.outPath, outMount, "rw", noSecrets)
 
 	s.member.callWithin(buildTimeout, "pkg_build",
 		map[string]any{"path": s.writerPath}).mustSucceed(t, "pkg_build")

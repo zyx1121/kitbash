@@ -108,6 +108,9 @@ type Registration struct {
 	// lists what it was sent, because the two have the same three fields on
 	// the wire and what a proc test asks is whether they crossed the socket.
 	Mounts []manifest.Mount `json:"mounts,omitempty"`
+	// Secrets are the names the unit declared. A test reads them to see that
+	// the names crossed the socket and that no value ever did.
+	Secrets []string `json:"secrets,omitempty"`
 }
 
 // Health is one Process's probe on the wire: the declaration a registration
@@ -158,6 +161,11 @@ type Daemon struct {
 	unregistered  []string
 	processes     Response
 	tokens        int
+
+	// The secrets family: what the caller holds, since one fake serves one
+	// session, and the answer that replaces the fake's own, see secrets.go.
+	held          map[string]heldSecret
+	secretsAnswer Response
 
 	// The users family: who the caller is, since one fake serves one session,
 	// and the member list users_list answers with.
@@ -253,6 +261,9 @@ func StartAt(socket string) (*Daemon, error) {
 	mux.HandleFunc("GET /kitbash/v1/users", d.listUsers)
 	mux.HandleFunc("POST /kitbash/v1/users/{name}/keys", d.addKey)
 	mux.HandleFunc("DELETE /kitbash/v1/users/{name}", d.removeUser)
+	mux.HandleFunc("PUT /kitbash/v1/secrets/{name}", d.setSecret)
+	mux.HandleFunc("GET /kitbash/v1/secrets", d.listSecrets)
+	mux.HandleFunc("DELETE /kitbash/v1/secrets/{name}", d.removeSecret)
 	mux.HandleFunc("POST /kitbash/v1/approvals", d.createApproval)
 	mux.HandleFunc("GET /kitbash/v1/approvals", d.listApprovals)
 	mux.HandleFunc("POST /kitbash/v1/approvals/{id}/claim", d.claimApproval)

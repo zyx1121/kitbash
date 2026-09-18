@@ -1,8 +1,9 @@
-# A template, not a finished manifest. The end to end job writes this file
-# twice with __NAME__, __SOURCE__, __TARGET__ and __MODE__ filled in: once as
-# the reader, which mounts a folder of the member's home read only, and once as
-# the writer, which mounts another one read write. The member's name is not
-# known until the job runs, so the source cannot be written here.
+# A template, not a finished manifest. The end to end job writes this file with
+# __NAME__, __SOURCE__, __TARGET__, __MODE__ and __SECRETS__ filled in: once as
+# the reader, which mounts a folder of the member's home read only, once as the
+# writer, which mounts another one read write, and again as the reader with a
+# secret declared. The member's name is not known until the job runs, so the
+# source cannot be written here.
 name: __NAME__
 description: >-
   The end to end fixture Package for Files mounts. Two tools, read and write,
@@ -33,6 +34,21 @@ provides:
         required: [content]
         properties:
           content: { type: string }
+    - name: env
+      description: >-
+        Answer with the value of an environment variable the Process was given,
+        which is how a declared secret is read back through the surface.
+      input:
+        type: object
+        additionalProperties: false
+        required: [name]
+        properties:
+          name: { type: string, maxLength: 64 }
+      output:
+        type: object
+        required: [value]
+        properties:
+          value: { type: string }
     - name: write
       description: >-
         Write a file where the Process can see it. A read only mount answers
@@ -55,6 +71,10 @@ deploy:
     - type: container
       build: .
       expose: mcp
+      # The names this unit needs and cannot get from its image. The job fills
+      # in [] for the mounts half and one name for the secrets half, see
+      # PLAN.md section 2.3.
+      secrets: __SECRETS__
       mounts:
         - source: __SOURCE__
           target: __TARGET__

@@ -17,6 +17,7 @@ socket: /run/kitbash/kitbashd.sock
 socket_owner: root:kitbash-users
 socket_mode: "0660"
 store: /var/lib/kitbash/kitbashd.db
+secrets: /var/lib/kitbash/secrets   # root owned 0700, one directory per member, see the secrets family
 
 tcp:
   description: >
@@ -42,6 +43,21 @@ tcp:
     KITBASH_USER: the member who ran it
     KITBASH_MCP_ENDPOINT: http://host.containers.internal:4318/mcp, see mcp_for_processes
     KITBASH_FANOUT_SECRET: the bearer every fan out request to this Process carries, see fan_out.authentication
+    declared_secrets: >
+      Beside the names above, the environment a Process is given carries every
+      name its unit declared in deploy.units[].secrets, resolved at this start
+      to the owner's current value. kitbashd writes the environment file
+      itself, the same file the Telemetry token is written into: it is created
+      root owned in a root owned directory, given to the member because their
+      podman is the one that reads it, and removed when the start returns, so
+      a value never crosses the request body of processes_register or
+      processes_start and is never on podman's command line. A declared name
+      the owner has not set is 404 not-found at the start, naming the secret;
+      on a restore it is the problem processes_list reports for that Process,
+      the same shape as a mount that stopped being legal. The names travel
+      with the registration and the values never do, so secrets_set is all a
+      rotation is: the next start of every Process that declares the name
+      reads the new value, see PLAN.md section 2.3.
   environment_when_kitbashd_is_unreachable: >
     kitbash-mcp removes every variable above from the manifest's environment
     before it adds back what a registration answered, so a Process started
@@ -228,7 +244,7 @@ api:
   processes_register:
     method: POST
     path: /kitbash/v1/processes
-    request: { id: "UUIDv7", package: "/home/loki/echo", name: "echo", container: "kitbash-echo-echo", digest: "sha256:...", expose: "mcp|http|none", endpoint: "http://127.0.0.1:40275 when expose is http", subscriptions: ["telemetry"], runner: "/org/pve-runner when a run kit owns this Process", health: { http: "/healthz", interval: "30s" }, mounts: [{ source: "/home/loki/notes", target: "/files/notes", mode: "ro|rw" }] }
+    request: { id: "UUIDv7", package: "/home/loki/echo", name: "echo", container: "kitbash-echo-echo", digest: "sha256:...", expose: "mcp|http|none", endpoint: "http://127.0.0.1:40275 when expose is http", subscriptions: ["telemetry"], runner: "/org/pve-runner when a run kit owns this Process", health: { http: "/healthz", interval: "30s" }, mounts: [{ source: "/home/loki/notes", target: "/files/notes", mode: "ro|rw" }], secrets: ["ANTHROPIC_API_KEY"] }
     response: { id: "UUIDv7", token: "opaque, at least 32 bytes of entropy, returned once", fanoutSecret: "opaque, 32 bytes, returned once; the bearer the fan out presents to this Process" }
     authorization: >
       The caller is the member the Process belongs to; kitbashd records the
@@ -259,6 +275,12 @@ api:
       registration whose mounts do not check out is refused and nothing is
       written, so a Process never holds a registration naming a folder it may
       not see.
+      secrets are the names the unit declared, at most sixteen, each matching
+      ^[A-Z][A-Z0-9_]{0,63}$ and none of them a KITBASH_ name, which kitbashd
+      speaks for. Only names are sent: a value never crosses this API except
+      as the body of secrets_set. Whether the owner holds a value for each
+      name is not asked here, because a name set after the registration and
+      before the start is a value the start reads; the start is what refuses.
     errors: [bad-request, not-permitted, not-visible, invalid-path, conflict, internal]
   processes_unregister:
     method: DELETE
@@ -536,8 +558,53 @@ api:
     method: DELETE
     path: /kitbash/v1/users/{name}
     response: { user, archived: "/org/.archive/<name>" }
-    authorization: admin only; an admin cannot remove themselves or the last admin. Stops and removes the member's kitbash containers as the member, deletes their registrations, approvals and build records, kills their processes, moves the home to /org/.archive/<name> owned by root 0700, deletes the account and its subordinate ranges.
+    authorization: admin only; an admin cannot remove themselves or the last admin. Stops and removes the member's kitbash containers as the member, deletes their registrations, approvals and build records, kills their processes, moves the home to /org/.archive/<name> owned by root 0700, removes their secrets directory under /var/lib/kitbash/secrets, deletes the account and its subordinate ranges.
     errors: [not-permitted, not-found, conflict, internal]
+  secrets_set:
+    method: PUT
+    path: /kitbash/v1/secrets/{name}
+    request: { value: "the value, 1 to 8192 bytes, no NUL and no line break" }
+    response: { name: "ANTHROPIC_API_KEY", updated: "RFC 3339" }
+    authorization: >
+      Any member, about themselves and nobody else. The owner is the peer
+      credentials of the socket and is never a field of the request, so there
+      is no name here to ask on somebody else's behalf with: an admin holds
+      their own set and reads nobody else's, because a Process runs under one
+      member and the value has to be that member's to give.
+    behaviour: >
+      The value is written as a root owned file at
+      /var/lib/kitbash/secrets/<member>/<NAME>, the directory 0700 and the
+      file 0600, created atomically as a temporary file that is renamed onto
+      the name, so a start either reads the value that was there or reads the
+      whole new one. It is outside the SQLite store on purpose, so the daily
+      backup copy carries no secret, see PLAN.md section 4.7. Nothing is
+      restarted: which Processes take a new value is the owner's decision,
+      and proc_stop followed by proc_run is how it is made.
+    errors: >
+      [bad-request, internal]. A name that is not ^[A-Z][A-Z0-9_]{0,63}$, a
+      name kitbashd speaks for, an empty value, a value over 8192 bytes and a
+      value carrying a NUL or a line break are all bad-request. No refusal
+      quotes the value.
+  secrets_list:
+    method: GET
+    path: /kitbash/v1/secrets
+    response: { secrets: [{ name: "ANTHROPIC_API_KEY", updated: "RFC 3339" }] }
+    authorization: any member; answers about the peer and never about another member.
+    behaviour: >
+      Names and timestamps, sorted by name, and never a value. A member who
+      holds none answers an empty list.
+    errors: [internal]
+  secrets_remove:
+    method: DELETE
+    path: /kitbash/v1/secrets/{name}
+    response: { name: "ANTHROPIC_API_KEY", removed: true }
+    authorization: any member; about the peer and nobody else.
+    behaviour: >
+      Idempotent: a name the caller does not hold answers removed false rather
+      than 404, because the call describes the state it wants. A Process that
+      declares the name keeps running with the value it was started with, and
+      its next start is not-found until the name is set again.
+    errors: [bad-request, internal]
   approvals_create:
     method: POST
     path: /kitbash/v1/approvals

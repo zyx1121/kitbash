@@ -25,6 +25,7 @@ import (
 	"github.com/zyx1121/kitbash/internal/cgroups"
 	"github.com/zyx1121/kitbash/internal/mounts"
 	"github.com/zyx1121/kitbash/internal/problem"
+	"github.com/zyx1121/kitbash/internal/secrets"
 	"github.com/zyx1121/kitbash/internal/store"
 	"github.com/zyx1121/kitbash/internal/sysusers"
 )
@@ -134,6 +135,11 @@ type Options struct {
 	// EnvDir is where the environment file of one Process is written before
 	// its container is started. Empty means DefaultEnvDir.
 	EnvDir string
+	// SecretsDir is where the values members set with secrets_set are kept,
+	// one root owned file per name. Empty means secrets.DefaultDir. It is
+	// configurable the way the store path is, so a test runs against a
+	// temporary directory rather than the host's, see internal/secrets.
+	SecretsDir string
 	// ProcessEndpoint is the address this host gives its Processes, which
 	// they export Telemetry to and reach the MCP surface on. Empty means
 	// DefaultProcessEndpoint. It exists for tests, the same way
@@ -198,6 +204,10 @@ type Server struct {
 	cgroups  cgroups.Cgroups
 	envDir   string
 	endpoint string
+	// secrets is the tree of values members hold, see internal/secrets. It is
+	// outside the store on purpose: the nightly copy of the database leaves
+	// the host and carries no secret with it, see PLAN.md section 4.7.
+	secrets *secrets.Store
 	// orgRoot is the shared root a mount source may name, see mounts in
 	// spec/kitbashd-api.yaml.
 	orgRoot string
@@ -280,6 +290,7 @@ func New(st *store.Store, opts Options) *Server {
 		sessions: opts.Sessions,
 		cgroups:  opts.Cgroups,
 		envDir:   opts.EnvDir,
+		secrets:  secrets.New(opts.SecretsDir),
 		endpoint: opts.ProcessEndpoint,
 		orgRoot:  opts.OrgRoot,
 		procRoot: opts.ProcRoot,
@@ -364,6 +375,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc(imagesPath+"/", s.image)
 	s.mux.HandleFunc(usersPath, s.usersFamily)
 	s.mux.HandleFunc(usersPath+"/", s.user)
+	s.mux.HandleFunc(secretsPath, s.secretsFamily)
+	s.mux.HandleFunc(secretsPath+"/", s.secret)
 	s.mux.HandleFunc(approvalsPath, s.approvalsFamily)
 	s.mux.HandleFunc(approvalsPath+"/", s.approval)
 	s.mux.HandleFunc(sessionsJoinPath, s.method(http.MethodPost, s.joinSession))
@@ -389,6 +402,10 @@ const (
 	imagesPath    = "/kitbash/v1/images"
 	usersPath     = "/kitbash/v1/users"
 	approvalsPath = "/kitbash/v1/approvals"
+	// secretsPath is the values a member gives their own Processes, see
+	// secrets.go. Nothing under it is reachable over TCP, like the rest of
+	// this API.
+	secretsPath = "/kitbash/v1/secrets"
 	// sessionsJoinPath is where a session asks to be placed in its member's
 	// cgroup, see run.go.
 	sessionsJoinPath = "/kitbash/v1/sessions/join"

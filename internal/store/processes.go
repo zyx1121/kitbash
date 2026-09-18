@@ -99,6 +99,16 @@ type Process struct {
 	// not a secret from its owner. A registration written before mounts
 	// existed carries none, which is a Process that sees no Files.
 	Mounts []mounts.Resolved `json:"mounts,omitempty"`
+	// Secrets is the names of the values this Process is given as environment,
+	// as its unit declared them. Only the names are here and only the names
+	// are ever stored: the values live with the member, outside the database,
+	// and every start resolves each name to the owner's current value, which
+	// is what makes rotation one call to secrets_set, see PLAN.md section 2.3.
+	// They are listed like the rest of the record, because which credentials a
+	// Process was given is not a secret from its owner; what a listing never
+	// carries is a value. A registration written before secrets existed
+	// carries none, which is a Process that is given none.
+	Secrets []string `json:"secrets,omitempty"`
 	// FanoutSecret is the bearer kitbashd puts on every fan out request to
 	// this Process. It is minted with the token at registration and handed to
 	// the container once. The tag keeps it out of processes_list, which is the
@@ -193,6 +203,20 @@ func mountsJSON(list []mounts.Resolved) string {
 		return ""
 	}
 	body, err := json.Marshal(list)
+	if err != nil {
+		return ""
+	}
+	return string(body)
+}
+
+// secretsJSON renders the declared names for the column. A Process that
+// declared none is an empty string rather than an empty array, so a legacy row
+// and a Process with no secrets read back the same.
+func secretsJSON(names []string) string {
+	if len(names) == 0 {
+		return ""
+	}
+	body, err := json.Marshal(names)
 	if err != nil {
 		return ""
 	}
@@ -298,12 +322,16 @@ func (s *Store) RegisterProcess(ctx context.Context, p Process, tokenHash string
 	// declared them: a start and a restore mount the resolved path, so nothing
 	// between here and podman has to resolve anything again.
 	mounted := mountsJSON(p.Mounts)
+	// The secret names are written as the unit declared them. The values are
+	// not here and never will be: they are root owned files outside this
+	// database, so the nightly copy of it carries none, see PLAN.md 4.7.
+	named := secretsJSON(p.Secrets)
 	// The fan out secret is replaced with the token, because the two are minted
 	// together: a container holding the old token holds the old secret.
 	if _, err := tx.ExecContext(ctx, `INSERT INTO processes
 		(id, owner, admin, package, name, container, digest, expose, endpoint,
-		 subscriptions, runner, permits, limits, health, mounts, token_hash, fanout_secret, registered_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		 subscriptions, runner, permits, limits, health, mounts, secrets, token_hash, fanout_secret, registered_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 			owner = excluded.owner, admin = excluded.admin, package = excluded.package,
 			name = excluded.name, container = excluded.container, digest = excluded.digest,
@@ -311,11 +339,11 @@ func (s *Store) RegisterProcess(ctx context.Context, p Process, tokenHash string
 			subscriptions = excluded.subscriptions, runner = excluded.runner,
 			permits = excluded.permits,
 			limits = excluded.limits, health = excluded.health,
-			mounts = excluded.mounts,
+			mounts = excluded.mounts, secrets = excluded.secrets,
 			token_hash = excluded.token_hash,
 			fanout_secret = excluded.fanout_secret, registered_at = excluded.registered_at`,
 		p.ID, p.Owner, p.Admin, p.Package, p.Name, p.Container, p.Digest, p.Expose, p.Endpoint,
-		string(subscriptions), p.Runner, string(permits), limits, health, mounted, tokenHash, p.FanoutSecret,
+		string(subscriptions), p.Runner, string(permits), limits, health, mounted, named, tokenHash, p.FanoutSecret,
 		p.RegisteredAt.UnixNano()); err != nil {
 		return fmt.Errorf("store: register the Process %s: %w", p.ID, err)
 	}
@@ -449,7 +477,7 @@ func (s *Store) Processes(ctx context.Context, owner string) ([]Process, error) 
 
 // processColumns is the one select every read of this table shares.
 const processColumns = `SELECT id, owner, admin, package, name, container, digest,
-	expose, endpoint, subscriptions, runner, permits, limits, health, mounts, fanout_secret, registered_at`
+	expose, endpoint, subscriptions, runner, permits, limits, health, mounts, secrets, fanout_secret, registered_at`
 
 // scanner is what both a single row and a row of a result set satisfy.
 type scanner interface {
@@ -458,11 +486,11 @@ type scanner interface {
 
 func scanProcess(row scanner) (Process, error) {
 	var p Process
-	var subscriptions, permits, limits, health, mounted string
+	var subscriptions, permits, limits, health, mounted, named string
 	var registered int64
 	if err := row.Scan(&p.ID, &p.Owner, &p.Admin, &p.Package, &p.Name, &p.Container, &p.Digest,
 		&p.Expose, &p.Endpoint, &subscriptions, &p.Runner, &permits, &limits, &health, &mounted,
-		&p.FanoutSecret,
+		&named, &p.FanoutSecret,
 		&registered); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Process{}, err
@@ -492,6 +520,11 @@ func scanProcess(row scanner) (Process, error) {
 	if mounted != "" {
 		if err := json.Unmarshal([]byte(mounted), &p.Mounts); err != nil {
 			return Process{}, fmt.Errorf("store: read the mounts of %s: %w", p.ID, err)
+		}
+	}
+	if named != "" {
+		if err := json.Unmarshal([]byte(named), &p.Secrets); err != nil {
+			return Process{}, fmt.Errorf("store: read the secrets of %s: %w", p.ID, err)
 		}
 	}
 	if permits != "" {
@@ -557,8 +590,12 @@ func migrate(db *sql.DB) error {
 	// The mounts arrive with M8: the folders of Files the Process sees, as
 	// kitbashd resolved them. A registration written before them carries none,
 	// which is a Process that sees no Files, the way every Process did.
+	// The secret names arrive with M9: the environment variables the Process
+	// is given the member's values under. A registration written before them
+	// carries none, which is a Process given nothing beyond what kitbashd
+	// speaks for, the way every Process was.
 	for _, column := range []string{
-		"container", "digest", "fanout_secret", "permits", "limits", "runner", "health", "mounts",
+		"container", "digest", "fanout_secret", "permits", "limits", "runner", "health", "mounts", "secrets",
 	} {
 		if err := addTextColumn(db, "processes", column); err != nil {
 			return err

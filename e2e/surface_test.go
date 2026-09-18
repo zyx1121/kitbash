@@ -13,15 +13,17 @@ import (
 	"time"
 )
 
-// builtIn is the whole built in surface, named rather than counted: 4 fs,
-// 4 pkg, 4 proc, 2 tel, 5 users and 3 approvals, the 22 the README's verify
-// step counts and the families of spec/mcp-surface.yaml one for one. A tool
-// that is renamed is a client that breaks, so the names are the assertion.
+// builtIn is the whole built in surface, sorted and named rather than counted:
+// 4 fs, 4 pkg, 4 proc, 3 secrets, 2 tel, 5 users and 3 approvals, the 25 the
+// README's verify step counts and the families of spec/mcp-surface.yaml one for
+// one. A tool that is renamed is a client that breaks, so the names are the
+// assertion.
 var builtIn = []string{
 	"approvals_approve", "approvals_list", "approvals_reject",
 	"fs_history", "fs_list", "fs_read", "fs_write",
 	"pkg_build", "pkg_import", "pkg_inspect", "pkg_list",
 	"proc_list", "proc_logs", "proc_run", "proc_stop",
+	"secrets_list", "secrets_remove", "secrets_set",
 	"tel_query", "tel_retention",
 	"users_add_key", "users_create", "users_list", "users_me", "users_remove",
 }
@@ -138,6 +140,9 @@ type state struct {
 	notesPath  string
 	outPath    string
 	noteText   string
+	// The value the member sets with secrets_set, made fresh at each run so a
+	// stale one cannot pass the assertions that read it back.
+	secret string
 }
 
 // probeOutput is what a drafted Package's probe tool reports about its binary,
@@ -231,6 +236,11 @@ func TestSurface(t *testing.T) {
 		{"a second Package mounted read write writes a file", runTheWriter},
 		{"fs_read answers with what the Process wrote", readWhatTheProcessWrote},
 		{"an illegal mount is refused at proc_run", illegalMounts},
+		{"the member sets a secret and the listing shows the name", theMemberSetsASecret},
+		{"a Package declaring that name runs and its tool reads the variable", aProcessReadsTheSecret},
+		{"the same Package under a member who has not set it is refused", aSecondMemberIsRefused},
+		{"the span of secrets_set carries no value", theSpanCarriesNoValue},
+		{"secrets_remove takes the name away and the next run is refused", theSecretIsRemoved},
 	}
 	// The steps are one story and share the host, so they run in order on one
 	// test rather than as subtests: the first failure ends the job, and the

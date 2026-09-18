@@ -184,6 +184,45 @@ func RegisterUsers(s *mcp.Server, client *telemetry.Client) {
 	}, removeUserHandler(client))
 }
 
+// RegisterSecrets adds the secrets family to an existing MCP server. The
+// values live with kitbashd as root owned files, so every tool here is
+// forwarded over the socket and the daemon answers about the peer: a session
+// runs as the member, and a member's own process is the one place a value must
+// never sit, see PLAN.md section 2.3.
+//
+// None of the three takes a path, so a Process calling one is governed by the
+// permitted tool names alone, like proc_list and tel_query, see permits.go.
+func RegisterSecrets(s *mcp.Server, client *telemetry.Client) {
+	mcp.AddTool(s, &mcp.Tool{
+		Name: "secrets_set",
+		Description: "Set one of the caller's secrets: the value a unit that declares this name is given as " +
+			"an environment variable at every start. Creating and replacing are the same call, so rotation " +
+			"is one call and nothing is rebuilt; it restarts nothing, and proc_stop followed by proc_run is " +
+			"how a member decides which Processes take the new value. The value is one line of at most 8192 " +
+			"bytes with no NUL and no line break, because the environment file a Process is given is line " +
+			"based. Secrets are the caller's own: an admin holds their own set and reads nobody else's.",
+		InputSchema:  secretsSetInputSchema,
+		OutputSchema: secretsSetOutputSchema,
+	}, setSecretHandler(client))
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name: "secrets_list",
+		Description: "The names the caller holds and when each was last written, sorted by name. Never a " +
+			"value: what a listing is for is seeing which names are there.",
+		InputSchema:  secretsListInputSchema,
+		OutputSchema: secretsListOutputSchema,
+	}, listSecretsHandler(client))
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name: "secrets_remove",
+		Description: "Drop one of the caller's secrets. Idempotent: a name the caller does not hold answers " +
+			"removed false. A Process that declares the name keeps running with the value it was started " +
+			"with, and its next start is not-found until the name is set again.",
+		InputSchema:  secretsRemoveInputSchema,
+		OutputSchema: secretsRemoveOutputSchema,
+	}, removeSecretHandler(client))
+}
+
 // RegisterApprovals adds the approvals family to an existing MCP server.
 // Listing and rejecting are forwarded to kitbashd; approving claims the
 // approval there and then runs the tool in this session, which is what makes
@@ -252,6 +291,14 @@ type keyInput struct {
 
 type nameInput struct {
 	Name string `json:"name"`
+}
+
+// secretInput is the input of secrets_set. The value is read out of it and
+// handed to the client, and it goes nowhere else: no log line, no problem
+// detail and no span attribute carries it, see tracing.go.
+type secretInput struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
 }
 
 type stateInput struct {
@@ -335,6 +382,41 @@ func addKeyHandler(client *telemetry.Client) mcp.ToolHandlerFor[keyInput, any] {
 func removeUserHandler(client *telemetry.Client) mcp.ToolHandlerFor[nameInput, any] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, in nameInput) (*mcp.CallToolResult, any, error) {
 		out, prob := client.RemoveUser(ctx, in.Name)
+		if prob != nil {
+			return errorResult(prob), nil, nil
+		}
+		return rawResult(out)
+	}
+}
+
+// The secrets family is forwarded to kitbashd the way the users family is, and
+// answered with the daemon's body as it arrived. The value is the one argument
+// on this surface that must not be repeated anywhere, so nothing here builds a
+// message out of it: a refusal is kitbashd's problem details, which describe
+// the shape of a value and never quote one.
+func setSecretHandler(client *telemetry.Client) mcp.ToolHandlerFor[secretInput, any] {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, in secretInput) (*mcp.CallToolResult, any, error) {
+		out, prob := client.SetSecret(ctx, in.Name, in.Value)
+		if prob != nil {
+			return errorResult(prob), nil, nil
+		}
+		return rawResult(out)
+	}
+}
+
+func listSecretsHandler(client *telemetry.Client) mcp.ToolHandlerFor[emptyInput, any] {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, any, error) {
+		out, prob := client.ListSecrets(ctx)
+		if prob != nil {
+			return errorResult(prob), nil, nil
+		}
+		return rawResult(out)
+	}
+}
+
+func removeSecretHandler(client *telemetry.Client) mcp.ToolHandlerFor[nameInput, any] {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, in nameInput) (*mcp.CallToolResult, any, error) {
+		out, prob := client.RemoveSecret(ctx, in.Name)
 		if prob != nil {
 			return errorResult(prob), nil, nil
 		}

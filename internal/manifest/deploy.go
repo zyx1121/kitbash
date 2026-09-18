@@ -1,5 +1,12 @@
 package manifest
 
+import (
+	"fmt"
+	"regexp"
+	"sort"
+	"strings"
+)
+
 // Exposures a container unit declares, see PLAN.md section 2.3.
 const (
 	ExposeMCP  = "mcp"
@@ -43,7 +50,8 @@ const (
 // cannot be run, because its tools would collide with the surface itself, see
 // PLAN.md section 2.3.
 var reserved = map[string]bool{
-	"fs": true, "pkg": true, "proc": true, "tel": true, "users": true, "approvals": true,
+	"fs": true, "pkg": true, "proc": true, "tel": true, "users": true,
+	"approvals": true, "secrets": true,
 }
 
 // Reserved reports whether a Package name collides with a built in tool family.
@@ -64,6 +72,91 @@ type Tool struct {
 type Limits struct {
 	CPU    string
 	Memory string
+}
+
+// MaxSecrets is how many names one unit may declare, see PLAN.md section 2.3.
+// A container that needs more than sixteen credentials is a container that
+// should be reading a file its unit mounts.
+const MaxSecrets = 16
+
+// OwnedEnvPrefix is what kitbashd speaks for in a Process's environment: the
+// Process's identity and its two credentials are all KITBASH_ names, so a
+// secret may not be one, see PLAN.md section 2.3 and internal/daemon's
+// ownedEnv, which this prefix covers one for one.
+const OwnedEnvPrefix = "KITBASH_"
+
+// secretName is the shape of a declared secret: an environment variable name
+// in the spelling a credential is written in, which is also what
+// spec/manifest.schema.json holds the array to.
+var secretName = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,63}$`)
+
+// ValidSecretName reports whether a name is one kitbash carries as a secret.
+// It is spelled here, beside Mount and Permits, because it is manifest
+// vocabulary: a unit declares the name, internal/secrets holds the value under
+// it, and two spellings of the rule would be two rules.
+func ValidSecretName(name string) bool { return secretName.MatchString(name) }
+
+// checkSecrets is the part of the secrets rule no JSON Schema can express: a
+// name the unit's own env also sets, and a name kitbashd speaks for. The shape
+// of a name, the count and the duplicates are in spec/manifest.schema.json,
+// which has already run when this does.
+//
+// A collision is refused rather than resolved because either resolution is a
+// surprise: dropping the secret starts a Process without the credential it
+// declared, and dropping the env entry drops a line of the manifest that is
+// written in front of the member. Both names are theirs to change.
+func checkSecrets(raw map[string]any) []string {
+	var messages []string
+	for i, unit := range units(raw) {
+		env := map[string]bool{}
+		if declared, ok := unit["env"].(map[string]any); ok {
+			for key := range declared {
+				env[key] = true
+			}
+		}
+		list, ok := unit["secrets"].([]any)
+		if !ok {
+			continue
+		}
+		for j, entry := range list {
+			name, ok := entry.(string)
+			if !ok {
+				continue
+			}
+			where := fmt.Sprintf("/deploy/units/%d/secrets/%d", i, j)
+			if strings.HasPrefix(name, OwnedEnvPrefix) {
+				messages = append(messages, fmt.Sprintf(
+					"%s: %s is a name kitbashd speaks for, so it is not one a member sets", where, name))
+			}
+			if env[name] {
+				messages = append(messages, fmt.Sprintf(
+					"%s: %s is also set by deploy.units[%d].env, so the unit declares it twice", where, name, i))
+			}
+		}
+	}
+	sort.Strings(messages)
+	return messages
+}
+
+// units is deploy.units as the document carries it, for a check that reads
+// every unit rather than the first one version 1 runs: a manifest is refused
+// as a whole, so a second unit with a name it may not declare is refused too.
+func units(raw map[string]any) []map[string]any {
+	deploy, ok := raw["deploy"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	list, ok := deploy["units"].([]any)
+	if !ok {
+		return nil
+	}
+	var out []map[string]any
+	for _, entry := range list {
+		if unit, ok := entry.(map[string]any); ok {
+			out = append(out, unit)
+		}
+	}
+	return out
 }
 
 // Mount is one entry of deploy.units[].mounts: a folder of Files the unit
@@ -110,7 +203,13 @@ type Unit struct {
 	// see PLAN.md section 2.3. They are read as the manifest wrote them:
 	// kitbashd resolves them as root and is the one that decides.
 	Mounts []Mount
-	Raw    map[string]any
+	// Secrets are the environment variable names this unit needs and does not
+	// get from the image, from Env or from kitbashd, at most MaxSecrets of
+	// them. Only the names are here and only the names ever travel: the
+	// values live with kitbashd, and a start resolves each name to the
+	// owner's current value, see PLAN.md section 2.3.
+	Secrets []string
+	Raw     map[string]any
 }
 
 // HealthProbe is the HTTP probe this unit declares: the path kitbashd requests
@@ -268,6 +367,13 @@ func (m *Manifest) Unit() (Unit, bool) {
 			mount.Target, _ = declared["target"].(string)
 			mount.Mode, _ = declared["mode"].(string)
 			unit.Mounts = append(unit.Mounts, mount)
+		}
+	}
+	if list, ok := raw["secrets"].([]any); ok {
+		for _, entry := range list {
+			if name, ok := entry.(string); ok {
+				unit.Secrets = append(unit.Secrets, name)
+			}
 		}
 	}
 	if limits, ok := raw["limits"].(map[string]any); ok {

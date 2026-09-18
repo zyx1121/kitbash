@@ -20,6 +20,7 @@ import (
 	"syscall"
 
 	"github.com/zyx1121/kitbash/internal/daemon"
+	"github.com/zyx1121/kitbash/internal/secrets"
 	"github.com/zyx1121/kitbash/internal/store"
 	"github.com/zyx1121/kitbash/internal/sysusers"
 )
@@ -39,6 +40,11 @@ const (
 	defaultOTLPListen = "0.0.0.0:4318"
 )
 
+// defaultSecrets is where the values members set with secrets_set are kept, as
+// spec/kitbashd-api.yaml declares them. The daemon creates the directory root
+// owned and 0700 at start, so no installer has to, see internal/secrets.
+const defaultSecrets = secrets.DefaultDir
+
 // defaultMCPBinary is the kitbash-mcp one MCP session of a Process runs, as
 // mcp_for_processes in spec/kitbashd-api.yaml declares it.
 const defaultMCPBinary = daemon.DefaultMCPBinary
@@ -50,6 +56,7 @@ const defaultMCPBinary = daemon.DefaultMCPBinary
 const (
 	socketEnv     = "KITBASH_SOCKET"
 	storeEnv      = "KITBASH_STORE"
+	secretsEnv    = "KITBASH_SECRETS"
 	otlpListenEnv = "KITBASH_OTLP_LISTEN"
 	noRestoreEnv  = "KITBASH_NO_RESTORE"
 	mcpBinaryEnv  = daemon.MCPBinaryEnv
@@ -78,6 +85,8 @@ func main() {
 func run() error {
 	socket := flag.String("socket", env(socketEnv, defaultSocket), "unix socket to listen on")
 	storePath := flag.String("store", env(storeEnv, defaultStore), "SQLite file holding Telemetry")
+	secretsDir := flag.String("secrets", env(secretsEnv, defaultSecrets),
+		"directory holding the values members set with secrets_set, one root owned file per name")
 	otlpListen := flag.String("otlp-listen", env(otlpListenEnv, defaultOTLPListen),
 		"address of the Process receiver, empty to serve the socket alone")
 	mcpBinary := flag.String("mcp-binary", env(mcpBinaryEnv, defaultMCPBinary),
@@ -114,6 +123,15 @@ func run() error {
 	if err := os.Chmod(storeDir, store.DirMode); err != nil {
 		return fmt.Errorf("store directory %s: %w", storeDir, err)
 	}
+	// The values members set with secrets_set live beside the store and never
+	// in it. The tree is prepared here rather than only in Prepare, and a
+	// failure stops the daemon: a base directory kitbashd will not write into,
+	// such as a symbolic link somebody put there, would otherwise show up as
+	// every secrets call failing on a daemon that had reported itself started,
+	// see internal/secrets.
+	if err := secrets.New(*secretsDir).Prepare(); err != nil {
+		return err
+	}
 	st, err := store.Open(*storePath)
 	if err != nil {
 		return err
@@ -141,9 +159,10 @@ func run() error {
 	defer stop()
 
 	srv := daemon.New(st, daemon.Options{
-		Version:   version,
-		MCPBinary: *mcpBinary,
-		NoRestore: *noRestore,
+		Version:    version,
+		MCPBinary:  *mcpBinary,
+		NoRestore:  *noRestore,
+		SecretsDir: *secretsDir,
 	})
 	defer srv.Close()
 	if _, err := srv.Sweep(ctx); err != nil {
