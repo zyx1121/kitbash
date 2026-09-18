@@ -93,13 +93,19 @@ A Process declares how it is exposed:
 - `http`: it gets an internal port, optionally a hostname through the reverse proxy.
 - `none`: a batch job or a subscriber that only talks to Telemetry.
 
-**How `mcp` exposure works.** The image's entrypoint is a stdio MCP server. The Process runs it as PID 1 with stdin held open, which keeps the container alive and is the liveness signal. Every MCP session the owner opens execs one more instance of the same entrypoint inside the container and proxies calls to it, the same way an agent runs a stdio server on a laptop. The tools the surface publishes are the ones the manifest declares, with the manifest's schemas, so input is validated against the manifest before it reaches the container. A tool the server offers but the manifest does not declare is not on the surface. Tool names are `<package>_<tool>`; a Package whose name collides with a built in family (`fs`, `pkg`, `proc`, `tel`, `users`, `approvals`) cannot be run.
+**How `mcp` exposure works.** The image's entrypoint is a stdio MCP server. The Process runs it as PID 1 with stdin held open, which keeps the container alive and is the liveness signal. Every MCP session the owner opens execs one more instance of the same entrypoint inside the container and proxies calls to it, the same way an agent runs a stdio server on a laptop. The tools the surface publishes are the ones the manifest declares, with the manifest's schemas, so input is validated against the manifest before it reaches the container. A tool the server offers but the manifest does not declare is not on the surface. Tool names are `<package>_<tool>`; a Package whose name collides with a built in family (`fs`, `pkg`, `proc`, `tel`, `users`, `approvals`, `secrets`) cannot be run.
 
 Every Process carries labels `kitbash.id`, `kitbash.user`, `kitbash.package`, `kitbash.name` and `kitbash.digest`. The container runtime holds the Process state and kitbashd reads it back; there is no second record.
 
 **How a Process sees Files.** A unit declares `mounts`, at most four, each one a `source` folder of Files, a `target` path inside the container and a `mode` of `ro` or `rw`. A source is a folder under the owner's own home or a top level folder of `/org`, and it has to be visible by the same rule the `fs` family reads by: it and every folder between it and its root carry a `kitbash.yaml` with a name and a description. A folder an agent cannot list is a folder a Process cannot be given, which keeps progressive disclosure one rule rather than two, and it is one function rather than two implementations of it. `rw` is allowed only under the owner's own home. `/org` is read only for everyone, admins included, because an approval is how a member writes there and a Process with a `rw` mount would be a way past the queue. A target may not be `/` or land under `/proc`, `/sys`, `/dev`, `/etc`, `/bin`, `/sbin`, `/usr`, `/lib` or `/lib64`. Mounts are independent of `provides.permits`: a permit governs what a Process may call back over `/mcp`, a mount is a kernel fact the Process needs no permit for.
 
 kitbashd validates every mount as root, at registration and again at every start: the source is opened beneath `/home/<owner>` or `/org` with `RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS`, so no component may be a symlink, inside the root as well as out of it, and no resolution may leave the root, the descriptor is fstatted, it has to be a directory, and under a home it has to be owned by that member. The resolved path is what podman is given, as `--mount type=bind,src=<resolved>,dst=<target>,ro=<true|false>,bind-nonrecursive,nosuid,nodev,noexec`. The mounts travel with the registration and are authoritative, so a restore mounts what was recorded rather than what a manifest says today, and a mount that has stopped being legal fails the restore with a problem the owner reads through `proc_list`. `kitbash-mcp` runs the same check as the member first, only so the problem arrives in the session that caused it; it is not trusted and the daemon's check is the one that decides. There is no `--userns` flag: container root already maps to the member. What a Process writes through a `rw` mount leaves no commit, see 2.1.
+
+**How a Process gets a secret.** A unit declares `secrets`, at most sixteen names, each one an environment variable the container needs and does not get from the image, from `env` or from kitbashd: an API key, a token for a service outside this machine. A name is the variable name, `^[A-Z][A-Z0-9_]{0,63}$`, and may not be one `env` also sets or one kitbashd speaks for (`KITBASH_*`); a manifest that does either is `invalid-manifest`. The values live with kitbashd and nowhere in Files or in an image: a member writes one with `secrets_set`, sees which names they hold with `secrets_list`, which answers names and timestamps and never a value, and drops one with `secrets_remove`. Secrets are the member's own, scoped by the socket's peer credentials the same way their home is: an admin holds their own set and reads nobody else's, and there is no shared set, because a Process runs under one member and the value has to be that member's to give. kitbashd keeps them as root owned files, `/var/lib/kitbash/secrets/<member>/<NAME>`, directory `0700` and file `0600`, outside the database so the daily backup copy carries none of them, and removes the directory with the account.
+
+At every start, the first and every restore, kitbashd resolves each declared name to the member's current value and writes it into the same root owned environment file that carries the Telemetry token, so a value never crosses `podman`'s command line and is never in a request body of `proc_run`. A declared name the member has not set is `not-found` at `proc_run`, naming the secret and the fix, and on restore it is the problem the owner reads through `proc_list`, the same shape as a mount that stopped being legal. The names travel with the registration; the values do not, which is what makes rotation one call: `secrets_set` writes the new value, and the next start of every Process that declares it reads it. `secrets_set` restarts nothing, as a health probe restarts nothing: which Processes to stop and run again is the owner's decision, and `proc_stop` followed by `proc_run` is how it is made. A value is one line of at most 8 KiB, no NUL, no newline, because the environment file is line based; a multi line credential is encoded by the member before it is set. `pkg_inspect` shows the declared names, because what a Package needs is part of reading it.
+
+What crosses the wire once is the value of `secrets_set`, from the agent over SSH to `kitbash-mcp` and over the socket to kitbashd. The span that call records carries the name and no value, `podman`'s error output is redacted before it is repeated, and no problem detail ever quotes a value. The member's own Processes can read the environment file their runtime is given, which is the point, and a Process may call `secrets_set` over `/mcp` only when its permits name it, like every other tool.
 
 **A swapped source is refused, not detected: the bind mounts are checked in the container's own namespace before its first instruction runs.** podman resolves the source path itself, in its own process, after kitbashd has looked at it, so a source replaced by a symlink in between is followed by podman and the container is given whatever it pointed at. That is not a small hole: an admin could point a `rw` mount at `/org` that way and write the shared root with no approval behind it, and the approval queue is the trail of every change there. Reporting it afterwards would not be enough either, because by then the entrypoint has run and a single write has landed.
 
@@ -167,6 +173,7 @@ deploy:
       builder: /org/nix-build # optional, the build kit that builds this unit, see section 3
       runner: /org/pve-runner # optional, the run kit that runs this Process, see section 3
       expose: mcp
+      secrets: [ANTHROPIC_API_KEY]   # names only; the member sets values with secrets_set, see section 2.3
       health: { http: /healthz, interval: 30s }  # probed and recorded, see section 2.4
       limits: { cpu: "1", memory: "512Mi" }
 ```
@@ -320,7 +327,7 @@ Infrastructure is three layers, and the object model binds to the shape of an OC
 
 ### 4.7 Storage
 
-kitbashd uses an embedded SQLite database for its own state and for Telemetry, at `/var/lib/kitbash/kitbashd.db`, opened through a pure Go driver so the binary stays static. One machine, one file, no second daemon. kitbashd copies that file once a day with `VACUUM INTO /var/lib/kitbash/backup/kitbashd-<stamp>.db`, keeps the newest seven and reports the last one in health; Files are git repositories the host snapshot covers. If Telemetry volume outgrows SQLite the store becomes a pluggable interface and an observability kit takes over long term retention. Postgres and ClickHouse are explicitly out of scope for the host.
+kitbashd uses an embedded SQLite database for its own state and for Telemetry, at `/var/lib/kitbash/kitbashd.db`, opened through a pure Go driver so the binary stays static. One machine, one file, no second daemon. kitbashd copies that file once a day with `VACUUM INTO /var/lib/kitbash/backup/kitbashd-<stamp>.db`, keeps the newest seven and reports the last one in health; Files are git repositories the host snapshot covers. Secrets are not in the database: they are root owned files under `/var/lib/kitbash/secrets/<member>/`, see 2.3, so a backup copy taken off the host carries none of them. If Telemetry volume outgrows SQLite the store becomes a pluggable interface and an observability kit takes over long term retention. Postgres and ClickHouse are explicitly out of scope for the host.
 
 ### 4.8 Releases
 
@@ -368,6 +375,8 @@ Each milestone is done when its acceptance sentence is true on a real machine, n
 
 **M8 Files mounts.** A member writes a file with `fs_write` under their home, runs a Package whose unit mounts that folder read only, and its tool reads the file back; a second unit mounted `rw` writes a file the member then reads with `fs_read`; a mount of another member's home and a `rw` mount of `/org` are both refused at `proc_run`.
 
+**M9 Secrets.** A member calls `secrets_set` with a name and a value, `secrets_list` shows the name and no value, a Package whose unit declares that name runs and its tool reads the variable, `proc_run` of the same Package under a second member who has not set it is refused naming the secret, and the span `secrets_set` recorded in Telemetry carries no value.
+
 ### 5.4 Risks
 
 - Rootless podman on Alpine needs cgroups v2, subuid ranges and fuse-overlayfs configured correctly. This is M1 work and is the first thing to verify on real hardware.
@@ -376,7 +385,7 @@ Each milestone is done when its acceptance sentence is true on a real machine, n
 
 ### 5.5 Open decisions
 
-The MCP tool surface is decided in `spec/mcp-surface.yaml`: six families, `fs` implemented in M1, the rest declared.
+The MCP tool surface is decided in `spec/mcp-surface.yaml`: seven families, `fs` implemented in M1, `secrets` in M9, the rest declared.
 
 - Whether `files` deploy units are needed in version 1 at all, or whether every Package is a container until a real case appears.
 - A Process started in one MCP session appears on another session's surface when that session reconnects, not live.
@@ -385,6 +394,7 @@ The MCP tool surface is decided in `spec/mcp-surface.yaml`: six families, `fs` i
 - Fan out is best effort. A subscriber that must not miss a record should read the store through `tel_query` and treat the push as a wake up.
 - Approvals cover `fs_write` and `pkg_import` into `/org`. Whether `proc_run` of an `/org` Package by a member should run as a shared Process rather than a private one is open; today it runs privately under the member.
 - A Process acting as an agent has its owner's full surface. Narrowing what a Process may call (a per Process allow list in the manifest) is deferred until a kit needs less than its owner has.
+- A secret set through `secrets_set` passes through the agent that calls it, so the agent's context holds the value once. A path that keeps the value out of the agent, such as `ssh kitbash-mcp secrets set NAME` reading stdin, is deferred until a member asks for it.
 
 ## 6. Vocabulary
 
