@@ -13,8 +13,8 @@ import (
 	"time"
 )
 
-// builtIn is the whole built in surface, named rather than counted: 4 fs,
-// 4 pkg, 4 proc, 2 tel, 5 users, 3 approvals and 3 secrets, the 25 the
+// builtIn is the whole built in surface, sorted and named rather than counted:
+// 4 fs, 4 pkg, 4 proc, 3 secrets, 2 tel, 5 users and 3 approvals, the 25 the
 // README's verify step counts and the families of spec/mcp-surface.yaml one for
 // one. A tool that is renamed is a client that breaks, so the names are the
 // assertion.
@@ -23,8 +23,8 @@ var builtIn = []string{
 	"fs_history", "fs_list", "fs_read", "fs_write",
 	"pkg_build", "pkg_import", "pkg_inspect", "pkg_list",
 	"proc_list", "proc_logs", "proc_run", "proc_stop",
-	"tel_query", "tel_retention",
 	"secrets_list", "secrets_remove", "secrets_set",
+	"tel_query", "tel_retention",
 	"users_add_key", "users_create", "users_list", "users_me", "users_remove",
 }
 
