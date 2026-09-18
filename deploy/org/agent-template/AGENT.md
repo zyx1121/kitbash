@@ -49,8 +49,8 @@ out of turns before it did, `max_tokens` when the final message was cut, and
 request and a hard task is many turns. Nothing polls and nothing resumes: a task
 too large for one run is two tasks, and a task whose result another run needs is
 a file the first one wrote. `AGENT_MAX_ITERATIONS` is the ceiling on the turns
-one run may take, 32 by default, and hitting it is `max_iterations` with
-whatever had been said by then.
+one run may take, 32 by default and 256 at the most, and hitting it is
+`max_iterations` with whatever had been said by then.
 
 ## What it may call
 
@@ -63,6 +63,14 @@ refuses anything outside it before the call runs:
   is installed, what is running and what any of it did.
 - `packages`, which is every tool your running Processes publish. The agent
   composes your other kits; it calls no built in that is not in this list.
+
+**It does not delegate to itself.** `packages` is every tool of every Process
+you have running, this one included, so the surface hands this Package its own
+`run` back. The kit drops it from what the model is given: an agent that could
+call itself would start a whole new loop inside one of its own turns, as deep as
+it liked, and one call would have to wait for all of them. Another agent Process
+you started is a different Package and stays on the list, so delegating to one
+is a Package you run, not a loop inside this one.
 
 It cannot `proc_run`, `pkg_build`, `secrets_set`, `users_*` or
 `approvals_approve`. An agent that could start Processes, build images and
@@ -83,8 +91,11 @@ The folder is the template. Nothing here is special to `/org`:
    `claude-opus-5`; the other current models are `claude-sonnet-5`, which is
    faster and cheaper, and `claude-fable-5-1`. `AGENT_EFFORT` is `low`,
    `medium`, `high`, `xhigh` or `max` and defaults to `high`.
-   `AGENT_MAX_ITERATIONS` defaults to 32. A value this kit cannot use is ignored
-   and the default runs, which it says on stderr.
+   `AGENT_MAX_ITERATIONS` defaults to 32 and is read between 1 and 256; a value
+   outside that, or one this kit cannot read at all, is ignored and the default
+   runs, which it says on stderr. Rename the folder, `name` in `kitbash.yaml`
+   and `name` in `package.json` together: the last is how the Process knows
+   which tool on the surface is its own.
 4. Edit `provides.permits` for what this agent may reach. Narrow is the point:
    an agent that only reads needs `fs_read` and `fs_list`, and one that drives
    your other kits needs `packages`.

@@ -15,6 +15,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
+import { ListToolsResultSchema } from "@modelcontextprotocol/sdk/types.js";
 import { parse as parseYaml } from "yaml";
 
 import {
@@ -25,6 +26,7 @@ import {
   readConfig,
   redactor,
   resultText,
+  selfToolNames,
   surfaceTools,
   systemBlocks,
 } from "../agent.js";
@@ -84,7 +86,7 @@ function fakeSurface({ tools, answers = {}, listThrows }) {
 // works in. It records the params it was built with, so a test reads what the
 // kit asked the API for.
 function fakeAnthropic({ plan, throws }) {
-  const state = { params: undefined, pushed: [], options: undefined, doneCalled: 0 };
+  const state = { params: undefined, pushed: [], results: [], doneCalled: 0 };
   const toolRunner = (params) => {
     state.params = params;
     const seen = [];
@@ -98,7 +100,9 @@ function fakeAnthropic({ plan, throws }) {
           for (const call of step.calls ?? []) {
             const tool = params.tools.find((entry) => entry.name === call.name);
             assert.ok(tool, `the kit published no tool named ${call.name}`);
-            await tool.run(call.input);
+            // What a tool hands back is what goes into the next request body,
+            // which is the model's context.
+            state.results.push(await tool.run(call.input));
           }
         }
       },
@@ -139,7 +143,7 @@ const LISTED = [
 ];
 
 // One agent wired to fakes, with the plan the fake model follows.
-function harness({ env = {}, tools = LISTED, answers, plan = [{ message: message({ content: [text("done")] }) }], throws, listThrows } = {}) {
+function harness({ env = {}, tools = LISTED, answers, plan = [{ message: message({ content: [text("done")] }) }], throws, listThrows, self = "agent-template" } = {}) {
   const surface = fakeSurface({ tools, answers, listThrows });
   const anthropic = fakeAnthropic({ plan, throws });
   const logged = [];
@@ -147,6 +151,7 @@ function harness({ env = {}, tools = LISTED, answers, plan = [{ message: message
     env: environment(env),
     prompt: "AGENT.md says this.",
     version: "0.1.0",
+    self,
     makeAnthropic: () => anthropic.client,
     makeSurface: surface.make,
     log: (line) => logged.push(line),
@@ -168,15 +173,23 @@ test("every tool of the surface becomes a tool with the same name and the same s
   assert.equal(built[0].type, "custom");
 });
 
-test("a tool the surface published without a schema or a description is still callable", () => {
+test("a tool the surface published without a description is still given one", () => {
   const built = surfaceTools({
-    listed: [{ name: "odd_tool" }, { name: "stringy_tool", inputSchema: { type: "string" } }],
+    listed: [{ name: "odd_tool", inputSchema: { type: "object" } }],
     callTool: async () => ({}),
     steps: [],
   });
-  assert.deepEqual(built[0].input_schema, { type: "object" });
-  assert.deepEqual(built[1].input_schema, { type: "object" });
   assert.match(built[0].description, /carries no description/);
+});
+
+// The kit trusts a listing's inputSchema because the MCP client has already
+// refused anything else: ToolSchema requires an object schema, and a listing
+// without one fails the whole tools/list rather than arriving here.
+test("the MCP client refuses a listing this kit would not be able to publish", () => {
+  for (const listing of [{ name: "a" }, { name: "a", inputSchema: { type: "string" } }]) {
+    assert.equal(ListToolsResultSchema.safeParse({ tools: [listing] }).success, false, JSON.stringify(listing));
+  }
+  assert.equal(ListToolsResultSchema.safeParse({ tools: [{ name: "a", inputSchema: { type: "object" } }] }).success, true);
 });
 
 // ---------------------------------------------------------------- a round trip
@@ -224,7 +237,7 @@ test("a tool that answers only structured content is read as JSON", async () => 
   });
   const answer = await agent.run({ task: "Summarise it." });
   assert.equal(answer.steps[0].ok, true);
-  assert.equal(resultText({ structuredContent: { summary: "short" } }), '{"summary":"short"}');
+  assert.deepEqual(resultText({ structuredContent: { summary: "short" } }), { text: '{"summary":"short"}', readable: true });
 });
 
 test("the run closes its session even when the loop fails", async () => {
@@ -262,6 +275,119 @@ test("a tool that throws is a failed step rather than a failed run", async () =>
   assert.match(result, /^This tool call failed and did nothing\./);
   assert.match(result, /the session went away/);
   assert.equal(steps[0].ok, false);
+});
+
+// ---------------------------------------------------------------- what reaches the model
+
+// A receiver that refuses a call answers with a body, and a body can hold the
+// Authorization header it was sent. That text goes into the tool result, the
+// tool result goes into the next request body, and the next request body is the
+// model's context: a model holding this Process's token can write it to a file
+// with the fs_write this kit permits.
+test("a tool failure echoing the bearer reaches the model redacted", async () => {
+  const echoed = new Error(`Error POSTing to endpoint (HTTP 403): {"error":"forbidden","authorization":"Bearer ${TOKEN}"}`);
+  const { agent, anthropic } = harness({
+    answers: {
+      fs_read: () => {
+        throw echoed;
+      },
+    },
+    plan: [
+      { message: message({ stop_reason: "tool_use", content: [] }), calls: [{ name: "fs_read", input: { path: "/org/handbook/kits.md" } }] },
+      { message: message({ content: [text("done")] }) },
+    ],
+  });
+
+  const answer = await agent.run({ task: "Read the handbook." });
+  const reached = anthropic.state.results.join("\n");
+  assert.ok(!reached.includes(TOKEN), reached);
+  assert.ok(!reached.includes(KEY), reached);
+  assert.match(reached, /Bearer \[redacted\]/);
+  assert.equal(answer.steps[0].ok, false);
+});
+
+test("a tool result echoing a secret reaches the model redacted as well", async () => {
+  const { agent, anthropic } = harness({
+    answers: { fs_read: () => ({ content: [text(`the file holds ${KEY} and ${TOKEN}`)] }) },
+    plan: [
+      { message: message({ stop_reason: "tool_use", content: [] }), calls: [{ name: "fs_read", input: { path: "/home/you/leak.txt" } }] },
+      { message: message({ content: [text("done")] }) },
+    ],
+  });
+  await agent.run({ task: "Read the file." });
+  const reached = anthropic.state.results.join("\n");
+  assert.ok(!reached.includes(KEY), reached);
+  assert.ok(!reached.includes(TOKEN), reached);
+  assert.equal(reached.split("[redacted]").length - 1, 2);
+});
+
+test("a result this kit cannot read is a failed step and says what it was", async () => {
+  const steps = [];
+  const built = surfaceTools({
+    listed: LISTED,
+    steps,
+    callTool: async () => ({ content: [{ type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" }] }),
+  });
+  const result = await built[0].run({ path: "/home/you/shot.png" });
+  assert.equal(result, "This tool answered content this kit cannot read (image or resource).");
+  assert.equal(steps[0].ok, false);
+  assert.deepEqual(resultText({ content: [{ type: "resource", resource: { uri: "file:///x" } }] }), {
+    text: "This tool answered content this kit cannot read (image or resource).",
+    readable: false,
+  });
+  // A tool that answered nothing at all did its work and answered nothing.
+  assert.deepEqual(resultText({ content: [] }), { text: "The tool answered nothing.", readable: true });
+});
+
+// ---------------------------------------------------------------- the kit's own tool
+
+// The surface publishes every tool of every Process the owner is running, this
+// one included, so a Package that permits packages is handed its own run tool
+// by the surface it just asked. Giving it to the model is a loop inside a turn,
+// as deep as the model likes.
+test("the kit's own tool is kept off the tools the model is given", async () => {
+  const { agent, anthropic, logged } = harness({
+    tools: [...LISTED, { name: "agent-template_run", description: "This Process's own tool.", inputSchema: { type: "object" } }],
+  });
+  await agent.run({ task: "Anything." });
+  assert.deepEqual(
+    anthropic.state.params.tools.map((tool) => tool.name),
+    ["fs_read", "notes_summarise"],
+  );
+  assert.ok(logged.some((line) => line.includes("agent-template_run")), logged.join("\n"));
+});
+
+test("a copy of this folder under another name filters its own tool and not the original's", async () => {
+  const { agent, anthropic } = harness({
+    self: "researcher",
+    env: { KITBASH_PACKAGE: "/home/you/researcher" },
+    tools: [
+      ...LISTED,
+      { name: "researcher_run", description: "This Process's own tool.", inputSchema: { type: "object" } },
+      { name: "agent-template_run", description: "Another member's agent, a different Process.", inputSchema: { type: "object" } },
+    ],
+  });
+  await agent.run({ task: "Anything." });
+  const names = anthropic.state.params.tools.map((tool) => tool.name);
+  assert.ok(!names.includes("researcher_run"), names.join(", "));
+  assert.ok(names.includes("agent-template_run"), "another agent Process is a tool this one may call");
+});
+
+test("the name is taken from the folder as well, for a copy that renamed one of the two", () => {
+  assert.deepEqual([...selfToolNames({ self: "researcher", packagePath: "/home/you/researcher" })], ["researcher_run"]);
+  assert.deepEqual([...selfToolNames({ self: "agent-template", packagePath: "/home/you/researcher" })], [
+    "agent-template_run",
+    "researcher_run",
+  ]);
+  assert.deepEqual([...selfToolNames({ self: "", packagePath: "" })], []);
+});
+
+test("a surface holding nothing but the kit's own tool is a problem, not an empty loop", async () => {
+  const { agent } = harness({ tools: [{ name: "agent-template_run", description: "Its own.", inputSchema: { type: "object" } }] });
+  await assert.rejects(
+    () => agent.run({ task: "Anything." }),
+    (err) => err instanceof AgentError && /permits/.test(err.fix),
+  );
 });
 
 // ---------------------------------------------------------------- clipping
@@ -310,6 +436,26 @@ test("a final message cut by max_tokens says so", async () => {
   const answer = await agent.run({ task: "Write something long." });
   assert.equal(answer.stopReason, "max_tokens");
   assert.equal(answer.answer, "half an ans");
+});
+
+test("a turn cut by max_tokens on the last allowed iteration is max_tokens, not max_iterations", async () => {
+  const plan = [
+    { message: message({ stop_reason: "tool_use", content: [text("working")] }) },
+    { message: message({ stop_reason: "max_tokens", content: [text("half an ans")] }) },
+  ];
+  const { agent } = harness({ env: { AGENT_MAX_ITERATIONS: "2" }, plan });
+  const answer = await agent.run({ task: "Write something long with tools." });
+  assert.equal(answer.stopReason, "max_tokens");
+});
+
+test("a turn still calling tools on the last allowed iteration is max_iterations", async () => {
+  const plan = [
+    { message: message({ stop_reason: "tool_use", content: [text("working")] }) },
+    { message: message({ stop_reason: "tool_use", content: [text("still working")] }) },
+  ];
+  const { agent } = harness({ env: { AGENT_MAX_ITERATIONS: "2" }, plan });
+  const answer = await agent.run({ task: "More than two turns of work." });
+  assert.equal(answer.stopReason, "max_iterations");
 });
 
 test("a paused turn is left to the runner, which resumes it itself", async () => {
@@ -490,6 +636,14 @@ test("a connection failure with no status is internal", async () => {
   assert.match(err.detail, /could not be reached/);
 });
 
+test("the agent exposes the redactor its entrypoint logs a stack through", () => {
+  const { agent } = harness();
+  const line = agent.redact(`unhandled failure: Error: bad key ${KEY} on token ${TOKEN}`);
+  assert.ok(!line.includes(KEY), line);
+  assert.ok(!line.includes(TOKEN), line);
+  assert.match(line, /unhandled failure/);
+});
+
 test("the redactor leaves a short value alone and removes a real one", () => {
   const redact = redactor([KEY, "ab", ""]);
   assert.equal(redact(`before ${KEY} after`), "before [redacted] after");
@@ -553,6 +707,12 @@ test("the manifest declares the permits, the secret and the env this kit is docu
   for (const forbidden of ["proc_run", "pkg_build", "secrets_set", "users_add", "approvals_approve"]) {
     assert.ok(!manifest.provides.permits.tools.includes(forbidden), `${forbidden} is permitted`);
   }
+});
+
+test("package.json and the manifest name this Package the same, which is how it knows its own tool", () => {
+  const pkg = JSON.parse(readFileSync(path.join(kitDir, "package.json"), "utf8"));
+  assert.equal(pkg.name, manifest.name);
+  assert.deepEqual([...selfToolNames({ self: pkg.name })], [`${manifest.name}_run`]);
 });
 
 test("a folder description and a tool description fit what the surface takes", () => {

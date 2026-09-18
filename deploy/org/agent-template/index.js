@@ -39,11 +39,16 @@ const here = import.meta.dirname;
 // The prompt this kit declares in provides.prompt. It is read once: it is part
 // of the image and a Process is replaced rather than reloaded.
 const prompt = readFileSync(path.join(here, "AGENT.md"), "utf8");
-const version = JSON.parse(readFileSync(path.join(here, "package.json"), "utf8")).version;
+const self = JSON.parse(readFileSync(path.join(here, "package.json"), "utf8"));
 
-const agent = createAgent({ env: process.env, prompt, version, Anthropic });
+// package.json's name is this Package's name, which is what the surface
+// publishes this kit's tool under, so a copy of this folder that renames itself
+// in both files still recognises its own tool and does not hand it to the
+// model. The test that holds package.json and kitbash.yaml to the same name is
+// what keeps that true here.
+const agent = createAgent({ env: process.env, prompt, version: self.version, self: self.name, Anthropic });
 
-const server = new Server({ name: SELF, version }, { capabilities: { tools: {} } });
+const server = new Server({ name: self.name, version: self.version }, { capabilities: { tools: {} } });
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
@@ -73,7 +78,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (err instanceof AgentError) return err.toResult();
     // Anything else is a bug in this kit rather than an answer, so the caller
     // is told where to read it and nothing of it is repeated here.
-    console.error(`[${SELF}] unhandled failure: ${err?.stack ?? err}`);
+    // A stack carries whatever the frame it was thrown from was holding, so it
+    // goes through the redactor like everything else this kit writes.
+    console.error(agent.redact(`[${SELF}] unhandled failure: ${err?.stack ?? err}`));
     return new AgentError({
       type: "https://kitbash.zyx.tw/errors/internal",
       status: 500,
@@ -85,4 +92,4 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 });
 
 await server.connect(new StdioServerTransport());
-console.error(`[${SELF}] ready, version ${version}`);
+console.error(`[${SELF}] ready, version ${self.version}`);

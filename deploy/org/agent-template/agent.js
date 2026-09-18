@@ -282,8 +282,31 @@ export async function openSurface({ endpoint, token, version }) {
   };
 }
 
-// Every tool the surface publishes, in the order it published them.
-async function listSurfaceTools(client) {
+// What the surface would publish this Package's own tool under. The surface
+// publishes every tool of every running Process of the owner, this Process
+// included, so a Package that permits packages is handed its own run tool by
+// the surface it just asked. The names are read from what this Process was
+// given rather than written here, so a copy of this folder under another name
+// still finds itself: package.json's name, which a copy renames beside the
+// manifest, and the last component of KITBASH_PACKAGE, which is the folder
+// kitbashd started.
+export function selfToolNames({ self, packagePath }) {
+  const names = new Set();
+  const candidates = [self, `${packagePath ?? ""}`.split("/").filter(Boolean).at(-1)];
+  for (const candidate of candidates) {
+    const name = typeof candidate === "string" ? candidate.trim() : "";
+    if (name !== "") names.add(`${name}_${RUN_TOOL.name}`);
+  }
+  return names;
+}
+
+// Every tool the surface publishes, in the order it published them, less this
+// Package's own. An agent given its own run tool calls itself: one turn of the
+// loop starts a whole new loop of up to AGENT_MAX_ITERATIONS turns, inside the
+// turn that asked for it, with no bound on the depth and a five minute timeout
+// per call that has to cover all of it. Delegating is a Process a member
+// started, not this one.
+async function listSurfaceTools(client, { exclude = new Set(), say = () => {} } = {}) {
   const tools = [];
   let cursor;
   for (let page = 0; page < MAX_TOOL_PAGES; page += 1) {
@@ -296,7 +319,14 @@ async function listSurfaceTools(client) {
         "Retry; if it persists, check this Process's session limit on the receiver.",
       );
     }
-    for (const tool of result?.tools ?? []) if (typeof tool?.name === "string") tools.push(tool);
+    for (const tool of result?.tools ?? []) {
+      if (typeof tool?.name !== "string") continue;
+      if (exclude.has(tool.name)) {
+        say(`[${SELF}] not giving the model ${tool.name}, which is this Process's own tool`);
+        continue;
+      }
+      tools.push(tool);
+    }
     cursor = typeof result?.nextCursor === "string" ? result.nextCursor : undefined;
     if (!cursor) break;
   }
@@ -304,21 +334,30 @@ async function listSurfaceTools(client) {
 }
 
 // What the model reads of a tool result: the text blocks, or the structured
-// content when a tool answered only that.
+// content when a tool answered only that. readable is false when the tool
+// answered something this kit cannot turn into text, which the model is told
+// was a failure rather than an empty answer.
 export function resultText(result) {
-  const text = (result?.content ?? [])
+  const blocks = result?.content ?? [];
+  const text = blocks
     .filter((block) => block?.type === "text" && typeof block.text === "string")
     .map((block) => block.text)
     .join("\n");
-  if (text !== "") return text;
+  if (text !== "") return { text, readable: true };
   if (result?.structuredContent !== undefined) {
     try {
-      return JSON.stringify(result.structuredContent);
+      return { text: JSON.stringify(result.structuredContent), readable: true };
     } catch {
-      return "The tool answered structured content this kit could not read as JSON.";
+      return { text: "This tool answered structured content this kit could not read as JSON.", readable: false };
     }
   }
-  return "The tool answered nothing.";
+  // An image or an embedded resource is a result this kit drops, so the model
+  // is told the call did not give it anything rather than left to read an
+  // empty answer as a done piece of work.
+  if (blocks.length > 0) {
+    return { text: "This tool answered content this kit cannot read (image or resource).", readable: false };
+  }
+  return { text: "The tool answered nothing.", readable: true };
 }
 
 // A result the model reads whole, or its first 256 KiB and a marker saying so.
@@ -328,15 +367,18 @@ export function clip(text) {
   return bytes.subarray(0, MAX_TOOL_RESULT_BYTES).toString("utf8") + CLIP_MARKER;
 }
 
-// A surface tool with no input schema, or one that is not an object schema, is
-// still a tool the model may call: it is given the empty object schema rather
-// than dropped, because a tool the surface published is one the owner has.
-const objectSchema = (schema) =>
-  schema && typeof schema === "object" && schema.type === "object" ? schema : { type: "object" };
-
 // Every tool of the surface as a tool the runner can call. Names pass through
-// unchanged: the surface already namespaces them as <package>_<tool>.
-export function surfaceTools({ listed, callTool, steps }) {
+// unchanged: the surface already namespaces them as <package>_<tool>. A
+// listing's inputSchema is an object schema and needs no check here, because
+// the MCP client validates tools/list against ToolSchema before this sees it
+// and a listing whose schema is anything else fails the listing itself. A
+// description is optional there, so that one is defaulted.
+//
+// redact is not optional in spirit: everything a tool answers is a stranger's
+// text on its way into the model's context, and this Process's own token is
+// what a receiver echoes back in a 401 or a 403 body. A model given the token
+// is a model that can write it into a file with fs_write.
+export function surfaceTools({ listed, callTool, steps, redact = (text) => text }) {
   return listed.map((listing) =>
     betaTool({
       name: listing.name,
@@ -344,16 +386,16 @@ export function surfaceTools({ listed, callTool, steps }) {
         typeof listing.description === "string" && listing.description !== ""
           ? listing.description
           : `The ${listing.name} tool of this machine's surface. It carries no description.`,
-      inputSchema: objectSchema(listing.inputSchema),
+      inputSchema: listing.inputSchema,
       run: async (input) => {
         const startedAt = Date.now();
         let ok = true;
         let text;
         try {
           const result = await callTool(listing.name, input ?? {});
-          ok = result?.isError !== true;
-          text = resultText(result);
-          if (!ok) text = `${TOOL_FAILED} ${text}`;
+          const read = resultText(result);
+          ok = result?.isError !== true && read.readable;
+          text = result?.isError === true ? `${TOOL_FAILED} ${read.text}` : read.text;
         } catch (err) {
           // A tool that threw is a tool that failed, and the model is told so
           // in the result rather than by the run ending.
@@ -361,7 +403,7 @@ export function surfaceTools({ listed, callTool, steps }) {
           text = `${TOOL_FAILED} ${oneLine(err)}`;
         }
         steps.push({ tool: listing.name, durationMs: Date.now() - startedAt, ok });
-        return clip(text);
+        return clip(redact(text));
       },
     }),
   );
@@ -422,7 +464,7 @@ const answerOf = (message) =>
 
 // ---------------------------------------------------------------- the run
 
-async function runTask(args, { env, prompt, version, makeAnthropic, makeSurface, log }) {
+async function runTask(args, { env, prompt, version, self, makeAnthropic, makeSurface, log }) {
   const task = args?.task;
   if (typeof task !== "string" || task.trim() === "") {
     throw badRequest("task is not a string with anything in it.", "Call run with a task that says what to do, in words.");
@@ -471,7 +513,10 @@ async function runTask(args, { env, prompt, version, makeAnthropic, makeSurface,
   });
 
   try {
-    const listed = await listSurfaceTools(session.client);
+    const listed = await listSurfaceTools(session.client, {
+      exclude: selfToolNames({ self, packagePath: env.KITBASH_PACKAGE }),
+      say,
+    });
     if (listed.length === 0) {
       throw internal(
         "The surface this Process reaches published no tools, so the agent has nothing to work with.",
@@ -481,6 +526,7 @@ async function runTask(args, { env, prompt, version, makeAnthropic, makeSurface,
     const tools = surfaceTools({
       listed,
       steps,
+      redact,
       callTool: (name, input) =>
         session.client.callTool({ name, arguments: input }, CallToolResultSchema, { timeout: CALL_TIMEOUT_MS }),
     });
@@ -537,15 +583,18 @@ async function runTask(args, { env, prompt, version, makeAnthropic, makeSurface,
       answer = "";
       const category = final.stop_details?.category;
       say(`[${SELF}] the model declined the task${category ? ` for ${category}` : ""}`);
+    } else if (stop === "max_tokens") {
+      // What the last message says of itself comes first: a turn cut by
+      // max_tokens on the last allowed iteration was cut by max_tokens, and
+      // reading the cap first would report the wrong one of the two.
+      stopReason = "max_tokens";
+      say(`[${SELF}] the final message hit max_tokens at ${MAX_TOKENS} and is cut`);
     } else if (iterations >= config.maxIterations && stop !== "end_turn" && stop !== "stop_sequence") {
       // The runner stops at the cap whatever the model was in the middle of, so
       // the answer is whatever it had said by then and the caller is told that
       // it was cut rather than finished.
       stopReason = "max_iterations";
       say(`[${SELF}] the loop hit AGENT_MAX_ITERATIONS at ${config.maxIterations} iterations`);
-    } else if (stop === "max_tokens") {
-      stopReason = "max_tokens";
-      say(`[${SELF}] the final message hit max_tokens at ${MAX_TOKENS} and is cut`);
     } else {
       stopReason = stop ?? "end_turn";
     }
@@ -571,12 +620,20 @@ export function createAgent({
   env = process.env,
   prompt = "",
   version = "0.0.0",
+  self = SELF,
   Anthropic,
   makeAnthropic = ({ apiKey }) => anthropicClient({ apiKey, Anthropic }),
   makeSurface = openSurface,
   log = (line) => console.error(line),
 } = {}) {
   return {
-    run: (args) => runTask(args, { env, prompt, version, makeAnthropic, makeSurface, log }),
+    run: (args) => runTask(args, { env, prompt, version, self, makeAnthropic, makeSurface, log }),
+    // The redactor over this Process's secrets, for the caller that logs
+    // something this file did not build. It reads the environment on every call
+    // so a rotated value is the one that is removed.
+    redact: (text) => {
+      const config = readConfig(env);
+      return redactor([config.apiKey, config.token])(text);
+    },
   };
 }
