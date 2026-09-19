@@ -18,7 +18,9 @@ jobs:
     runs-on: ubuntu-latest
     # The budget of issue #73. A job that has spent it is a job that hung: it
     # runs in about three minutes, of which the surface test is half a minute.
-    timeout-minutes: 8
+    # The scheduler half waits for a tick, at most a minute and a half, which
+    # is why this is ten rather than eight.
+    timeout-minutes: 10
     env:
       KITBASH_E2E: "1"
       KITBASH_E2E_ADMIN: admin1

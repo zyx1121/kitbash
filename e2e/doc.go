@@ -7,6 +7,10 @@
 // kitbashd running as root on the default socket. The workflow starts and stops
 // the daemons; these tests drive the surface between those steps.
 //
+// The scheduler is driven here: a Package whose unit declares a five field cron
+// expression is registered early in the surface story and read at the end, so
+// the minute a tick costs is spent on the steps in between rather than waiting.
+//
 // The health probe is not driven here. kitbashd probes the path a Package
 // declares on the Process's endpoint, and the echo fixture is an expose: mcp
 // Process on stdio: it publishes no port, so it has no endpoint to request and

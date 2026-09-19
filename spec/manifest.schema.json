@@ -178,6 +178,12 @@
           "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$",
           "maxLength": 253
         },
+        "schedule": {
+          "type": "string",
+          "description": "Five cron fields, minute hour day-of-month month day-of-week, read in UTC. A unit that declares one is a job: proc_run registers it and starts nothing, kitbashd starts the container at each tick as the owner and the run is over when the entrypoint exits, and every run writes one kitbash.schedule metric record. The dialect is *, a number, a range a-b, a step */s or a-b/s and comma separated lists of those; names are not accepted, and day of week takes 0 to 7 with both 0 and 7 meaning Sunday. It is allowed only with expose: none and without health, restart or provides.subscriptions, each of which describes a Process that stays up; any of them beside a schedule is invalid-manifest. A tick that arrives while the previous run is still going is skipped and recorded, ticks missed while the host was down are not made up, and a run longer than six hours is stopped. See PLAN.md section 2.3.",
+          "pattern": "^[0-9*][0-9*,/-]*([ \\t]+[0-9*][0-9*,/-]*){4}$",
+          "maxLength": 256
+        },
         "env": {
           "type": "object",
           "description": "Plain environment variables, written into the container as the manifest spells them. A credential belongs in secrets instead, because everything here is readable by anyone who can read the manifest.",

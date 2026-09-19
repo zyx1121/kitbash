@@ -327,6 +327,9 @@ func (s *Server) removeUser(w http.ResponseWriter, r *http.Request, caller Calle
 		// freed, which is a port the next member's container may be given, see
 		// proxy.go.
 		s.proxy.untrack(id)
+		// And the jobs they registered: a tick of a member this host no longer
+		// has would start a container as nobody, see schedule.go.
+		s.jobs.untrack(id)
 		s.endMCPSessions(id)
 	}
 	if _, err := s.store.DeleteApprovals(r.Context(), name); err != nil {

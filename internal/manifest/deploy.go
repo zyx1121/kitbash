@@ -200,6 +200,12 @@ type Unit struct {
 	// the member owns whose record points at this host, and it is served only
 	// when the host has a domain at all, see PLAN.md section 2.3.
 	Hostname string
+	// Schedule is the five field cron expression this unit is started by,
+	// read in UTC, empty for a unit that is a Process rather than a job. A
+	// unit that declares one declares expose: none and no health, restart or
+	// subscriptions, which checkSchedule is what refuses, see PLAN.md
+	// section 2.3 and cron.go.
+	Schedule string
 	Env      map[string]string
 	Health   map[string]any
 	Limits   Limits
@@ -216,6 +222,10 @@ type Unit struct {
 	Secrets []string
 	Raw     map[string]any
 }
+
+// Scheduled reports whether this unit is a job kitbashd starts on time rather
+// than a Process it keeps up.
+func (u Unit) Scheduled() bool { return u.Schedule != "" }
 
 // HealthProbe is the HTTP probe this unit declares: the path kitbashd requests
 // on the Process's endpoint, and how often it requests it, both as the
@@ -353,6 +363,7 @@ func (m *Manifest) Unit() (Unit, bool) {
 	}
 	unit.Port = intOf(raw["port"])
 	unit.Hostname, _ = raw["hostname"].(string)
+	unit.Schedule, _ = raw["schedule"].(string)
 	if env, ok := raw["env"].(map[string]any); ok {
 		unit.Env = map[string]string{}
 		for k, v := range env {

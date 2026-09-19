@@ -1,0 +1,18 @@
+name: ticker
+description: >-
+  The end to end fixture Package for the built in scheduler. Its container
+  prints one line and exits, which is what a run of a job is: kitbashd starts it
+  at each tick and the run ends with the entrypoint, see PLAN.md section 2.3.
+tags: [e2e, fixture]
+
+deploy:
+  units:
+    - type: container
+      build: .
+      # A job and nothing else: no exposure, no probe, no restart policy and no
+      # subscription, each of which describes a Process that stays up.
+      expose: none
+      # Every minute, read in UTC, so the job the end to end host registers
+      # runs inside the wait that step gives it.
+      schedule: "* * * * *"
+      env: { TICKER_NOTE: "the end to end job" }

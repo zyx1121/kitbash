@@ -159,6 +159,15 @@ type Runner interface {
 	// daemon restart. A container keeps the cgroup parent it was created
 	// with, so restoring one only has to place the child again.
 	Start(ctx context.Context, m Member, container, cgroup string) error
+	// WaitContainer waits for one container's entrypoint to exit and answers
+	// the status it exited with, which is how the built in scheduler runs a
+	// job: the tick starts the container and the run is over when this
+	// returns. A container the runtime does not have is ErrNoContainer.
+	//
+	// It is the one call here the caller's cancellation reaches: a wait tears
+	// nothing down, so giving up on one leaves the container as it was, and
+	// the budget is the caller's deadline because a run may take hours.
+	WaitContainer(ctx context.Context, m Member, container string) (int, error)
 	// ContainerConfig reads back the part of one container's configuration
 	// that has to survive being created again: what cgroup it was made under,
 	// the image it runs, and the environment, labels, ports and restart policy

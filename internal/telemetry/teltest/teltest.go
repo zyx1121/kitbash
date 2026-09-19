@@ -118,6 +118,32 @@ type Registration struct {
 	// Secrets are the names the unit declared. A test reads them to see that
 	// the names crossed the socket and that no value ever did.
 	Secrets []string `json:"secrets,omitempty"`
+	// Schedule is the job the unit declared, as the registration sends it,
+	// and NextRun the tick the daemon answers it will run at. A client sends
+	// the first and never the second; this fake computes the second from the
+	// expression the way the daemon does, so a proc test reads the tick a
+	// session publishes, see PLAN.md section 2.3.
+	Schedule *Schedule `json:"schedule,omitempty"`
+	NextRun  string    `json:"nextRun,omitempty"`
+	// LastRun is the run the daemon saw this job finish most recently. A
+	// client sends none; a test seeds it to stand in for a tick that ran.
+	LastRun *LastRun `json:"lastRun,omitempty"`
+}
+
+// Schedule is one job on the wire: the cron expression, and what a tick starts
+// the container with.
+type Schedule struct {
+	Cron   string            `json:"cron"`
+	Env    map[string]string `json:"env,omitempty"`
+	Memory string            `json:"memory,omitempty"`
+	CPU    string            `json:"cpu,omitempty"`
+}
+
+// LastRun is one finished run as processes_list answers it.
+type LastRun struct {
+	StartedAt  string `json:"startedAt"`
+	ExitCode   int    `json:"exitCode"`
+	DurationMs int64  `json:"durationMs"`
 }
 
 // Health is one Process's probe on the wire: the declaration a registration
@@ -635,6 +661,16 @@ func (d *Daemon) register(w http.ResponseWriter, r *http.Request) {
 			"the body is not a Process registration", ""))
 		return
 	}
+	// A job is answered with the tick it will run at, which is the daemon's
+	// answer and not the session's: the expression is the member's and the
+	// clock is the host's.
+	if reg.Schedule != nil && reg.Schedule.Cron != "" {
+		if cron, err := manifest.ParseCron(reg.Schedule.Cron); err == nil {
+			if next, ok := cron.Next(time.Now()); ok {
+				reg.NextRun = next.UTC().Format(time.RFC3339)
+			}
+		}
+	}
 	d.store(reg)
 	d.tokens++
 	token := fmt.Sprintf("%x", sha256.Sum256([]byte(fmt.Sprintf("%s-%d", reg.ID, d.tokens))))
@@ -642,7 +678,8 @@ func (d *Daemon) register(w http.ResponseWriter, r *http.Request) {
 	d.minted[reg.ID] = token
 	d.secrets[reg.ID] = secret
 	d.mu.Unlock()
-	answer, _ := json.Marshal(map[string]string{"id": reg.ID, "token": token, "fanoutSecret": secret})
+	answer, _ := json.Marshal(map[string]string{
+		"id": reg.ID, "token": token, "fanoutSecret": secret, "nextRun": reg.NextRun})
 	write(w, Response{Status: http.StatusOK, ContentType: "application/json", Body: string(answer)})
 }
 

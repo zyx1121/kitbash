@@ -599,6 +599,31 @@ families:
           with is registered with its runner and reported with it, and
           kitbashd supervises none of it.
 
+          A unit with expose: none may declare deploy.units[0].schedule, five
+          cron fields, minute hour day-of-month month day-of-week, read in
+          UTC. proc_run then registers a job: it resolves the digest, builds
+          nothing further, starts no container, and answers state scheduled
+          with nextRun, the tick kitbashd will start it at, RFC 3339 in UTC.
+          kitbashd starts the container at each tick as the owner, through the
+          same four steps any start takes and with the same environment,
+          secrets, mounts, cgroup ceiling and Telemetry token, and the run is
+          over when the entrypoint exits. Every tick writes one
+          kitbash.schedule metric record, see tel_query. A tick that arrives
+          while the previous run is still going is skipped and recorded, at
+          most eight scheduled runs go at once on a host and a tick beyond
+          that is skipped as busy, a run longer than six hours is stopped and
+          recorded with exit code 137, and ticks missed while the host was
+          down are not made up. Converging is the same rule as any Process:
+          the same Package, name and digest is the same job, a new digest
+          replaces it. The dialect is *, a number, a range a-b, a step */s or
+          a-b/s and comma separated lists of those; names are not accepted and
+          day of week takes 0 to 7, both 0 and 7 meaning Sunday. A schedule on
+          a unit that is not expose: none, or beside health, restart or
+          provides.subscriptions, is invalid-manifest; one on a unit that
+          names a runner is not-permitted; and a member may hold 32 scheduled
+          Processes, beyond which registering one is conflict, the same answer
+          the 64 Process limit gives.
+
           A unit whose deploy.units[0].mounts declares folders of Files gets
           them as bind mounts, at most four, each one nosuid, nodev, noexec
           and non recursive. A source is a folder under the caller's own home
@@ -678,9 +703,11 @@ families:
             name: { type: string }
             package: { type: string }
             digest: { type: string }
-            state: { type: string, enum: [starting, running, unhealthy, stopped, failed] }
+            state: { type: string, enum: [starting, running, unhealthy, stopped, failed, scheduled] }
             expose: { type: string, enum: [mcp, http, none] }
             endpoint: { type: string, description: "Internal URL when expose is http" }
+            schedule: { type: string, description: "The cron expression this Process is a job of, absent for a Process that stays up" }
+            nextRun: { type: string, format: date-time, description: "When kitbashd runs this job next, UTC" }
             url: { type: string, description: "The address this Process is reached at from outside the host, https://<name>.<member>.<domain> or the hostname the unit declared. Absent on a host with no domain, which routes nothing" }
             tools: { type: array, items: { type: string }, description: "Surface tool names added when expose is mcp" }
             runner: { type: string, description: "Package path of the run kit that owns this Process, absent when kitbashd runs it" }
@@ -715,7 +742,12 @@ families:
           no longer legal is reported failed with that as its problem. A
           Process with expose: http on a host that has a domain carries the
           url it is reached at, which is the address a member hands to
-          somebody else, see proc_run.
+          somebody else, see proc_run. A Process whose unit declares a
+          schedule is scheduled between its runs and running during one, and
+          carries schedule, nextRun and, once it has run under the daemon that
+          is answering, lastRun with the exit code and how long it took; the
+          runs before that are kitbash.schedule records, which is where a
+          job's history is.
         input:
           type: object
           additionalProperties: false
@@ -738,9 +770,22 @@ families:
                   name: { type: string }
                   package: { type: string }
                   digest: { type: string, description: "Absent from a line" }
-                  state: { type: string, enum: [starting, running, unhealthy, stopped, failed] }
+                  state: { type: string, enum: [starting, running, unhealthy, stopped, failed, scheduled] }
                   expose: { type: string, enum: [mcp, http, none] }
                   url: { type: string, description: "Where an http Process is served, when the host has a domain" }
+                  schedule: { type: string, description: "The cron expression this Process is a job of, absent for a Process that stays up" }
+                  nextRun: { type: string, format: date-time, description: "When kitbashd runs this job next, UTC" }
+                  lastRun:
+                    type: object
+                    description: >
+                      The run this job finished most recently. Absent until it has run once
+                      under the daemon that is answering, which holds the runs it saw the way
+                      it holds health readings.
+                    required: [startedAt, exitCode, durationMs]
+                    properties:
+                      startedAt: { type: string, format: date-time }
+                      exitCode: { type: integer }
+                      durationMs: { type: integer }
                   startedAt: { type: string, format: date-time }
                   problem: { type: string, description: "Why this Process is not running, when kitbashd could not bring it back" }
                   fix: { type: string, description: "What the owner can do about it" }
@@ -773,12 +818,19 @@ families:
           Its tools leave the surface. A Process a run kit owns is stopped
           through that kit's stop tool, see $package_tools.run_hook; a kit that
           declares no stop tool owns a Process kitbash cannot stop, which is
-          not-permitted with a fix naming the kit.
+          not-permitted with a fix naming the kit. Stopping a scheduled
+          Process unregisters the schedule, so no tick runs it again, and
+          removes the container its last run left behind.
         input: { type: object, additionalProperties: false, required: [id], properties: { id: { type: string } } }
         output: { type: object, required: [id, state], properties: { id: { type: string }, state: { type: string } } }
         errors: [not-found, not-permitted, invalid-manifest, internal]
       proc_logs:
-        description: Recent stdout and stderr of a Process. Structured logs are in Telemetry; this is the raw stream.
+        description: >
+          Recent stdout and stderr of a Process. Structured logs are in
+          Telemetry; this is the raw stream. For a scheduled Process it is the
+          last run: the container of a run is kept until the next tick replaces
+          it, and a job whose first tick has not come has no output, which is
+          not-found saying so.
         input: { type: object, additionalProperties: false, required: [id], properties: { id: { type: string }, lines: { type: integer, minimum: 1, default: 200, maximum: 5000 } } }
         output: { type: object, required: [id, lines], properties: { id: { type: string }, lines: { type: array, items: { type: string } } } }
         errors: [not-found, not-permitted, internal]
@@ -800,6 +852,14 @@ families:
           any member or omit user for the whole machine. since defaults to 24
           hours ago, until to now. Metrics are accepted by the store but no
           producer emits them before M4, so that signal returns an empty page.
+          The metrics kitbashd writes itself are kitbash.health, one per probe,
+          and kitbash.schedule, one per tick of a scheduled Process: asking
+          whether a job ran this morning is
+          {signal: metrics, process: <id>, since: <this morning>}, whose
+          records carry kitbash.schedule.result, ran, skipped or
+          failed_to_start, kitbash.schedule.exit_code,
+          kitbash.schedule.duration_ms and, on a skipped tick,
+          kitbash.schedule.reason, running or busy.
         input:
           type: object
           additionalProperties: false

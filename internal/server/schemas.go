@@ -198,9 +198,21 @@ const processDef = `{
     "name": { "type": "string" },
     "package": { "type": "string" },
     "digest": { "type": "string", "description": "Absent from a line" },
-    "state": { "type": "string", "enum": ["starting", "running", "unhealthy", "stopped", "failed"] },
+    "state": { "type": "string", "enum": ["starting", "running", "unhealthy", "stopped", "failed", "scheduled"] },
     "expose": { "type": "string", "enum": ["mcp", "http", "none"] },
     "url": { "type": "string", "description": "Where an http Process is served, when the host has a domain" },
+    "schedule": { "type": "string", "description": "The cron expression this Process is a job of, absent for a Process that stays up" },
+    "nextRun": { "type": "string", "format": "date-time", "description": "When kitbashd runs this job next, UTC" },
+    "lastRun": {
+      "type": "object",
+      "description": "The run this job finished most recently. Absent until it has run once under the daemon that is answering, which holds the runs it saw the way it holds health readings.",
+      "required": ["startedAt", "exitCode", "durationMs"],
+      "properties": {
+        "startedAt": { "type": "string", "format": "date-time" },
+        "exitCode": { "type": "integer" },
+        "durationMs": { "type": "integer" }
+      }
+    },
     "startedAt": { "type": "string", "format": "date-time" },
     "problem": { "type": "string", "description": "Why this Process is not running, when kitbashd could not bring it back" },
     "fix": { "type": "string", "description": "What the owner can do about it" },
@@ -333,9 +345,21 @@ var (
     "name": { "type": "string" },
     "package": { "type": "string" },
     "digest": { "type": "string" },
-    "state": { "type": "string", "enum": ["starting", "running", "unhealthy", "stopped", "failed"] },
+    "state": { "type": "string", "enum": ["starting", "running", "unhealthy", "stopped", "failed", "scheduled"] },
     "expose": { "type": "string", "enum": ["mcp", "http", "none"] },
     "endpoint": { "type": "string", "description": "Internal URL when expose is http" },
+    "schedule": { "type": "string", "description": "The cron expression this Process is a job of, absent for a Process that stays up" },
+    "nextRun": { "type": "string", "format": "date-time", "description": "When kitbashd runs this job next, UTC" },
+    "lastRun": {
+      "type": "object",
+      "description": "The run this job finished most recently. Absent until it has run once under the daemon that is answering, which holds the runs it saw the way it holds health readings.",
+      "required": ["startedAt", "exitCode", "durationMs"],
+      "properties": {
+        "startedAt": { "type": "string", "format": "date-time" },
+        "exitCode": { "type": "integer" },
+        "durationMs": { "type": "integer" }
+      }
+    },
     "tools": { "type": "array", "items": { "type": "string" }, "description": "Surface tool names added when expose is mcp" },
     "runner": { "type": "string", "description": "Package path of the run kit that owns this Process, absent when kitbashd runs it" }
   }

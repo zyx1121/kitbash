@@ -332,6 +332,7 @@ CREATE TABLE IF NOT EXISTS processes (
   endpoint      TEXT    NOT NULL DEFAULT '',
   subscriptions TEXT    NOT NULL DEFAULT '',
   runner        TEXT    NOT NULL DEFAULT '',
+  schedule      TEXT    NOT NULL DEFAULT '',
   token_hash    TEXT    NOT NULL,
   fanout_secret TEXT    NOT NULL DEFAULT '',
   registered_at INTEGER NOT NULL

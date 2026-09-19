@@ -120,6 +120,12 @@ func Parse(data []byte) (*Manifest, error) {
 	if messages := checkSecrets(raw); len(messages) > 0 {
 		return nil, &ErrInvalid{Messages: messages}
 	}
+	// And the rules a scheduled unit is held to, for the same reason: a
+	// schedule beside an exposure or a restart policy is a manifest whose
+	// author expected something this host does not do, see checkSchedule.
+	if messages := checkSchedule(raw); len(messages) > 0 {
+		return nil, &ErrInvalid{Messages: messages}
+	}
 	m := &Manifest{Raw: raw}
 	m.Name, _ = raw["name"].(string)
 	m.Description, _ = raw["description"].(string)

@@ -307,6 +307,12 @@ func run() error {
 	go func() {
 		srv.Prepare(serve)
 		srv.Restore(serve)
+		// The ticker starts after restore as well, and for the same reason:
+		// a job whose host is still bringing containers back would be started
+		// while the runtime is busy with the boot. Ticks missed while the
+		// daemon was down are not made up, so it starts from now, see
+		// PLAN.md section 2.3.
+		go srv.ScheduleLoop(serve)
 		// The health probes start after restore rather than beside it: a
 		// Process that is still coming back would be probed while its
 		// container is starting, and the first record of the boot would say

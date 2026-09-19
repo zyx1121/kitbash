@@ -26,13 +26,17 @@ import (
 	"github.com/zyx1121/kitbash/internal/uuid"
 )
 
-// States the surface publishes, see the proc_run output schema.
+// States the surface publishes, see the proc_run output schema. A scheduled
+// Process is scheduled between its runs and running during one: it is not
+// stopped, because nobody stopped it, and it is not starting, because nothing
+// is coming up, see PLAN.md section 2.3.
 const (
 	StateStarting  = "starting"
 	StateRunning   = "running"
 	StateUnhealthy = "unhealthy"
 	StateStopped   = "stopped"
 	StateFailed    = "failed"
+	StateScheduled = "scheduled"
 )
 
 // StopTimeout is how long a Process is given to exit on its own.
@@ -87,6 +91,15 @@ type Process struct {
 	// rather than what the manifest asked for. Absent for a Process that
 	// declared none, which is every Process written before mounts existed.
 	Mounts []mounts.Resolved `json:"mounts,omitempty"`
+	// Schedule is the cron expression a job declares, NextRun the tick
+	// kitbashd will start it at and LastRun the run it finished most
+	// recently. All three are absent for a Process that is not a job, and the
+	// last one until the job has run once under this daemon: the daemon holds
+	// the runs it saw, the same way it holds health readings, see PLAN.md
+	// section 2.3.
+	Schedule string   `json:"schedule,omitempty"`
+	NextRun  string   `json:"nextRun,omitempty"`
+	LastRun  *LastRun `json:"lastRun,omitempty"`
 
 	// Container is the runtime name the bridge execs into. It is not part of
 	// the tool's output: the surface names a Process by its id.
@@ -101,6 +114,16 @@ type Process struct {
 type Health struct {
 	Last    string `json:"last,omitempty"`
 	Healthy bool   `json:"healthy"`
+}
+
+// LastRun is the run one job finished most recently: when kitbashd started the
+// container, what its entrypoint exited with, and how long it took. A run that
+// was skipped is not one of these; it is a kitbash.schedule record, which is
+// where the whole history of a job is, see PLAN.md section 2.4.
+type LastRun struct {
+	StartedAt  string `json:"startedAt"`
+	ExitCode   int    `json:"exitCode"`
+	DurationMs int64  `json:"durationMs"`
 }
 
 // ListResult is the output of proc_list.
@@ -119,6 +142,10 @@ type Line struct {
 	State   string `json:"state"`
 	Expose  string `json:"expose,omitempty"`
 	URL     string `json:"url,omitempty"`
+	// NextRun is when kitbashd runs a job next, which is the one thing a line
+	// about a scheduled Process has to carry: its state says it is waiting and
+	// this says what for.
+	NextRun string `json:"nextRun,omitempty"`
 }
 
 // LinesResult is the output of proc_list without a package.
@@ -137,6 +164,7 @@ func (r *ListResult) Lines() *LinesResult {
 			State:   p.State,
 			Expose:  p.Expose,
 			URL:     p.URL,
+			NextRun: p.NextRun,
 		})
 	}
 	return out
@@ -297,6 +325,14 @@ func (s *Service) run(ctx context.Context, span *telemetry.Span, path, digest, n
 		name = m.Name
 	}
 	container := ContainerName(m.Name, name)
+
+	// A unit that declares a schedule is a job: it is registered with
+	// kitbashd, which starts its container at each tick, and nothing is
+	// started here. It is not a third way of running a Package either, it is
+	// the same built in runner started by the clock, see PLAN.md section 2.3.
+	if unit.Scheduled() {
+		return s.runJob(ctx, m, folder, unit, image, name, container)
+	}
 
 	// The whole run command is built and checked before anything is removed.
 	// Replacing a Process destroys the old container, so every failure that
@@ -523,7 +559,12 @@ func (s *Service) List(ctx context.Context) (*ListResult, *problem.Problem) {
 	for _, container := range containers {
 		process := s.describe(container, manifest.Unit{})
 		if reported, held := known[process.ID]; held {
-			if reported.Problem != "" && process.State != StateRunning {
+			if scheduledEntry(reported) {
+				// A job's container is the run before this one, or the one
+				// going now. Either way what the member reads is the job.
+				process = asJob(process, reported)
+			}
+			if reported.Problem != "" && process.State != StateRunning && process.State != StateScheduled {
 				process.State = StateFailed
 				process.Problem = reported.Problem
 				process.Fix = reported.ProblemFix
@@ -548,6 +589,9 @@ func (s *Service) List(ctx context.Context) (*ListResult, *problem.Problem) {
 	// There is nothing in the runtime to read, so without this they would
 	// simply stop being listed and their owner would have no problem to read.
 	result.Processes = append(result.Processes, s.failedWithoutAContainer(known, result.Processes)...)
+	// And the jobs whose first tick has not come yet, which have no container
+	// here at all: the registration is what says they exist, see schedule.go.
+	result.Processes = append(result.Processes, s.scheduledProcesses(known, result.Processes)...)
 	sort.Slice(result.Processes, func(i, j int) bool {
 		return result.Processes[i].Name < result.Processes[j].Name
 	})
@@ -610,6 +654,12 @@ func (s *Service) Stop(ctx context.Context, id string) (*StopResult, *problem.Pr
 	// exists at all.
 	if reg, owned := s.kitOwned(ctx, id); owned {
 		return s.stopWithKit(ctx, id, reg)
+	}
+	// A job is stopped by unregistering the schedule, which is the thing that
+	// would run it again. Between its runs there is no container to stop, and
+	// the one its last run left is removed with it, see schedule.go.
+	if reg, job := s.scheduledJob(ctx, id); job {
+		return s.stopJob(ctx, id, reg)
 	}
 	container, prob := s.byID(ctx, id)
 	if prob != nil {
@@ -848,6 +898,13 @@ func (s *Service) Logs(ctx context.Context, id string, lines int) (*LogsResult, 
 	}
 	container, prob := s.byID(ctx, id)
 	if prob != nil {
+		// A job whose first tick has not come has no container and no output,
+		// which is an answer rather than a Process nobody has heard of: the
+		// logs of a job are the last run's, see PLAN.md section 2.3.
+		if _, job := s.scheduledJob(ctx, id); job {
+			return nil, problem.NotFoundFix(id, "this Process is scheduled and has not run yet, so it has no output",
+				"Call proc_list to see when kitbashd runs it next, and read the logs after that run.")
+		}
 		return nil, prob
 	}
 	out, err := s.runner.Logs(ctx, container.Name, lines)

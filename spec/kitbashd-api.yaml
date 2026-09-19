@@ -244,8 +244,8 @@ api:
   processes_register:
     method: POST
     path: /kitbash/v1/processes
-    request: { id: "UUIDv7", package: "/home/loki/echo", name: "echo", container: "kitbash-echo-echo", digest: "sha256:...", expose: "mcp|http|none", endpoint: "http://127.0.0.1:40275 when expose is http", hostname: "status.example.org when the unit declares one", subscriptions: ["telemetry"], runner: "/org/pve-runner when a run kit owns this Process", health: { http: "/healthz", interval: "30s" }, mounts: [{ source: "/home/loki/notes", target: "/files/notes", mode: "ro|rw" }], secrets: ["ANTHROPIC_API_KEY"] }
-    response: { id: "UUIDv7", token: "opaque, at least 32 bytes of entropy, returned once", fanoutSecret: "opaque, 32 bytes, returned once; the bearer the fan out presents to this Process", host: "echo.loki.kitbash.example, the name the proxy serves this Process under, absent on a host with no domain" }
+    request: { id: "UUIDv7", package: "/home/loki/echo", name: "echo", container: "kitbash-echo-echo", digest: "sha256:...", expose: "mcp|http|none", endpoint: "http://127.0.0.1:40275 when expose is http", hostname: "status.example.org when the unit declares one", subscriptions: ["telemetry"], runner: "/org/pve-runner when a run kit owns this Process", health: { http: "/healthz", interval: "30s" }, mounts: [{ source: "/home/loki/notes", target: "/files/notes", mode: "ro|rw" }], secrets: ["ANTHROPIC_API_KEY"], schedule: { cron: "0 8 * * *", env: { TZ: "UTC" }, memory: "512Mi", cpu: "1" } }
+    response: { id: "UUIDv7", token: "opaque, at least 32 bytes of entropy, returned once", fanoutSecret: "opaque, 32 bytes, returned once; the bearer the fan out presents to this Process", host: "echo.loki.kitbash.example, the name the proxy serves this Process under, absent on a host with no domain", nextRun: "2026-09-20T08:00:00Z, when kitbashd runs a registered job next, absent for a Process that stays up" }
     authorization: >
       The caller is the member the Process belongs to; kitbashd records the
       peer user as the Process owner and whether they are an admin at
@@ -257,6 +257,10 @@ api:
       A replacement is not a new Process and is never refused by the limit.
       Every registration is a live token and, for a subscriber, a queue, so
       this count is what bounds what one member costs the daemon.
+      Of those, at most 32 may be scheduled; the 33rd is 409 conflict with the
+      same shape of answer. Every job is a container this host starts by
+      itself, so the count is what bounds what one member costs the ticker,
+      see scheduled_processes.
     validation: >
       id is a canonical version 7 UUID of 36 characters, package an absolute
       path, expose one of mcp, http or none, subscriptions a subset of
@@ -288,6 +292,14 @@ api:
       The daemon answers the name it serves the Process under as host, which is
       the declared one or <name>.<member>.<domain>, and nothing at all on a
       host with no domain, see reverse_proxy.
+      schedule is the job the unit declared: cron, five fields read in UTC, and
+      the environment and ceiling a tick starts the container with, which
+      travel here because a tick has no session behind it. It is accepted only
+      on a registration with expose: none, no health block, no subscriptions
+      and no runner; anything else is bad-request, and the runner is
+      not-permitted, because a Process a run kit owns has no container here to
+      start. An expression kitbashd cannot read is bad-request, see
+      scheduled_processes.
       secrets are the names the unit declared, at most sixteen, each matching
       ^[A-Z][A-Z0-9_]{0,63}$ and none of them a KITBASH_ name, which kitbashd
       speaks for. Only names are sent: a value never crosses this API except
@@ -337,6 +349,9 @@ api:
       A host whose cgroup filesystem is not version 2 or not writable runs the
       Process without placing it, records the limits, and says so on that
       start. One action at a time is served per Process id.
+      A registration that carries a schedule is not started here: kitbashd
+      starts a job at its ticks and nowhere else, so this answers 403
+      not-permitted, see scheduled_processes.
       The mounts of the registration are resolved again here, before anything
       is created: the check at registration says what was true then, and a
       folder can be removed, replaced by a symlink or lose its manifest in
@@ -403,6 +418,7 @@ api:
       hostname, host,
       limits: { memory, cpu, pids, ceiling },
       health: { http, interval, last, healthy },
+      schedule: { cron }, nextRun, lastRun: { startedAt, exitCode, durationMs },
       subscriptions, registeredAt, problem, problemFix } ] }. The caller's
       registered Processes, every key present even when its value is empty,
       and no token anywhere. An admin sees every member's.
@@ -416,7 +432,11 @@ api:
       still a ceiling, see restore.cgroups. In health, http and interval are
       the declaration the registration carried and last and healthy the reading
       of the most recent probe, absent for a Process kitbashd has not probed
-      yet, see health_probes. problem and problemFix are why a
+      yet, see health_probes. schedule.cron is the expression a job declared,
+      nextRun the tick kitbashd will start it at and lastRun the run it
+      finished most recently, absent until it has run once under this daemon:
+      like the health readings, the runs are the daemon's own memory and not a
+      column, see scheduled_processes. problem and problemFix are why a
       Process is not running, written by the restore that could not bring it
       back and cleared by the next start that works; both are left out for a
       Process kitbashd has nothing to report about. They are the daemon's
@@ -901,6 +921,56 @@ restore:
     that came back without a ceiling is counted in one line for its owner
     rather than one line each. One that still cannot start is counted failed
     and its owner reads the reason through proc_list, see processes_list.
+
+scheduled_processes:
+  description: >
+    A Process whose unit declares deploy.units[0].schedule is a job: kitbashd
+    holds the cron expression, computes the next tick in UTC, and at each tick
+    starts the container as the owner through the same four steps a start
+    takes, create, init, verify, start, with the same environment file,
+    secrets, mounts, cgroup ceiling and Telemetry token. The run is over when
+    the entrypoint exits. One goroutine holds the ticker; it starts after
+    restore, beside the health probes, and follows the registrations as they
+    come and go.
+  registration: >
+    processes_register carries the schedule and starts nothing. The
+    registration is what a tick reads: the container name, the image digest,
+    the environment the unit declared and the ceiling it asked for, because a
+    tick has no session behind it. A start of a scheduled Process is 403
+    not-permitted, and restore registers every job again and starts none of
+    them.
+  missed_ticks: >
+    Ticks missed while the daemon was down are not made up. The next tick of
+    every job is computed from now, at every registration and at every start of
+    the daemon, so a host that was off over a nightly run runs that job the
+    next night.
+  concurrency: >
+    The runs of one job are serialised: a tick that arrives while the previous
+    run is still going is skipped and recorded with the reason "running".
+    Across jobs a host runs at most 8 scheduled containers at once, and a tick
+    beyond that is skipped and recorded with the reason "busy". A run longer
+    than 6 hours is stopped with podman stop and recorded with exit code 137
+    and the result "ran": the container ran, and this host ended it.
+  logs: >
+    The container of a run is kept after it exits, which is what proc_logs
+    reads, and removed at the next tick, which creates it again from the
+    registration. A job whose first tick has not come has no container at all.
+    proc_stop unregisters the schedule and removes whatever container the last
+    run left.
+  records: >
+    Each tick writes one metric record named kitbash.schedule, value 1 for a
+    tick that ran the container and 0 for one that did not, carrying
+    kitbash.user (the owner), kitbash.package, kitbash.process and
+    kitbash.path (the Package folder), kitbash.producer = kitbashd,
+    kitbash.schedule.result, which is ran, skipped or failed_to_start,
+    kitbash.schedule.duration_ms, kitbash.schedule.exit_code on every tick that
+    was not skipped, and kitbash.schedule.reason on one that was. The record is
+    stored and fanned out like every other record, so tel_query answers "did it
+    run this morning" to the job's owner and to admins. A run whose job was
+    unregistered while it was going is recorded about nobody and dropped, the
+    same rule a health reading follows.
+  limit: >
+    A member holds at most 32 jobs, see processes_register.limit.
 
 health_probes:
   description: >

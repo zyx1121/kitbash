@@ -158,6 +158,16 @@ without either variable leaves the file as it is. A host with no domain routes
 nothing and an `http` Process keeps its internal port, which is how kitbash
 works without this.
 
+**Run something on time.** A unit with `expose: none` may declare `schedule`,
+five cron fields read in UTC, and kitbashd starts it on time: `proc_run`
+registers the job and starts nothing, answering `state: scheduled` and the
+`nextRun` it will make, and at each tick the daemon starts the container as the
+owner with the same environment, secrets, mounts and ceiling any start gets.
+Every tick writes one `kitbash.schedule` record, so "did it run this morning" is
+a `tel_query`; `proc_logs` reads the last run and `proc_stop` unregisters the
+schedule. A tick during a run is skipped and recorded, a run longer than 6 hours
+is stopped, and ticks missed while the host was down are not made up.
+
 **Or boot the ISO.** `kitbash-0.12.1-x86_64.iso` and `kitbash-0.12.1-aarch64.iso`
 on the release are Alpine's own image with the kitbashd apk and its
 dependencies on it. Booted from a VM's CD drive either comes up as a working
