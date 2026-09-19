@@ -41,6 +41,26 @@ def number(value, digits=0):
     return "%d" % round(value)
 
 
+def tokens(row):
+    """What a run read and wrote, for a client that reports no price."""
+    usage = row.get("usage") or {}
+    read = usage.get("input_tokens") or 0
+    written = usage.get("output_tokens") or 0
+    return read, written
+
+
+def spend(rows):
+    """What a run cost, in money, or in tokens for a client with no price."""
+    cost = mean([r.get("cost_usd") for r in rows])
+    if cost is not None:
+        return "USD %.2f" % cost
+    read = mean([tokens(r)[0] for r in rows])
+    written = mean([tokens(r)[1] for r in rows])
+    if not read:
+        return "an amount this client does not report"
+    return "{:,} tokens in and {:,} out".format(int(round(read)), int(round(written)))
+
+
 def by_sentence(rows):
     """Rows grouped by sentence id, in the order the sentences were run."""
     grouped = {}
@@ -140,16 +160,17 @@ def readings(rows, summaries):
             "" if not handed_back else " (%s)" % ", ".join("`%s`" % i for i in sorted(set(handed_back))),
         ),
         "",
-        "**What a sentence costs.** The mean run cost %s and took %s. From nothing it was %s, "
-        "from a repository %s, from a fault %s. M10 measured USD 0.28, 0.18 and 0.39 by hand on the "
-        "three sentences this round keeps."
+        "**What a sentence costs.** The mean run cost %s and took %s. From nothing it was %s, from a "
+        "repository %s, from a fault %s. M10 measured USD 0.28, 0.18 and 0.39 by hand on the three "
+        "sentences this round keeps."
         % (
-            "-" if cost is None else "USD %.2f" % cost,
+            spend(rows),
             "-" if mean([r.get("wall_ms") for r in rows]) is None else "%.0f minutes" % (mean([r.get("wall_ms") for r in rows]) / 60000.0),
-            "-" if mean([s["cost_usd"] for s in nothing]) is None else "USD %.2f" % mean([s["cost_usd"] for s in nothing]),
-            "-" if mean([s["cost_usd"] for s in repository]) is None else "USD %.2f" % mean([s["cost_usd"] for s in repository]),
-            "-" if mean([s["cost_usd"] for s in fault]) is None else "USD %.2f" % mean([s["cost_usd"] for s in fault]),
-        ),
+            spend([r for r in rows if r["class"] == "nothing"]),
+            spend([r for r in rows if r["class"] == "repository"]),
+            spend([r for r in rows if r["class"] == "fault"]),
+        )
+        + ("" if cost is not None else " This client reports no price, so what a run cost is its own token count."),
         "",
         "**The number to watch is the kitbash calls per sentence.** It is %s here against M10's 8 to 14, "
         "with %s tool calls in all and %s of them failing. A fault was mitigated in %s."

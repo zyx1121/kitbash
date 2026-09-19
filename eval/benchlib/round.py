@@ -177,9 +177,20 @@ class Round:
                 fixtures.deploy(session, member, depends["fixture"], depends["package"], variables, self.log)
             self.log("  deploying %s" % setup["package"])
             fixtures.deploy(session, member, setup["fixture"], setup["package"], variables, self.log)
-        healthy = fixtures.wait_healthy(
-            self.context(variables=variables), self.resolve(sentence["check"], variables), HEALTHY_SECONDS
-        )
+        context = self.context(variables=variables)
+        spec = self.resolve(sentence["check"], variables)
+        healthy = fixtures.wait_healthy(context, spec, HEALTHY_SECONDS)
+        if not healthy.get("passed"):
+            # A Process can be running and answer 502, which the first Codex
+            # round hit, so it is stopped and run again once before the round
+            # gives up on breaking something that worked.
+            self.log("  the fixture does not answer yet, running it again: %s" % healthy.get("detail"))
+            home = "/home/%s" % member
+            with self.session() as session:
+                for package in [(setup.get("depends") or {}).get("package"), setup["package"]]:
+                    if package:
+                        fixtures.start(session, "%s/%s" % (home, package), package, self.log)
+            healthy = fixtures.wait_healthy(context, spec, HEALTHY_SECONDS)
         report["healthy_before"] = healthy
         if not healthy.get("passed"):
             self.log("  the fixture does not answer before the fault: %s" % healthy.get("detail"))

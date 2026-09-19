@@ -10,6 +10,7 @@
  "member": "bench-20260920-0100",
  "member_created_at": "2026-09-19T17:00:49+00:00",
  "member_removed_at": "2026-09-19T22:19:30+00:00",
+ "note": "Codex ran out of allowance with three sentences left, at 17:48 UTC, and the round stopped there rather than writing rows for runs that never reached the host. The same command was run again at 22:06 UTC, when the allowance was back, and it continued with the same member, which is what resumable was for. The member was removed cleanly at the end, the Processes having been stopped over the surface first.\n\nOne row is weaker than the others and says so in its own fields. `fault-dependency` was deployed on top of the attempt the usage limit had cut off, and its notes Process answered 502 for the whole five minutes the round waits for a fixture to come up, state running, so the fault was injected against something that was already broken: `inject_verified` is true and `setup.healthy_before.passed` is false. Codex stopped and ran both Processes again and the address answered, which is a mitigation of more than the fault. The round now runs a fixture that does not answer once more before it gives up on it.",
  "removed": {
   "archived": "/org/.archive/bench-20260920-0100",
   "user": "bench-20260920-0100"

@@ -4,6 +4,10 @@ One round of the M11 bench: 15 sentences, k=1, agent codex, model gpt-6-astra, k
 
 The member the round created was `bench-20260920-0100`. Every number below is read from the rows in this folder; the transcripts are under `runs/`.
 
+Codex ran out of allowance with three sentences left, at 17:48 UTC, and the round stopped there rather than writing rows for runs that never reached the host. The same command was run again at 22:06 UTC, when the allowance was back, and it continued with the same member, which is what resumable was for. The member was removed cleanly at the end, the Processes having been stopped over the surface first.
+
+One row is weaker than the others and says so in its own fields. `fault-dependency` was deployed on top of the attempt the usage limit had cut off, and its notes Process answered 502 for the whole five minutes the round waits for a fixture to come up, state running, so the fault was injected against something that was already broken: `inject_verified` is true and `setup.healthy_before.passed` is false. Codex stopped and ran both Processes again and the address answered, which is a mitigation of more than the fault. The round now runs a fixture that does not answer once more before it gives up on it.
+
 ## From nothing
 
 | Sentence | pass^k | turns | tool calls | kitbash calls | tool errors | questions | cost USD | wall |
@@ -50,6 +54,6 @@ The member the round created was `bench-20260920-0100`. Every number below is re
 
 **The deployment conversation is gone.** 14 of 15 sentences passed every run. The answers asked 0 questions in all, and 0 runs ended by handing a decision back.
 
-**What a sentence costs.** The mean run cost - and took 3 minutes. From nothing it was -, from a repository -, from a fault -. M10 measured USD 0.28, 0.18 and 0.39 by hand on the three sentences this round keeps.
+**What a sentence costs.** The mean run cost 372,117 tokens in and 3,093 out and took 3 minutes. From nothing it was 301,853 tokens in and 5,157 out, from a repository 467,094 tokens in and 2,593 out, from a fault 347,404 tokens in and 1,530 out. M10 measured USD 0.28, 0.18 and 0.39 by hand on the three sentences this round keeps. This client reports no price, so what a run cost is its own token count.
 
 **The number to watch is the kitbash calls per sentence.** It is 12.7 here against M10's 8 to 14, with 18.0 tool calls in all and 2.7 of them failing. A fault was mitigated in 2.0 minutes on average.

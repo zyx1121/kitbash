@@ -48,6 +48,15 @@ class Render(unittest.TestCase):
     def test_the_member_is_named_and_said_to_be_gone(self):
         self.assertIn("bench-20260919-2300", self.text)
 
+    def test_a_client_that_reports_no_price_is_read_in_tokens(self):
+        costless = [
+            dict(r, cost_usd=None, usage={"input_tokens": 48000, "output_tokens": 2400})
+            for r in self.rows
+        ]
+        self.assertIn("tokens in", report.spend(costless))
+        self.assertIn("48,000 tokens in and 2,400 out", report.spend(costless))
+        self.assertEqual(report.spend(self.rows)[:3], "USD")
+
     def test_an_empty_folder_says_so(self):
         self.assertIn("No rows", report.render(os.path.join(FIXTURES, "rows", "nothing-here")))
 
