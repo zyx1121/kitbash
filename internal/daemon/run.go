@@ -340,6 +340,11 @@ func (s *Server) startProcess(w http.ResponseWriter, r *http.Request, p store.Pr
 	if prob := s.trackProbeAs(r.Context(), m, p, r.URL.Path); prob != nil {
 		logger.Printf("health: not probing %s of %s: %s", p.ID, p.Owner, prob.Detail)
 	}
+	// And this is where the name this Process is served under gets the port to
+	// forward to: the container publishes one now, so the routing table reads
+	// it off the runtime rather than waiting for the next restore, see
+	// proxy.go.
+	s.trackRoute(r.Context(), m, p)
 	writeJSON(w, r.URL.Path, startResponse{ID: p.ID, Container: p.Container, ContainerID: id})
 }
 
@@ -351,6 +356,10 @@ func (s *Server) stopProcess(w http.ResponseWriter, r *http.Request, p store.Pro
 		writeProblem(w, s.runProblem(r, err, p, podman.RunOptions{}))
 		return
 	}
+	// The registration stands, so the name stands with it and answers 503:
+	// what a member reads at the address of a Process they stopped is that it
+	// is not running, not that the address is nobody's, see proxy.go.
+	s.trackRoute(r.Context(), m, p)
 	writeJSON(w, r.URL.Path, startResponse{ID: p.ID, Container: p.Container})
 }
 
@@ -367,6 +376,10 @@ func (s *Server) removeProcess(w http.ResponseWriter, r *http.Request, p store.P
 	if err := s.cgroups.RemoveProcess(r.Context(), m.Name, p.ID); err != nil {
 		logger.Printf("cgroups: the cgroup of %s could not be removed: %v", p.ID, err)
 	}
+	// There is no container to forward to any more. The registration may still
+	// be there for a moment, because the session unregisters after this, so
+	// the name is dropped here rather than left pointing at nothing.
+	s.proxy.untrack(p.ID)
 	writeJSON(w, r.URL.Path, startResponse{ID: p.ID, Container: p.Container})
 }
 

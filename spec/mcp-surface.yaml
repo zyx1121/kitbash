@@ -541,6 +541,9 @@ families:
           merged with the builds kitbashd recorded, so a build carries the
           member who made it and a build another member has is listed even
           though this member's store does not hold it, see PLAN.md section 2.2.
+          The manifest is answered as it is written, so a unit's hostname, the
+          secrets it declares and its permits block are all read here: what a
+          Package asks for is part of reading it.
         input: { type: object, additionalProperties: false, required: [path], properties: { path: { type: string } } }
         output:
           type: object
@@ -625,6 +628,23 @@ families:
           the restore, and proc_list reports that Process failed with the
           reason.
 
+          A unit with expose: http is served by kitbashd's reverse proxy when
+          the host has a domain, KITBASH_DOMAIN at install: the Process is
+          reached at https://<name>.<member>.<domain>, or at the
+          deploy.units[0].hostname the unit declared, and that address is the
+          url this returns. The member's label is the attribution: whose work
+          a service is, is visible in its address. A host with no domain
+          routes nothing and answers no url, and the Process keeps its
+          internal endpoint, which is how kitbash worked before the proxy
+          existed. A hostname another Process on this host already serves,
+          its declared name or the name derived for it, is conflict; one on a
+          unit that is not expose: http is bad-request; one on a unit that
+          names a runner is not-permitted, because a Process a run kit owns
+          has no container here to forward to. The proxy routes by host name
+          to the port that Process's own container publishes, the same port
+          the health probe is held to, and writes one span per forwarded
+          request, see reverse_proxy in spec/kitbashd-api.yaml.
+
           The bind mounts are held to what kitbashd validated in the
           container's own mount namespace before its first instruction runs:
           the container is made, the runtime prepares it, kitbashd reads it,
@@ -651,6 +671,7 @@ families:
             state: { type: string, enum: [starting, running, unhealthy, stopped, failed] }
             expose: { type: string, enum: [mcp, http, none] }
             endpoint: { type: string, description: "Internal URL when expose is http" }
+            url: { type: string, description: "The address this Process is reached at from outside the host, https://<name>.<member>.<domain> or the hostname the unit declared. Absent on a host with no domain, which routes nothing" }
             tools: { type: array, items: { type: string }, description: "Surface tool names added when expose is mcp" }
             runner: { type: string, description: "Package path of the run kit that owns this Process, absent when kitbashd runs it" }
             mounts:
@@ -681,7 +702,10 @@ families:
           probe kitbashd ran, see health_probes there. A Process that declared
           mounts carries them as kitbashd resolved them, which is how a member
           reads what folders of Files their Process can see; one whose mount is
-          no longer legal is reported failed with that as its problem.
+          no longer legal is reported failed with that as its problem. A
+          Process with expose: http on a host that has a domain carries the
+          url it is reached at, which is the address a member hands to
+          somebody else, see proc_run.
         input:
           type: object
           additionalProperties: false
@@ -706,7 +730,7 @@ families:
                   digest: { type: string, description: "Absent from a line" }
                   state: { type: string, enum: [starting, running, unhealthy, stopped, failed] }
                   expose: { type: string, enum: [mcp, http, none] }
-                  url: { type: string, description: "Where an http Process is served, when the host has a domain" }
+                  url: { type: string, description: "Where an http Process is served, absent on a host with no domain" }
                   startedAt: { type: string, format: date-time }
                   problem: { type: string, description: "Why this Process is not running, when kitbashd could not bring it back" }
                   fix: { type: string, description: "What the owner can do about it" }

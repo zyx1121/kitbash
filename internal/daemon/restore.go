@@ -66,6 +66,11 @@ type RestoreCounts struct {
 func (s *Server) Restore(ctx context.Context) RestoreCounts {
 	if s.noRestore {
 		logger.Printf("restore: skipped, the daemon was started with restore off")
+		// The table is still built. It says what is reachable, which on a host
+		// whose Processes were not started is every registered name answering
+		// 503, and the container of one that was running already keeps being
+		// forwarded to, see proxy.go.
+		s.LoadRoutes(ctx)
 		return RestoreCounts{}
 	}
 	list, err := s.store.Processes(ctx, "")
@@ -97,6 +102,7 @@ func (s *Server) Restore(ctx context.Context) RestoreCounts {
 			}
 			s.fanout.untrack(p.ID)
 			s.probes.untrack(p.ID)
+			s.proxy.untrack(p.ID)
 			s.endMCPSessions(p.ID)
 			continue
 		}
@@ -126,6 +132,12 @@ func (s *Server) Restore(ctx context.Context) RestoreCounts {
 		}()
 	}
 	wg.Wait()
+
+	// The routing table is built from the registrations that are left, once,
+	// after every container this boot brings back is up: the names travel with
+	// the registration, so what a Process was reachable at before a reboot is
+	// what it is reachable at after one, see PLAN.md section 2.3.
+	s.LoadRoutes(ctx)
 
 	logger.Printf("restore: started %d (%d were already running), missing %d, failed %d, legacy %d, healed %d, owned by a run kit %d",
 		counts.Started, counts.Running, counts.Missing, counts.Failed, counts.Legacy, counts.Healed, counts.Kit)
@@ -250,6 +262,7 @@ func (s *Server) restoreOwner(ctx context.Context, owner string, processes []sto
 			// There is no Process left to report a problem about.
 			s.clearProcessProblem(p.ID)
 			s.probes.untrack(p.ID)
+			s.proxy.untrack(p.ID)
 			s.endMCPSessions(p.ID)
 		default:
 			logger.Printf("restore: starting %s of %s: %v", p.Container, owner, err)

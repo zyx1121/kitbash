@@ -1,0 +1,890 @@
+package daemon
+
+import (
+	"bufio"
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"golang.org/x/crypto/acme/autocert"
+
+	"github.com/zyx1121/kitbash/internal/manifest"
+	"github.com/zyx1121/kitbash/internal/problem"
+	"github.com/zyx1121/kitbash/internal/store"
+	"github.com/zyx1121/kitbash/internal/sysusers"
+)
+
+// kitbashd is the reverse proxy of every Process with expose: http, see
+// PLAN.md section 2.3. It is not a third built in: it is how the built in
+// runner exposes what it runs, decided by the manifest and by one setting the
+// operator gives the host, see PLAN.md section 3.
+//
+// A host with no domain routes nothing, which is what every kitbash host did
+// before this existed: an http Process keeps its internal port and is reached
+// over loopback. With a domain every such Process is <name>.<member>.<domain>,
+// or the name its unit declared, and a request for that name is forwarded to
+// the port that Process's own container publishes.
+//
+// Two rules hold the whole thing up. A name that is not in the routing table
+// never reaches a container, so the proxy is not a way to ask this daemon to
+// request an arbitrary address. And the port is never the member's word: it is
+// read off the container as its owner, the same discovery the health probe is
+// held to, so a registration can never point the proxy at a neighbour's
+// Process or at a port nobody published, see routePort.
+
+// The two ways a kitbash host terminates TLS, as KITBASH_TLS spells them.
+// acme is the default with a domain: kitbashd listens on 80 and 443 and
+// obtains one certificate per host name. gateway listens on 80 alone and
+// trusts the Host a gateway that already terminated TLS forwards, which is how
+// a host behind one public address is put on the internet.
+const (
+	TLSACME    = "acme"
+	TLSGateway = "gateway"
+)
+
+// Where the proxy listens when the operator names no address. Both are every
+// interface: a host with a domain is a host something reaches from outside.
+const (
+	DefaultProxyListen    = ":80"
+	DefaultProxyTLSListen = ":443"
+)
+
+// DefaultCertDir is where autocert keeps the certificates it obtains. It is
+// root owned and 0700 like the rest of /var/lib/kitbash: a private key is the
+// proof this host is the name it serves.
+const DefaultCertDir = "/var/lib/kitbash/certs"
+
+// CertDirMode is the mode of that directory.
+const CertDirMode = 0o700
+
+// ProxyResponseHeaderTimeout is how long a Process has to begin answering one
+// forwarded request. There is no timeout on the body after that and no idle
+// timeout on the connection: a Process that streams is the point of an http
+// Process, and a download of an hour is not a failure.
+const ProxyResponseHeaderTimeout = 60 * time.Second
+
+// ProxyReadHeaderTimeout bounds the request line and headers of a request off
+// the wire, which is what stops a connection that dribbles a header forever.
+const ProxyReadHeaderTimeout = 10 * time.Second
+
+// ProxyShutdownTimeout is how long a forwarded request gets when the daemon
+// stops. It is shorter than a streaming response on purpose: a daemon that is
+// stopping does not wait out a download.
+const ProxyShutdownTimeout = 5 * time.Second
+
+// ProxySpan is the name of the span one forwarded request writes.
+const ProxySpan = "proxy"
+
+// The attributes that span carries beyond the four, as the OpenTelemetry
+// conventions spell them. kitbash.host is this daemon's own: which name the
+// request arrived under is the question a member asks of these records.
+const (
+	AttrRequestMethod = "http.request.method"
+	AttrResponseCode  = "http.response.status_code"
+	AttrURLPath       = "url.path"
+	AttrProxyHost     = "kitbash.host"
+)
+
+// The two listeners the proxy binds, as health names them.
+const (
+	listenerProxy    = "proxy"
+	listenerProxyTLS = "proxy-tls"
+)
+
+// route is one name the proxy serves: which Process answers it, and on which
+// port of the loopback address. A port of zero is a Process that is registered
+// and has no container publishing anything, which is a name that answers 503
+// rather than one that is not served at all.
+type route struct {
+	host      string
+	id        string
+	owner     string
+	pkg       string
+	container string
+	port      int
+}
+
+// proxy holds the routing table and the two things built from it: the client
+// that forwards a request and, in acme mode, the certificates. Everything here
+// is read on the request path, so the lock is a read write one and the table is
+// replaced rather than walked.
+type proxy struct {
+	// domain is what the operator gave this host, empty for a host that has
+	// none, which is a proxy that routes nothing.
+	domain string
+	// mode is TLSACME or TLSGateway.
+	mode string
+
+	mu     sync.RWMutex
+	routes map[string]route
+
+	forwarder *httputil.ReverseProxy
+	// certs is the ACME client, nil in gateway mode and on a host with no
+	// domain.
+	certs *autocert.Manager
+}
+
+// routeKey carries the route one request was matched to from the handler into
+// the rewrite, so the forwarder is built once rather than per request.
+type routeKey struct{}
+
+// newProxy builds the proxy for one domain. An empty domain is a host that
+// routes nothing: every method still works and the table stays empty, so
+// nothing else in the daemon has to ask whether there is a proxy.
+func newProxy(domain, mode string) *proxy {
+	if mode == "" {
+		mode = TLSACME
+	}
+	p := &proxy{domain: domain, mode: mode, routes: map[string]route{}}
+	p.forwarder = &httputil.ReverseProxy{
+		Rewrite:      p.rewrite,
+		Transport:    proxyTransport(),
+		ErrorLog:     logger,
+		ErrorHandler: p.upstreamFailed,
+	}
+	return p
+}
+
+// proxyTransport is how the proxy reaches a Process: over loopback and nowhere
+// else. The dialler is the fan out's, which re-checks at connect time what the
+// routing table checked when it was built, so a name that somehow reached this
+// transport with an address in it still cannot take the daemon off the host.
+func proxyTransport() *http.Transport {
+	return &http.Transport{
+		DialContext:           dialLoopback,
+		MaxIdleConns:          64,
+		MaxIdleConnsPerHost:   8,
+		IdleConnTimeout:       IdleSubscriberTimeout,
+		ResponseHeaderTimeout: ProxyResponseHeaderTimeout,
+		// No HTTP/2 to the Process: a WebSocket upgrade is an HTTP/1.1
+		// connection the proxy hands over whole, and a Process that speaks
+		// HTTP/2 is not something kitbash negotiates for a member.
+		ForceAttemptHTTP2: false,
+	}
+}
+
+// enabled reports whether this host routes anything at all.
+func (p *proxy) enabled() bool { return p != nil && p.domain != "" }
+
+// acme reports whether this host obtains its own certificates.
+func (p *proxy) acme() bool { return p.enabled() && p.mode == TLSACME }
+
+// track puts one name on the table, replacing whatever the Process held
+// before. A Process that moved from one name to another leaves no entry
+// behind: the old name is dropped by id before the new one is written.
+func (p *proxy) track(r route) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.dropID(r.id)
+	p.routes[r.host] = r
+}
+
+// untrack takes one Process off the table, which is what stopping,
+// unregistering and removing it do.
+func (p *proxy) untrack(id string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.dropID(id)
+}
+
+// dropID removes every name one Process holds. The caller holds the lock.
+func (p *proxy) dropID(id string) {
+	for host, held := range p.routes {
+		if held.id == id {
+			delete(p.routes, host)
+		}
+	}
+}
+
+// reload replaces the whole table, which is what a restore does: the
+// registrations are the source of truth and a name nothing is registered under
+// any more is not served.
+func (p *proxy) reload(routes []route) {
+	table := make(map[string]route, len(routes))
+	for _, r := range routes {
+		table[r.host] = r
+	}
+	p.mu.Lock()
+	p.routes = table
+	p.mu.Unlock()
+}
+
+// lookup answers which Process serves one name.
+func (p *proxy) lookup(host string) (route, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	r, held := p.routes[host]
+	return r, held
+}
+
+// holds reports whether this host serves a name at all, which is what the
+// certificate policy asks: kitbashd obtains a certificate for the names it
+// routes and for no other, so a request for a name nobody registered costs the
+// host nothing at the certificate authority.
+func (p *proxy) holds(host string) bool {
+	_, held := p.lookup(host)
+	return held
+}
+
+// count is how many names are served, which health reports.
+func (p *proxy) count() int {
+	if p == nil {
+		return 0
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return len(p.routes)
+}
+
+// hostFor is the name one registration is served under: the one its unit
+// declared, or <name>.<member>.<domain>. It answers an empty string for every
+// Process that is not served at all, which is a host with no domain, a Process
+// that is not exposed over HTTP, one a run kit owns, because there is no
+// container of it here, and one whose name does not make a DNS name.
+//
+// A member's account name and a Process name are both held to patterns the
+// surface enforces, so the derived name is almost always valid; almost is not
+// always, because an account name may end in a hyphen and a DNS label may not.
+// Such a Process is not routed rather than routed under a name no resolver
+// answers.
+func hostFor(p store.Process, domain string) string {
+	if domain == "" || p.Expose != ExposeHTTP || p.Runner != "" {
+		return ""
+	}
+	if p.Hostname != "" {
+		if !manifest.ValidHostname(p.Hostname) {
+			return ""
+		}
+		return p.Hostname
+	}
+	return defaultHost(p.Name, p.Owner, domain)
+}
+
+// defaultHost is the name a Process that declares none is served under. The
+// member's label is the attribution: whose work a service is, is visible in
+// its address, see PLAN.md section 2.3.
+func defaultHost(name, owner, domain string) string {
+	if name == "" || owner == "" || domain == "" {
+		return ""
+	}
+	host := name + "." + owner + "." + domain
+	if !manifest.ValidHostname(host) {
+		return ""
+	}
+	return host
+}
+
+// heldNames is every name one registration claims: the declared one, whether
+// or not this host has a domain, and the derived one, which needs a domain to
+// exist at all. It is what a registration declaring a host name is checked
+// against, so two Processes never claim one name even on a host that routes
+// nothing yet.
+func heldNames(p store.Process, domain string) []string {
+	var names []string
+	if p.Hostname != "" {
+		names = append(names, p.Hostname)
+	}
+	if p.Expose == ExposeHTTP && p.Runner == "" {
+		if derived := defaultHost(p.Name, p.Owner, domain); derived != "" && derived != p.Hostname {
+			names = append(names, derived)
+		}
+	}
+	return names
+}
+
+// urlFor is the address a member is given for one Process, which proc_run
+// answers and proc_list shows. It is https whichever mode the host is in: in
+// acme mode kitbashd holds the certificate, in gateway mode the gateway in
+// front of it does, and either way the address a member hands to somebody is
+// the one with TLS on it.
+func urlFor(host string) string {
+	if host == "" {
+		return ""
+	}
+	return "https://" + host
+}
+
+// hostOf reads the name a request names itself with: the Host header without
+// its port, folded to lower case, held to what a DNS name may carry.
+//
+// This is the one place a client's own bytes decide anything, so it decides as
+// little as possible. A Host with a path, an at sign, a space or a control
+// character in it is not a name and is refused here rather than being looked
+// up, matched against a certificate policy or written into a span. An address
+// literal is refused too: kitbash routes names.
+func hostOf(raw string) (string, bool) {
+	host := raw
+	if strings.Contains(host, ":") {
+		split, _, err := net.SplitHostPort(host)
+		if err != nil {
+			return "", false
+		}
+		host = split
+	}
+	host = strings.ToLower(host)
+	if !manifest.ValidHostname(host) {
+		return "", false
+	}
+	return host, true
+}
+
+// ProxyHandler is the reverse proxy, for the listener and for a test that
+// serves it over its own.
+func (s *Server) ProxyHandler() http.Handler {
+	return recovered(http.HandlerFunc(s.serveProxy))
+}
+
+// serveProxy answers one request off the wire: it matches the Host against the
+// routing table and forwards, or it refuses.
+func (s *Server) serveProxy(w http.ResponseWriter, r *http.Request) {
+	host, ok := hostOf(r.Host)
+	if !ok {
+		// The Host itself is not repeated: it is a client's bytes and this is
+		// the answer to a request that carried something that is not a name.
+		writeProblem(w, problem.BadRequest(r.URL.Path,
+			"this request does not name a host kitbash could read",
+			"Request the address kitbash answered with, which is https://<name>.<member>.<domain>."))
+		return
+	}
+	target, held := s.proxy.lookup(host)
+	if !held {
+		writeProblem(w, problem.NotFoundFix(r.URL.Path,
+			fmt.Sprintf("no Process on this host is served at %s", host),
+			"Call proc_list to see which address each of your Processes answers on."))
+		return
+	}
+	if target.port == 0 {
+		// The name is served and the Process behind it is not running: its
+		// container publishes nothing, so there is nowhere to forward to. That
+		// is a different answer from a name nobody holds, and it is the one a
+		// member reads when they stopped their own Process.
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprintf(w, "%s is registered on this host and its Process is not running.\n", host)
+		s.recordForward(r, target, host, http.StatusServiceUnavailable, s.now(), s.now())
+		return
+	}
+	s.forward(w, r, target, host)
+}
+
+// forward hands one request to the Process and records what happened.
+func (s *Server) forward(w http.ResponseWriter, r *http.Request, target route, host string) {
+	start := s.now()
+	recorder := &recordingWriter{ResponseWriter: w}
+	s.proxy.forwarder.ServeHTTP(recorder, r.WithContext(context.WithValue(r.Context(), routeKey{}, target)))
+	s.recordForward(r, target, host, recorder.code(), start, s.now())
+}
+
+// rewrite builds the request the Process receives. Three things decide it and
+// none of them is a header the client sent.
+//
+// The address is the routing table's, which is the loopback port the runtime
+// says this Process's own container publishes. The Host the Process sees is
+// the one the request arrived under, because an application writes its own
+// addresses from it. And the three X-Forwarded headers are set here, which
+// replaces whatever the client sent: SetXForwarded writes the peer's address
+// into X-Forwarded-For rather than appending to a chain a client can write, so
+// a request cannot arrive claiming to come from somewhere else.
+//
+// X-Forwarded-Proto is the one value a gateway is believed about, and only in
+// gateway mode: the gateway is what terminated TLS, so it is the only thing
+// that knows whether the member out there was on https. In acme mode it is
+// https, because this daemon terminated TLS itself and plain 80 is redirected
+// before it reaches here.
+func (p *proxy) rewrite(r *httputil.ProxyRequest) {
+	target, ok := r.In.Context().Value(routeKey{}).(route)
+	if !ok {
+		return
+	}
+	r.SetURL(&url.URL{Scheme: "http", Host: net.JoinHostPort(LoopbackHost, strconv.Itoa(target.port))})
+	r.Out.Host = r.In.Host
+	r.SetXForwarded()
+	r.Out.Header.Set("X-Forwarded-Proto", p.forwardedProto(r.In))
+}
+
+// forwardedProto is what the Process is told the member reached this host over.
+func (p *proxy) forwardedProto(in *http.Request) string {
+	if p.mode != TLSGateway {
+		return "https"
+	}
+	// Only the two spellings, and only in gateway mode. Anything else is a
+	// value this daemon does not pass on: what reaches the Process is what
+	// kitbash is prepared to say about the request.
+	switch strings.ToLower(strings.TrimSpace(in.Header.Get("X-Forwarded-Proto"))) {
+	case "http":
+		return "http"
+	case "https":
+		return "https"
+	}
+	// A gateway terminated TLS in front of this host, which is what this mode
+	// is, so https is what a request that says nothing is.
+	return "https"
+}
+
+// upstreamFailed answers a Process that could not be reached or that closed
+// the connection mid answer. The runtime's own words stay in the daemon log,
+// which is the operator's.
+func (p *proxy) upstreamFailed(w http.ResponseWriter, r *http.Request, err error) {
+	logger.Printf("proxy: forwarding a request for %s: %v", r.Host, err)
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusBadGateway)
+	fmt.Fprintln(w, "The Process serving this address did not answer.")
+}
+
+// recordingWriter is the response writer the forwarder is given, which
+// remembers the status for the span and hands everything else through. A
+// WebSocket upgrade takes the connection over, so Hijack and Flush are passed
+// on as well: a wrapper that swallowed either would break streaming and
+// upgrades, which are the two things an http Process does that a JSON API does
+// not.
+type recordingWriter struct {
+	http.ResponseWriter
+	status int
+	wrote  bool
+}
+
+func (w *recordingWriter) WriteHeader(code int) {
+	if !w.wrote {
+		w.status = code
+		w.wrote = true
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *recordingWriter) Write(b []byte) (int, error) {
+	if !w.wrote {
+		w.status = http.StatusOK
+		w.wrote = true
+	}
+	return w.ResponseWriter.Write(b)
+}
+
+// Unwrap is what http.ResponseController follows to find the writer's own
+// Flush and Hijack.
+func (w *recordingWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+func (w *recordingWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (w *recordingWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hijacker, ok := w.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("daemon: this connection cannot be handed over to a Process")
+	}
+	if !w.wrote {
+		// The forwarder writes the 101 to the connection itself once it has
+		// it, so this is where an upgrade is recorded.
+		w.status = http.StatusSwitchingProtocols
+		w.wrote = true
+	}
+	return hijacker.Hijack()
+}
+
+// code is the status of the response, or 502 for a forward that wrote nothing
+// at all, which is a Process that dropped the connection before the header.
+func (w *recordingWriter) code() int {
+	if !w.wrote {
+		return http.StatusBadGateway
+	}
+	return w.status
+}
+
+// recordForward writes the one span a forwarded request produces. It carries
+// the four attributes of PLAN.md section 2.4, so a member's query by user
+// answers what was requested of their Processes, plus the method, the status,
+// the path and the name it arrived under. No body is read and no header is
+// copied: a span per request has to stay cheap.
+func (s *Server) recordForward(r *http.Request, target route, host string, status int, start, end time.Time) {
+	traceID, parentID := traceContext(r.Header.Get("traceparent"))
+	spanID, err := randomID(spanIDBytes)
+	if err != nil {
+		logger.Printf("proxy: could not record a request for %s: %v", host, err)
+		return
+	}
+	export := store.Export{Spans: []store.Span{{
+		TraceID:      traceID,
+		SpanID:       spanID,
+		ParentSpanID: parentID,
+		Name:         ProxySpan,
+		StartNS:      start.UnixNano(),
+		EndNS:        end.UnixNano(),
+		Status:       spanStatus(status),
+		Attributes: store.Attributes{
+			User:     target.owner,
+			Package:  target.pkg,
+			Process:  target.id,
+			Path:     r.URL.Path,
+			Producer: InternalProducer,
+			Other: map[string]any{
+				AttrRequestMethod: r.Method,
+				AttrResponseCode:  status,
+				AttrURLPath:       r.URL.Path,
+				AttrProxyHost:     host,
+			},
+		},
+	}}}
+	write, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), HealthWriteTimeout)
+	defer cancel()
+	if err := s.store.Insert(write, export); err != nil {
+		logger.Printf("proxy: could not record a request for %s: %v", host, err)
+		return
+	}
+	s.fanout.dispatch(export, InternalProducer)
+}
+
+// spanStatus is what the store records about one forwarded request. A status
+// the Process answered is the Process's business, so only a request kitbash
+// could not forward is an error.
+func spanStatus(status int) string {
+	if status == http.StatusBadGateway || status == http.StatusServiceUnavailable {
+		return "error"
+	}
+	return "ok"
+}
+
+// The widths of a trace id and a span id, in bytes, as W3C trace context and
+// the query surface spell them.
+const (
+	traceIDBytes = 16
+	spanIDBytes  = 8
+)
+
+// traceContext reads the caller's traceparent, so a request that arrived with
+// one is recorded in that trace rather than in a trace of its own. A header
+// this daemon cannot read is one trace id it makes up: a span with a broken
+// parent would be a span nothing finds.
+func traceContext(header string) (traceID, parentID string) {
+	fields := strings.Split(strings.TrimSpace(header), "-")
+	if len(fields) == 4 && fields[0] == "00" &&
+		validHex(fields[1], traceIDBytes*2) && validHex(fields[2], spanIDBytes*2) &&
+		strings.Trim(fields[1], "0") != "" && strings.Trim(fields[2], "0") != "" {
+		return strings.ToLower(fields[1]), strings.ToLower(fields[2])
+	}
+	id, err := randomID(traceIDBytes)
+	if err != nil {
+		return "", ""
+	}
+	return id, ""
+}
+
+// validHex reports whether a field is exactly that many lower case hex
+// characters, which is what an identifier on the wire is.
+func validHex(field string, width int) bool {
+	if len(field) != width {
+		return false
+	}
+	_, err := hex.DecodeString(strings.ToLower(field))
+	return err == nil
+}
+
+// randomID mints one trace or span id.
+func randomID(width int) (string, error) {
+	b := make([]byte, width)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// routePort is the port one Process is forwarded to: the port its own
+// container publishes on the host, read off the runtime as the owner.
+//
+// The registration's endpoint is where the port is read from and it is never
+// what decides: kitbash-mcp runs as the member, so the endpoint it sent is a
+// claim, and the claim is held to what the runtime says that container
+// publishes. This is the discovery the health probe is held to, for the same
+// reason, see verifyProbe: a port the member chose would turn a registration
+// into a way to have kitbashd forward the internet at a neighbour's Process.
+//
+// A Process whose container is not there yet, or whose container publishes
+// nothing, has no port. That is not a refusal: the name stays on the table and
+// answers 503 until the start that creates the container puts the port on it.
+func (s *Server) routePort(ctx context.Context, m sysusers.Member, p store.Process) int {
+	if p.Container == "" || p.Runner != "" {
+		return 0
+	}
+	port, ok := endpointPort(p.Endpoint)
+	if !ok {
+		return 0
+	}
+	config, err := s.runner.ContainerConfig(ctx, m, p.Container)
+	if err != nil {
+		return 0
+	}
+	if !publishes(config, port) {
+		return 0
+	}
+	return port
+}
+
+// publishes reports whether one container publishes a host port, which is the
+// one question both the health probe and the proxy ask of the runtime.
+func publishes(config sysusers.ContainerConfig, port int) bool {
+	for _, published := range config.Publish {
+		if published.HostPort == port {
+			return true
+		}
+	}
+	return false
+}
+
+// trackRoute puts one registration on the routing table, or takes it off. It
+// is what a registration, a start and a restore each call for one Process.
+func (s *Server) trackRoute(ctx context.Context, m sysusers.Member, p store.Process) {
+	if !s.proxy.enabled() {
+		return
+	}
+	host := hostFor(p, s.proxy.domain)
+	if host == "" {
+		s.proxy.untrack(p.ID)
+		return
+	}
+	s.proxy.track(route{
+		host:      host,
+		id:        p.ID,
+		owner:     p.Owner,
+		pkg:       p.Package,
+		container: p.Container,
+		port:      s.routePort(ctx, m, p),
+	})
+}
+
+// trackRouteFor is trackRoute for a caller that has not looked the owner up. A
+// member this daemon cannot look up is a Process it cannot read a port for, so
+// the name is not served.
+func (s *Server) trackRouteFor(ctx context.Context, p store.Process) {
+	if !s.proxy.enabled() {
+		return
+	}
+	m, found, err := s.users.Lookup(ctx, p.Owner)
+	if err != nil || !found {
+		s.proxy.untrack(p.ID)
+		return
+	}
+	s.trackRoute(ctx, m, p)
+}
+
+// LoadRoutes builds the routing table from the registrations kitbashd holds,
+// which is what makes a name survive a reboot: the names travel with the
+// registration, so a restore rebuilds the table rather than waiting for every
+// member to run their Processes again.
+//
+// It replaces the table rather than adding to it, so a name whose registration
+// is gone stops being served.
+func (s *Server) LoadRoutes(ctx context.Context) int {
+	if !s.proxy.enabled() {
+		return 0
+	}
+	list, err := s.store.Processes(ctx, "")
+	if err != nil {
+		logger.Printf("proxy: could not read the registered Processes: %v", err)
+		return 0
+	}
+	members := map[string]sysusers.Member{}
+	var routes []route
+	held := map[string]string{}
+	for _, p := range list {
+		host := hostFor(p, s.proxy.domain)
+		if host == "" {
+			continue
+		}
+		if other, taken := held[host]; taken {
+			// Two registrations claiming one name is not something a request
+			// can be answered from, so the first one keeps it. Registration
+			// refuses this, so a table that finds it is reading rows written
+			// before the check existed or under another domain.
+			logger.Printf("proxy: %s is claimed by the Processes %s and %s; %s keeps it",
+				host, other, p.ID, other)
+			continue
+		}
+		m, known := members[p.Owner]
+		if !known {
+			looked, found, err := s.users.Lookup(ctx, p.Owner)
+			if err != nil || !found {
+				logger.Printf("proxy: not serving %s: %s owns it and could not be looked up: %v",
+					host, p.Owner, err)
+				continue
+			}
+			m = looked
+			members[p.Owner] = m
+		}
+		held[host] = p.ID
+		routes = append(routes, route{
+			host:      host,
+			id:        p.ID,
+			owner:     p.Owner,
+			pkg:       p.Package,
+			container: p.Container,
+			port:      s.routePort(ctx, m, p),
+		})
+	}
+	s.proxy.reload(routes)
+	if len(routes) > 0 {
+		logger.Printf("proxy: serving %d name(s) under %s", len(routes), s.proxy.domain)
+	}
+	return len(routes)
+}
+
+// hostConflict refuses a registration that declares a name another Process on
+// this host already holds, which is conflict at proc_run, see PLAN.md section
+// 2.3. A name is one Process's: two of them would be a request nobody can
+// answer, and the member who declared it second is the one who can change it.
+//
+// Only a declared name is checked, because a derived name is the Process's own
+// by construction: it carries the owner's account name and the Process name,
+// which is unique for that member. What a declared name is checked against is
+// both kinds, the declared names of other Processes and their derived ones.
+func (s *Server) hostConflict(ctx context.Context, instance string, p store.Process) *problem.Problem {
+	if p.Hostname == "" {
+		return nil
+	}
+	list, err := s.store.Processes(ctx, "")
+	if err != nil {
+		return problem.Internal(instance, err.Error(), "")
+	}
+	for _, other := range list {
+		if other.ID == p.ID {
+			// A re-registration of the same Process keeps its own name.
+			continue
+		}
+		for _, name := range heldNames(other, s.proxy.domain) {
+			if name != p.Hostname {
+				continue
+			}
+			return problem.ConflictFix(instance,
+				fmt.Sprintf("the host name %s is already served by another Process on this host", p.Hostname),
+				"Declare another deploy.units[0].hostname, or stop the Process that holds this one.")
+		}
+	}
+	return nil
+}
+
+// certManager is the ACME client of a host in acme mode: one certificate per
+// host name, cached under the daemon's own directory, and obtained for the
+// names in the routing table and for no others.
+//
+// There is no wildcard certificate. A wildcard covers one label and the
+// default names have two, see PLAN.md section 2.3.
+func (s *Server) certManager(dir string) (*autocert.Manager, error) {
+	if dir == "" {
+		dir = DefaultCertDir
+	}
+	if err := os.MkdirAll(dir, CertDirMode); err != nil {
+		return nil, fmt.Errorf("daemon: the certificate directory %s: %w", dir, err)
+	}
+	if err := os.Chmod(dir, CertDirMode); err != nil {
+		return nil, fmt.Errorf("daemon: the certificate directory %s: %w", dir, err)
+	}
+	return &autocert.Manager{
+		Cache:  autocert.DirCache(dir),
+		Prompt: autocert.AcceptTOS,
+		HostPolicy: func(_ context.Context, host string) error {
+			name, ok := hostOf(host)
+			if !ok || !s.proxy.holds(name) {
+				return fmt.Errorf("daemon: this host serves no Process at %q", host)
+			}
+			return nil
+		},
+	}, nil
+}
+
+// ServeProxy answers the plain HTTP listener until ctx is done.
+//
+// What it serves depends on the mode. In gateway mode this is the whole proxy:
+// a gateway in front of the host terminated TLS and forwards here. In acme
+// mode it is the ACME client's own handler, which answers the HTTP-01
+// challenge on its one path and redirects everything else to https, because
+// this daemon holds the certificates and plain HTTP is not how a Process is
+// reached.
+//
+// Nothing after the bind needs root. The listener is opened by the caller,
+// before or after it drops anything it likes; this handler reads the routing
+// table, opens loopback connections and writes the store, all of which the
+// daemon does as itself.
+func (s *Server) ServeProxy(ctx context.Context, ln net.Listener) error {
+	handler := s.ProxyHandler()
+	if s.proxy.acme() && s.proxy.certs != nil {
+		handler = s.proxy.certs.HTTPHandler(http.HandlerFunc(redirectToHTTPS))
+	}
+	return s.serveProxyListener(ctx, ln, listenerProxy, handler, nil)
+}
+
+// ServeProxyTLS answers the HTTPS listener until ctx is done. It exists in
+// acme mode alone: in gateway mode the gateway holds the certificate.
+func (s *Server) ServeProxyTLS(ctx context.Context, ln net.Listener) error {
+	if !s.proxy.acme() || s.proxy.certs == nil {
+		return fmt.Errorf("daemon: this host does not terminate TLS itself, so there is no listener for 443")
+	}
+	return s.serveProxyListener(ctx, ln, listenerProxyTLS, s.ProxyHandler(), s.proxy.certs)
+}
+
+// serveProxyListener runs one of the two listeners. The timeouts are the
+// proxy's own and not the API's: a Process that streams holds a response open
+// for as long as it likes, so there is no write timeout and no idle timeout
+// here, and the header timeout is what bounds a connection that says nothing.
+func (s *Server) serveProxyListener(ctx context.Context, ln net.Listener, kind string,
+	handler http.Handler, certs *autocert.Manager) error {
+	s.bind(kind, ln.Addr().String())
+	defer s.bind(kind, "")
+	srv := &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: ProxyReadHeaderTimeout,
+		ErrorLog:          logger,
+	}
+	errs := make(chan error, 1)
+	go func() {
+		if certs != nil {
+			srv.TLSConfig = certs.TLSConfig()
+			errs <- srv.ServeTLS(limit(ln, s.maxConns), "", "")
+			return
+		}
+		errs <- srv.Serve(limit(ln, s.maxConns))
+	}()
+	select {
+	case err := <-errs:
+		if isServerClosed(err) {
+			return nil
+		}
+		return fmt.Errorf("daemon: serve the proxy: %w", err)
+	case <-ctx.Done():
+		shutdown, cancel := context.WithTimeout(context.WithoutCancel(ctx), ProxyShutdownTimeout)
+		defer cancel()
+		if err := srv.Shutdown(shutdown); err != nil {
+			srv.Close()
+		}
+		return nil
+	}
+}
+
+// isServerClosed reports the error a listener that was shut down answers with.
+func isServerClosed(err error) bool {
+	return err == nil || errors.Is(err, http.ErrServerClosed)
+}
+
+// redirectToHTTPS is what plain HTTP gets in acme mode, everything but the
+// ACME challenge path the client's own handler answers first.
+func redirectToHTTPS(w http.ResponseWriter, r *http.Request) {
+	host, ok := hostOf(r.Host)
+	if !ok {
+		writeProblem(w, problem.BadRequest(r.URL.Path,
+			"this request does not name a host kitbash could read",
+			"Request the address kitbash answered with, which is https://<name>.<member>.<domain>."))
+		return
+	}
+	target := url.URL{Scheme: "https", Host: host, Path: r.URL.Path, RawQuery: r.URL.RawQuery}
+	http.Redirect(w, r, target.String(), http.StatusMovedPermanently)
+}

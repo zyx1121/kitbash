@@ -91,6 +91,42 @@ that skipped it has the receiver open; operator rules belong in
 `/etc/nftables.d/<name>.nft`, which that file includes after kitbash's own table
 and `install.sh` never touches.
 
+**Give the host a domain.** Optional, and what turns the reverse proxy on. With
+one, every Process with `expose: http` is reached at
+`https://<name>.<member>.<domain>`: `proc_run` answers the address and
+`proc_list` shows it, so sharing a web application is giving somebody its
+address. Set it at install, or later in `/etc/conf.d/kitbashd` followed by
+`rc-service kitbashd restart`:
+
+```sh
+KITBASH_DOMAIN=kitbash.example.org sh /usr/share/kitbash/install.sh
+```
+
+The DNS record is one wildcard: `*.kitbash.example.org` and
+`kitbash.example.org` both pointing at the host's public address. Two labels
+are below the domain, `<name>.<member>`, so the record has to be `*` at that
+level or a wildcard covering both, which is what a provider's `*` record under
+a delegated zone does.
+
+`KITBASH_TLS` decides who holds the certificate. `acme`, the default with a
+domain, has kitbashd listen on 80 and 443 and obtain one certificate per host
+name from Let's Encrypt, which needs both ports reachable from the internet.
+There is no wildcard certificate, because a wildcard covers one label and these
+names have two. `gateway` has kitbashd listen on 80 alone and trust the `Host`
+a gateway in front of it forwards, which is how a host behind one public
+address is put on the internet: the gateway holds a wildcard certificate for
+the domain and forwards everything under it. With Caddy:
+
+```caddyfile
+*.kitbash.example { tls { dns cloudflare {env.CF_API_TOKEN} } reverse_proxy <host>:80 }
+```
+
+install.sh writes `KITBASH_DOMAIN` and `KITBASH_TLS` to `/etc/conf.d/kitbashd`
+and opens 80, and 443 in `acme` mode, in the ruleset above. Running it again
+without either variable leaves the file as it is. A host with no domain routes
+nothing and an `http` Process keeps its internal port, which is how kitbash
+works without this.
+
 **Or boot the ISO.** `kitbash-0.11.0-x86_64.iso` and `kitbash-0.11.0-aarch64.iso`
 on the release are Alpine's own image with the kitbashd apk and its
 dependencies on it. Booted from a VM's CD drive either comes up as a working
@@ -155,6 +191,8 @@ Processes back the way a reboot does.
 | `/home/<member>` | A member's Files, a git repository, mode 0700 |
 | `/var/lib/kitbash/kitbashd.db` | Telemetry, Process registrations, approvals and settings. Root only |
 | `/var/lib/kitbash/secrets/<member>/<NAME>` | The values a member set with `secrets_set`. Root only, 0700 and 0600, outside the database so the nightly backup carries none |
+| `/var/lib/kitbash/certs` | The certificates the reverse proxy obtained in `acme` mode. Root only, 0700 |
+| `/etc/conf.d/kitbashd` | What the host tells kitbashd about itself, `KITBASH_DOMAIN` and `KITBASH_TLS` among them |
 | `/var/log/kitbashd.log` | The daemon's log, both streams of the OpenRC service |
 | `/org/.archive/<member>` | The home of a removed member, root only and invisible to the surface |
 

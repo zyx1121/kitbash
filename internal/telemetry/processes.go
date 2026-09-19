@@ -98,13 +98,20 @@ func EndpointForProcesses() string {
 // registered without one is permitted nothing, so the difference between "no
 // permits" and "an older kitbash-mcp" is not one kitbashd has to guess at.
 type Registration struct {
-	ID            string           `json:"id"`
-	Package       string           `json:"package"`
-	Name          string           `json:"name"`
-	Container     string           `json:"container,omitempty"`
-	Digest        string           `json:"digest,omitempty"`
-	Expose        string           `json:"expose"`
-	Endpoint      string           `json:"endpoint,omitempty"`
+	ID        string `json:"id"`
+	Package   string `json:"package"`
+	Name      string `json:"name"`
+	Container string `json:"container,omitempty"`
+	Digest    string `json:"digest,omitempty"`
+	Expose    string `json:"expose"`
+	Endpoint  string `json:"endpoint,omitempty"`
+	// Hostname is the name deploy.units[0].hostname declared, sent only when
+	// the unit declares one. Without it kitbashd serves the Process under the
+	// name it derives from the Process name, the owner and the host's domain;
+	// with it the daemon serves that name instead, and refuses the
+	// registration when another Process on the host already holds it, see
+	// PLAN.md section 2.3.
+	Hostname      string           `json:"hostname,omitempty"`
 	Subscriptions []string         `json:"subscriptions,omitempty"`
 	Permits       manifest.Permits `json:"permits"`
 	// Runner is the Package path of the run kit that owns this Process, empty
@@ -180,10 +187,16 @@ type Registered struct {
 	// Digest and Runner are what proc_list reads for a Process a run kit
 	// owns: it has no container here, so this record is the only thing that
 	// says which image it runs and which kit to stop it through.
-	Digest        string   `json:"digest,omitempty"`
-	Runner        string   `json:"runner,omitempty"`
-	Expose        string   `json:"expose,omitempty"`
-	Endpoint      string   `json:"endpoint,omitempty"`
+	Digest   string `json:"digest,omitempty"`
+	Runner   string `json:"runner,omitempty"`
+	Expose   string `json:"expose,omitempty"`
+	Endpoint string `json:"endpoint,omitempty"`
+	// Host is the name kitbashd serves this Process under, empty on a host
+	// with no domain and for a Process that is not exposed over HTTP. It is
+	// the daemon's answer and not the declaration: the derived name for a
+	// Process that declared none, the declared one for a Process that did.
+	// proc_list publishes it as the Process's url.
+	Host          string   `json:"host,omitempty"`
 	Subscriptions []string `json:"subscriptions,omitempty"`
 	Owner         string   `json:"owner,omitempty"`
 	Admin         bool     `json:"admin,omitempty"`

@@ -172,6 +172,17 @@ type Options struct {
 	// DefaultProcRoot. It exists for tests, which run no containers and stage
 	// a tree of their own in its shape.
 	ProcRoot string
+	// Domain is the domain this host was given, KITBASH_DOMAIN at install.
+	// Empty is a host with no route from the outside: nothing is routed and an
+	// http Process keeps its internal port, which is every kitbash host before
+	// the proxy existed, see PLAN.md section 2.3.
+	Domain string
+	// TLS is how this host terminates TLS, TLSACME or TLSGateway. Empty means
+	// TLSACME, which is the default with a domain.
+	TLS string
+	// CertDir is where the certificates of acme mode are cached. Empty means
+	// DefaultCertDir. It exists for tests, the same way SecretsDir does.
+	CertDir string
 	// NoRestore stops the daemon from starting the registered Processes,
 	// which an operator sets with KITBASH_NO_RESTORE to bring a host up
 	// without its Processes, and a test sets to keep the runtime out of it.
@@ -226,6 +237,11 @@ type Server struct {
 	// requests, see health.go. The loop that requests them is started by the
 	// caller after restore.
 	probes *prober
+	// proxy is the routing table of every Process with expose: http and the
+	// two listeners built from it, see proxy.go. On a host with no domain it
+	// exists and routes nothing, so nothing else here has to ask whether there
+	// is a proxy.
+	proxy *proxy
 
 	// The MCP endpoint of the Process receiver: the handler of the SDK, the
 	// live sessions, the binary each one runs and how long one may sit idle,
@@ -297,6 +313,7 @@ func New(st *store.Store, opts Options) *Server {
 		actions:  newActionLock(),
 		fetches:  newFetchLock(),
 		probes:   newProber(opts.HealthMinInterval),
+		proxy:    newProxy(opts.Domain, opts.TLS),
 
 		mcpSessions: newMCPRegistry(),
 		mcpBinary:   mcpBinaryPath(opts.MCPBinary),
@@ -350,6 +367,18 @@ func New(st *store.Store, opts Options) *Server {
 		s.now = time.Now
 	}
 	s.started = s.now()
+	// The certificates of acme mode are the daemon's own: the directory is
+	// made here, at start, rather than on the first request for a name, so an
+	// operator reads the failure in the log of a daemon that started rather
+	// than in the first refused handshake.
+	if s.proxy.acme() {
+		certs, err := s.certManager(opts.CertDir)
+		if err != nil {
+			logger.Printf("%v; this host serves no certificates of its own until that is fixed", err)
+		} else {
+			s.proxy.certs = certs
+		}
+	}
 	s.routes()
 	go s.mcpSweepLoop()
 	go s.internalWriter()
@@ -459,10 +488,15 @@ func (s *Server) bind(kind, address string) {
 		s.bound.Socket = address
 	case listenerTCP:
 		s.bound.TCP = address
+	case listenerProxy:
+		s.bound.Proxy = address
+	case listenerProxyTLS:
+		s.bound.ProxyTLS = address
 	}
 }
 
-// The two listeners health names.
+// The listeners health names. The last two are the reverse proxy's, which a
+// host with no domain does not bind at all, see proxy.go.
 const (
 	listenerSocket = "socket"
 	listenerTCP    = "tcp"

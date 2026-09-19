@@ -26,6 +26,7 @@ package() {
 	install -Dm755 kitbash-mcp "$pkgdir"/usr/bin/kitbash-mcp
 	install -Dm755 kitbashd "$pkgdir"/usr/bin/kitbashd
 	install -Dm755 packaging/openrc/kitbashd.initd "$pkgdir"/etc/init.d/kitbashd
+	install -Dm644 packaging/openrc/kitbashd.confd "$pkgdir"/etc/conf.d/kitbashd
 	install -Dm755 deploy/kitbash-adduser "$pkgdir"/usr/bin/kitbash-adduser
 	install -Dm755 deploy/install.sh "$pkgdir"/usr/share/kitbash/install.sh
 	install -Dm755 deploy/rootless-prereqs.sh "$pkgdir"/usr/share/kitbash/rootless-prereqs.sh

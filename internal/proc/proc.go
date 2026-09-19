@@ -54,8 +54,12 @@ type Process struct {
 	Expose   string `json:"expose,omitempty"`
 	Endpoint string `json:"endpoint,omitempty"`
 	// URL is the address kitbashd's proxy serves an http Process at, when the
-	// host has a domain. It is empty on a host without one, and on every
-	// Process that is not exposed as http.
+	// host has a domain: https://<name>.<member>.<domain>, or the name the
+	// unit declared. It is empty on a host without one, which routes nothing
+	// and leaves an http Process with its internal port alone, and on every
+	// Process that is not exposed as http. kitbashd is what assigns it, so it
+	// is read back from the registration rather than worked out here, see
+	// PLAN.md section 2.3.
 	URL       string   `json:"url,omitempty"`
 	StartedAt string   `json:"startedAt,omitempty"`
 	Tools     []string `json:"tools,omitempty"`
@@ -390,10 +394,14 @@ func (s *Service) run(ctx context.Context, span *telemetry.Span, path, digest, n
 		// The container name and the image are what boot restore starts from,
 		// so they are registered with the Process rather than read back from a
 		// manifest at boot, see registration_fields in spec/kitbashd-api.yaml.
-		Container:     container,
-		Digest:        image.ID,
-		Expose:        unit.Expose,
-		Endpoint:      endpoint,
+		Container: container,
+		Digest:    image.ID,
+		Expose:    unit.Expose,
+		Endpoint:  endpoint,
+		// The one name this unit declared for itself, if it declared one.
+		// kitbashd decides whether it may hold it: a name another Process on
+		// the host already serves is a conflict, see PLAN.md section 2.3.
+		Hostname:      unit.Hostname,
 		Subscriptions: m.Subscriptions(),
 		// What this Process may call back over /mcp. The manifest is the
 		// declaration, so a Package that asks for nothing gets an empty
@@ -451,6 +459,9 @@ func (s *Service) run(ctx context.Context, span *telemetry.Span, path, digest, n
 	// the daemon is the one that resolved them.
 	if held, ok := s.registered(ctx)[process.ID]; ok {
 		process.Mounts = held.Mounts
+		// And the address it answers on, which is the daemon's to assign: it
+		// holds the domain and the routing table, see PLAN.md section 2.3.
+		process.URL = processURL(held.Host)
 	}
 	return &process, nil
 }
@@ -524,6 +535,7 @@ func (s *Service) List(ctx context.Context) (*ListResult, *problem.Problem) {
 			// registration knows what kitbash agreed to bind, which is the
 			// one a member reads.
 			process.Mounts = reported.Mounts
+			process.URL = processURL(reported.Host)
 		}
 		result.Processes = append(result.Processes, process)
 	}
@@ -563,6 +575,18 @@ func (s *Service) registered(ctx context.Context) map[string]telemetry.Registere
 		entries[entry.ID] = entry
 	}
 	return entries
+}
+
+// processURL is the address of one Process, from the name kitbashd serves it
+// under. It is https whichever way the host terminates TLS: kitbashd holds the
+// certificate in acme mode and the gateway in front of it does in gateway
+// mode, so the address a member hands to somebody has TLS on it either way,
+// see PLAN.md section 2.3.
+func processURL(host string) string {
+	if host == "" {
+		return ""
+	}
+	return "https://" + host
 }
 
 // health is the probe one unit declares, or nothing. A unit that declares a

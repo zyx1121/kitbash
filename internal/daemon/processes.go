@@ -75,13 +75,18 @@ var uuidV7 = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-
 // kitbash-mcp sends no block, and the surface it would otherwise be given is
 // its owner's whole one.
 type processRequest struct {
-	ID            string           `json:"id"`
-	Package       string           `json:"package"`
-	Name          string           `json:"name,omitempty"`
-	Container     string           `json:"container,omitempty"`
-	Digest        string           `json:"digest,omitempty"`
-	Expose        string           `json:"expose"`
-	Endpoint      string           `json:"endpoint,omitempty"`
+	ID        string `json:"id"`
+	Package   string `json:"package"`
+	Name      string `json:"name,omitempty"`
+	Container string `json:"container,omitempty"`
+	Digest    string `json:"digest,omitempty"`
+	Expose    string `json:"expose"`
+	Endpoint  string `json:"endpoint,omitempty"`
+	// Hostname is the one name deploy.units[0].hostname declared, which
+	// kitbashd serves this Process under in place of the name it derives. A
+	// name another Process on this host already holds is a conflict, see
+	// proxy.go.
+	Hostname      string           `json:"hostname,omitempty"`
 	Subscriptions []string         `json:"subscriptions,omitempty"`
 	Permits       manifest.Permits `json:"permits,omitempty"`
 	// Runner is the Package path of the run kit that owns this Process, sent
@@ -121,6 +126,12 @@ type processResponse struct {
 	ID           string `json:"id"`
 	Token        string `json:"token"`
 	FanoutSecret string `json:"fanoutSecret"`
+	// Host is the name the reverse proxy serves this Process under, absent on
+	// a host with no domain and for a Process that is not exposed over HTTP.
+	// It is the daemon's answer rather than the declaration: the derived name
+	// for a Process that declared none, the declared one for a Process that
+	// did, see proxy.go.
+	Host string `json:"host,omitempty"`
 }
 
 // processList is what processes_list answers, without a token anywhere in it.
@@ -137,6 +148,11 @@ type listedProcess struct {
 	store.Process
 	Problem string `json:"problem,omitempty"`
 	Fix     string `json:"problemFix,omitempty"`
+	// Host is the name the reverse proxy serves this Process under. Like the
+	// problem it is not a column: it is derived from the registration and the
+	// domain this host was given, so a host that gains a domain serves every
+	// Process that was already registered under it, see proxy.go.
+	Host string `json:"host,omitempty"`
 }
 
 // processes answers POST and GET on /kitbash/v1/processes.
@@ -207,6 +223,7 @@ func (s *Server) registerProcess(w http.ResponseWriter, r *http.Request, caller 
 		Digest:        req.Digest,
 		Expose:        req.Expose,
 		Endpoint:      req.Endpoint,
+		Hostname:      req.Hostname,
 		Subscriptions: req.Subscriptions,
 		Runner:        req.Runner,
 		Permits:       req.Permits,
@@ -222,6 +239,13 @@ func (s *Server) registerProcess(w http.ResponseWriter, r *http.Request, caller 
 	verified, prob := s.checkedProbe(r, caller, p)
 
 	if prob != nil {
+		writeProblem(w, prob)
+		return
+	}
+	// A declared host name is checked against the names the other Processes
+	// on this host hold, before the row is written: one name is one Process's,
+	// and the member who declared it second is the one who can change it.
+	if prob := s.hostConflict(r.Context(), r.URL.Path, p); prob != nil {
 		writeProblem(w, prob)
 		return
 	}
@@ -252,7 +276,13 @@ func (s *Server) registerProcess(w http.ResponseWriter, r *http.Request, caller 
 	} else {
 		s.probes.untrack(p.ID)
 	}
-	writeJSON(w, r.URL.Path, processResponse{ID: p.ID, Token: token, FanoutSecret: secret})
+	// The name is served from the registration, whether or not the container
+	// exists yet: a Process that is registered and not running answers 503 on
+	// its own name rather than looking like a name nobody holds.
+	s.trackRouteFor(r.Context(), p)
+	writeJSON(w, r.URL.Path, processResponse{
+		ID: p.ID, Token: token, FanoutSecret: secret, Host: hostFor(p, s.proxy.domain),
+	})
 }
 
 // checkedProbe holds one registration's declared probe to the ports its
@@ -302,7 +332,7 @@ func (s *Server) listProcesses(w http.ResponseWriter, r *http.Request, caller Ca
 	// probe saw.
 	listed := make([]listedProcess, 0, len(list))
 	for _, p := range s.withReadings(list) {
-		entry := listedProcess{Process: p}
+		entry := listedProcess{Process: p, Host: hostFor(p, s.proxy.domain)}
 		if prob := s.processProblem(p.ID); prob.Detail != "" {
 			entry.Problem = prob.Detail
 			entry.Fix = prob.Fix
@@ -382,6 +412,9 @@ func (s *Server) unregisterProcess(w http.ResponseWriter, r *http.Request, id st
 	// Nothing is probed for a Process nobody runs. A request already in
 	// flight for it is answered to nobody, see probeOnce.
 	s.probes.untrack(id)
+	// And nothing is routed to it: the name a Process held is served while it
+	// is registered and not a moment longer.
+	s.proxy.untrack(id)
 	// The token that opened them is revoked, so the sessions it opened are
 	// over and the kitbash-mcp of each one exits.
 	s.endMCPSessions(id)
@@ -468,6 +501,9 @@ func validateProcess(instance string, req processRequest) *problem.Problem {
 	if prob := validateHealth(instance, req.Health); prob != nil {
 		return prob
 	}
+	if prob := validateHostname(instance, req); prob != nil {
+		return prob
+	}
 	// The count is held here rather than in the resolution, so a registration
 	// declaring a hundred mounts is one refusal and not a hundred opens.
 	if len(req.Mounts) > mounts.Max {
@@ -522,6 +558,40 @@ func validateSecrets(instance string, names []string) *problem.Problem {
 			return refuse(fmt.Sprintf("%s is declared twice", name))
 		}
 		seen[name] = true
+	}
+	return nil
+}
+
+// validateHostname checks the one name a unit declares for itself. It is held
+// to the same shape spec/manifest.schema.json holds it to, checked again here
+// because a registration is a request and not a manifest: kitbash-mcp runs as
+// the member, so what it sends about a unit is a claim.
+//
+// Two rules beyond the shape. A name is served for a Process that is exposed
+// over HTTP, because that is the Process a name leads to; declaring one on any
+// other exposure is asking for something that does not exist. And a Process a
+// run kit owns is not served by kitbashd at all: there is no container of it
+// here, so the daemon has nothing to forward to, the same reason it probes
+// none, see verifyProbe.
+func validateHostname(instance string, req processRequest) *problem.Problem {
+	if req.Hostname == "" {
+		return nil
+	}
+	if !manifest.ValidHostname(req.Hostname) {
+		return problem.BadRequest(instance,
+			fmt.Sprintf("%q is not a host name kitbashd serves", req.Hostname),
+			fmt.Sprintf("Declare deploy.units[0].hostname as a lower case DNS name of at least two labels and at most %d bytes, such as app.example.org.", manifest.MaxHostname))
+	}
+	if req.Expose != ExposeHTTP {
+		return problem.BadRequest(instance,
+			fmt.Sprintf("this unit declares the host name %s and is exposed as %s, so there is nothing at that name to reach",
+				req.Hostname, req.Expose),
+			"Declare deploy.units[0].expose: http beside the hostname, or remove the hostname.")
+	}
+	if req.Runner != "" {
+		return problem.NotPermitted(instance,
+			"a Process a run kit owns is not served by kitbashd, so it has no host name here",
+			fmt.Sprintf("Remove deploy.units[0].hostname from this Package, or have %s publish the Process it runs.", req.Runner))
 	}
 	return nil
 }

@@ -705,3 +705,89 @@ func TestStateMapping(t *testing.T) {
 		})
 	}
 }
+
+// hostnameManifest is a unit that asks for one name of its own, which
+// kitbashd serves it under in place of the name it would derive.
+const hostnameManifest = `name: dashboard
+description: A small web interface a member opens in a browser on this host.
+deploy:
+  units:
+    - type: container
+      build: .
+      expose: http
+      port: 8080
+      hostname: status.example.org
+`
+
+// A host with a domain gives every http Process an address, and proc_run
+// answers it: sharing a web application is giving somebody its address, see
+// PLAN.md section 2.3. kitbashd assigns the name, so the session reads it back
+// from the registration rather than working it out.
+func TestRunAnswersTheURLOfAnHTTPProcess(t *testing.T) {
+	f := newFixture(t)
+	f.daemon.Domain = "kitbash.example"
+	folder := f.pack(t, "dashboard", httpManifest)
+	f.build(folder, "dashboard")
+
+	process, prob := f.processes.Run(context.Background(), folder, "", "")
+	if prob != nil {
+		t.Fatalf("Run: %s", prob.Detail)
+	}
+	want := "https://dashboard." + teltest.FakeMember + ".kitbash.example"
+	if process.URL != want {
+		t.Errorf("url is %q, want %q", process.URL, want)
+	}
+	// And proc_list shows the same address, which is where a member reads it
+	// again tomorrow.
+	list, prob := f.processes.List(context.Background())
+	if prob != nil {
+		t.Fatalf("List: %s", prob.Detail)
+	}
+	if len(list.Processes) != 1 || list.Processes[0].URL != want {
+		t.Errorf("the listing carries %+v, want the url %q", list.Processes, want)
+	}
+}
+
+// The name a unit declares travels with the registration, and the url is that
+// name.
+func TestRunRegistersTheDeclaredHostname(t *testing.T) {
+	f := newFixture(t)
+	f.daemon.Domain = "kitbash.example"
+	folder := f.pack(t, "dashboard", hostnameManifest)
+	f.build(folder, "dashboard")
+
+	process, prob := f.processes.Run(context.Background(), folder, "", "")
+	if prob != nil {
+		t.Fatalf("Run: %s", prob.Detail)
+	}
+	reg, found := f.daemon.Registration(process.ID)
+	if !found {
+		t.Fatal("the Process was not registered")
+	}
+	if reg.Hostname != "status.example.org" {
+		t.Errorf("the registration carries the hostname %q, want the one the unit declared", reg.Hostname)
+	}
+	if process.URL != "https://status.example.org" {
+		t.Errorf("url is %q, want the declared name", process.URL)
+	}
+}
+
+// A host with no domain routes nothing, so there is no address to answer with:
+// an http Process keeps its internal endpoint and nothing else, which is how
+// kitbash worked before the proxy existed.
+func TestRunAnswersNoURLWithoutADomain(t *testing.T) {
+	f := newFixture(t)
+	folder := f.pack(t, "dashboard", httpManifest)
+	f.build(folder, "dashboard")
+
+	process, prob := f.processes.Run(context.Background(), folder, "", "")
+	if prob != nil {
+		t.Fatalf("Run: %s", prob.Detail)
+	}
+	if process.URL != "" {
+		t.Errorf("url is %q on a host with no domain, want none", process.URL)
+	}
+	if process.Endpoint == "" {
+		t.Error("the Process lost its internal endpoint")
+	}
+}

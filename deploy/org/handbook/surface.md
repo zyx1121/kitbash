@@ -45,6 +45,16 @@ Processes. A Package running as a rootless container under the caller.
 | `proc_stop` | Stop a Process. It stays known, and its tools leave the surface |
 | `proc_logs` | The recent stdout and stderr of a Process |
 
+A unit with `expose: http` gets an address when the host has a domain:
+`proc_run` answers `url` and `proc_list` shows it, `https://<name>.<member>.<domain>`,
+where the member's label is the attribution. kitbashd is the reverse proxy in
+front of it and routes by that name to the port the Process's own container
+publishes. A unit may declare `hostname` in `deploy.units[]` instead, one name
+the member owns whose DNS record points at this host, and `pkg_inspect` shows
+it with the rest of the manifest; a name another Process on the host already
+serves is `conflict` at `proc_run`. A host with no domain answers no `url` and
+the Process keeps its internal port.
+
 ## tel
 
 Telemetry. OTLP in, queryable out.

@@ -82,6 +82,13 @@ type Registration struct {
 	Expose        string   `json:"expose,omitempty"`
 	Endpoint      string   `json:"endpoint,omitempty"`
 	Subscriptions []string `json:"subscriptions,omitempty"`
+	// Hostname is the name the unit declared for itself, as the registration
+	// sends it, and Host the name kitbashd answers that it serves the Process
+	// under. A client sends the first and never the second; this fake derives
+	// the second when it was given a Domain, the way the daemon does, so a
+	// test reads the url a session publishes, see PLAN.md section 2.3.
+	Hostname string `json:"hostname,omitempty"`
+	Host     string `json:"host,omitempty"`
 	// Runner is the Package path of the run kit that owns the Process, as a
 	// session whose manifest named a runner registers it.
 	Runner string `json:"runner,omitempty"`
@@ -133,6 +140,11 @@ type Response struct {
 type Daemon struct {
 	// Socket is the path to give KITBASH_SOCKET.
 	Socket string
+	// Domain is the domain this fake host was given. Empty is a host that
+	// routes nothing, which is what every test that says nothing about it
+	// gets; with one, a registration with expose: http is answered with the
+	// host name it is served under, see hostFor.
+	Domain string
 
 	dir      string
 	listener net.Listener
@@ -566,8 +578,37 @@ func (d *Daemon) store(reg Registration) {
 	if _, held := d.registrations[reg.ID]; !held {
 		d.order = append(d.order, reg.ID)
 	}
+	reg.Host = d.hostFor(reg)
 	d.registrations[reg.ID] = reg
 }
+
+// hostFor is the name this fake says it serves a Process under, which a test
+// turns on by giving the fake a Domain. It is the daemon's rule in one line:
+// the declared name, or <name>.<member>.<domain>, and nothing at all for a
+// Process that is not exposed over HTTP or for a fake with no domain. The real
+// rule and its edges are the daemon's to test, see internal/daemon/proxy.go.
+func (d *Daemon) hostFor(reg Registration) string {
+	if reg.Host != "" {
+		// A test that seeded one is standing in for a daemon that assigned it.
+		return reg.Host
+	}
+	if d.Domain == "" || reg.Expose != "http" {
+		return ""
+	}
+	if reg.Hostname != "" {
+		return reg.Hostname
+	}
+	owner := reg.Owner
+	if owner == "" {
+		owner = FakeMember
+	}
+	return reg.Name + "." + owner + "." + d.Domain
+}
+
+// FakeMember is the member label this fake puts in a derived host name when a
+// registration carries no owner, which is every one a client sends: kitbashd
+// reads the owner from the socket's peer credentials and this fake has none.
+const FakeMember = "member"
 
 // register answers processes_register: it records the Process and mints a
 // token and a fan out secret for it. Registering an id again replaces the

@@ -244,8 +244,8 @@ api:
   processes_register:
     method: POST
     path: /kitbash/v1/processes
-    request: { id: "UUIDv7", package: "/home/loki/echo", name: "echo", container: "kitbash-echo-echo", digest: "sha256:...", expose: "mcp|http|none", endpoint: "http://127.0.0.1:40275 when expose is http", subscriptions: ["telemetry"], runner: "/org/pve-runner when a run kit owns this Process", health: { http: "/healthz", interval: "30s" }, mounts: [{ source: "/home/loki/notes", target: "/files/notes", mode: "ro|rw" }], secrets: ["ANTHROPIC_API_KEY"] }
-    response: { id: "UUIDv7", token: "opaque, at least 32 bytes of entropy, returned once", fanoutSecret: "opaque, 32 bytes, returned once; the bearer the fan out presents to this Process" }
+    request: { id: "UUIDv7", package: "/home/loki/echo", name: "echo", container: "kitbash-echo-echo", digest: "sha256:...", expose: "mcp|http|none", endpoint: "http://127.0.0.1:40275 when expose is http", hostname: "status.example.org when the unit declares one", subscriptions: ["telemetry"], runner: "/org/pve-runner when a run kit owns this Process", health: { http: "/healthz", interval: "30s" }, mounts: [{ source: "/home/loki/notes", target: "/files/notes", mode: "ro|rw" }], secrets: ["ANTHROPIC_API_KEY"] }
+    response: { id: "UUIDv7", token: "opaque, at least 32 bytes of entropy, returned once", fanoutSecret: "opaque, 32 bytes, returned once; the bearer the fan out presents to this Process", host: "echo.loki.kitbash.example, the name the proxy serves this Process under, absent on a host with no domain" }
     authorization: >
       The caller is the member the Process belongs to; kitbashd records the
       peer user as the Process owner and whether they are an admin at
@@ -275,6 +275,14 @@ api:
       registration whose mounts do not check out is refused and nothing is
       written, so a Process never holds a registration naming a folder it may
       not see.
+      hostname is the one name the unit declared for itself: a lower case DNS
+      name of at least two labels and at most 253 bytes, on a unit with
+      expose: http and no runner, because a name leads to a container on this
+      host. A name another Process on this host already holds, its declared
+      name or the name derived for it, is conflict: a name is one Process's.
+      The daemon answers the name it serves the Process under as host, which is
+      the declared one or <name>.<member>.<domain>, and nothing at all on a
+      host with no domain, see reverse_proxy.
       secrets are the names the unit declared, at most sixteen, each matching
       ^[A-Z][A-Z0-9_]{0,63}$ and none of them a KITBASH_ name, which kitbashd
       speaks for. Only names are sent: a value never crosses this API except
@@ -387,11 +395,17 @@ api:
     path: /kitbash/v1/processes
     response: >
       { processes: [ { id, owner, admin, package, name, expose, endpoint,
+      hostname, host,
       limits: { memory, cpu, pids, ceiling },
       health: { http, interval, last, healthy },
       subscriptions, registeredAt, problem, problemFix } ] }. The caller's
       registered Processes, every key present even when its value is empty,
       and no token anywhere. An admin sees every member's.
+      hostname is the name the unit declared, empty for one that declared none,
+      and host the name the reverse proxy serves this Process under, empty on a
+      host with no domain and for a Process that is not exposed over HTTP. host
+      is derived rather than stored, so a host that is given a domain serves
+      every Process that was already registered, see reverse_proxy.
       limits.ceiling says kitbashd has made this Process a cgroup of its own
       and created its container under it; a ceiling that limits nothing is
       still a ceiling, see restore.cgroups. In health, http and interval are
@@ -942,6 +956,78 @@ health_probes:
     The health path reports probes: how many Processes are being probed.
     processes_list carries the last reading per Process and proc_list publishes
     it as health: { last, healthy }.
+
+reverse_proxy:
+  description: >
+    kitbashd is the reverse proxy of every Process with expose: http, see
+    PLAN.md section 2.3. It is not a third built in: it is how the built in
+    runner exposes what it runs. A host with no domain routes nothing and an
+    http Process keeps its internal port, which is how kitbash worked before
+    the proxy existed.
+  settings: >
+    KITBASH_DOMAIN is the domain this host was given, empty for a host with no
+    route from the outside. KITBASH_TLS is acme, the default with a domain, or
+    gateway. KITBASH_PROXY_LISTEN (:80), KITBASH_PROXY_TLS_LISTEN (:443) and
+    KITBASH_CERTS (/var/lib/kitbash/certs) are where it listens and where the
+    certificates are cached. All five are read from the environment;
+    deploy/install.sh writes the first two into /etc/conf.d/kitbashd, which the
+    OpenRC service exports, and opens 80, and 443 in acme mode, in the nftables
+    ruleset it writes. A domain that is not a lower case DNS name of at least
+    two labels, and a KITBASH_TLS that is neither mode, stop the daemon from
+    starting rather than leaving it serving nothing.
+  names: >
+    Every registered Process with expose: http and no runner is served at
+    <name>.<member>.<domain>, or at the hostname its unit declared. The
+    member's label is the attribution: whose work a service is, is visible in
+    its address. A name whose labels do not make a DNS name, which an account
+    name ending in a hyphen would give, is not served rather than served under
+    a name no resolver answers. The names travel with the registration, so the
+    routing table is rebuilt from the registrations at every start and a
+    Process reachable before a reboot is reachable after one.
+  forwarding: >
+    A request is matched by its Host, port stripped and folded to lower case,
+    held to what a DNS name may carry: a Host with a path, an at sign, a space
+    or a control character in it is 400 bad-request and reaches no container. A
+    name the routing table does not hold is 404 not-found, so nothing but a
+    registered Process is ever forwarded to. A name whose Process is not
+    running is 503 with a short body. Everything else is forwarded to
+    http://127.0.0.1:<published port> of that Process, over a connection that
+    is refused unless it lands on a loopback address.
+  what_it_forwards_to: >
+    The port is the runtime's answer and never the member's word, the rule
+    health probes follow: the endpoint of the registration is held to the host
+    ports the Process's own container publishes, read off the container as the
+    owner. A registration naming a port its container does not publish is not
+    forwarded to at all, whatever is listening there.
+  headers: >
+    X-Forwarded-For is the peer's own address, which replaces whatever the
+    client sent; a client does not write its own chain. X-Forwarded-Host is the
+    name the request arrived under, and the Host the Process sees is that name
+    too, because an application writes its own addresses from it.
+    X-Forwarded-Proto is https in acme mode, where this daemon terminated TLS,
+    and in gateway mode it is the gateway's own header when that is http or
+    https and https otherwise. A WebSocket upgrade is handed over whole. There
+    is no limit on a request body, a 60 s response header timeout and no idle
+    limit, because a Process that streams is the point of an http Process.
+  tls: >
+    In acme mode kitbashd listens on 80 and 443 and obtains one certificate per
+    host name with ACME HTTP-01, cached under KITBASH_CERTS, root owned 0700.
+    The host policy is the routing table: a name no Process is served at is
+    never asked for at the certificate authority. There is no wildcard
+    certificate, because a wildcard covers one label and the default names have
+    two. Plain 80 answers the ACME challenge path and redirects everything else
+    to https. In gateway mode kitbashd listens on 80 alone and the gateway in
+    front of the host holds the certificate.
+  records: >
+    Each forwarded request writes one span named proxy carrying kitbash.user
+    (the owner), kitbash.package, kitbash.process and kitbash.path (the path
+    requested), kitbash.producer = kitbashd, plus http.request.method,
+    http.response.status_code, url.path and kitbash.host. The span is parented
+    from the request's traceparent when it carries one this daemon can read. No
+    body is read and no header is copied.
+  reporting: >
+    The health path reports routes, how many names are served, and the two
+    listeners as proxy and proxyTls.
 
 backup:
   description: >
