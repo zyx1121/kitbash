@@ -119,32 +119,45 @@ func TestTheRulesetOpensTheProxyOnlyWithADomain(t *testing.T) {
 	// one the test owns.
 	fragment := cut(t, "cat > /etc/nftables.nft.kitbash-new", "if nft -c -f")
 	cases := []struct {
-		domain string
-		tls    string
-		http   bool
-		https  bool
+		domain  string
+		tls     string
+		gateway string
+		http    bool
+		https   bool
+		from    string
 	}{
-		{"", "acme", false, false},
-		{"kitbash.example", "acme", true, true},
-		{"kitbash.example", "gateway", true, false},
+		{"", "acme", "", false, false, ""},
+		{"kitbash.example", "acme", "", true, true, ""},
+		{"kitbash.example", "gateway", "", true, false, ""},
+		// A gateway that was named is the only source 80 is open to: the proxy
+		// is reachable through it and from nowhere else.
+		{"kitbash.example", "gateway", "203.0.113.10", true, false, "ip saddr 203.0.113.10"},
+		{"kitbash.example", "gateway", "2001:db8::1", true, false, "ip6 saddr 2001:db8::1"},
 	}
 	for _, c := range cases {
 		dir := t.TempDir()
 		ruleset := filepath.Join(dir, "nftables.nft")
 		body := strings.ReplaceAll(fragment, "/etc/nftables.nft.kitbash-new", ruleset)
-		run(t, "set -eu\ndomain='"+c.domain+"'\ntls='"+c.tls+"'\n"+body)
+		run(t, "set -eu\ndomain='"+c.domain+"'\ntls='"+c.tls+"'\ngateway='"+c.gateway+"'\n"+body)
 		rendered, err := os.ReadFile(ruleset)
 		if err != nil {
 			t.Fatal(err)
 		}
 		got := string(rendered)
-		if strings.Contains(got, "tcp dport 80 accept") != c.http {
+		if strings.Contains(got, "tcp dport 80 ") != c.http {
 			t.Errorf("domain %q, tls %s: 80 open = %v, want %v:\n%s",
 				c.domain, c.tls, !c.http, c.http, got)
 		}
-		if strings.Contains(got, "tcp dport 443 accept") != c.https {
+		if strings.Contains(got, "tcp dport 443 ") != c.https {
 			t.Errorf("domain %q, tls %s: 443 open = %v, want %v:\n%s",
 				c.domain, c.tls, !c.https, c.https, got)
+		}
+		if c.from != "" && !strings.Contains(got, "tcp dport 80 "+c.from+" accept") {
+			t.Errorf("domain %q, gateway %q: 80 is not narrowed to the gateway:\n%s",
+				c.domain, c.gateway, got)
+		}
+		if c.from == "" && strings.Contains(got, "saddr") {
+			t.Errorf("domain %q: 80 names a source address and no gateway was given:\n%s", c.domain, got)
 		}
 		// Whatever else changed, the receiver stays off the wire and SSH
 		// stays first: the way back into the host never depends on a rule
@@ -184,7 +197,7 @@ func TestTheGeneratedRulesetParses(t *testing.T) {
 			t.Fatal(err)
 		}
 		body = strings.ReplaceAll(body, "/etc/nftables.d/", include+"/")
-		run(t, "set -eu\ndomain='"+domain+"'\ntls=acme\n"+body)
+		run(t, "set -eu\ndomain='"+domain+"'\ntls=acme\ngateway=''\n"+body)
 		out, err := exec.Command(nft, "-c", "-f", ruleset).CombinedOutput()
 		if err != nil {
 			t.Errorf("domain %q: nft -c: %v\n%s", domain, err, out)

@@ -203,6 +203,18 @@ func (s *Server) restoreOwner(ctx context.Context, owner string, processes []sto
 			s.processFailed(p.ID, failed.Detail, failed.Fix)
 			continue
 		}
+		// The name the unit declared is proved again too, and for the same
+		// reason: a record the member moved while this host was down is a name
+		// kitbashd would serve for whoever holds it now. The owner reads it
+		// through proc_list in the shape a missing secret has, see
+		// hostnames.go.
+		if prob := s.proveHostname(ctx, "", p); prob != nil {
+			counts.Failed++
+			logger.Printf("restore: not starting %s of %s: %s", p.Container, owner, prob.Detail)
+			failed := hostnameProblem(prob)
+			s.processFailed(p.ID, failed.Detail, failed.Fix)
+			continue
+		}
 		// The Process's cgroup is created again, with its ceiling, before the
 		// container starts: the cgroup filesystem does not survive a reboot,
 		// and a container whose cgroup parent is gone does not start at all.

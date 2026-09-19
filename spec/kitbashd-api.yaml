@@ -278,8 +278,13 @@ api:
       hostname is the one name the unit declared for itself: a lower case DNS
       name of at least two labels and at most 253 bytes, on a unit with
       expose: http and no runner, because a name leads to a container on this
-      host. A name another Process on this host already holds, its declared
-      name or the name derived for it, is conflict: a name is one Process's.
+      host. A name under KITBASH_DOMAIN, the domain itself included, and a name
+      that is an address written out are both invalid-manifest: under the
+      domain there are derived names and nothing else. A name another Process
+      on this host already holds, its declared name or the name derived for it,
+      is conflict: a name is one Process's. A name that does not resolve to an
+      address of this host, or to a CNAME of the derived name, is
+      not-permitted, checked here and again at every start, see reverse_proxy.
       The daemon answers the name it serves the Process under as host, which is
       the declared one or <name>.<member>.<domain>, and nothing at all on a
       host with no domain, see reverse_proxy.
@@ -967,17 +972,26 @@ reverse_proxy:
   settings: >
     KITBASH_DOMAIN is the domain this host was given, empty for a host with no
     route from the outside. KITBASH_TLS is acme, the default with a domain, or
-    gateway. KITBASH_PROXY_LISTEN (:80), KITBASH_PROXY_TLS_LISTEN (:443) and
-    KITBASH_CERTS (/var/lib/kitbash/certs) are where it listens and where the
-    certificates are cached. All five are read from the environment;
-    deploy/install.sh writes the first two into /etc/conf.d/kitbashd, which the
-    OpenRC service exports, and opens 80, and 443 in acme mode, in the nftables
-    ruleset it writes. A domain that is not a lower case DNS name of at least
-    two labels, and a KITBASH_TLS that is neither mode, stop the daemon from
+    gateway. KITBASH_PUBLIC_ADDRESS is the address the proxy is reached on from
+    outside, which a declared hostname is proved against. KITBASH_PROXY_LISTEN
+    (:80), KITBASH_PROXY_TLS_LISTEN (:443) and KITBASH_CERTS
+    (/var/lib/kitbash/certs) are where it listens and where the certificates
+    are cached. All of them are read from the environment; deploy/install.sh
+    writes the domain, the mode, the public address and KITBASH_GATEWAY_ADDRESS
+    into /etc/conf.d/kitbashd, which the OpenRC service exports, and opens 80,
+    and 443 in acme mode, in the nftables ruleset it writes, narrowing 80 to
+    the gateway address when gateway mode names one. A domain that is not a
+    lower case DNS name of at least two labels, a KITBASH_TLS that is neither
+    mode, and a public address that is not an address, stop the daemon from
     starting rather than leaving it serving nothing.
   names: >
     Every registered Process with expose: http and no runner is served at
-    <name>.<member>.<domain>, or at the hostname its unit declared. The
+    <name>.<member>.<domain>, or at the hostname its unit declared, which is
+    never a name under the domain and never an address, and which is served
+    only while it resolves to an address of this host or to a CNAME of the
+    derived name. That is checked at registration, at every start and when the
+    routing table is built, with the system resolver and a 5 s timeout, and the
+    answer is never kept across a start. The
     member's label is the attribution: whose work a service is, is visible in
     its address. A name whose labels do not make a DNS name, which an account
     name ending in a hyphen would give, is not served rather than served under
@@ -997,8 +1011,11 @@ reverse_proxy:
     The port is the runtime's answer and never the member's word, the rule
     health probes follow: the endpoint of the registration is held to the host
     ports the Process's own container publishes, read off the container as the
-    owner. A registration naming a port its container does not publish is not
-    forwarded to at all, whatever is listening there.
+    owner, and the container has to be running. What a container publishes is
+    the configuration it was created with and survives a stop, an exit and the
+    prepared state, so the state is what tells a name whose Process is down
+    from one whose Process answers; a registration naming a port its container
+    does not publish is not forwarded to at all, whatever is listening there.
   headers: >
     X-Forwarded-For is the peer's own address, which replaces whatever the
     client sent; a client does not write its own chain. X-Forwarded-Host is the
@@ -1006,9 +1023,14 @@ reverse_proxy:
     too, because an application writes its own addresses from it.
     X-Forwarded-Proto is https in acme mode, where this daemon terminated TLS,
     and in gateway mode it is the gateway's own header when that is http or
-    https and https otherwise. A WebSocket upgrade is handed over whole. There
+    https, and http otherwise, because that is what arrived. Forwarded,
+    X-Real-IP, True-Client-IP, CF-Connecting-IP, X-Forwarded-Port,
+    X-Original-URL and X-Rewrite-URL are dropped in both modes: a Process
+    behind this proxy reads what kitbash says about the client and nothing the
+    client said about itself. A WebSocket upgrade is handed over whole. There
     is no limit on a request body, a 60 s response header timeout and no idle
-    limit, because a Process that streams is the point of an http Process.
+    limit on a response, because a Process that streams is the point of an http
+    Process.
   tls: >
     In acme mode kitbashd listens on 80 and 443 and obtains one certificate per
     host name with ACME HTTP-01, cached under KITBASH_CERTS, root owned 0700.
@@ -1022,9 +1044,22 @@ reverse_proxy:
     Each forwarded request writes one span named proxy carrying kitbash.user
     (the owner), kitbash.package, kitbash.process and kitbash.path (the path
     requested), kitbash.producer = kitbashd, plus http.request.method,
-    http.response.status_code, url.path and kitbash.host. The span is parented
-    from the request's traceparent when it carries one this daemon can read. No
-    body is read and no header is copied.
+    http.response.status_code, url.path and kitbash.host. The span begins a
+    trace of its own: a traceparent off the internet is a stranger's claim, so
+    it is never adopted as the parent and is recorded as
+    kitbash.client.traceparent, at most 256 bytes. No body is read and no other
+    header is copied.
+  budget: >
+    The proxy's listeners have a budget of their own, 4096 connections, so what
+    the internet holds against them is never why a member's session cannot
+    reach the socket. One client holds at most 64 of them: in acme mode the
+    peer is the client and the listener counts it, in gateway mode every
+    connection is the gateway's, so what is counted is requests in flight per
+    the first address of X-Forwarded-For, which that mode's gateway writes, and
+    the peer where there is none. A client over its share has its connection
+    closed in acme mode and its request answered 429 in gateway mode. One
+    request head is at most 64 KiB and has 10 s to arrive; an idle kept alive
+    connection is closed after 120 s.
   reporting: >
     The health path reports routes, how many names are served, and the two
     listeners as proxy and proxyTls.

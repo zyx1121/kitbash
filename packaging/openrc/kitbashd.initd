@@ -19,6 +19,7 @@ description="kitbash daemon: OTLP receiver and Telemetry store"
 # name is exported here. Exporting one that is unset sets nothing: the daemon
 # sees the variables the conf.d file names and no others.
 export KITBASH_DOMAIN KITBASH_TLS KITBASH_PROXY_LISTEN KITBASH_PROXY_TLS_LISTEN KITBASH_CERTS
+export KITBASH_PUBLIC_ADDRESS KITBASH_GATEWAY_ADDRESS
 export KITBASH_OTLP_LISTEN KITBASH_SECRETS KITBASH_STORE KITBASH_SOCKET KITBASH_NO_RESTORE
 
 supervisor="supervise-daemon"

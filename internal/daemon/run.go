@@ -259,6 +259,16 @@ func (s *Server) startProcess(w http.ResponseWriter, r *http.Request, p store.Pr
 		writeProblem(w, prob)
 		return
 	}
+	// And the name the unit declared is proved again, for the same reason a
+	// secret is resolved again: what it points at is a fact about the world
+	// and not part of the registration. A name that stopped pointing here is a
+	// name this host would serve for nobody and, in acme mode, ask a
+	// certificate authority for, so the start is refused rather than made and
+	// the owner reads why, see hostnames.go.
+	if prob := s.proveHostname(r.Context(), r.URL.Path, p); prob != nil {
+		writeProblem(w, prob)
+		return
+	}
 
 	// The Process gets a cgroup of its own, with its ceiling written by root,
 	// and the container is created under it. A host that cannot place it runs

@@ -607,7 +607,33 @@ func (f *Fake) Stop(_ context.Context, m Member, container string, timeout int) 
 		return f.StopErr
 	}
 	f.Stopped = append(f.Stopped, StopCall{Member: m.Name, Container: container, Timeout: timeout})
+	// A stopped container is exited and keeps the configuration it was created
+	// with, ports included: what a container publishes is creation
+	// configuration and not runtime state, which is what podman answers too.
+	// A caller that reads a port off this has to read the state as well, see
+	// internal/daemon/proxy.go.
+	if config, held := f.Configs[container]; held {
+		config.State = podman.StateExited
+		config.PID = 0
+		f.Configs[container] = config
+	}
 	return nil
+}
+
+// SetState stages what the runtime says one container is doing, for a test
+// that has to stand in front of a state no call of this fake produces.
+func (f *Fake) SetState(container, state string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.Configs == nil {
+		f.Configs = map[string]ContainerConfig{}
+	}
+	config := f.Configs[container]
+	config.State = state
+	if state == podman.StateRunning && config.PID == 0 {
+		config.PID = f.pidFor(container)
+	}
+	f.Configs[container] = config
 }
 
 // RemoveContainer records a removal as one member.

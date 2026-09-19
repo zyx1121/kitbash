@@ -121,8 +121,25 @@ if [ -n "${KITBASH_TLS+set}" ]; then
   log "writing KITBASH_TLS to $confd"
   set_confd KITBASH_TLS "$KITBASH_TLS"
 fi
+#     The address the proxy is reached on from outside, which is what a unit's
+#     declared hostname is proved against: kitbashd resolves that name and
+#     serves it only when it points here. In gateway mode this host's own
+#     addresses are behind the gateway, so without this no declared hostname is
+#     served at all; names under KITBASH_DOMAIN are unaffected, because those
+#     are the host's own.
+if [ -n "${KITBASH_PUBLIC_ADDRESS+set}" ]; then
+  log "writing KITBASH_PUBLIC_ADDRESS to $confd"
+  set_confd KITBASH_PUBLIC_ADDRESS "$KITBASH_PUBLIC_ADDRESS"
+fi
+#     And, in gateway mode, the address the gateway forwards from, which the
+#     ruleset below narrows the accept on 80 to.
+if [ -n "${KITBASH_GATEWAY_ADDRESS+set}" ]; then
+  log "writing KITBASH_GATEWAY_ADDRESS to $confd"
+  set_confd KITBASH_GATEWAY_ADDRESS "$KITBASH_GATEWAY_ADDRESS"
+fi
 domain=$(confd_value KITBASH_DOMAIN)
 tls=$(confd_value KITBASH_TLS)
+gateway=$(confd_value KITBASH_GATEWAY_ADDRESS)
 if [ -n "$domain" ] && [ -z "$tls" ]; then
   # A host with a domain and nothing said about TLS obtains its own
   # certificates, which is the default PLAN.md 2.3 names.
@@ -274,15 +291,26 @@ NFT
 #     the gateway in front of this host holds the certificate and forwards
 #     to 80.
 if [ -n "$domain" ]; then
-  cat >> /etc/nftables.nft.kitbash-new <<'NFT'
-
-		# The reverse proxy of every http Process, see PLAN.md 2.3.
-		tcp dport 80 accept comment "The reverse proxy"
-NFT
+  printf '\n\t\t# The reverse proxy of every http Process, see PLAN.md 2.3.\n' \
+    >> /etc/nftables.nft.kitbash-new
+  if [ "$tls" = gateway ] && [ -n "$gateway" ]; then
+    #   A gateway in front of this host is the only thing that reaches the
+    #   proxy, so the accept names it. The family of the rule follows the
+    #   family of the address: this is one inet table and ip saddr matches
+    #   IPv4 alone.
+    case "$gateway" in
+      *:*) family=ip6 ;;
+      *)   family=ip ;;
+    esac
+    printf '\t\ttcp dport 80 %s saddr %s accept comment "The reverse proxy, from the gateway alone"\n' \
+      "$family" "$gateway" >> /etc/nftables.nft.kitbash-new
+  else
+    printf '\t\ttcp dport 80 accept comment "The reverse proxy"\n' \
+      >> /etc/nftables.nft.kitbash-new
+  fi
   if [ "$tls" = acme ]; then
-    cat >> /etc/nftables.nft.kitbash-new <<'NFT'
-		tcp dport 443 accept comment "The reverse proxy, which holds this host's own certificates"
-NFT
+    printf '\t\ttcp dport 443 accept comment "The reverse proxy, which holds this host'"'"'s own certificates"\n' \
+      >> /etc/nftables.nft.kitbash-new
   fi
 fi
 cat >> /etc/nftables.nft.kitbash-new <<'NFT'

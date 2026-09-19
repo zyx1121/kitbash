@@ -25,6 +25,19 @@
 # a host behind one public address is put on the internet.
 #KITBASH_TLS="acme"
 
+# The address the proxy is reached on from outside this host. It is what a
+# unit's declared hostname is proved against: kitbashd resolves that name and
+# serves it only when it points here. In gateway mode this host's own addresses
+# are behind the gateway, so a host that is not told this one serves no
+# declared hostname at all; under KITBASH_DOMAIN nothing changes, because those
+# names are the host's own.
+#KITBASH_PUBLIC_ADDRESS="203.0.113.9"
+
+# In gateway mode, the address the gateway forwards from. deploy/install.sh
+# narrows the nftables accept on 80 to it when it is set, so the proxy is
+# reachable through the gateway and from nowhere else.
+#KITBASH_GATEWAY_ADDRESS="203.0.113.10"
+
 # Where the proxy listens. Both are every interface by default, which is what a
 # host with a domain wants; name an address to narrow it.
 #KITBASH_PROXY_LISTEN=":80"

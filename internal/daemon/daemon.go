@@ -183,6 +183,25 @@ type Options struct {
 	// CertDir is where the certificates of acme mode are cached. Empty means
 	// DefaultCertDir. It exists for tests, the same way SecretsDir does.
 	CertDir string
+	// PublicAddress is the address the proxy is reached on from outside, which
+	// is what a unit's declared hostname is proved against. Empty is a host
+	// that was told none: in gateway mode that means no declared name can be
+	// proved, because the host's own addresses are behind the gateway, see
+	// hostnames.go.
+	PublicAddress string
+	// ProxyMaxConnections caps the proxy's own connections and ProxyPerAddress
+	// how many one client may hold. Zero means the defaults. They are separate
+	// from MaxConnections because the proxy carries the internet and the
+	// socket carries the members, see budget.go.
+	ProxyMaxConnections int
+	ProxyPerAddress     int
+	// Resolver answers what a declared hostname points at. Nil means the
+	// system resolver, which is what /etc/resolv.conf names. A test answers
+	// for a zone of its own rather than for the internet.
+	Resolver interface {
+		LookupIPAddr(ctx context.Context, host string) ([]net.IPAddr, error)
+		LookupCNAME(ctx context.Context, host string) (string, error)
+	}
 	// NoRestore stops the daemon from starting the registered Processes,
 	// which an operator sets with KITBASH_NO_RESTORE to bring a host up
 	// without its Processes, and a test sets to keep the runtime out of it.
@@ -242,6 +261,9 @@ type Server struct {
 	// exists and routes nothing, so nothing else here has to ask whether there
 	// is a proxy.
 	proxy *proxy
+	// resolver answers what a unit's declared hostname points at, which is the
+	// one thing that makes such a name the member's, see hostnames.go.
+	resolver resolver
 
 	// The MCP endpoint of the Process receiver: the handler of the SDK, the
 	// live sessions, the binary each one runs and how long one may sit idle,
@@ -313,7 +335,8 @@ func New(st *store.Store, opts Options) *Server {
 		actions:  newActionLock(),
 		fetches:  newFetchLock(),
 		probes:   newProber(opts.HealthMinInterval),
-		proxy:    newProxy(opts.Domain, opts.TLS),
+		proxy:    newProxy(opts),
+		resolver: opts.Resolver,
 
 		mcpSessions: newMCPRegistry(),
 		mcpBinary:   mcpBinaryPath(opts.MCPBinary),
@@ -365,6 +388,9 @@ func New(st *store.Store, opts Options) *Server {
 	}
 	if s.now == nil {
 		s.now = time.Now
+	}
+	if s.resolver == nil {
+		s.resolver = net.DefaultResolver
 	}
 	s.started = s.now()
 	// The certificates of acme mode are the daemon's own: the directory is

@@ -321,6 +321,12 @@ func (s *Server) removeUser(w http.ResponseWriter, r *http.Request, caller Calle
 	for _, id := range ids {
 		s.fanout.untrack(id)
 		s.probes.untrack(id)
+		// The names their Processes held go with the account. A name left on
+		// the routing table would answer for a member this host no longer has,
+		// and it would answer by forwarding to a host port their container has
+		// freed, which is a port the next member's container may be given, see
+		// proxy.go.
+		s.proxy.untrack(id)
 		s.endMCPSessions(id)
 	}
 	if _, err := s.store.DeleteApprovals(r.Context(), name); err != nil {

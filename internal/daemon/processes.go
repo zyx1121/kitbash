@@ -242,10 +242,22 @@ func (s *Server) registerProcess(w http.ResponseWriter, r *http.Request, caller 
 		writeProblem(w, prob)
 		return
 	}
-	// A declared host name is checked against the names the other Processes
-	// on this host hold, before the row is written: one name is one Process's,
-	// and the member who declared it second is the one who can change it.
+	// A declared host name is checked before the row is written. First the two
+	// rules that do not need the network: a name under this host's own domain
+	// is not a member's to declare, because under the domain there are derived
+	// names and nothing else. Then the names the other Processes hold: one
+	// name is one Process's, and the member who declared it second is the one
+	// who can change it. Then the record itself, because a name that does not
+	// point here is a name this host answers for nobody, see hostnames.go.
+	if prob := s.declaredHostname(r.URL.Path, p); prob != nil {
+		writeProblem(w, prob)
+		return
+	}
 	if prob := s.hostConflict(r.Context(), r.URL.Path, p); prob != nil {
+		writeProblem(w, prob)
+		return
+	}
+	if prob := s.proveHostname(r.Context(), r.URL.Path, p); prob != nil {
 		writeProblem(w, prob)
 		return
 	}

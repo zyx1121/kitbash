@@ -636,11 +636,21 @@ families:
           a service is, is visible in its address. A host with no domain
           routes nothing and answers no url, and the Process keeps its
           internal endpoint, which is how kitbash worked before the proxy
-          existed. A hostname another Process on this host already serves,
-          its declared name or the name derived for it, is conflict; one on a
-          unit that is not expose: http is bad-request; one on a unit that
-          names a runner is not-permitted, because a Process a run kit owns
-          has no container here to forward to. The proxy routes by host name
+          existed. A hostname under the host's domain, the domain itself
+          included, and one that is an address written out, are both
+          invalid-manifest: under the domain a Process is served at
+          <name>.<member>.<domain> and nothing else, so no member takes the
+          apex or a neighbour's address. A hostname another Process on this
+          host already serves, its declared name or the name derived for it,
+          is conflict; one on a unit that is not expose: http is bad-request;
+          one on a unit that names a runner is not-permitted, because a
+          Process a run kit owns has no container here to forward to. What
+          makes a declared name the member's is that it points here: kitbashd
+          resolves it at proc_run and at every start and serves it only while
+          it answers with an address of this host, or is a CNAME to the
+          derived name; anything else is not-permitted naming what it resolved
+          to, and a name that stops pointing here fails the next restore with
+          that as the Process's problem. The proxy routes by host name
           to the port that Process's own container publishes, the same port
           the health probe is held to, and writes one span per forwarded
           request, see reverse_proxy in spec/kitbashd-api.yaml.
@@ -730,7 +740,7 @@ families:
                   digest: { type: string, description: "Absent from a line" }
                   state: { type: string, enum: [starting, running, unhealthy, stopped, failed] }
                   expose: { type: string, enum: [mcp, http, none] }
-                  url: { type: string, description: "Where an http Process is served, absent on a host with no domain" }
+                  url: { type: string, description: "Where an http Process is served, when the host has a domain" }
                   startedAt: { type: string, format: date-time }
                   problem: { type: string, description: "Why this Process is not running, when kitbashd could not bring it back" }
                   fix: { type: string, description: "What the owner can do about it" }

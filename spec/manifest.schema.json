@@ -174,7 +174,7 @@
         },
         "hostname": {
           "type": "string",
-          "description": "One host name kitbashd serves this Process under, in place of the <name>.<member>.<domain> it derives. A lower case DNS name of at least two labels whose record points at this host. It is served only when the host has a domain, KITBASH_DOMAIN at install; without one an http Process keeps its internal port and nothing is routed. A name another Process on this host already serves is conflict at proc_run. See PLAN.md section 2.3.",
+          "description": "One host name kitbashd serves this Process under, in place of the <name>.<member>.<domain> it derives. A lower case DNS name of at least two labels, outside KITBASH_DOMAIN and never an address, whose record points at this host: kitbashd resolves it at proc_run and at every start and serves it only while it answers with an address of this host or is a CNAME to the derived name. A name under the host domain or an address is invalid-manifest, a name another Process on this host already serves is conflict, and a name that does not point here is not-permitted. It is served only when the host has a domain; without one an http Process keeps its internal port and nothing is routed. See PLAN.md section 2.3.",
           "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$",
           "maxLength": 253
         },

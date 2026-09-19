@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/netip"
 	"net/url"
 	"os"
 	"strconv"
@@ -20,6 +21,7 @@ import (
 	"golang.org/x/crypto/acme/autocert"
 
 	"github.com/zyx1121/kitbash/internal/manifest"
+	"github.com/zyx1121/kitbash/internal/podman"
 	"github.com/zyx1121/kitbash/internal/problem"
 	"github.com/zyx1121/kitbash/internal/store"
 	"github.com/zyx1121/kitbash/internal/sysusers"
@@ -60,6 +62,12 @@ const (
 	DefaultProxyTLSListen = ":443"
 )
 
+// PublicAddressEnv is the name of the setting that tells this host the address
+// it is reached on from outside, which is what a unit's declared hostname is
+// proved against. It is named here because the problem a member reads says how
+// to fix it and the fix is in /etc/conf.d/kitbashd.
+const PublicAddressEnv = "KITBASH_PUBLIC_ADDRESS"
+
 // DefaultCertDir is where autocert keeps the certificates it obtains. It is
 // root owned and 0700 like the rest of /var/lib/kitbash: a private key is the
 // proof this host is the name it serves.
@@ -94,7 +102,15 @@ const (
 	AttrResponseCode  = "http.response.status_code"
 	AttrURLPath       = "url.path"
 	AttrProxyHost     = "kitbash.host"
+	// AttrClientTraceparent is the trace context the client claimed, recorded
+	// as a claim and never adopted as this span's parent, see recordForward.
+	AttrClientTraceparent = "kitbash.client.traceparent"
 )
+
+// MaxClientTraceparent is how much of that header is kept. A traceparent is 55
+// characters; what is over that is not one, and a record is not a place to put
+// a client's bytes by the kilobyte.
+const MaxClientTraceparent = 256
 
 // The two listeners the proxy binds, as health names them.
 const (
@@ -125,6 +141,20 @@ type proxy struct {
 	domain string
 	// mode is TLSACME or TLSGateway.
 	mode string
+	// public is the address the proxy is reached on from outside, as the
+	// operator named it, invalid when they named none. It is what a declared
+	// host name is proved against, see hostnames.go.
+	public netip.Addr
+	// interfaces reads this host's own addresses. It is a field so a test
+	// answers for a host it does not have.
+	interfaces func() []netip.Addr
+
+	// maxConns is how many connections this listener serves at once and
+	// perAddress how many one client may hold. They are the proxy's own and
+	// not the API's: the socket carries a session per member and this carries
+	// the internet, so one budget spent is not the other.
+	maxConns   int
+	perAddress int
 
 	mu     sync.RWMutex
 	routes map[string]route
@@ -133,6 +163,10 @@ type proxy struct {
 	// certs is the ACME client, nil in gateway mode and on a host with no
 	// domain.
 	certs *autocert.Manager
+	// inflight counts the requests one client has in flight, which is how
+	// gateway mode caps a client whose connections all belong to the gateway,
+	// see budget.go.
+	inflight *addressCounter
 }
 
 // routeKey carries the route one request was matched to from the handler into
@@ -142,11 +176,35 @@ type routeKey struct{}
 // newProxy builds the proxy for one domain. An empty domain is a host that
 // routes nothing: every method still works and the table stays empty, so
 // nothing else in the daemon has to ask whether there is a proxy.
-func newProxy(domain, mode string) *proxy {
+func newProxy(opts Options) *proxy {
+	mode := opts.TLS
 	if mode == "" {
 		mode = TLSACME
 	}
-	p := &proxy{domain: domain, mode: mode, routes: map[string]route{}}
+	p := &proxy{
+		domain:     opts.Domain,
+		mode:       mode,
+		interfaces: hostInterfaceAddrs,
+		maxConns:   opts.ProxyMaxConnections,
+		perAddress: opts.ProxyPerAddress,
+		routes:     map[string]route{},
+	}
+	if p.maxConns <= 0 {
+		p.maxConns = ProxyMaxConnections
+	}
+	if p.perAddress <= 0 {
+		p.perAddress = ProxyPerAddress
+	}
+	p.inflight = newAddressCounter(p.perAddress)
+	if opts.PublicAddress != "" {
+		addr, err := netip.ParseAddr(opts.PublicAddress)
+		if err != nil {
+			logger.Printf("proxy: %s is %q, which is not an address; no declared hostname can be proved against it",
+				PublicAddressEnv, opts.PublicAddress)
+		} else {
+			p.public = addr.Unmap()
+		}
+	}
 	p.forwarder = &httputil.ReverseProxy{
 		Rewrite:      p.rewrite,
 		Transport:    proxyTransport(),
@@ -322,7 +380,8 @@ func urlFor(host string) string {
 // little as possible. A Host with a path, an at sign, a space or a control
 // character in it is not a name and is refused here rather than being looked
 // up, matched against a certificate policy or written into a span. An address
-// literal is refused too: kitbash routes names.
+// is refused as well, written out in either family: kitbash routes names, and
+// four numeric labels are a name by shape alone.
 func hostOf(raw string) (string, bool) {
 	host := raw
 	if strings.Contains(host, ":") {
@@ -333,7 +392,10 @@ func hostOf(raw string) (string, bool) {
 		host = split
 	}
 	host = strings.ToLower(host)
-	if !manifest.ValidHostname(host) {
+	// One trailing dot is the root, which is the same name written out in
+	// full: a client that sends it is naming the Process, not something else.
+	host = strings.TrimSuffix(host, ".")
+	if !manifest.ValidHostname(host) || isAddressLiteral(host) {
 		return "", false
 	}
 	return host, true
@@ -348,6 +410,22 @@ func (s *Server) ProxyHandler() http.Handler {
 // serveProxy answers one request off the wire: it matches the Host against the
 // routing table and forwards, or it refuses.
 func (s *Server) serveProxy(w http.ResponseWriter, r *http.Request) {
+	// In gateway mode every connection belongs to the gateway, so the
+	// listener's per peer cap would cap the gateway itself: what one client
+	// may hold is counted here instead, by the address the gateway wrote into
+	// X-Forwarded-For, see budget.go. In acme mode the peer is the client and
+	// the listener has already counted it.
+	if s.proxy.mode == TLSGateway {
+		key := s.proxy.clientKey(r)
+		if !s.proxy.inflight.take(key) {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.Header().Set("Retry-After", RetryAfterSeconds)
+			w.WriteHeader(http.StatusTooManyRequests)
+			fmt.Fprintln(w, "This client has too many requests in flight on this host.")
+			return
+		}
+		defer s.proxy.inflight.release(key)
+	}
 	host, ok := hostOf(r.Host)
 	if !ok {
 		// The Host itself is not repeated: it is a client's bytes and this is
@@ -402,6 +480,12 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, target route, h
 // that knows whether the member out there was on https. In acme mode it is
 // https, because this daemon terminated TLS itself and plain 80 is redirected
 // before it reaches here.
+//
+// The three X-Forwarded headers are not the only thing a client writes about
+// who it is, so every other header a Process is likely to believe is dropped
+// rather than passed on: a proxy that replaced three names and forwarded five
+// others would be telling the Process what the client wanted it to hear.
+// kitbash speaks for the client's address in one header and in no other.
 func (p *proxy) rewrite(r *httputil.ProxyRequest) {
 	target, ok := r.In.Context().Value(routeKey{}).(route)
 	if !ok {
@@ -411,6 +495,26 @@ func (p *proxy) rewrite(r *httputil.ProxyRequest) {
 	r.Out.Host = r.In.Host
 	r.SetXForwarded()
 	r.Out.Header.Set("X-Forwarded-Proto", p.forwardedProto(r.In))
+	for _, header := range clientClaims {
+		r.Out.Header.Del(header)
+	}
+}
+
+// clientClaims are the headers a client writes about itself that a Process
+// behind a proxy would otherwise read as the proxy's word. Forwarded is the
+// standard one, the rest are what the large proxies made de facto; a Process
+// that reads any of them has to read what kitbash says and not what the
+// internet said, so none of them survives the forward. They are dropped in
+// both modes, because a gateway that means one of them can write
+// X-Forwarded-Proto, which is the one value this proxy takes from it.
+var clientClaims = []string{
+	"Forwarded",
+	"X-Real-Ip",
+	"True-Client-Ip",
+	"Cf-Connecting-Ip",
+	"X-Forwarded-Port",
+	"X-Original-Url",
+	"X-Rewrite-Url",
 }
 
 // forwardedProto is what the Process is told the member reached this host over.
@@ -427,9 +531,12 @@ func (p *proxy) forwardedProto(in *http.Request) string {
 	case "https":
 		return "https"
 	}
-	// A gateway terminated TLS in front of this host, which is what this mode
-	// is, so https is what a request that says nothing is.
-	return "https"
+	// A gateway that says nothing has said nothing: what reached this daemon
+	// is plain HTTP over the wire between them, and a Process told https would
+	// be told something no part of this host observed. The url a member is
+	// given is still https, because that is what the gateway holds the
+	// certificate for; what the Process is told is what arrived.
+	return "http"
 }
 
 // upstreamFailed answers a Process that could not be reached or that closed
@@ -508,33 +615,39 @@ func (w *recordingWriter) code() int {
 // answers what was requested of their Processes, plus the method, the status,
 // the path and the name it arrived under. No body is read and no header is
 // copied: a span per request has to stay cheap.
+//
+// The span begins a trace of its own. A request off the internet may carry a
+// traceparent and whoever sent it is nobody this host knows: adopting it would
+// let a stranger write their own trace id into a member's Telemetry, join
+// their requests to somebody else's trace and, with one id repeated, make
+// every member's records answer one query. The header is recorded as what it
+// is, a claim, in kitbash.client.traceparent, so a member whose own client
+// sent one can still follow it.
 func (s *Server) recordForward(r *http.Request, target route, host string, status int, start, end time.Time) {
-	traceID, parentID := traceContext(r.Header.Get("traceparent"))
+	traceID, err := randomID(traceIDBytes)
+	if err != nil {
+		logger.Printf("proxy: could not record a request for %s: %v", host, err)
+		return
+	}
 	spanID, err := randomID(spanIDBytes)
 	if err != nil {
 		logger.Printf("proxy: could not record a request for %s: %v", host, err)
 		return
 	}
 	export := store.Export{Spans: []store.Span{{
-		TraceID:      traceID,
-		SpanID:       spanID,
-		ParentSpanID: parentID,
-		Name:         ProxySpan,
-		StartNS:      start.UnixNano(),
-		EndNS:        end.UnixNano(),
-		Status:       spanStatus(status),
+		TraceID: traceID,
+		SpanID:  spanID,
+		Name:    ProxySpan,
+		StartNS: start.UnixNano(),
+		EndNS:   end.UnixNano(),
+		Status:  spanStatus(status),
 		Attributes: store.Attributes{
 			User:     target.owner,
 			Package:  target.pkg,
 			Process:  target.id,
 			Path:     r.URL.Path,
 			Producer: InternalProducer,
-			Other: map[string]any{
-				AttrRequestMethod: r.Method,
-				AttrResponseCode:  status,
-				AttrURLPath:       r.URL.Path,
-				AttrProxyHost:     host,
-			},
+			Other:    proxyAttributes(r, host, status),
 		},
 	}}}
 	write, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), HealthWriteTimeout)
@@ -563,32 +676,30 @@ const (
 	spanIDBytes  = 8
 )
 
-// traceContext reads the caller's traceparent, so a request that arrived with
-// one is recorded in that trace rather than in a trace of its own. A header
-// this daemon cannot read is one trace id it makes up: a span with a broken
-// parent would be a span nothing finds.
-func traceContext(header string) (traceID, parentID string) {
-	fields := strings.Split(strings.TrimSpace(header), "-")
-	if len(fields) == 4 && fields[0] == "00" &&
-		validHex(fields[1], traceIDBytes*2) && validHex(fields[2], spanIDBytes*2) &&
-		strings.Trim(fields[1], "0") != "" && strings.Trim(fields[2], "0") != "" {
-		return strings.ToLower(fields[1]), strings.ToLower(fields[2])
+// proxyAttributes is what one forwarded request records beyond the four.
+func proxyAttributes(r *http.Request, host string, status int) map[string]any {
+	other := map[string]any{
+		AttrRequestMethod: r.Method,
+		AttrResponseCode:  status,
+		AttrURLPath:       r.URL.Path,
+		AttrProxyHost:     host,
 	}
-	id, err := randomID(traceIDBytes)
-	if err != nil {
-		return "", ""
+	if claimed := clientTraceparent(r.Header.Get("traceparent")); claimed != "" {
+		other[AttrClientTraceparent] = claimed
 	}
-	return id, ""
+	return other
 }
 
-// validHex reports whether a field is exactly that many lower case hex
-// characters, which is what an identifier on the wire is.
-func validHex(field string, width int) bool {
-	if len(field) != width {
-		return false
+// clientTraceparent is the trace context a client claimed, bounded, for the
+// one attribute that records it. It is not parsed and not believed: what it is
+// for is a member following their own client's header, so it is carried as it
+// arrived and cut to a length a header this daemon does not act on is worth.
+func clientTraceparent(header string) string {
+	header = strings.TrimSpace(header)
+	if len(header) > MaxClientTraceparent {
+		header = header[:MaxClientTraceparent]
 	}
-	_, err := hex.DecodeString(strings.ToLower(field))
-	return err == nil
+	return header
 }
 
 // randomID mints one trace or span id.
@@ -626,6 +737,16 @@ func (s *Server) routePort(ctx context.Context, m sysusers.Member, p store.Proce
 		return 0
 	}
 	if !publishes(config, port) {
+		return 0
+	}
+	// And the container has to be running. What a container publishes is the
+	// configuration it was created with and it survives a stop, an exit and
+	// the prepared state the four step start pauses in, so the published port
+	// alone would have this daemon forward a name to a host port nothing is
+	// bound to any more, which is the port the next member's container may be
+	// given. The state is what restore reads for the same reason, see
+	// restoreOne.
+	if config.State != podman.StateRunning {
 		return 0
 	}
 	return port
@@ -711,6 +832,17 @@ func (s *Server) LoadRoutes(ctx context.Context) int {
 				host, other, p.ID, other)
 			continue
 		}
+		// A declared name is proved again here, because this is the table the
+		// certificate policy answers from: a name whose record moved while
+		// this host was down must not be served and must not be asked for at
+		// a certificate authority, see hostnames.go. A derived name is this
+		// host's own by construction and is not looked up.
+		if p.Hostname != "" {
+			if prob := s.proveHostname(ctx, "", p); prob != nil {
+				logger.Printf("proxy: not serving %s: %s", host, prob.Detail)
+				continue
+			}
+		}
 		m, known := members[p.Owner]
 		if !known {
 			looked, found, err := s.users.Lookup(ctx, p.Owner)
@@ -747,7 +879,11 @@ func (s *Server) LoadRoutes(ctx context.Context) int {
 // Only a declared name is checked, because a derived name is the Process's own
 // by construction: it carries the owner's account name and the Process name,
 // which is unique for that member. What a declared name is checked against is
-// both kinds, the declared names of other Processes and their derived ones.
+// both kinds, the declared names of other Processes and their derived ones. A
+// declared name can no longer be under this host's domain, so the derived half
+// answers one case: a host whose domain was changed under registrations that
+// were written before it, where a name that was outside the old domain is a
+// derived name under the new one.
 func (s *Server) hostConflict(ctx context.Context, instance string, p store.Process) *problem.Problem {
 	if p.Hostname == "" {
 		return nil
@@ -843,16 +979,28 @@ func (s *Server) serveProxyListener(ctx context.Context, ln net.Listener, kind s
 	srv := &http.Server{
 		Handler:           handler,
 		ReadHeaderTimeout: ProxyReadHeaderTimeout,
+		IdleTimeout:       ProxyIdleTimeout,
+		MaxHeaderBytes:    ProxyMaxHeaderBytes,
 		ErrorLog:          logger,
 	}
+	// The proxy's budget is its own and not the API's: the socket carries a
+	// session per member, and what the internet holds against 80 must never be
+	// the reason a member cannot reach the daemon. Inside it one peer is capped
+	// as well, except in gateway mode, where every connection is the gateway's
+	// and the cap is counted per request instead, see budget.go.
+	perAddress := s.proxy.perAddress
+	if s.proxy.mode == TLSGateway {
+		perAddress = 0
+	}
+	bounded := limitProxy(ln, s.proxy.maxConns, perAddress)
 	errs := make(chan error, 1)
 	go func() {
 		if certs != nil {
 			srv.TLSConfig = certs.TLSConfig()
-			errs <- srv.ServeTLS(limit(ln, s.maxConns), "", "")
+			errs <- srv.ServeTLS(bounded, "", "")
 			return
 		}
-		errs <- srv.Serve(limit(ln, s.maxConns))
+		errs <- srv.Serve(bounded)
 	}()
 	select {
 	case err := <-errs:

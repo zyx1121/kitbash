@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/netip"
 	"os"
 	"os/signal"
 	"os/user"
@@ -80,6 +81,11 @@ const (
 	proxyListenEnv    = "KITBASH_PROXY_LISTEN"
 	proxyTLSListenEnv = "KITBASH_PROXY_TLS_LISTEN"
 	certsEnv          = "KITBASH_CERTS"
+	// publicAddressEnv is the address the proxy is reached on from outside,
+	// which is what a unit's declared hostname is proved against. In gateway
+	// mode the host's own addresses are behind the gateway, so the operator
+	// names the public one here.
+	publicAddressEnv = daemon.PublicAddressEnv
 )
 
 // SocketGroup owns the socket with root, so every member may connect and
@@ -123,6 +129,8 @@ func run() error {
 		"address the reverse proxy serves HTTPS on, used only with a domain in acme mode")
 	certs := flag.String("certs", env(certsEnv, defaultCerts),
 		"directory the certificates of acme mode are cached in")
+	publicAddress := flag.String("public-address", env(publicAddressEnv, ""),
+		"the address the proxy is reached on from outside, which a unit's declared hostname is proved against")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
 	if *showVersion {
@@ -133,7 +141,7 @@ func run() error {
 	// A domain that is not a name, and a mode this daemon does not have, are
 	// refused here rather than at the first request: a host told to serve a
 	// domain and serving nothing is worse than one that did not start.
-	if prob := checkProxySettings(*domain, *tlsMode); prob != nil {
+	if prob := checkProxySettings(*domain, *tlsMode, *publicAddress); prob != nil {
 		return prob
 	}
 
@@ -218,13 +226,14 @@ func run() error {
 	defer stop()
 
 	srv := daemon.New(st, daemon.Options{
-		Version:    version,
-		MCPBinary:  *mcpBinary,
-		NoRestore:  *noRestore,
-		SecretsDir: *secretsDir,
-		Domain:     *domain,
-		TLS:        *tlsMode,
-		CertDir:    *certs,
+		Version:       version,
+		MCPBinary:     *mcpBinary,
+		NoRestore:     *noRestore,
+		SecretsDir:    *secretsDir,
+		Domain:        *domain,
+		TLS:           *tlsMode,
+		CertDir:       *certs,
+		PublicAddress: *publicAddress,
 	})
 	defer srv.Close()
 	if _, err := srv.Sweep(ctx); err != nil {
@@ -340,7 +349,7 @@ func clearLegacySubIDLock() {
 // checkProxySettings refuses a domain that is not a name and a TLS mode this
 // daemon does not have. A host with no domain is not checked: that is a host
 // that routes nothing, which is every kitbash host before the proxy existed.
-func checkProxySettings(domain, mode string) error {
+func checkProxySettings(domain, mode, publicAddress string) error {
 	if domain != "" && !manifest.ValidHostname(domain) {
 		return fmt.Errorf("%s is %q, which is not a domain; it is a lower case DNS name of at least two labels, such as kitbash.example.org",
 			domainEnv, domain)
@@ -348,6 +357,12 @@ func checkProxySettings(domain, mode string) error {
 	if mode != daemon.TLSACME && mode != daemon.TLSGateway {
 		return fmt.Errorf("%s is %q; it is %s, which obtains this host's own certificates, or %s, which trusts the gateway in front of it",
 			tlsEnv, mode, daemon.TLSACME, daemon.TLSGateway)
+	}
+	if publicAddress != "" {
+		if _, err := netip.ParseAddr(publicAddress); err != nil {
+			return fmt.Errorf("%s is %q, which is not an address; it is the address the proxy is reached on from outside, such as 203.0.113.9",
+				publicAddressEnv, publicAddress)
+		}
 	}
 	return nil
 }

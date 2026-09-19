@@ -108,6 +108,16 @@ are below the domain, `<name>.<member>`, so the record has to be `*` at that
 level or a wildcard covering both, which is what a provider's `*` record under
 a delegated zone does.
 
+A unit may ask for one name of its own with `hostname`, outside the domain:
+under `KITBASH_DOMAIN` there are derived names and nothing else, so a name
+there is refused and no member can take the apex or a neighbour's address. What
+makes a declared name the member's is that it points here, so kitbashd resolves
+it when the Process is run and at every start and serves it only while the
+answer carries an address of this host, or is a `CNAME` to the derived name.
+Behind a gateway or a static NAT the host's own addresses are not the public
+one, so name it with `KITBASH_PUBLIC_ADDRESS`; in `gateway` mode a host that
+was not told it serves no declared name at all.
+
 `KITBASH_TLS` decides who holds the certificate. `acme`, the default with a
 domain, has kitbashd listen on 80 and 443 and obtain one certificate per host
 name from Let's Encrypt, which needs both ports reachable from the internet.
@@ -121,7 +131,12 @@ the domain and forwards everything under it. With Caddy:
 *.kitbash.example { tls { dns cloudflare {env.CF_API_TOKEN} } reverse_proxy <host>:80 }
 ```
 
-install.sh writes `KITBASH_DOMAIN` and `KITBASH_TLS` to `/etc/conf.d/kitbashd`
+With a gateway, set `KITBASH_GATEWAY_ADDRESS` to the address it forwards from
+and install.sh narrows the accept on 80 to it, so the proxy is reachable
+through the gateway and from nowhere else.
+
+install.sh writes `KITBASH_DOMAIN`, `KITBASH_TLS`, `KITBASH_PUBLIC_ADDRESS` and
+`KITBASH_GATEWAY_ADDRESS` to `/etc/conf.d/kitbashd`
 and opens 80, and 443 in `acme` mode, in the ruleset above. Running it again
 without either variable leaves the file as it is. A host with no domain routes
 nothing and an `http` Process keeps its internal port, which is how kitbash
