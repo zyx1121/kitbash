@@ -329,6 +329,16 @@ One break glass path exists for the operator: a serial console or a dedicated `o
 
 **Every answer is the size of the question.** A tool result is read by a model at a price per byte, so the surface answers what was asked and nothing more. `fs_list` of a root answers names and descriptions, not the files of every folder; `pkg_list` answers paths and latest digests; `proc_list` takes a `package` and answers that Package's Processes, and without one answers one line per Process; `pkg_build` answers the last twenty lines of the log and the digest; a problem answers cause and fix in two sentences. The first trial's root listing was 7 KiB and its Process listing 5.7 KiB, more than the todo application it wrote.
 
+**What M10 measured, 2026-09-19.** The same clean agent (Claude Code, a fresh configuration directory, no CLAUDE.md, no memory, the account's default model claude-sonnet-5, only the kitbash MCP server), the same three sentences, once on the laptop with no kitbash and once with kitbash 0.12.1 (the third with 0.13.0), tokens read from the client's own accounting:
+
+| Sentence | Laptop, no kitbash | kitbash | Where it landed |
+|---|---|---|---|
+| "Make a todo web app I can share with my classmates." | 19 turns, 18 calls, 4 failed, USD 0.30; a local Express app and advice to deploy on Render or Railway | 14 turns, 13 calls (8 kitbash), USD 0.28 | `https://todo.loki.kitbash.zyx.tw`, opens, shared list persists on a mount |
+| "Every morning at eight, fetch the weather for Hsinchu and post it as a new item on our class board" | 6 turns, 3 failed; stopped and asked the user which compromise to take, because nothing on a laptop schedules durably | 7 turns, 6 calls (5 kitbash), USD 0.18 | `/home/loki/weather-bot` registered with `schedule: 0 0 * * *` (the agent converted 08:00 Taipei to UTC), first tick the next morning |
+| "Set up a PDF conversion service my classmates can use." | 3 turns, nothing built; three questions back, one of them where to host it | 25 turns, 24 calls (14 kitbash), USD 0.39 | `https://pdf-converter.loki.kitbash.zyx.tw`, LibreOffice behind Express, converted a text file to a 9 KB PDF |
+
+Three readings. The deployment conversation is gone: no sentence produced a question about where or how to run, and the two that the laptop could not finish finished. The token count is even on the task both sides could do (the todo application), and it was 36 turns and USD 0.50 before 4.5's rules, so the rules paid for the round trips to the host and a little more. Where kitbash spends more it is doing more: the PDF service's 25 turns bought a running LibreOffice at a public address, against three questions. The number to watch next is the 8 to 14 kitbash calls per sentence: `fs_write` with `files`, `pkg_build`, `proc_run` and one `proc_logs` is four, and the rest is the agent reading before it writes, which the instructions could shorten further only by growing.
+
 ### 4.6 The three infrastructure layers
 
 Infrastructure is three layers, and the object model binds to the shape of an OCI image rather than to any layer's API.
@@ -389,7 +399,7 @@ Each milestone is done when its acceptance sentence is true on a real machine, n
 
 **M9 Secrets.** A member calls `secrets_set` with a name and a value, `secrets_list` shows the name and no value, a Package whose unit declares that name runs and its tool reads the variable, `proc_run` of the same Package under a second member who has not set it is refused naming the secret, and the span `secrets_set` recorded in Telemetry carries no value.
 
-**M10 Ship.** A clean Claude Code with the kitbash MCP server and nothing else configured is told three things by a member who names no tool, no host and no way of deploying: "make a todo web app I can share with my classmates", "every morning at eight fetch the weather and post it to the group", and "set up a PDF conversion service". The first appears at `https://<name>.<member>.<domain>` and opens in a browser, the second is a `kitbash.schedule` record at 08:00 UTC the next day, and the third is a URL a second member opens. The tokens the three conversations cost are counted against the same three tasks done on the laptop without kitbash, and the number is written down here.
+**M10 Ship.** A clean Claude Code with the kitbash MCP server and nothing else configured is told three things by a member who names no tool, no host and no way of deploying: "make a todo web app I can share with my classmates", "every morning at eight fetch the weather and post it to the group", and "set up a PDF conversion service". The first appears at `https://<name>.<member>.<domain>` and opens in a browser, the second is a `kitbash.schedule` record at the next morning's tick, and the third is a URL a second member opens. The tokens the three conversations cost are counted against the same three tasks done on the laptop without kitbash, and the numbers are in 4.5. Done 2026-09-19 on kitbash 0.12.1 and 0.13.0, the weather tick pending its first morning.
 
 ### 5.4 Risks
 
