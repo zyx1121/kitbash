@@ -131,6 +131,12 @@ type Registration struct {
 	// what a member's process says about a path is a claim, see PLAN.md
 	// section 2.3.
 	Mounts []mounts.Declared `json:"mounts,omitempty"`
+	// Schedule is the job this unit declares: the cron expression, and what a
+	// tick starts the container with. It is sent only for a unit that
+	// declares one, and a registration that carries it starts nothing here:
+	// kitbashd registers the job and its ticker is what runs the container,
+	// see PLAN.md section 2.3.
+	Schedule *Schedule `json:"schedule,omitempty"`
 	// Secrets are the names the unit declared in deploy.units[].secrets. Only
 	// the names are sent, ever: kitbashd reads the owner's values from root
 	// owned files at every start and writes them into the environment file
@@ -147,6 +153,31 @@ type Health struct {
 	Interval string `json:"interval,omitempty"`
 	Last     string `json:"last,omitempty"`
 	Healthy  *bool  `json:"healthy,omitempty"`
+}
+
+// Schedule is one job as a registration carries it: the five field cron
+// expression read in UTC, and the environment and ceiling a tick starts the
+// container with. The last three travel with the registration because a tick
+// has no session behind it, see PLAN.md section 2.3.
+//
+// processes_list answers the cron alone, which is what a member reads; the
+// rest is what kitbashd needs and already holds.
+type Schedule struct {
+	Cron   string            `json:"cron"`
+	Env    map[string]string `json:"env,omitempty"`
+	Memory string            `json:"memory,omitempty"`
+	CPU    string            `json:"cpu,omitempty"`
+}
+
+// LastRun is the run one job finished most recently: when kitbashd started the
+// container, the status its entrypoint exited with, and how long it took. It
+// is the daemon's own memory rather than a column, the same as a health
+// reading, so a daemon that has just started reports none, see
+// internal/daemon/schedule.go.
+type LastRun struct {
+	StartedAt  string `json:"startedAt"`
+	ExitCode   int    `json:"exitCode"`
+	DurationMs int64  `json:"durationMs"`
 }
 
 // The shapes the two restore fields must have. kitbashd starts what the
@@ -222,6 +253,14 @@ type Registered struct {
 	// was given is not a secret from its owner, and a listing carries no value
 	// any more than it carries a token.
 	Secrets []string `json:"secrets,omitempty"`
+	// Schedule is the job this Process is, for a registration that declares
+	// one, and NextRun the tick kitbashd will start it at, RFC 3339 in UTC.
+	// LastRun is the run it finished most recently, absent until it has run
+	// once under this daemon. proc_list publishes all three, see PLAN.md
+	// section 2.3.
+	Schedule *Schedule `json:"schedule,omitempty"`
+	NextRun  string    `json:"nextRun,omitempty"`
+	LastRun  *LastRun  `json:"lastRun,omitempty"`
 }
 
 // UnmarshalJSON reads a listed Process, accepting user as a spelling of owner.

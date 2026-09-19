@@ -59,7 +59,7 @@ func TestProcessTokensAreStoredAsHashes(t *testing.T) {
 	if hash == token || store.HashToken(token) != hash {
 		t.Errorf("hash = %q, want the SHA-256 of the token", hash)
 	}
-	if err := st.RegisterProcess(ctx, process(idOne, "alice", false), hash, 0); err != nil {
+	if err := st.RegisterProcess(ctx, process(idOne, "alice", false), hash, store.Quota{}); err != nil {
 		t.Fatalf("RegisterProcess: %v", err)
 	}
 
@@ -82,11 +82,11 @@ func TestRegisterReplacesForTheSameOwner(t *testing.T) {
 	ctx := context.Background()
 
 	first, firstHash, _ := store.NewToken()
-	if err := st.RegisterProcess(ctx, process(idOne, "alice", false), firstHash, 0); err != nil {
+	if err := st.RegisterProcess(ctx, process(idOne, "alice", false), firstHash, store.Quota{}); err != nil {
 		t.Fatalf("RegisterProcess: %v", err)
 	}
 	second, secondHash, _ := store.NewToken()
-	if err := st.RegisterProcess(ctx, process(idOne, "alice", true), secondHash, 0); err != nil {
+	if err := st.RegisterProcess(ctx, process(idOne, "alice", true), secondHash, store.Quota{}); err != nil {
 		t.Fatalf("RegisterProcess again: %v", err)
 	}
 
@@ -113,11 +113,11 @@ func TestRegisterRefusesAnotherOwnersID(t *testing.T) {
 	ctx := context.Background()
 
 	_, hash, _ := store.NewToken()
-	if err := st.RegisterProcess(ctx, process(idOne, "alice", false), hash, 0); err != nil {
+	if err := st.RegisterProcess(ctx, process(idOne, "alice", false), hash, store.Quota{}); err != nil {
 		t.Fatalf("RegisterProcess: %v", err)
 	}
 	_, otherHash, _ := store.NewToken()
-	err := st.RegisterProcess(ctx, process(idOne, "bob", false), otherHash, 0)
+	err := st.RegisterProcess(ctx, process(idOne, "bob", false), otherHash, store.Quota{})
 	if err == nil || !strings.Contains(err.Error(), "another member") {
 		t.Fatalf("registering another owner's id returned %v, want a conflict", err)
 	}
@@ -134,11 +134,11 @@ func TestProcessesListAndDelete(t *testing.T) {
 	ctx := context.Background()
 
 	aliceToken, aliceHash, _ := store.NewToken()
-	if err := st.RegisterProcess(ctx, process(idOne, "alice", false), aliceHash, 0); err != nil {
+	if err := st.RegisterProcess(ctx, process(idOne, "alice", false), aliceHash, store.Quota{}); err != nil {
 		t.Fatalf("RegisterProcess: %v", err)
 	}
 	_, bobHash, _ := store.NewToken()
-	if err := st.RegisterProcess(ctx, process(idTwo, "bob", false), bobHash, 0); err != nil {
+	if err := st.RegisterProcess(ctx, process(idTwo, "bob", false), bobHash, store.Quota{}); err != nil {
 		t.Fatalf("RegisterProcess: %v", err)
 	}
 
@@ -283,7 +283,7 @@ func TestFanOutSecretsAreMintedAndReplaced(t *testing.T) {
 	}
 	p := process(idOne, "alice", false)
 	p.FanoutSecret = first
-	if err := st.RegisterProcess(ctx, p, hash, 0); err != nil {
+	if err := st.RegisterProcess(ctx, p, hash, store.Quota{}); err != nil {
 		t.Fatalf("RegisterProcess: %v", err)
 	}
 	got, found, err := st.Process(ctx, idOne)
@@ -297,7 +297,7 @@ func TestFanOutSecretsAreMintedAndReplaced(t *testing.T) {
 	// A re-registration mints a new token, so it replaces the secret too: a
 	// container holding the old token holds the old secret.
 	p.FanoutSecret = second
-	if err := st.RegisterProcess(ctx, p, hash, 0); err != nil {
+	if err := st.RegisterProcess(ctx, p, hash, store.Quota{}); err != nil {
 		t.Fatalf("RegisterProcess again: %v", err)
 	}
 	got, _, err = st.Process(ctx, idOne)
@@ -336,7 +336,7 @@ func TestMigrationAddsTheFanOutSecretColumn(t *testing.T) {
 	}
 	legacy := process(idOne, "alice", false)
 	legacy.FanoutSecret = "written-before-the-column-was-dropped"
-	if err := st.RegisterProcess(ctx, legacy, hash, 0); err != nil {
+	if err := st.RegisterProcess(ctx, legacy, hash, store.Quota{}); err != nil {
 		t.Fatalf("RegisterProcess: %v", err)
 	}
 	if err := st.Close(); err != nil {
@@ -382,7 +382,7 @@ func TestMigrationAddsTheFanOutSecretColumn(t *testing.T) {
 	}
 	p := process(idOne, "alice", false)
 	p.FanoutSecret = fresh
-	if err := st.RegisterProcess(ctx, p, hash, 0); err != nil {
+	if err := st.RegisterProcess(ctx, p, hash, store.Quota{}); err != nil {
 		t.Fatalf("RegisterProcess after the migration: %v", err)
 	}
 	got, _, err = st.Process(ctx, idOne)

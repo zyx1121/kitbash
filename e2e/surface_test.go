@@ -146,6 +146,10 @@ type state struct {
 	// The value the member sets with secrets_set, made fresh at each run so a
 	// stale one cannot pass the assertions that read it back.
 	secret string
+	// The scheduled Package and the job proc_run registered for it, which the
+	// last steps read the tick of, see schedule_test.go.
+	tickerPath string
+	tickerID   string
 }
 
 // probeOutput is what a drafted Package's probe tool reports about its binary,
@@ -196,6 +200,7 @@ func TestSurface(t *testing.T) {
 		noteText:   fmt.Sprintf("# notes\n\nWritten by a member at %s.\n", time.Now().UTC().Format(time.RFC3339)),
 
 		pkgPath:       filepath.Join("/home", adminName(), packageName),
+		tickerPath:    filepath.Join("/home", adminName(), tickerName),
 		runnerPath:    filepath.Join("/home", adminName(), runnerName),
 		elsewherePath: filepath.Join("/home", adminName(), elsewhereName),
 		cliPath:       filepath.Join("/home", adminName(), cliName),
@@ -220,6 +225,12 @@ func TestSurface(t *testing.T) {
 		{"a member's write to /org is queued", queuedWrite},
 		{"the admin approves it and the member is the author", approveTheWrite},
 		{"tel_query returns the span and the build log", queryTelemetry},
+		// The job is registered here and read at the end: a tick is a minute
+		// away and the builds in between cost more than that, so the wait at
+		// the end is a budget rather than a delay. It comes after the query
+		// above because that one reads the newest build log of this member,
+		// and a build of this Package would be it, see schedule_test.go.
+		{"a scheduled Package is registered and starts nothing", registerTheJob},
 		{"the new member is served their own identity", theNewMember},
 		{"a run kit is built and joins the surface", buildTheRunKit},
 		{"proc_run dispatches to the run kit", dispatchToTheRunKit},
@@ -244,6 +255,8 @@ func TestSurface(t *testing.T) {
 		{"the same Package under a member who has not set it is refused", aSecondMemberIsRefused},
 		{"the span of secrets_set carries no value", theSpanCarriesNoValue},
 		{"secrets_remove takes the name away and the next run is refused", theSecretIsRemoved},
+		{"kitbashd ran the job on time and recorded the tick", theJobRan},
+		{"proc_stop unregisters the schedule", stopTheJob},
 	}
 	// The steps are one story and share the host, so they run in order on one
 	// test rather than as subtests: the first failure ends the job, and the

@@ -338,6 +338,8 @@ type healthResponse struct {
 	Subscribers   int       `json:"subscribers"`
 	MCPSessions   int       `json:"mcpSessions"`
 	Probes        int       `json:"probes"`
+	// Jobs is how many scheduled Processes the ticker holds, see schedule.go.
+	Jobs int `json:"jobs"`
 	// Routes is how many host names the reverse proxy serves, zero on a host
 	// with no domain, see proxy.go.
 	Routes          int    `json:"routes"`
@@ -371,6 +373,7 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		Subscribers:     s.fanout.count(),
 		MCPSessions:     s.mcpSessions.count(),
 		Probes:          s.probes.count(),
+		Jobs:            s.jobs.count(),
 		Routes:          s.proxy.count(),
 		LastBackup:      backup.LastBackup,
 		Backups:         backup.Backups,

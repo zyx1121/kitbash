@@ -67,7 +67,7 @@ func (h *harness) supervise(owner, container string) string {
 		// registration, and a start must not drop it, see #76.
 		Permits:      manifest.Permits{Tools: []string{"fs_read"}, Paths: []string{"/org"}},
 		RegisteredAt: time.Now().UTC(),
-	}, hash, 0); err != nil {
+	}, hash, store.Quota{}); err != nil {
 		h.t.Fatalf("RegisterProcess: %v", err)
 	}
 	return id
@@ -349,7 +349,7 @@ func (h *harness) superviseKit(owner, runner string) string {
 		Expose:       ExposeNone,
 		FanoutSecret: "the-secret",
 		RegisteredAt: time.Now().UTC(),
-	}, hash, 0); err != nil {
+	}, hash, store.Quota{}); err != nil {
 		h.t.Fatalf("RegisterProcess: %v", err)
 	}
 	return id

@@ -166,6 +166,49 @@ func (p *Podman) Start(ctx context.Context, m Member, container, cgroup string) 
 	return nil
 }
 
+// WaitContainer waits for one container's entrypoint to exit and answers the
+// status it exited with. It is what the built in scheduler runs a job by: the
+// tick starts the container and the run is over when this returns, see
+// internal/daemon/schedule.go.
+//
+// Unlike every other call here the caller's cancellation does reach the child.
+// A wait tears nothing down, so a wait that is given up on leaves the
+// container exactly as it was, and the budget is the caller's deadline: a run
+// may take hours, which is not a thing this package has an opinion about.
+//
+// A container the runtime does not have is ErrNoContainer, and a wait that
+// answers anything but a number is the runtime failing rather than the
+// container exiting, which is an error and not an exit status.
+func (p *Podman) WaitContainer(ctx context.Context, m Member, container string) (int, error) {
+	if err := ensureRuntimeDir(p.runUser(), m); err != nil {
+		return 0, err
+	}
+	if err := p.exists(ctx, m, container); err != nil {
+		return 0, err
+	}
+	cmd, closer, err := p.command(ctx, m, "", "wait", container)
+	defer closer()
+	if err != nil {
+		return 0, err
+	}
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return 0, fmt.Errorf("sysusers: waiting for %s as %s: %w", container, m.Name, ctxErr)
+		}
+		return 0, fmt.Errorf("sysusers: %s wait %s as %s: %w: %s",
+			p.binary(), container, m.Name, err, strings.TrimSpace(stderr.String()))
+	}
+	code, err := strconv.Atoi(strings.TrimSpace(stdout.String()))
+	if err != nil {
+		return 0, fmt.Errorf("sysusers: %s wait %s as %s answered %q, which is not an exit status",
+			p.binary(), container, m.Name, strings.TrimSpace(stdout.String()))
+	}
+	return code, nil
+}
+
 // ContainerConfig is the part of one container's configuration kitbashd reads
 // back off the runtime. It is not everything podman knows: it is what a
 // container has to be created again with so that nothing a manifest declared

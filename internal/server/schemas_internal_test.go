@@ -111,6 +111,16 @@ func TestFsSchemasMatchTheSurfaceSpecification(t *testing.T) {
 		{"pkg", "pkg_list", "output", string(pkgListOutputSchema)},
 		{"proc", "proc_list", "input", string(procListInputSchema)},
 		{"proc", "proc_list", "output", string(procListOutputSchema)},
+		// proc_run answers the same Process the listing describes, plus what
+		// only a run answers. It is diffed for the reason proc_list is: a
+		// field one side gained, such as the last run of a job, is a shape a
+		// client reads from the specification and never receives.
+		{"proc", "proc_run", "input", string(procRunInputSchema)},
+		{"proc", "proc_run", "output", string(procRunOutputSchema)},
+		{"proc", "proc_stop", "input", string(procStopInputSchema)},
+		{"proc", "proc_stop", "output", string(procStopOutputSchema)},
+		{"proc", "proc_logs", "input", string(procLogsInputSchema)},
+		{"proc", "proc_logs", "output", string(procLogsOutputSchema)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.tool+" "+tc.side, func(t *testing.T) {

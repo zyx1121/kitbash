@@ -83,7 +83,10 @@ func RegisterProcesses(s *mcp.Server, processes *proc.Service, b *bridge.Bridge)
 			"and a port is registered as a fan out subscriber. A unit whose runner names a Package is started " +
 			"by that kit instead: the kit has to be running as a Process of the caller, it is called with the " +
 			"Package, digest, name and unit, and the id, state and endpoint it answers with are the Process. " +
-			"kitbashd registers such a Process and supervises none of it.",
+			"kitbashd registers such a Process and supervises none of it. A unit with expose: none may declare " +
+			"schedule, five cron fields read in UTC: this registers the job, builds and starts nothing, and " +
+			"answers state scheduled with the next run kitbashd will make. kitbashd starts the container at " +
+			"each tick and a tick during a run is skipped.",
 		InputSchema:  procRunInputSchema,
 		OutputSchema: procRunOutputSchema,
 	}, runHandler(processes, b))
@@ -93,7 +96,9 @@ func RegisterProcesses(s *mcp.Server, processes *proc.Service, b *bridge.Bridge)
 		Description: "Processes owned by the caller, running or stopped. With a package, only that " +
 			"Package's Processes, each in full: digest, when it started, why it is not running, its " +
 			"mounts and its last health probe. Without one, every Process as a single line of id, name, " +
-			"package, state and exposure, which is what naming one to ask about takes.",
+			"package, state and exposure, which is what naming one to ask about takes. A scheduled Process " +
+			"is scheduled between its runs and running during one, and carries nextRun and, once it has run " +
+			"under this daemon, lastRun with the exit code and the duration.",
 		InputSchema:  procListInputSchema,
 		OutputSchema: procListOutputSchema,
 	}, processesHandler(processes))
@@ -102,7 +107,9 @@ func RegisterProcesses(s *mcp.Server, processes *proc.Service, b *bridge.Bridge)
 		Name: "proc_stop",
 		Description: "Stop a Process. It stays known and can be run again with proc_run. Its tools leave " +
 			"the surface. A Process a run kit owns is stopped through that kit's stop tool; a kit that " +
-			"declares none owns a Process kitbash cannot stop, which is not-permitted.",
+			"declares none owns a Process kitbash cannot stop, which is not-permitted. Stopping a scheduled " +
+			"Process unregisters the schedule, so no tick runs it again, and removes the container of its " +
+			"last run.",
 		InputSchema:  procStopInputSchema,
 		OutputSchema: procStopOutputSchema,
 	}, stopHandler(processes, b))
@@ -110,7 +117,8 @@ func RegisterProcesses(s *mcp.Server, processes *proc.Service, b *bridge.Bridge)
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "proc_logs",
 		Description: "Recent stdout and stderr of a Process. Structured logs are in Telemetry; this is the " +
-			"raw stream.",
+			"raw stream. For a scheduled Process it is the last run, which is kept until the next tick " +
+			"replaces it.",
 		InputSchema:  procLogsInputSchema,
 		OutputSchema: procLogsOutputSchema,
 	}, logsHandler(processes))

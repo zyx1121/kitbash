@@ -50,6 +50,11 @@ type RestoreCounts struct {
 	// PLAN.md section 3. The registration stays, because it is what keeps the
 	// Process on its owner's proc_list and its token alive.
 	Kit int
+	// Scheduled is how many are jobs, which restore registers with the ticker
+	// and starts none of: a job runs at its ticks and nowhere else, and the
+	// ticks missed while this host was down are not made up, see PLAN.md
+	// section 2.3.
+	Scheduled int
 }
 
 // Restore starts every registered Process again as its owner, which is what
@@ -80,6 +85,7 @@ func (s *Server) Restore(ctx context.Context) RestoreCounts {
 	}
 
 	var counts RestoreCounts
+	now := s.now()
 	byOwner := map[string][]store.Process{}
 	for _, p := range list {
 		// A Process a run kit owns is not this daemon's to start. It carries
@@ -103,7 +109,17 @@ func (s *Server) Restore(ctx context.Context) RestoreCounts {
 			s.fanout.untrack(p.ID)
 			s.probes.untrack(p.ID)
 			s.proxy.untrack(p.ID)
+			s.jobs.untrack(p.ID)
 			s.endMCPSessions(p.ID)
+			continue
+		}
+		// A job is registered again and started by nothing: its container is
+		// made at the next tick, from this registration, and the tick it
+		// would have had while the host was down is not made up, see
+		// schedule.go.
+		if scheduled(p) {
+			counts.Scheduled++
+			s.jobs.track(p, now)
 			continue
 		}
 		byOwner[p.Owner] = append(byOwner[p.Owner], p)
@@ -139,8 +155,9 @@ func (s *Server) Restore(ctx context.Context) RestoreCounts {
 	// what it is reachable at after one, see PLAN.md section 2.3.
 	s.LoadRoutes(ctx)
 
-	logger.Printf("restore: started %d (%d were already running), missing %d, failed %d, legacy %d, healed %d, owned by a run kit %d",
-		counts.Started, counts.Running, counts.Missing, counts.Failed, counts.Legacy, counts.Healed, counts.Kit)
+	logger.Printf("restore: started %d (%d were already running), missing %d, failed %d, legacy %d, healed %d, owned by a run kit %d, scheduled %d",
+		counts.Started, counts.Running, counts.Missing, counts.Failed, counts.Legacy, counts.Healed, counts.Kit,
+		counts.Scheduled)
 	return counts
 }
 
@@ -275,6 +292,7 @@ func (s *Server) restoreOwner(ctx context.Context, owner string, processes []sto
 			s.clearProcessProblem(p.ID)
 			s.probes.untrack(p.ID)
 			s.proxy.untrack(p.ID)
+			s.jobs.untrack(p.ID)
 			s.endMCPSessions(p.ID)
 		default:
 			logger.Printf("restore: starting %s of %s: %v", p.Container, owner, err)
@@ -484,7 +502,7 @@ func (s *Server) healCeiling(ctx context.Context, m sysusers.Member, p store.Pro
 	// The registration catches up only now: the ceiling is recorded, so the
 	// next boot takes the ordinary path, and the token is the one the new
 	// container is holding.
-	if err := s.store.RegisterProcess(ctx, ceilingWritten(p), hash, 0); err != nil {
+	if err := s.store.RegisterProcess(ctx, ceilingWritten(p), hash, store.Quota{}); err != nil {
 		// The container is up and the store missed the write. Saying so is the
 		// whole answer: the Process runs, its exports are refused until it is
 		// run again, and the next boot heals nothing because the container is
@@ -682,7 +700,7 @@ func (s *Server) remakeMounted(ctx context.Context, m sysusers.Member, p store.P
 	if err := s.createVerifiedContainer(make, m, p, opts, leaf, mounted); err != nil {
 		return err
 	}
-	if err := s.store.RegisterProcess(ctx, p, hash, 0); err != nil {
+	if err := s.store.RegisterProcess(ctx, p, hash, store.Quota{}); err != nil {
 		logger.Printf("restore: recording the token of %s: %v", p.ID, err)
 	}
 	return nil

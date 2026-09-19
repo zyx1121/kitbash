@@ -9,9 +9,11 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/zyx1121/kitbash/internal/manifest"
 	"github.com/zyx1121/kitbash/internal/mounts"
+	"github.com/zyx1121/kitbash/internal/podman"
 	"github.com/zyx1121/kitbash/internal/problem"
 	"github.com/zyx1121/kitbash/internal/store"
 )
@@ -105,6 +107,23 @@ type processRequest struct {
 	// are the owner's and are read from root owned files at every start, so
 	// none of them is ever in this body, see secrets.go.
 	Secrets []string `json:"secrets,omitempty"`
+	// Schedule is the job this unit declared: the cron expression, and what a
+	// tick starts the container with. A registration that carries one starts
+	// no container here; kitbashd registers the job and its ticker runs it,
+	// see schedule.go.
+	Schedule *scheduleRequest `json:"schedule,omitempty"`
+}
+
+// scheduleRequest is the job one registration declares. The environment and
+// the ceiling are in it because a tick has no session behind it: what a start
+// request would carry has to travel with the registration or it never reaches
+// the daemon at all, see PLAN.md section 2.3. No value of a secret is in it,
+// the same as every other body here.
+type scheduleRequest struct {
+	Cron   string            `json:"cron"`
+	Env    map[string]string `json:"env,omitempty"`
+	Memory string            `json:"memory,omitempty"`
+	CPU    string            `json:"cpu,omitempty"`
 }
 
 // healthRequest is the probe a registration declares, which is the part of
@@ -132,6 +151,11 @@ type processResponse struct {
 	// for a Process that declared none, the declared one for a Process that
 	// did, see proxy.go.
 	Host string `json:"host,omitempty"`
+	// NextRun is when kitbashd will start a registered job, RFC 3339 in UTC,
+	// absent for every registration that is not one. It is the daemon's
+	// answer too: the expression is the member's, the clock is the host's,
+	// see schedule.go.
+	NextRun string `json:"nextRun,omitempty"`
 }
 
 // processList is what processes_list answers, without a token anywhere in it.
@@ -153,6 +177,20 @@ type listedProcess struct {
 	// domain this host was given, so a host that gains a domain serves every
 	// Process that was already registered under it, see proxy.go.
 	Host string `json:"host,omitempty"`
+	// NextRun is the tick kitbashd will start a job at, and LastRun the run it
+	// finished most recently. Neither is a column: the next tick is computed
+	// from the expression and this host's clock, and the last run is what this
+	// daemon saw, so one that has just started answers a job with a next tick
+	// and no last run, see schedule.go.
+	NextRun string     `json:"nextRun,omitempty"`
+	LastRun *listedRun `json:"lastRun,omitempty"`
+}
+
+// listedRun is one finished run as processes_list answers it.
+type listedRun struct {
+	StartedAt  string `json:"startedAt"`
+	ExitCode   int    `json:"exitCode"`
+	DurationMs int64  `json:"durationMs"`
 }
 
 // processes answers POST and GET on /kitbash/v1/processes.
@@ -230,6 +268,7 @@ func (s *Server) registerProcess(w http.ResponseWriter, r *http.Request, caller 
 		Health:        declaredHealth(req.Health),
 		Mounts:        resolved,
 		Secrets:       req.Secrets,
+		Schedule:      declaredSchedule(req.Schedule),
 		FanoutSecret:  secret,
 		RegisteredAt:  s.now().UTC(),
 	}
@@ -261,11 +300,17 @@ func (s *Server) registerProcess(w http.ResponseWriter, r *http.Request, caller 
 		writeProblem(w, prob)
 		return
 	}
-	if err := s.store.RegisterProcess(r.Context(), p, hash, MaxProcessesPerMember); err != nil {
+	if err := s.store.RegisterProcess(r.Context(), p, hash, store.Quota{Processes: MaxProcessesPerMember, Scheduled: MaxScheduledPerMember}); err != nil {
 		if errors.Is(err, store.ErrProcessOwned) {
 			writeProblem(w, problem.ConflictFix(r.URL.Path,
 				fmt.Sprintf("the Process %s belongs to another member", req.ID),
 				"Register the Process under a new id."))
+			return
+		}
+		if errors.Is(err, store.ErrTooManyScheduled) {
+			writeProblem(w, problem.ConflictFix(r.URL.Path,
+				fmt.Sprintf("%s already has %d scheduled Processes registered", caller.User, MaxScheduledPerMember),
+				"Stop a scheduled Process you are no longer using, which unregisters it, then run this one."))
 			return
 		}
 		if errors.Is(err, store.ErrTooManyProcesses) {
@@ -292,8 +337,13 @@ func (s *Server) registerProcess(w http.ResponseWriter, r *http.Request, caller 
 	// exists yet: a Process that is registered and not running answers 503 on
 	// its own name rather than looking like a name nobody holds.
 	s.trackRouteFor(r.Context(), p)
+	// A job is registered and nothing is started: the ticker is what runs it,
+	// and the first tick is computed from now, so a job registered a minute
+	// after its time runs at the next one, see schedule.go.
+	s.jobs.track(p, s.now())
 	writeJSON(w, r.URL.Path, processResponse{
 		ID: p.ID, Token: token, FanoutSecret: secret, Host: hostFor(p, s.proxy.domain),
+		NextRun: s.nextRun(p.ID),
 	})
 }
 
@@ -327,6 +377,37 @@ func declaredHealth(req *healthRequest) store.Health {
 	return store.Health{HTTP: req.HTTP, Interval: req.Interval}
 }
 
+// declaredSchedule reads the job of one registration. A body without one is a
+// Process that stays up, which is every registration written before schedules
+// existed.
+func declaredSchedule(req *scheduleRequest) store.Schedule {
+	if req == nil {
+		return store.Schedule{}
+	}
+	held := store.Schedule{Cron: req.Cron, Env: req.Env, Memory: req.Memory, CPU: req.CPU}
+	// The expression is stored as this daemon read it, fields separated by one
+	// space, rather than as the member spaced them: what kitbashd holds is
+	// what it will run, and a listing that echoed the manifest's own spacing
+	// would be answering the file rather than the registry. The expression has
+	// already been parsed by validateSchedule, so a spelling that does not
+	// parse never reaches here.
+	if cron, err := manifest.ParseCron(req.Cron); err == nil {
+		held.Cron = cron.Expr
+	}
+	return held
+}
+
+// nextRun is when kitbashd will start one job, as the surface spells a time. A
+// Process that is not a job, and one whose expression this daemon could not
+// read, answer nothing.
+func (s *Server) nextRun(id string) string {
+	next, _, _, tracked := s.jobs.reading(id)
+	if !tracked || next.IsZero() {
+		return ""
+	}
+	return next.UTC().Format(time.RFC3339)
+}
+
 // listProcesses answers with the caller's Processes, or every member's for an
 // admin, the same rule tel_query follows.
 func (s *Server) listProcesses(w http.ResponseWriter, r *http.Request, caller Caller) {
@@ -345,6 +426,18 @@ func (s *Server) listProcesses(w http.ResponseWriter, r *http.Request, caller Ca
 	listed := make([]listedProcess, 0, len(list))
 	for _, p := range s.withReadings(list) {
 		entry := listedProcess{Process: p, Host: hostFor(p, s.proxy.domain)}
+		if next, last, hasLast, tracked := s.jobs.reading(p.ID); tracked {
+			if !next.IsZero() {
+				entry.NextRun = next.UTC().Format(time.RFC3339)
+			}
+			if hasLast {
+				entry.LastRun = &listedRun{
+					StartedAt:  last.startedAt.UTC().Format(time.RFC3339),
+					ExitCode:   last.exitCode,
+					DurationMs: last.duration.Milliseconds(),
+				}
+			}
+		}
 		if prob := s.processProblem(p.ID); prob.Detail != "" {
 			entry.Problem = prob.Detail
 			entry.Fix = prob.Fix
@@ -395,6 +488,13 @@ func (s *Server) unregisterProcess(w http.ResponseWriter, r *http.Request, id st
 		return
 	}
 
+	// The action lock is held across the read, the delete and the untracking,
+	// because a tick of a scheduled Process reads its registration and writes
+	// the token of the run back into it: without this the unregister would be
+	// undone by the tick it raced, and the job would come back at the next
+	// start of the daemon, see schedule.go.
+	unlock := s.actions.lock(id)
+	defer unlock()
 	p, found, err := s.store.Process(r.Context(), id)
 	if err != nil {
 		writeProblem(w, problem.Internal(r.URL.Path, err.Error(), ""))
@@ -427,6 +527,9 @@ func (s *Server) unregisterProcess(w http.ResponseWriter, r *http.Request, id st
 	// And nothing is routed to it: the name a Process held is served while it
 	// is registered and not a moment longer.
 	s.proxy.untrack(id)
+	// A job goes with its registration too: proc_stop is what unregisters a
+	// scheduled Process, and there is no tick after it, see schedule.go.
+	s.jobs.untrack(id)
 	// The token that opened them is revoked, so the sessions it opened are
 	// over and the kitbash-mcp of each one exits.
 	s.endMCPSessions(id)
@@ -514,6 +617,9 @@ func validateProcess(instance string, req processRequest) *problem.Problem {
 		return prob
 	}
 	if prob := validateHostname(instance, req); prob != nil {
+		return prob
+	}
+	if prob := validateSchedule(instance, req); prob != nil {
 		return prob
 	}
 	// The count is held here rather than in the resolution, so a registration
@@ -604,6 +710,54 @@ func validateHostname(instance string, req processRequest) *problem.Problem {
 		return problem.NotPermitted(instance,
 			"a Process a run kit owns is not served by kitbashd, so it has no host name here",
 			fmt.Sprintf("Remove deploy.units[0].hostname from this Package, or have %s publish the Process it runs.", req.Runner))
+	}
+	return nil
+}
+
+// validateSchedule checks the job a registration declares. It is the same rule
+// spec/manifest.schema.json and internal/manifest read, checked again here
+// because a registration is a request and not a manifest: kitbash-mcp runs as
+// the member, so what it sends about a unit is a claim.
+//
+// Everything that describes a Process which stays up is refused beside a
+// schedule, because a job is not one: it is started at its tick, it exits, and
+// between runs there is nothing to expose, probe, restart or deliver records
+// to. A Process a run kit owns is refused for the reason it is not probed: the
+// container is not on this host, so there is nothing here to start.
+func validateSchedule(instance string, req processRequest) *problem.Problem {
+	if req.Schedule == nil {
+		return nil
+	}
+	refuse := func(detail string) *problem.Problem {
+		return problem.BadRequest(instance, detail, manifest.ScheduleFix)
+	}
+	if _, err := manifest.ParseCron(req.Schedule.Cron); err != nil {
+		return refuse(err.Error())
+	}
+	if req.Expose != ExposeNone {
+		return refuse(fmt.Sprintf(
+			"this unit declares a schedule and is exposed as %s, and a job is a container that runs and exits",
+			req.Expose))
+	}
+	if req.Health != nil {
+		return refuse("this unit declares a schedule and a health probe, and between the runs of a job there is nothing to probe")
+	}
+	if len(req.Subscriptions) > 0 {
+		return refuse("this Package declares a schedule and a subscription, and a subscriber is a Process that is up to receive records")
+	}
+	if req.Runner != "" {
+		return problem.NotPermitted(instance,
+			"a Process a run kit owns is not started by kitbashd, so it has no schedule here",
+			fmt.Sprintf("Remove deploy.units[0].schedule from this Package, or have %s start what it runs on time.", req.Runner))
+	}
+	if prob := checkEnv(instance, req.Schedule.Env); prob != nil {
+		return prob
+	}
+	if req.Schedule.Memory != "" && !podman.ValidMemory(podman.MemoryLimit(req.Schedule.Memory)) {
+		return refuse(fmt.Sprintf("limits.memory %q is not a size the container runtime takes", req.Schedule.Memory))
+	}
+	if req.Schedule.CPU != "" && !podman.ValidCPUs(req.Schedule.CPU) {
+		return refuse(fmt.Sprintf("limits.cpu %q is not a number of cores", req.Schedule.CPU))
 	}
 	return nil
 }

@@ -611,7 +611,7 @@ func (h *harness) declareSecrets(id string, declared ...string) {
 	if err != nil {
 		h.t.Fatalf("NewToken: %v", err)
 	}
-	if err := h.store.RegisterProcess(context.Background(), p, hash, 0); err != nil {
+	if err := h.store.RegisterProcess(context.Background(), p, hash, store.Quota{}); err != nil {
 		h.t.Fatalf("RegisterProcess: %v", err)
 	}
 }

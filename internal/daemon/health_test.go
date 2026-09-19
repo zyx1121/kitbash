@@ -201,7 +201,7 @@ func (h *harness) storedProbeOf(fake *sysusers.Fake, owner, container, endpoint,
 		Endpoint:     endpoint,
 		Health:       store.Health{HTTP: "/healthz", Interval: interval},
 		RegisteredAt: time.Now().UTC(),
-	}, hash, 0); err != nil {
+	}, hash, store.Quota{}); err != nil {
 		h.t.Fatalf("RegisterProcess: %v", err)
 	}
 	return id
@@ -826,7 +826,7 @@ func TestTheProbeLoopSkipsAProcessARunKitOwns(t *testing.T) {
 	p := h.process(id)
 	p.Runner = "/org/pve-runner"
 	p.Container = ""
-	if err := h.store.RegisterProcess(context.Background(), p, "hash-of-a-token", 0); err != nil {
+	if err := h.store.RegisterProcess(context.Background(), p, "hash-of-a-token", store.Quota{}); err != nil {
 		t.Fatalf("RegisterProcess: %v", err)
 	}
 

@@ -227,6 +227,15 @@ func (s *Server) owned(r *http.Request, caller Caller, id string) (store.Process
 // inside their cgroup leaf and under their delegated subtree, which is what
 // makes the manifest's limits an enforcement, see internal/cgroups.
 func (s *Server) startProcess(w http.ResponseWriter, r *http.Request, p store.Process, m sysusers.Member) {
+	// A job is started by its ticks and by nothing else. A session that asked
+	// for one would run the container at a time nobody declared, and the run
+	// would be recorded as a tick that never came, see schedule.go.
+	if p.Schedule.Declared() {
+		writeProblem(w, problem.NotPermitted(r.URL.Path,
+			fmt.Sprintf("the Process %s is a job, and kitbashd starts a job at its schedule", p.ID),
+			"Wait for the next tick, or remove deploy.units[0].schedule from this Package and run it again."))
+		return
+	}
 	var req startRequest
 	if prob := decodeBody(w, r, &req); prob != nil {
 		writeProblem(w, prob)
@@ -684,7 +693,7 @@ func (s *Server) mintToken(ctx context.Context, p store.Process) (string, error)
 	// The record is written back as it was read, so nothing but the token
 	// hash changes: the limit is not applied, because replacing a Process is
 	// never a new one.
-	if err := s.store.RegisterProcess(ctx, p, hash, 0); err != nil {
+	if err := s.store.RegisterProcess(ctx, p, hash, store.Quota{}); err != nil {
 		return "", err
 	}
 	return token, nil

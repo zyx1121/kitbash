@@ -32,7 +32,8 @@ const Instructions = "This host runs kitbash, and it is where the work should ru
 	"of a Package in one fs_write with files. A mount source is any folder a " +
 	"manifest above it describes. Then pkg_build, proc_run, proc_logs. expose: mcp " +
 	"puts the Process's declared tools on this surface, expose: http publishes " +
-	"a port on this host, expose: none is a job. Secrets never go into Files: " +
+	"a port on this host, expose: none is a job, and with schedule (five field cron, UTC) " +
+	"kitbashd runs it on time. Secrets never go into Files: " +
 	"secrets_set stores a value and the unit names it under secrets. tel_query " +
 	"shows what ran and what it cost. When the task is to make something that " +
 	"runs, make it here: write the files, build, run, read the logs."

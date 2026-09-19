@@ -58,6 +58,23 @@ that does not resolve to this host, checked again at every start, is
 `not-permitted` naming what it resolved to. A host with no domain answers no `url` and
 the Process keeps its internal port.
 
+A unit with `expose: none` may declare `schedule` in `deploy.units[]`, five cron
+fields read in UTC, and then it is a job: `proc_run` registers it, starts
+nothing, and answers `state: scheduled` with the `nextRun` kitbashd will start
+it at, which `proc_list` shows beside the `lastRun` of a job that has run.
+kitbashd starts the container at each tick as the owner, with the same
+environment, secrets, mounts and ceiling any start gets, and every tick writes
+one `kitbash.schedule` record, so "did it run this morning" is a `tel_query`.
+A tick that arrives while the previous run is still going is skipped and
+recorded, a host runs at most 8 scheduled containers at once and one member at
+most 3 of those, a tick beyond either is skipped as busy, a run longer than 6
+hours is stopped and recorded with exit code 137, ticks missed while the host
+was down are not made up, and a member holds at most 32 jobs. Every run is given
+a token of its own, revoked when the container exits. `proc_logs` reads the last run, whose container is
+kept until the next tick replaces it, and `proc_stop` unregisters the schedule
+and removes it. A `schedule` on any other `expose`, or beside `health`,
+`restart` or `subscriptions`, is `invalid-manifest`.
+
 ## tel
 
 Telemetry. OTLP in, queryable out.

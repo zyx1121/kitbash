@@ -31,7 +31,7 @@ func TestProcessKeepsTheLimitsItWasStartedWith(t *testing.T) {
 		Expose:       "none",
 		Limits:       want,
 		RegisteredAt: time.Now().UTC(),
-	}, hash, 0); err != nil {
+	}, hash, store.Quota{}); err != nil {
 		t.Fatalf("RegisterProcess: %v", err)
 	}
 
@@ -75,7 +75,7 @@ func TestAProcessRegisteredBeforeLimitsReadsBackWithNone(t *testing.T) {
 		Expose:       "none",
 		Limits:       store.Limits{Memory: "512Mi"},
 		RegisteredAt: time.Now().UTC(),
-	}, hash, 0); err != nil {
+	}, hash, store.Quota{}); err != nil {
 		t.Fatalf("RegisterProcess: %v", err)
 	}
 	if err := st.Close(); err != nil {

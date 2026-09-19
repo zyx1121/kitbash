@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"os"
 	"strings"
@@ -17,6 +18,11 @@ import (
 
 	_ "modernc.org/sqlite" // pure Go driver, so the binary stays static
 )
+
+// logger writes where the operator reads, the same shape internal/daemon uses.
+// This package says almost nothing: what it writes is a record it read and
+// could not make sense of, which is the operator's to see and nobody else's.
+var logger = log.New(os.Stderr, "kitbashd: ", log.LstdFlags)
 
 // Signals a query and a retention window can name, see spec/mcp-surface.yaml.
 const (
@@ -332,6 +338,7 @@ CREATE TABLE IF NOT EXISTS processes (
   endpoint      TEXT    NOT NULL DEFAULT '',
   subscriptions TEXT    NOT NULL DEFAULT '',
   runner        TEXT    NOT NULL DEFAULT '',
+  schedule      TEXT    NOT NULL DEFAULT '',
   token_hash    TEXT    NOT NULL,
   fanout_secret TEXT    NOT NULL DEFAULT '',
   registered_at INTEGER NOT NULL

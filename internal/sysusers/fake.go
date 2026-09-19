@@ -79,6 +79,18 @@ type Fake struct {
 	// mounted something else writes over it afterwards.
 	ProcRoot string
 
+	// Exits are the statuses WaitContainer answers per container. A container
+	// with no entry exits 0, which is a job that did what it was started to
+	// do.
+	Exits map[string]int
+	// Waiting are containers whose wait blocks until the test sends the exit
+	// status, or until the caller's context is done, which is how a run that
+	// outlives its ceiling is staged without waiting six hours.
+	Waiting map[string]chan int
+	// WaitErr makes every wait fail, which is a runtime that would not answer
+	// what a container exited with.
+	WaitErr error
+
 	// Missing are containers Start, Stop and Remove answer ErrNoContainer
 	// for, by name, and images Run answers ErrNoImage for.
 	Missing map[string]bool
@@ -106,6 +118,7 @@ type Fake struct {
 	Ran               []RunCall
 	Inited            []StartCall
 	Stopped           []StopCall
+	Waited            []StopCall
 	Renamed           []RenameCall
 	RemovedContainers []StopCall
 	RemovedFor        []string
@@ -618,6 +631,59 @@ func (f *Fake) Stop(_ context.Context, m Member, container string, timeout int) 
 		f.Configs[container] = config
 	}
 	return nil
+}
+
+// WaitContainer answers what one container exited with. A container staged in
+// Waiting blocks until the test releases it or the caller gives up, which is
+// the run that is still going when its ceiling passes; every other container
+// exits at once with the status in Exits, zero by default.
+func (f *Fake) WaitContainer(ctx context.Context, m Member, container string) (int, error) {
+	f.mu.Lock()
+	if f.Missing[container] {
+		f.mu.Unlock()
+		return 0, fmt.Errorf("%w: %s", ErrNoContainer, container)
+	}
+	if f.WaitErr != nil {
+		f.mu.Unlock()
+		return 0, f.WaitErr
+	}
+	held := f.Waiting[container]
+	code := f.Exits[container]
+	f.Waited = append(f.Waited, StopCall{Member: m.Name, Container: container})
+	f.mu.Unlock()
+	if held == nil {
+		f.exited(container)
+		return code, nil
+	}
+	select {
+	case got := <-held:
+		f.exited(container)
+		return got, nil
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+// exited leaves the container in the state a container whose entrypoint
+// returned is in, which is what proc_logs and proc_list read afterwards.
+func (f *Fake) exited(container string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if config, held := f.Configs[container]; held {
+		config.State = podman.StateExited
+		config.PID = 0
+		f.Configs[container] = config
+	}
+	delete(f.Running, container)
+}
+
+// Waits is every wait the caller asked for, in order.
+func (f *Fake) Waits() []StopCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]StopCall, len(f.Waited))
+	copy(out, f.Waited)
+	return out
 }
 
 // SetState stages what the runtime says one container is doing, for a test

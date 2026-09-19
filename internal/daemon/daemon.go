@@ -163,6 +163,17 @@ type Options struct {
 	// to. Zero means MinHealthInterval. It exists for tests, which cannot
 	// wait five seconds to see a second probe.
 	HealthMinInterval time.Duration
+	// ScheduleMaxRuns caps how many scheduled runs this host has going at
+	// once. Zero means MaxScheduledRuns. It exists for tests, which cannot
+	// start eight containers to see the ninth tick skipped.
+	ScheduleMaxRuns int
+	// ScheduleMaxRun is how long one scheduled run may take before kitbashd
+	// stops it. Zero means MaxRunTime. It exists for tests, which cannot wait
+	// six hours to see a run stopped.
+	ScheduleMaxRun time.Duration
+	// ScheduleMaxPerMember caps how many scheduled runs one member has going
+	// at once, out of ScheduleMaxRuns. Zero means MaxRunsPerMember.
+	ScheduleMaxPerMember int
 	// OrgRoot is the shared root a mount source may name, /org on a kitbash
 	// host. Empty means mounts.OrgRoot. It exists for tests, which have no
 	// /org of their own to put a folder in.
@@ -256,6 +267,14 @@ type Server struct {
 	// requests, see health.go. The loop that requests them is started by the
 	// caller after restore.
 	probes *prober
+	// jobs holds the registered Processes whose unit declared a schedule, and
+	// how many of their runs are going, see schedule.go. The loop that starts
+	// them is started by the caller after restore, like the health probes.
+	jobs *scheduler
+	// scheduleMaxRun is how long one scheduled run may take before kitbashd
+	// stops it. Zero means MaxRunTime; it is configurable for the tests, the
+	// same way the health interval floor is.
+	scheduleMaxRun time.Duration
 	// proxy is the routing table of every Process with expose: http and the
 	// two listeners built from it, see proxy.go. On a host with no domain it
 	// exists and routes nothing, so nothing else here has to ask whether there
@@ -335,6 +354,10 @@ func New(st *store.Store, opts Options) *Server {
 		actions:  newActionLock(),
 		fetches:  newFetchLock(),
 		probes:   newProber(opts.HealthMinInterval),
+		jobs:     newScheduler(opts.ScheduleMaxRuns, opts.ScheduleMaxPerMember),
+
+		scheduleMaxRun: opts.ScheduleMaxRun,
+
 		proxy:    newProxy(opts),
 		resolver: opts.Resolver,
 

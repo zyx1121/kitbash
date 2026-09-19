@@ -241,7 +241,7 @@ func TestARemovedMembersNameIsNoLongerAsked(t *testing.T) {
 		ID: uuid.V7(), Owner: "alice", Package: "/org/sensorium", Name: testProcessName,
 		Container: container, Digest: testDigest, Expose: ExposeHTTP,
 		Endpoint: up.server.URL, RegisteredAt: time.Now().UTC(),
-	}, hash, 0); err != nil {
+	}, hash, store.Quota{}); err != nil {
 		t.Fatalf("RegisterProcess: %v", err)
 	}
 	h.server.LoadRoutes(context.Background())

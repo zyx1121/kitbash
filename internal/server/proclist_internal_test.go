@@ -74,6 +74,28 @@ func aProcess() proc.Process {
 	}
 }
 
+// aJob is one scheduled Process as proc_run and proc_list answer about it:
+// waiting between its runs, with the expression kitbashd holds, the tick it
+// will make and the run it finished. It is a second shape the one published
+// schema has to take, see PLAN.md section 2.3.
+func aJob() proc.Process {
+	return proc.Process{
+		ID:       "0199a000-0000-7000-8000-000000000002",
+		Name:     "weather",
+		Package:  "/home/tester/weather",
+		Digest:   "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+		State:    proc.StateScheduled,
+		Expose:   "none",
+		Schedule: "0 8 * * *",
+		NextRun:  "2026-09-20T08:00:00Z",
+		LastRun: &proc.LastRun{
+			StartedAt:  "2026-09-19T08:00:00Z",
+			ExitCode:   0,
+			DurationMs: 1200,
+		},
+	}
+}
+
 // TestProcListOutputValidatesBothShapes is the guard on proc_list answering
 // two shapes through one schema: a Process in full and a line have to validate
 // against the published output, and a client's validator is what says so.
@@ -90,6 +112,15 @@ func TestProcListOutputValidatesBothShapes(t *testing.T) {
 	if err := validate(t, schema, full.OfPackage("/home/tester/app")); err != nil {
 		t.Errorf("a listing of one Package does not validate against proc_list's output:\n%v", err)
 	}
+	// And the other shape the same schema answers: a job, waiting, with the
+	// tick it will make and the run it finished.
+	jobs := &proc.ListResult{Processes: []proc.Process{aJob()}}
+	if err := validate(t, schema, jobs); err != nil {
+		t.Errorf("a scheduled Process does not validate against proc_list's output:\n%v", err)
+	}
+	if err := validate(t, schema, jobs.Lines()); err != nil {
+		t.Errorf("a line of a scheduled Process does not validate against proc_list's output:\n%v", err)
+	}
 
 	// And the schema is doing work: an answer that is not a Process is
 	// refused, so the two above passing means something.
@@ -103,6 +134,28 @@ func TestProcListOutputValidatesBothShapes(t *testing.T) {
 	missing := map[string]any{"processes": []any{map[string]any{"id": "x"}}}
 	if err := validate(t, schema, missing); err == nil {
 		t.Error("a Process with no name, package or state validated")
+	}
+}
+
+// proc_run answers the same two shapes, so its own published schema is held to
+// both: a Process that is up and a job that is waiting.
+func TestProcRunOutputValidatesAProcessAndAJob(t *testing.T) {
+	schema := compileSchema(t, procRunOutputSchema)
+	for name, answer := range map[string]proc.Process{"a Process": aProcess(), "a job": aJob()} {
+		if err := validate(t, schema, answer); err != nil {
+			t.Errorf("%s does not validate against proc_run's output:\n%v", name, err)
+		}
+	}
+	// The schema is doing work: a state the surface has no name for is
+	// refused, so the two above passing means something.
+	refused := map[string]any{
+		"id": "0199a000-0000-7000-8000-000000000001", "name": "app",
+		"package": "/home/tester/app",
+		"digest":  "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+		"state":   "waiting",
+	}
+	if err := validate(t, schema, refused); err == nil {
+		t.Error("a Process in a state the surface has no name for validated")
 	}
 }
 
