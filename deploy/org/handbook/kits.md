@@ -228,7 +228,7 @@ says what to do next.
 
 ## Test before building
 
-Six of the seven seeded Packages ship a driver under `test/` that runs the
+Five of the six seeded Packages ship a driver under `test/` that runs the
 Package as a plain process against fakes: a fake kitbashd receiver for a
 subscriber, a fake MCP surface for one that calls tools. Copy that shape. A
 driver finds a wrong schema or a missing header in a second, where a build and a
@@ -321,47 +321,9 @@ given as an output is `not-permitted`, and a Package that declares no mounts
 refuses every path. The kit writes what you asked for;
 kitbashd decides at `proc_run` whether it is legal.
 
-## Making a Process an agent
-
-`agent-template` is the other side of `KITBASH_MCP_ENDPOINT`: where `workflow`
-walks a graph you wrote, this one hands the surface to a model and lets it
-decide which tool to call next. Its one tool, `run`, takes a task in words and
-answers with the result, one entry per tool call it made and what the run cost.
-
-It needs a key, which is the first Package here to need a secret:
-
-1. `secrets_set` with `{"name": "ANTHROPIC_API_KEY", "value": "sk-ant-..."}`.
-   The value lives with kitbashd and is resolved into the container at every
-   start, so a key set after the Process started is not in its environment:
-   `proc_stop` and `proc_run` again, which is what the problem says as well.
-2. `proc_run` with `{"package": "/org/agent-template"}`.
-3. `agent-template_run` with `{"task": "Read /home/you/notes/inbox.md, group
-   what is in it by project, and write the groups to
-   /home/you/notes/by-project.md"}`.
-
-What it may call is `provides.permits` and nothing else: Files under `/org` and
-`/home/*`, the readers of Packages, Processes and Telemetry, and `packages`,
-which is the tools of your other running Processes. There is no `proc_run`, no
-`pkg_build` and nothing that writes a member or approves a change, because an
-agent anyone may copy is not an admin by default.
-
-The folder is a template, which is the point of it. Copy it into your home,
-edit `AGENT.md` for what this agent is for, the unit's `env` for `AGENT_MODEL`,
-`AGENT_EFFORT` and `AGENT_MAX_ITERATIONS`, and `provides.permits` for what it
-may reach, then `pkg_build` and `proc_run` it. Its tool joins the surface as
-`<name>_run`, so agents of different names run side by side. `AGENT.md` in the
-folder is the whole of it, and reading it is `fs_read` or the `prompt` the
-Package declares.
-
-A run is synchronous and one call can take minutes, because a turn is an API
-request and a hard task is many turns. Nothing polls and nothing resumes: a task
-too large for one run is two tasks, and a result the next run needs is a file
-the first one wrote.
-
 ## The seeded Packages
 
-Worked examples under `/org`. Five declare a kit hook; `workflow` and
-`agent-template` declare none.
+Worked examples under `/org`. Five declare a kit hook; `workflow` declares none.
 
 - `import-cli`: an import kit for a command line tool from an Alpine package. It
   drafts a Package, and its `refine` tool turns the binary's own help text into
@@ -372,5 +334,3 @@ Worked examples under `/org`. Five declare a kit hook; `workflow` and
 - `evaluate-latency`: observe and evaluate. It judges slow spans.
 - `workflow`: it calls the owner's tools through `KITBASH_MCP_ENDPOINT`, and its
   `WORKFLOW.md` is what a `prompt` entry is for.
-- `agent-template`: a Process that is an agent. It gives the surface it reaches
-  to a model and lets it call the tools until the task is done.
