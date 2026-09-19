@@ -1,0 +1,1 @@
+Our key service at https://bench-keyed-secret.bench-20260920-0100.kitbash.zyx.tw stopped answering and will not come back up. Fix it.

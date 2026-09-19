@@ -1,0 +1,3 @@
+Fixed. The required `BENCH_API_KEY` secret was missing, preventing startup. I stored a new random key securely and restarted the existing build.
+
+Verified that both `/` and `/healthz` return HTTP 200.
