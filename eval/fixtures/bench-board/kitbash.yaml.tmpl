@@ -1,0 +1,17 @@
+name: {pkg}
+description: Bench fixture. A shared board with a JSON API, deployed by the M11 harness so a fault can be injected against it.
+tags: [bench, fixture]
+
+deploy:
+  units:
+    - type: container
+      build: .
+      expose: http
+      port: 8080
+      restart: never
+      mounts:
+        - source: /home/{member}/{pkg}-data
+          target: /data
+          mode: rw
+      health: { http: /healthz, interval: 30s }
+      limits: { cpu: "1", memory: "256Mi" }

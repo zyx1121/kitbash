@@ -1,0 +1,1 @@
+Our notes page at https://bench-notes-dep.bench-20260920-0100.kitbash.zyx.tw says it cannot reach its cache. Fix it.

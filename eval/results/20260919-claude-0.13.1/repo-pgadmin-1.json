@@ -1,0 +1,102 @@
+{
+ "agent": "claude",
+ "asks_user": false,
+ "check": {
+  "check": "http_ok",
+  "detail": "no address answered as asked",
+  "passed": false,
+  "tried": [
+   {
+    "body": "The Process serving this address did not answer.\n",
+    "bytes": 49,
+    "state": "failed",
+    "status": 502,
+    "url": "https://postgres-pgadmin.bench-20260919-2334.kitbash.zyx.tw/"
+   }
+  ]
+ },
+ "class": "repository",
+ "cost_usd": 2.2296287999999995,
+ "ended_at": "2026-09-19T16:21:34+00:00",
+ "error": null,
+ "exit_code": 1,
+ "id": "repo-pgadmin",
+ "inject_verified": null,
+ "injected_at": null,
+ "kitbash_calls": 75,
+ "kitbash_calls_by_tool": {
+  "fs_list": 6,
+  "fs_read": 11,
+  "fs_write": 23,
+  "pkg_build": 21,
+  "pkg_list": 1,
+  "proc_logs": 6,
+  "proc_run": 2,
+  "secrets_set": 5
+ },
+ "kitbash_version": "0.13.1",
+ "member": "bench-20260919-2334",
+ "model": "claude-sonnet-5",
+ "passed": false,
+ "prompt": "Get https://github.com/docker/awesome-compose/tree/master/postgresql-pgadmin running so my classmates can use it.",
+ "questions_asked": 0,
+ "rate_limited": false,
+ "result_text": "",
+ "run": 1,
+ "setup": null,
+ "started_at": "2026-09-19T16:07:40+00:00",
+ "stop_reason": "error_max_turns",
+ "time_to_mitigate_ms": null,
+ "timed_out": false,
+ "tool_calls": 96,
+ "tool_errors": 13,
+ "tools": {
+  "Bash": 12,
+  "Edit": 3,
+  "ToolSearch": 2,
+  "WebFetch": 4,
+  "mcp__kitbash__fs_list": 6,
+  "mcp__kitbash__fs_read": 11,
+  "mcp__kitbash__fs_write": 23,
+  "mcp__kitbash__pkg_build": 21,
+  "mcp__kitbash__pkg_list": 1,
+  "mcp__kitbash__proc_logs": 6,
+  "mcp__kitbash__proc_run": 2,
+  "mcp__kitbash__secrets_set": 5
+ },
+ "turns": 81,
+ "usage": {
+  "cache_creation": {
+   "ephemeral_1h_input_tokens": 102451,
+   "ephemeral_5m_input_tokens": 0
+  },
+  "cache_creation_input_tokens": 102451,
+  "cache_read_input_tokens": 6406234,
+  "inference_geo": "not_available",
+  "input_tokens": 160,
+  "iterations": [
+   {
+    "cache_creation": {
+     "ephemeral_1h_input_tokens": 1520,
+     "ephemeral_5m_input_tokens": 0
+    },
+    "cache_creation_input_tokens": 1520,
+    "cache_read_input_tokens": 121746,
+    "input_tokens": 2,
+    "output_tokens": 98,
+    "type": "message"
+   }
+  ],
+  "output_tokens": 53559,
+  "output_tokens_details": {
+   "thinking_tokens": 35385
+  },
+  "server_tool_use": {
+   "web_fetch_requests": 0,
+   "web_search_requests": 0
+  },
+  "service_tier": "standard",
+  "speed": "standard"
+ },
+ "wall_ms": 833505
+}

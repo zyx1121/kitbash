@@ -1,0 +1,7 @@
+{"type":"thread.started","thread_id":"01a0ba42-7a0e-7d23-bec3-b75a3a33f10a"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"I’ll call the kitbash `users_me` tool.\n"}}
+{"type":"item.started","item":{"id":"item_1","type":"mcp_tool_call","server":"kitbash","tool":"users_me","arguments":{},"result":null,"error":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_1","type":"mcp_tool_call","server":"kitbash","tool":"users_me","arguments":{},"result":{"content":[{"type":"text","text":"{\"user\":\"bench-demo\",\"uid\":4242,\"admin\":true,\"groups\":[\"bench-demo\",\"kitbash-users\",\"kitbash-admin\"]}"}],"structured_content":{"user":"bench-demo","uid":4242,"admin":true,"groups":["bench-demo","kitbash-users","kitbash-admin"]}},"error":null,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"The user name is `bench-demo`."}}
+{"type":"turn.completed","usage":{"input_tokens":28633,"cached_input_tokens":26240,"cache_write_input_tokens":0,"output_tokens":104,"reasoning_output_tokens":0}}

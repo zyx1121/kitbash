@@ -1,0 +1,5 @@
+Built and live: [Little Link](https://go.bench-20260920-0100.kitbash.zyx.tw)
+
+Paste a URL, optionally choose a name like `biology-notes`, then copy and share. Links are saved persistently and work for everyone.
+
+Verified link creation, redirects, and invalid URL handling.

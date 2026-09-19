@@ -1,0 +1,149 @@
+{
+ "agent": "codex",
+ "asks_user": false,
+ "check": {
+  "check": "all_of",
+  "detail": "https://bench-board-image.bench-20260920-0100.kitbash.zyx.tw/ answered 200; https://bench-board-image.bench-20260920-0100.kitbash.zyx.tw took the item and gave it back",
+  "parts": [
+   {
+    "check": "http_ok",
+    "detail": "https://bench-board-image.bench-20260920-0100.kitbash.zyx.tw/ answered 200",
+    "name": "http_ok",
+    "passed": true,
+    "seen": {
+     "bytes": 204,
+     "state": "running",
+     "status": 200,
+     "url": "https://bench-board-image.bench-20260920-0100.kitbash.zyx.tw/"
+    }
+   },
+   {
+    "check": "http_post_roundtrip",
+    "detail": "https://bench-board-image.bench-20260920-0100.kitbash.zyx.tw took the item and gave it back",
+    "name": "http_post_roundtrip",
+    "passed": true,
+    "seen": {
+     "get_status": 200,
+     "marker": "bench-c1cdfdb5b335",
+     "post_body": "{\"ok\": true, \"count\": 4}",
+     "post_status": 201,
+     "url": "https://bench-board-image.bench-20260920-0100.kitbash.zyx.tw"
+    }
+   }
+  ],
+  "passed": true
+ },
+ "class": "fault",
+ "cost_usd": null,
+ "ended_at": "2026-09-19T22:10:33+00:00",
+ "error": null,
+ "exit_code": 0,
+ "id": "fault-image",
+ "inject_verified": true,
+ "injected_at": "2026-09-19T22:09:07+00:00",
+ "kitbash_calls": 12,
+ "kitbash_calls_by_tool": {
+  "fs_list": 2,
+  "fs_read": 3,
+  "pkg_build": 1,
+  "pkg_inspect": 1,
+  "pkg_list": 1,
+  "proc_list": 2,
+  "proc_logs": 1,
+  "proc_run": 1
+ },
+ "kitbash_version": "0.13.1",
+ "member": "bench-20260920-0100",
+ "model": "gpt-6-astra",
+ "passed": true,
+ "prompt": "The board at https://bench-board-image.bench-20260920-0100.kitbash.zyx.tw vanished, nothing loads. Get it back.",
+ "questions_asked": 0,
+ "rate_limited": false,
+ "result_text": "[The board is back online](https://bench-board-image.bench-20260920-0100.kitbash.zyx.tw).\n\nI rebuilt the missing build and started the service with its existing data. Verified the page, health check, and items API all load successfully; both saved items were preserved.",
+ "run": 1,
+ "setup": {
+  "broken_after_inject": true,
+  "broken_detail": "http_ok: no address answered as asked",
+  "fixture": "bench-board",
+  "healthy_before": {
+   "check": "all_of",
+   "detail": "https://bench-board-image.bench-20260920-0100.kitbash.zyx.tw/ answered 200; https://bench-board-image.bench-20260920-0100.kitbash.zyx.tw took the item and gave it back",
+   "parts": [
+    {
+     "check": "http_ok",
+     "detail": "https://bench-board-image.bench-20260920-0100.kitbash.zyx.tw/ answered 200",
+     "name": "http_ok",
+     "passed": true,
+     "seen": {
+      "bytes": 150,
+      "state": "running",
+      "status": 200,
+      "url": "https://bench-board-image.bench-20260920-0100.kitbash.zyx.tw/"
+     }
+    },
+    {
+     "check": "http_post_roundtrip",
+     "detail": "https://bench-board-image.bench-20260920-0100.kitbash.zyx.tw took the item and gave it back",
+     "name": "http_post_roundtrip",
+     "passed": true,
+     "seen": {
+      "get_status": 200,
+      "marker": "bench-50fabf485faa",
+      "post_body": "{\"ok\": true, \"count\": 2}",
+      "post_status": 201,
+      "url": "https://bench-board-image.bench-20260920-0100.kitbash.zyx.tw"
+     }
+    }
+   ],
+   "passed": true
+  },
+  "injected": [
+   {
+    "code": 0,
+    "command": "podman stop -t 2 kitbash-bench-board-image-bench-board-image || true",
+    "err": "time=\"2026-09-19T22:09:05Z\" level=warning msg=\"StopSignal SIGTERM failed to stop container kitbash-bench-board-image-bench-board-image in 2 seconds, resorting to SIGKILL\"",
+    "out": "kitbash-bench-board-image-bench-board-image"
+   },
+   {
+    "code": 0,
+    "command": "podman rm -f kitbash-bench-board-image-bench-board-image || true",
+    "err": "",
+    "out": "kitbash-bench-board-image-bench-board-image"
+   },
+   {
+    "code": 0,
+    "command": "podman rmi -f $(podman images --filter label=kitbash.name=bench-board-image -q | tr '\\n' ' ') || true",
+    "err": "",
+    "out": "Untagged: localhost/kitbash/bench-board-image:dbe171e9e343\nDeleted: 2e5b163ab86dc338d2341f7edf7564fe46408cf4bb0b6b279dfc80abea1dcac7"
+   }
+  ],
+  "package": "bench-board-image"
+ },
+ "started_at": "2026-09-19T22:09:00+00:00",
+ "stop_reason": "completed",
+ "time_to_mitigate_ms": 79661,
+ "timed_out": false,
+ "tool_calls": 15,
+ "tool_errors": 0,
+ "tools": {
+  "command_execution": 2,
+  "kitbash__fs_list": 2,
+  "kitbash__fs_read": 3,
+  "kitbash__pkg_build": 1,
+  "kitbash__pkg_inspect": 1,
+  "kitbash__pkg_list": 1,
+  "kitbash__proc_list": 2,
+  "kitbash__proc_logs": 1,
+  "kitbash__proc_run": 1,
+  "web_search": 1
+ },
+ "turns": 18,
+ "usage": {
+  "cache_write_input_tokens": 0,
+  "cached_input_tokens": 241536,
+  "input_tokens": 269097,
+  "output_tokens": 934,
+  "reasoning_output_tokens": 0
+ },
+ "wall_ms": 85538
+}

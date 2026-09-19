@@ -1,0 +1,14 @@
+name: {pkg}
+description: Bench fixture. A service that refuses to start without BENCH_API_KEY, deployed by the M11 harness so a revoked secret can be injected against it.
+tags: [bench, fixture]
+
+deploy:
+  units:
+    - type: container
+      build: .
+      expose: http
+      port: 8080
+      restart: never
+      secrets: [BENCH_API_KEY]
+      health: { http: /healthz, interval: 30s }
+      limits: { cpu: "1", memory: "256Mi" }

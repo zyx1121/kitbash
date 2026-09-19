@@ -1,0 +1,175 @@
+{
+ "agent": "claude",
+ "asks_user": false,
+ "check": {
+  "check": "all_of",
+  "detail": "https://bench-board-image.bench-20260919-2334.kitbash.zyx.tw/ answered 200; https://bench-board-image.bench-20260919-2334.kitbash.zyx.tw took the item and gave it back",
+  "parts": [
+   {
+    "check": "http_ok",
+    "detail": "https://bench-board-image.bench-20260919-2334.kitbash.zyx.tw/ answered 200",
+    "name": "http_ok",
+    "passed": true,
+    "seen": {
+     "bytes": 204,
+     "state": "running",
+     "status": 200,
+     "url": "https://bench-board-image.bench-20260919-2334.kitbash.zyx.tw/"
+    }
+   },
+   {
+    "check": "http_post_roundtrip",
+    "detail": "https://bench-board-image.bench-20260919-2334.kitbash.zyx.tw took the item and gave it back",
+    "name": "http_post_roundtrip",
+    "passed": true,
+    "seen": {
+     "get_status": 200,
+     "marker": "bench-812a6a17792e",
+     "post_body": "{\"ok\": true, \"count\": 4}",
+     "post_status": 201,
+     "url": "https://bench-board-image.bench-20260919-2334.kitbash.zyx.tw"
+    }
+   }
+  ],
+  "passed": true
+ },
+ "class": "fault",
+ "cost_usd": 0.22162900000000002,
+ "ended_at": "2026-09-19T16:32:23+00:00",
+ "error": null,
+ "exit_code": 0,
+ "id": "fault-image",
+ "inject_verified": true,
+ "injected_at": "2026-09-19T16:31:39+00:00",
+ "kitbash_calls": 13,
+ "kitbash_calls_by_tool": {
+  "fs_list": 1,
+  "fs_read": 3,
+  "pkg_build": 1,
+  "pkg_inspect": 1,
+  "pkg_list": 1,
+  "proc_list": 3,
+  "proc_logs": 2,
+  "proc_run": 1
+ },
+ "kitbash_version": "0.13.1",
+ "member": "bench-20260919-2334",
+ "model": "claude-sonnet-5",
+ "passed": true,
+ "prompt": "The board at https://bench-board-image.bench-20260919-2334.kitbash.zyx.tw vanished, nothing loads. Get it back.",
+ "questions_asked": 0,
+ "rate_limited": false,
+ "result_text": "The board is back up and serving its existing data (3 items preserved from the mounted volume).\n\n**Root cause:** the `bench-board-image` package had never been built and had no running process at all \u2014 the kitbash Package existed with its manifest/code, but nothing had ever deployed it, so the URL had nothing to answer.\n\n**Fix:** built the package (`pkg_build`) and started it (`proc_run`). It's now running at `https://bench-board-image.bench-20260919-2334.kitbash.zyx.tw`, serving the homepage, `/api/items`, and `/healthz` \u2014 all returning 200, with the previously-stored board items intact from the mounted `/data` volume.",
+ "run": 1,
+ "setup": {
+  "broken_after_inject": true,
+  "broken_detail": "http_ok: no address answered as asked",
+  "fixture": "bench-board",
+  "healthy_before": {
+   "check": "all_of",
+   "detail": "https://bench-board-image.bench-20260919-2334.kitbash.zyx.tw/ answered 200; https://bench-board-image.bench-20260919-2334.kitbash.zyx.tw took the item and gave it back",
+   "parts": [
+    {
+     "check": "http_ok",
+     "detail": "https://bench-board-image.bench-20260919-2334.kitbash.zyx.tw/ answered 200",
+     "name": "http_ok",
+     "passed": true,
+     "seen": {
+      "bytes": 150,
+      "state": "running",
+      "status": 200,
+      "url": "https://bench-board-image.bench-20260919-2334.kitbash.zyx.tw/"
+     }
+    },
+    {
+     "check": "http_post_roundtrip",
+     "detail": "https://bench-board-image.bench-20260919-2334.kitbash.zyx.tw took the item and gave it back",
+     "name": "http_post_roundtrip",
+     "passed": true,
+     "seen": {
+      "get_status": 200,
+      "marker": "bench-a14e77cf5d04",
+      "post_body": "{\"ok\": true, \"count\": 2}",
+      "post_status": 201,
+      "url": "https://bench-board-image.bench-20260919-2334.kitbash.zyx.tw"
+     }
+    }
+   ],
+   "passed": true
+  },
+  "injected": [
+   {
+    "code": 0,
+    "command": "podman stop -t 2 kitbash-bench-board-image-bench-board-image || true",
+    "err": "time=\"2026-09-19T16:31:37Z\" level=warning msg=\"StopSignal SIGTERM failed to stop container kitbash-bench-board-image-bench-board-image in 2 seconds, resorting to SIGKILL\"",
+    "out": "kitbash-bench-board-image-bench-board-image"
+   },
+   {
+    "code": 0,
+    "command": "podman rm -f kitbash-bench-board-image-bench-board-image || true",
+    "err": "",
+    "out": "kitbash-bench-board-image-bench-board-image"
+   },
+   {
+    "code": 0,
+    "command": "podman rmi -f $(podman images --filter label=kitbash.name=bench-board-image -q | tr '\\n' ' ') || true",
+    "err": "",
+    "out": "Untagged: localhost/kitbash/bench-board-image:a907d75c5656\nDeleted: d1ab41244f06cf4c8c9cbbd3075b0089e08d98ae89247d062f2996416c5f33e2"
+   }
+  ],
+  "package": "bench-board-image"
+ },
+ "started_at": "2026-09-19T16:31:32+00:00",
+ "stop_reason": "success",
+ "time_to_mitigate_ms": 33341,
+ "timed_out": false,
+ "tool_calls": 17,
+ "tool_errors": 0,
+ "tools": {
+  "Bash": 2,
+  "ToolSearch": 2,
+  "mcp__kitbash__fs_list": 1,
+  "mcp__kitbash__fs_read": 3,
+  "mcp__kitbash__pkg_build": 1,
+  "mcp__kitbash__pkg_inspect": 1,
+  "mcp__kitbash__pkg_list": 1,
+  "mcp__kitbash__proc_list": 3,
+  "mcp__kitbash__proc_logs": 2,
+  "mcp__kitbash__proc_run": 1
+ },
+ "turns": 18,
+ "usage": {
+  "cache_creation": {
+   "ephemeral_1h_input_tokens": 23947,
+   "ephemeral_5m_input_tokens": 0
+  },
+  "cache_creation_input_tokens": 23947,
+  "cache_read_input_tokens": 499695,
+  "inference_geo": "not_available",
+  "input_tokens": 26,
+  "iterations": [
+   {
+    "cache_creation": {
+     "ephemeral_1h_input_tokens": 534,
+     "ephemeral_5m_input_tokens": 0
+    },
+    "cache_creation_input_tokens": 534,
+    "cache_read_input_tokens": 44228,
+    "input_tokens": 2,
+    "output_tokens": 219,
+    "type": "message"
+   }
+  ],
+  "output_tokens": 2585,
+  "output_tokens_details": {
+   "thinking_tokens": 601
+  },
+  "server_tool_use": {
+   "web_fetch_requests": 0,
+   "web_search_requests": 0
+  },
+  "service_tier": "standard",
+  "speed": "standard"
+ },
+ "wall_ms": 43154
+}

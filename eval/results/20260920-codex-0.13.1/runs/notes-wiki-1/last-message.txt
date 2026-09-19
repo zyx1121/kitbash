@@ -1,0 +1,5 @@
+Your [study group wiki is live](https://study-wiki.bench-20260920-0100.kitbash.zyx.tw).
+
+Share the link with your group. Click **New page** to write Markdown notes, preview them, and save. Includes search, revision history, and a formatting guide.
+
+Anyone with the link can read and edit. Notes persist across restarts. Creating, reading, previewing, and saving pages were verified.

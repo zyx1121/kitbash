@@ -1,0 +1,3 @@
+Fixed. I restarted the failed cache and the unresponsive notes service. The [notes page](https://bench-notes-dep.bench-20260920-0100.kitbash.zyx.tw) and its API now return HTTP 200.
+
+The cache stores notes only in memory; immediately after recovery, it returned an empty notes list.

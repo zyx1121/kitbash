@@ -1,0 +1,3 @@
+[The board is back online](https://bench-board-image.bench-20260920-0100.kitbash.zyx.tw).
+
+I rebuilt the missing build and started the service with its existing data. Verified the page, health check, and items API all load successfully; both saved items were preserved.

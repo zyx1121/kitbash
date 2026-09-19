@@ -1,0 +1,1 @@
+The [class board](https://bench-board-stopped.bench-20260920-0100.kitbash.zyx.tw) is back online. I restarted its failed process and verified the page, data API, and health check all succeed. Existing board data is intact.

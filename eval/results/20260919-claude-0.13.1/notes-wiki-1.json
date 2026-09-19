@@ -1,0 +1,95 @@
+{
+ "agent": "claude",
+ "asks_user": true,
+ "check": {
+  "check": "http_ok",
+  "detail": "https://notes-wiki.bench-20260919-2334.kitbash.zyx.tw/ answered 200",
+  "passed": true,
+  "seen": {
+   "bytes": 8415,
+   "state": "running",
+   "status": 200,
+   "url": "https://notes-wiki.bench-20260919-2334.kitbash.zyx.tw/"
+  }
+ },
+ "class": "nothing",
+ "cost_usd": 0.5691068,
+ "ended_at": "2026-09-19T15:56:43+00:00",
+ "error": null,
+ "exit_code": 0,
+ "id": "notes-wiki",
+ "inject_verified": null,
+ "injected_at": null,
+ "kitbash_calls": 15,
+ "kitbash_calls_by_tool": {
+  "fs_list": 4,
+  "fs_read": 6,
+  "fs_write": 2,
+  "pkg_build": 1,
+  "proc_run": 1,
+  "users_me": 1
+ },
+ "kitbash_version": "0.13.1",
+ "member": "bench-20260919-2334",
+ "model": "claude-sonnet-5",
+ "passed": true,
+ "prompt": "Set up a Markdown notes wiki for my study group where we can write pages and read each other's.",
+ "questions_asked": 0,
+ "rate_limited": false,
+ "result_text": "Your study group wiki is live at:\n\n**https://notes-wiki.bench-20260919-2334.kitbash.zyx.tw**\n\nShare that link with the group. Anyone who opens it can:\n- See a list of all pages, who wrote them, and when they were last updated\n- Click **New page** to write notes in Markdown (title + your name + content)\n- Click any page to read it rendered, or **Edit**/**Delete** it\n\nIt's a single container (Python stdlib server, no framework) with pages stored as JSON on a persistent mount (`notes-wiki-data`), so content survives restarts/redeploys. Markdown is rendered server-side and sanitized before being sent to browsers, so pasted HTML/script tags can't run as stored XSS against other members.\n\nThere's no login \u2014 anyone with the link can read and write, matching a casual study-group use case. Let me know if you'd like a shared password, per-person accounts, or page history/versioning added.",
+ "run": 1,
+ "setup": null,
+ "started_at": "2026-09-19T15:53:57+00:00",
+ "stop_reason": "success",
+ "time_to_mitigate_ms": null,
+ "timed_out": false,
+ "tool_calls": 22,
+ "tool_errors": 2,
+ "tools": {
+  "Bash": 3,
+  "Read": 1,
+  "ToolSearch": 2,
+  "Write": 1,
+  "mcp__kitbash__fs_list": 4,
+  "mcp__kitbash__fs_read": 6,
+  "mcp__kitbash__fs_write": 2,
+  "mcp__kitbash__pkg_build": 1,
+  "mcp__kitbash__proc_run": 1,
+  "mcp__kitbash__users_me": 1
+ },
+ "turns": 23,
+ "usage": {
+  "cache_creation": {
+   "ephemeral_1h_input_tokens": 49926,
+   "ephemeral_5m_input_tokens": 0
+  },
+  "cache_creation_input_tokens": 49926,
+  "cache_read_input_tokens": 838474,
+  "inference_geo": "not_available",
+  "input_tokens": 34,
+  "iterations": [
+   {
+    "cache_creation": {
+     "ephemeral_1h_input_tokens": 305,
+     "ephemeral_5m_input_tokens": 0
+    },
+    "cache_creation_input_tokens": 305,
+    "cache_read_input_tokens": 70436,
+    "input_tokens": 2,
+    "output_tokens": 306,
+    "type": "message"
+   }
+  ],
+  "output_tokens": 20164,
+  "output_tokens_details": {
+   "thinking_tokens": 3817
+  },
+  "server_tool_use": {
+   "web_fetch_requests": 0,
+   "web_search_requests": 0
+  },
+  "service_tier": "standard",
+  "speed": "standard"
+ },
+ "wall_ms": 166037
+}

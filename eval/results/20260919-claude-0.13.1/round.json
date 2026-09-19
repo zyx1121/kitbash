@@ -1,0 +1,18 @@
+{
+ "admin": "kitbash-mcp",
+ "agent": "claude",
+ "alias": "bench-member",
+ "domain": "kitbash.zyx.tw",
+ "host": "kitbash-mcp",
+ "k": 1,
+ "key": "/private/tmp/claude-501/-Users-loki/2165efcd-556e-4b44-9159-69d7bf38a71f/scratchpad/kb-eval/eval/results/20260919-claude-0.13.1/id_ed25519",
+ "kitbash_version": "0.13.1",
+ "member": "bench-20260919-2334",
+ "member_created_at": "2026-09-19T15:34:30+00:00",
+ "member_removed_at": "2026-09-19T16:59:13+00:00",
+ "note": "The member was removed at the end, and `users_remove` answered an internal 500 while doing it, twice. Both causes are in this host's internal log and both are findings of this round: the first attempt timed out, `kitbash-mcp`'s client deadline being shorter than a removal of a member holding seventeen Processes, which cancelled `userdel` halfway; the second failed to chown one file the mount fault had made immutable, having already archived the home, so the account was gone and the caller was told nothing had happened. The round now clears that flag before it removes its member.\n\nThree sentences were run more than once and only the last run is kept as their row. `weather-job` first failed on a check of the bench's own: `proc_list` without a package answers one line per Process and that line carries the state and not the cron expression, so a registered job read as no job; the check now reads the Package's own listing when it sees a Process whose state is scheduled. `repo-filebrowser` was replaced by `repo-linkding`, because filebrowser/filebrowser was archived on 2026-09-01 and its final release prints a wind down notice and exits, so no agent could have passed it. `weather-job` was then run a third time with its first attempt's Package moved out of the member's home, because a sentence re-run against a member that already answered it is not a trial of anything.",
+ "round": "20260919-claude-0.13.1",
+ "ssh_config": "/private/tmp/claude-501/-Users-loki/2165efcd-556e-4b44-9159-69d7bf38a71f/scratchpad/kb-eval/eval/results/20260919-claude-0.13.1/ssh_config",
+ "started_at": "2026-09-19T15:34:29+00:00",
+ "uid": 1008
+}

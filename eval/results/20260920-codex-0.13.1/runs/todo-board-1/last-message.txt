@@ -1,0 +1,5 @@
+Your app is live: [Open Classboard](https://classboard.bench-20260920-0100.kitbash.zyx.tw/b/15160d41dce8f41b308e6356fbcd49067832).
+
+Add tasks, assign classmates, set due dates, and track progress. Click **Share board** to copy the link—anyone with it can edit, and updates sync automatically.
+
+Verified task creation, completion, deletion, and shared access.

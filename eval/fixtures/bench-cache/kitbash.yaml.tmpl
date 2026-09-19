@@ -1,0 +1,13 @@
+name: {pkg}
+description: Bench fixture. The key value store the bench notes page reads through, deployed by the M11 harness as the dependency a fault takes down.
+tags: [bench, fixture]
+
+deploy:
+  units:
+    - type: container
+      build: .
+      expose: http
+      port: 8080
+      restart: never
+      health: { http: /healthz, interval: 30s }
+      limits: { cpu: "1", memory: "256Mi" }

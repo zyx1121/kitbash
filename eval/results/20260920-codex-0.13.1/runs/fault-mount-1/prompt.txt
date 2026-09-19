@@ -1,0 +1,1 @@
+Adding anything to our board at https://bench-board-mount.bench-20260920-0100.kitbash.zyx.tw fails. Sort it out.
