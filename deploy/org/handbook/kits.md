@@ -129,7 +129,7 @@ nothing about any kit that implements it.
 | Hook | What the kit declares |
 |------|----------------------|
 | import | `kit: [import]` and a tool named `import` whose input `source` is a string with a `pattern`. `pkg_import` picks the running kit whose schema accepts the source, calls it, and writes the files it returns as one commit |
-| observe | `kit: [observe]`, `subscriptions: [telemetry]`, `expose: http` and a `port`. kitbashd POSTs every stored record to the Process as OTLP/HTTP JSON on `/v1/traces`, `/v1/logs` and `/v1/metrics` |
+| observe | `kit: [observe]`, `subscriptions: [telemetry]`, `expose: http` and a `port`. kitbashd POSTs every stored record to the Process as OTLP/HTTP JSON on `/v1/traces`, `/v1/logs` and `/v1/metrics`. The port is kitbashd's to reach, so a subscriber is served under no name and has no `url` |
 | evaluate | `kit: [evaluate]`, usually with the observe declarations. The kit writes judgments back with `kitbash.eval: true` and `kitbash.subject.trace_id` and `kitbash.subject.span_id` |
 | build | `kit: [build]` and a tool `build` with input `{path, context}` and output `{digest, log}`. `pkg_build` calls it for a unit whose `builder` names this Package folder |
 | run | `kit: [run]` and a tool `run` with input `{package, digest, name, unit}` and output `{id, state, endpoint}`, and optionally `stop` with input `{id}`. `proc_run` calls it for a unit whose `runner` names this Package folder |

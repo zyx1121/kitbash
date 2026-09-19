@@ -672,7 +672,13 @@ families:
           host already serves, its declared name or the name derived for it,
           is conflict; one on a unit that is not expose: http is bad-request;
           one on a unit that names a runner is not-permitted, because a
-          Process a run kit owns has no container here to forward to. What
+          Process a run kit owns has no container here to forward to; one on a
+          unit that declares provides.subscriptions is invalid-manifest,
+          because a subscriber is a receiver for kitbashd and is not
+          published. A unit with subscriptions is exposed over HTTP so
+          kitbashd has a port to POST records to, so it is served under no
+          name and this answers no url for it, whether or not the host has a
+          domain. What
           makes a declared name the member's is that it points here: kitbashd
           resolves it at proc_run and at every start and serves it only while
           it answers with an address of this host, or is a CNAME to the
@@ -722,7 +728,7 @@ families:
                 startedAt: { type: string, format: date-time }
                 exitCode: { type: integer }
                 durationMs: { type: integer }
-            url: { type: string, description: "The address this Process is reached at from outside the host, https://<name>.<member>.<domain> or the hostname the unit declared. Absent on a host with no domain, which routes nothing" }
+            url: { type: string, description: "The address this Process is reached at from outside the host, https://<name>.<member>.<domain> or the hostname the unit declared. Absent on a host with no domain, which routes nothing, and on a unit that declares subscriptions, which is a receiver for kitbashd and is not published" }
             tools: { type: array, items: { type: string }, description: "Surface tool names added when expose is mcp" }
             runner: { type: string, description: "Package path of the run kit that owns this Process, absent when kitbashd runs it" }
             mounts:
