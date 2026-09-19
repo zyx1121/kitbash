@@ -131,17 +131,18 @@ func TestResolveOne(t *testing.T) {
 			source: filepath.Join(home, "notes", "week"),
 		},
 		{
-			// The reproduction of the hole this rule closes: the top level
-			// folder is visible and this one is not, and fs_read of it is
-			// not-visible, so a mount of it has to be too.
-			name:  "an invisible folder below a visible top level folder",
-			mount: mounts.Declared{Source: filepath.Join(home, "notes", "hidden-sub"), Target: "/files/sub"},
-			slug:  problem.SlugNotVisible,
+			// The rule stops at the nearest manifest, so a folder inside a
+			// visible one is mountable without a manifest of its own: fs_list
+			// of it is an answer, and what an agent can list a Process can be
+			// given, see PLAN.md section 2.1.
+			name:   "a folder with no manifest below a visible top level folder",
+			mount:  mounts.Declared{Source: filepath.Join(home, "notes", "hidden-sub"), Target: "/files/sub"},
+			source: filepath.Join(home, "notes", "hidden-sub"),
 		},
 		{
-			name:  "a folder below an invisible one",
-			mount: mounts.Declared{Source: filepath.Join(home, "notes", "hidden-sub", "deeper"), Target: "/files/deeper"},
-			slug:  problem.SlugNotVisible,
+			name:   "a folder two deep with no manifest of its own",
+			mount:  mounts.Declared{Source: filepath.Join(home, "notes", "hidden-sub", "deeper"), Target: "/files/deeper"},
+			source: filepath.Join(home, "notes", "hidden-sub", "deeper"),
 		},
 		{
 			// A relative link to a visible folder beside it: nothing escapes

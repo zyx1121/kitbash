@@ -251,6 +251,12 @@ func plantOutside(t *testing.T) string {
 // until stop is closed. It is the window issue #22 named, driven rather than
 // staged: the tools below run against a path whose middle changes underneath
 // them.
+//
+// Between the rename and the link the folder does not exist, and a write of a
+// file inside a Package makes the folders it needs, so the call under test may
+// put a real folder back there before this one does. Whatever it finds in the
+// way is cleared, because a swapper that gives up at the first collision stops
+// swapping and the race it exists to drive is never run.
 func swapFolder(t *testing.T, folder, real, planted string, stop <-chan struct{}) <-chan struct{} {
 	t.Helper()
 	done := make(chan struct{})
@@ -265,15 +271,29 @@ func swapFolder(t *testing.T, folder, real, planted string, stop <-chan struct{}
 			if err := os.Rename(folder, real); err != nil {
 				continue
 			}
+			// From here the folder that was there is at real, so anything at
+			// folder is something the call under test made in the window.
 			if err := os.Symlink(planted, folder); err != nil {
-				os.Rename(real, folder)
-				continue
+				os.RemoveAll(folder)
+				if err := os.Symlink(planted, folder); err != nil {
+					restore(folder, real)
+					continue
+				}
 			}
 			os.Remove(folder)
-			os.Rename(real, folder)
+			restore(folder, real)
 		}
 	}()
 	return done
+}
+
+// restore puts the folder that was renamed away back, clearing whatever the
+// call under test wrote where it belongs.
+func restore(folder, real string) {
+	if err := os.Rename(real, folder); err != nil {
+		os.RemoveAll(folder)
+		os.Rename(real, folder)
+	}
 }
 
 // A folder swapped for a link while reads run: every answer is acceptable

@@ -84,7 +84,9 @@ func TestLatestBuild(t *testing.T) {
 			Digest string `json:"digest"`
 		} `json:"processes"`
 	}
-	admin.ok("proc_list", map[string]any{}, &listed)
+	// Asked about this Package, so the answer is its Processes in full: a
+	// listing of everything is one line each and carries no digest.
+	admin.ok("proc_list", map[string]any{"package": path}, &listed)
 	found := false
 	for _, p := range listed.Processes {
 		if p.ID != out.ID {

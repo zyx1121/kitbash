@@ -88,11 +88,28 @@ func run(ctx context.Context, files *fs.Service, packages *pkg.Service, permits 
 		if prob := decodeInput(approval, &in); prob != nil {
 			return nil, prob
 		}
-		if prob := confined(files, approval, in.Path); prob != nil {
+		if prob := mixedForms(in); prob != nil {
 			return nil, prob
 		}
-		if prob := permittedApproval(permits, in.Path); prob != nil {
-			return nil, prob
+		// A queued list is one approval, so every path in it is confined and
+		// permitted before any of it runs, the same as the one path form.
+		for _, path := range approvedPaths(in) {
+			if prob := confined(files, approval, path); prob != nil {
+				return nil, prob
+			}
+			if prob := permittedApproval(permits, path); prob != nil {
+				return nil, prob
+			}
+		}
+		if len(in.Files) > 0 {
+			telemetry.SetPath(ctx, in.Files[0].Path)
+			return files.WriteAll(ctx, fs.WriteAllRequest{
+				Files:       in.entries(),
+				Message:     in.Message,
+				ExpectedSha: in.ExpectedSha,
+				Author:      approval.Requester,
+				ApprovedBy:  admin,
+			})
 		}
 		telemetry.SetPath(ctx, in.Path)
 		return files.Write(ctx, fs.WriteRequest{
@@ -131,6 +148,20 @@ func run(ctx context.Context, files *fs.Service, packages *pkg.Service, permits 
 			fmt.Sprintf("%q is not a tool this session can execute", approval.Tool),
 			"Only fs_write and pkg_import are queued, so only those can be approved.")
 	}
+}
+
+// approvedPaths are the Files paths one approved write names: the one path, or
+// every path of a list. An empty list answers the one path, which is empty for
+// an input that carries neither and is refused by the tool.
+func approvedPaths(in writeInput) []string {
+	if len(in.Files) == 0 {
+		return []string{in.Path}
+	}
+	paths := make([]string, 0, len(in.Files))
+	for _, file := range in.Files {
+		paths = append(paths, file.Path)
+	}
+	return paths
 }
 
 // permittedApproval refuses an approved call whose queued path is outside what

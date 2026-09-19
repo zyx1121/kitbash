@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -85,18 +86,108 @@ func TestUsersAndApprovalsSchemasMatchTheSurfaceSpecification(t *testing.T) {
 	}
 }
 
+// The fs family is this server's own, and the schemas below are the whole
+// wire contract of it, so they are diffed against spec/mcp-surface.yaml the
+// way the forwarded families are: a shape that changed in one place and not in
+// the other is a specification nobody can trust, see PLAN.md section 4.5.
+func TestFsSchemasMatchTheSurfaceSpecification(t *testing.T) {
+	surface := readSurface(t)
+	cases := []struct {
+		family string
+		tool   string
+		side   string
+		got    string
+	}{
+		{"fs", "fs_list", "input", string(listInputSchema)},
+		{"fs", "fs_list", "output", string(listOutputSchema)},
+		{"fs", "fs_write", "input", string(writeInputSchema)},
+		{"fs", "fs_write", "output", string(writeOutputSchema)},
+		{"fs", "fs_history", "input", string(historyInputSchema)},
+		{"fs", "fs_history", "output", string(historyOutputSchema)},
+		// fs_read publishes no output schema, and the metadata block it
+		// returns instead is still an answer a caller parses.
+		{"fs", "fs_read", "output", string(readMetaSchema)},
+		{"pkg", "pkg_build", "output", string(pkgBuildOutputSchema)},
+		{"pkg", "pkg_list", "output", string(pkgListOutputSchema)},
+		{"proc", "proc_list", "input", string(procListInputSchema)},
+		{"proc", "proc_list", "output", string(procListOutputSchema)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.tool+" "+tc.side, func(t *testing.T) {
+			matches(t, tc.got, resolve(t, surface, dig(t, surface, "families", tc.family, "tools", tc.tool, tc.side)))
+		})
+	}
+}
+
+// resolve replaces every {"$ref": "#/$defs/x"} with the definition it names.
+// The specification factors the shapes it repeats and the transcription writes
+// them out, so the two are compared as the documents a client reads.
+func resolve(t *testing.T, surface map[string]any, node any) any {
+	t.Helper()
+	switch value := normalise(t, node).(type) {
+	case map[string]any:
+		if ref, held := value["$ref"].(string); held {
+			name, found := strings.CutPrefix(ref, "#/$defs/")
+			if !found {
+				t.Fatalf("%s holds a reference this test cannot resolve: %s", surfacePath, ref)
+			}
+			return resolve(t, surface, dig(t, surface, "$defs", name))
+		}
+		out := map[string]any{}
+		for key, child := range value {
+			out[key] = resolve(t, surface, child)
+		}
+		return out
+	case []any:
+		out := make([]any, 0, len(value))
+		for _, child := range value {
+			out = append(out, resolve(t, surface, child))
+		}
+		return out
+	default:
+		return value
+	}
+}
+
 // matches holds one transcribed schema to the node of the specification it was
-// transcribed from.
+// transcribed from. Both sides are trimmed string by string first: a folded
+// block scalar in YAML ends with a newline and a JSON string does not, so a
+// description written across several lines of the specification is the same
+// description here.
 func matches(t *testing.T, transcribed string, want any) {
 	t.Helper()
-	specified := normalise(t, want)
+	specified := trimmed(normalise(t, want))
 	var got any
 	if err := json.Unmarshal([]byte(transcribed), &got); err != nil {
 		t.Fatalf("the transcribed schema is not JSON: %v", err)
 	}
+	got = trimmed(got)
 	if !reflect.DeepEqual(got, specified) {
 		t.Errorf("the transcribed schema is\n%s\nand the specification says\n%s",
 			pretty(t, got), pretty(t, specified))
+	}
+}
+
+// trimmed strips the whitespace a folded YAML scalar carries from every string
+// of a decoded document.
+func trimmed(value any) any {
+	switch v := value.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case map[string]any:
+		out := map[string]any{}
+		for key, child := range v {
+			out[key] = trimmed(child)
+		}
+		return out
+	case []any:
+		out := make([]any, 0, len(v))
+		for _, child := range v {
+			out = append(out, trimmed(child))
+		}
+		return out
+	default:
+		return value
 	}
 }
 

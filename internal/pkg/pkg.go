@@ -32,10 +32,13 @@ import (
 var containerfiles = []string{"Containerfile", "Dockerfile"}
 
 // LogTailLines and LogTailBytes cap the build log the surface returns. The
-// full log never leaves the host.
+// full log never leaves the host, and what a caller needs to see is the end: a
+// build that failed says why in its last lines, and a build that worked is
+// read for its digest. Twenty lines is about 2 KiB of a podman build, which is
+// what the byte cap is set to, see PLAN.md section 4.5.
 const (
-	LogTailLines = 40
-	LogTailBytes = 4 << 10
+	LogTailLines = 20
+	LogTailBytes = 2 << 10
 )
 
 // TagPrefix is the local repository every built image is tagged under. The
@@ -50,13 +53,14 @@ type BuildResult struct {
 	Log    string `json:"log,omitempty"`
 }
 
-// Entry is one Package in the output of pkg_list.
+// Entry is one Package in the output of pkg_list: where it is, what it is
+// called and the digest of its latest build. When it was built is in
+// pkg_inspect and how many Processes it has is in proc_list, so neither is
+// repeated per Package here, see PLAN.md section 4.5.
 type Entry struct {
-	Path    string `json:"path"`
-	Name    string `json:"name"`
-	Digest  string `json:"digest,omitempty"`
-	BuiltAt string `json:"builtAt,omitempty"`
-	Running int    `json:"running"`
+	Path   string `json:"path"`
+	Name   string `json:"name"`
+	Digest string `json:"digest,omitempty"`
 }
 
 // ListResult is the output of pkg_list.
@@ -437,27 +441,11 @@ func (s *Service) List(ctx context.Context) (*ListResult, *problem.Problem) {
 			newest[path] = image
 		}
 	}
-	containers, err := s.runner.Containers(ctx, podman.Filter{podman.LabelUser: s.files.User()}, false)
-	if err != nil {
-		return nil, problem.Internal("pkg", err.Error(), "")
-	}
-	running := map[string]int{}
-	for _, container := range containers {
-		if container.State == podman.StateRunning {
-			running[container.Labels[podman.LabelPackage]]++
-		}
-	}
-
 	result := &ListResult{Packages: []Entry{}}
 	for _, entry := range entries {
-		out := Entry{
-			Path:    entry.Path,
-			Name:    entry.Manifest.Name,
-			Running: running[entry.Path],
-		}
+		out := Entry{Path: entry.Path, Name: entry.Manifest.Name}
 		if image, ok := newest[entry.Path]; ok {
 			out.Digest = image.ID
-			out.BuiltAt = image.Created.UTC().Format(time.RFC3339)
 		}
 		result.Packages = append(result.Packages, out)
 	}
@@ -650,14 +638,22 @@ func shortSha(sha string) string {
 	return sha
 }
 
-// tail is the end of the build log, bounded by lines and by bytes.
+// tail is the end of the build log, bounded by lines and by bytes. It cuts
+// whole lines at both limits: a byte cut through the middle of a line would
+// hand the caller half a message to read, and the first line of the answer is
+// the one they read first.
 func tail(log string) string {
 	lines := strings.Split(strings.TrimRight(log, "\n"), "\n")
 	if len(lines) > LogTailLines {
 		lines = lines[len(lines)-LogTailLines:]
 	}
+	for len(lines) > 1 && len(strings.Join(lines, "\n")) > LogTailBytes {
+		lines = lines[1:]
+	}
 	out := strings.Join(lines, "\n")
 	if len(out) > LogTailBytes {
+		// One line of its own is over the limit, so there is nothing to drop
+		// and the end of it is what is kept.
 		out = out[len(out)-LogTailBytes:]
 	}
 	return out

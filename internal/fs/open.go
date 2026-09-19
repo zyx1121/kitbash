@@ -1,9 +1,12 @@
 package fs
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/zyx1121/kitbash/internal/manifest"
 	"github.com/zyx1121/kitbash/internal/safeopen"
@@ -80,6 +83,41 @@ func (s *Service) visible(dir string) (*manifest.Manifest, bool) {
 		return nil, false
 	}
 	return manifest.VisibleBelow(root, rel)
+}
+
+// remove unlinks a resolved caller path through a descriptor on the folder it
+// sits in, so no component of the path is resolved by name a second time. It
+// is what a refused multi file write puts the folder back with, and a rollback
+// that resolved the path again would be a second chance to point it somewhere
+// else, see writeall.go.
+//
+// A path that is already gone is not an error: the rollback runs over every
+// path the call planned, and one that was never written is one with nothing to
+// undo.
+func (s *Service) remove(clean string) error {
+	root, rel, err := s.relative(clean)
+	if err != nil {
+		return err
+	}
+	folder, name := filepath.Split(rel)
+	if folder == "" {
+		folder = "."
+	}
+	dir, err := safeopen.Open(root, folder, os.O_RDONLY|syscall.O_DIRECTORY, 0)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	defer dir.Close()
+	if err := unix.Unlinkat(int(dir.Fd()), name, 0); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return &os.PathError{Op: "unlinkat", Path: clean, Err: err}
+	}
+	return nil
 }
 
 // chmod sets the mode of a resolved caller path through a descriptor rather

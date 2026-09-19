@@ -8,25 +8,36 @@ import "encoding/json"
 
 const folderEntryDef = `{
   "type": "object",
-  "required": ["path", "name", "description"],
+  "required": ["path", "name"],
   "properties": {
     "path": { "type": "string" },
     "name": { "type": "string" },
-    "description": { "type": "string" },
-    "tags": { "type": "array", "items": { "type": "string" } },
-    "package": { "type": "boolean", "description": "true when the manifest carries a deploy block" }
+    "description": { "type": "string", "description": "From the folder's own kitbash.yaml; absent for a folder inside a Package, which the Package describes" }
   }
 }`
 
 const fileEntryDef = `{
   "type": "object",
-  "required": ["path", "name", "size", "mediaType"],
+  "required": ["name", "size"],
   "properties": {
-    "path": { "type": "string" },
     "name": { "type": "string" },
-    "size": { "type": "integer" },
-    "mediaType": { "type": "string", "description": "IANA media type guessed from extension and sniffing" },
-    "modified": { "type": "string", "format": "date-time" }
+    "size": { "type": "integer" }
+  }
+}`
+
+const writeFileDef = `{
+  "description": "One file of an fs_write that carries a list. Exactly one of content and contentBase64 is set.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["path"],
+  "oneOf": [
+    { "required": ["content"] },
+    { "required": ["contentBase64"] }
+  ],
+  "properties": {
+    "path": { "type": "string", "description": "Absolute path, under the same top level folder as every other file of this call" },
+    "content": { "type": "string", "description": "UTF-8 text" },
+    "contentBase64": { "type": "string", "contentEncoding": "base64" }
   }
 }`
 
@@ -52,12 +63,12 @@ var (
 
 	listOutputSchema = json.RawMessage(`{
   "type": "object",
-  "required": ["path", "folders", "files"],
+  "required": ["path", "folders"],
   "properties": {
     "path": { "type": "string" },
-    "manifest": { "type": "object", "description": "This folder's parsed kitbash.yaml, absent at the roots" },
+    "manifest": { "type": "object", "description": "The kitbash.yaml this folder carries itself, absent at the roots and inside a Package" },
     "folders": { "type": "array", "items": ` + folderEntryDef + ` },
-    "files": { "type": "array", "items": ` + fileEntryDef + ` }
+    "files": { "type": "array", "description": "The files directly in this folder, absent at the roots and for a folder that holds none", "items": ` + fileEntryDef + ` }
   }
 }`)
 
@@ -75,31 +86,68 @@ var (
 	// fs_read declares no output schema. Its result is content blocks only, so
 	// a client that prefers structured content still shows the caller the file
 	// body. The metadata shape it returns as its trailing text block is
-	// fs.ReadMeta, and it is documented in spec/mcp-surface.yaml.
+	// fs.ReadMeta, and readMetaSchema below is that shape: it is not published
+	// as the tool's output schema, and it is declared here so the block a
+	// caller parses is held to spec/mcp-surface.yaml like every other answer.
 
 	writeInputSchema = json.RawMessage(`{
   "type": "object",
   "additionalProperties": false,
-  "required": ["path", "message"],
+  "required": ["message"],
   "oneOf": [
-    { "required": ["content"] },
-    { "required": ["contentBase64"] }
+    {
+      "required": ["path"],
+      "not": { "required": ["files"] },
+      "oneOf": [
+        { "required": ["content"] },
+        { "required": ["contentBase64"] }
+      ]
+    },
+    {
+      "required": ["files"],
+      "not": { "anyOf": [{ "required": ["path"] }, { "required": ["content"] }, { "required": ["contentBase64"] }] }
+    }
   ],
   "properties": {
     "path": { "type": "string" },
     "content": { "type": "string", "description": "UTF-8 text" },
     "contentBase64": { "type": "string", "contentEncoding": "base64" },
+    "files": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "description": "Several files as one commit, all under one top level folder, 16 MiB in total",
+      "items": ` + writeFileDef + `
+    },
     "message": { "type": "string", "minLength": 3, "maxLength": 200, "description": "Commit message, imperative mood" },
-    "expectedSha": { "type": "string", "description": "Last known commit sha for this file; optimistic lock" }
+    "expectedSha": { "type": "string", "description": "Last known commit sha; optimistic lock, read against the file for one path and against the repository head for a list" }
   }
 }`)
 
 	writeOutputSchema = json.RawMessage(`{
   "type": "object",
-  "required": ["path", "commit"],
+  "required": ["commit"],
+  "oneOf": [
+    { "required": ["path"] },
+    { "required": ["paths"] }
+  ],
+  "properties": {
+    "path": { "type": "string", "description": "The file that was written, for the one file form" },
+    "paths": { "type": "array", "items": { "type": "string" }, "description": "The files that were written, for a list" },
+    "commit": ` + commitDef + `
+  }
+}`)
+
+	readMetaSchema = json.RawMessage(`{
+  "description": "Content blocks only. fs_read declares no outputSchema and returns no structuredContent, because clients prefer structuredContent when it is present and would then show the caller the metadata instead of the file body. The first block is the file: text media types as a text block, image/png and image/jpeg as an image block. The trailing block is a text block holding this metadata object as JSON.",
+  "type": "object",
+  "required": ["path", "mediaType", "size"],
   "properties": {
     "path": { "type": "string" },
-    "commit": ` + commitDef + `
+    "mediaType": { "type": "string" },
+    "size": { "type": "integer" },
+    "sha": { "type": "string", "description": "Commit that last touched this file" },
+    "truncated": { "type": "boolean" }
   }
 }`)
 
@@ -137,18 +185,39 @@ const buildEntryDef = `{
   }
 }`
 
+// processDef is one Process as proc_list answers about it, and it is one
+// shape rather than two: without a package the fields a line does not carry
+// are simply absent, so a listing of either kind is read against this. A
+// oneOf of two shapes would be a schema a full Process matches twice, see
+// spec/mcp-surface.yaml.
 const processDef = `{
   "type": "object",
-  "required": ["id", "name", "package", "digest", "state"],
+  "required": ["id", "name", "package", "state"],
   "properties": {
     "id": { "type": "string" },
     "name": { "type": "string" },
     "package": { "type": "string" },
-    "digest": { "type": "string" },
+    "digest": { "type": "string", "description": "Absent from a line" },
     "state": { "type": "string", "enum": ["starting", "running", "unhealthy", "stopped", "failed"] },
     "expose": { "type": "string", "enum": ["mcp", "http", "none"] },
+    "url": { "type": "string", "description": "Where an http Process is served, when the host has a domain" },
     "startedAt": { "type": "string", "format": "date-time" },
+    "problem": { "type": "string", "description": "Why this Process is not running, when kitbashd could not bring it back" },
+    "fix": { "type": "string", "description": "What the owner can do about it" },
     "runner": { "type": "string", "description": "Package path of the run kit that owns this Process, absent when kitbashd runs it" },
+    "mounts": {
+      "type": "array",
+      "description": "The folders of Files this Process sees, as the registration kitbashd holds records them. Absent for a Process that declared none.",
+      "items": {
+        "type": "object",
+        "required": ["source", "target", "mode"],
+        "properties": {
+          "source": { "type": "string" },
+          "target": { "type": "string" },
+          "mode": { "type": "string", "enum": ["ro", "rw"] }
+        }
+      }
+    },
     "health": {
       "type": "object",
       "description": "The most recent health probe kitbashd ran, for a Process kitbashd runs itself whose manifest declares deploy.units[0].health.http. Absent until it has been probed once.",
@@ -219,9 +288,7 @@ var (
         "properties": {
           "path": { "type": "string" },
           "name": { "type": "string" },
-          "digest": { "type": "string" },
-          "builtAt": { "type": "string", "format": "date-time" },
-          "running": { "type": "integer", "description": "Number of Processes of this Package" }
+          "digest": { "type": "string", "description": "The latest build, absent for a Package nothing has built" }
         }
       }
     }
@@ -277,11 +344,14 @@ var (
 	procListInputSchema = json.RawMessage(`{
   "type": "object",
   "additionalProperties": false,
-  "properties": {}
+  "properties": {
+    "package": { "type": "string", "description": "Package path. Omit for one line per Process." }
+  }
 }`)
 
 	procListOutputSchema = json.RawMessage(`{
   "type": "object",
+  "description": "One line per Process without a package, and the full shape below with one.",
   "required": ["processes"],
   "properties": {
     "processes": { "type": "array", "items": ` + processDef + ` }

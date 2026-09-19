@@ -22,9 +22,15 @@ type PackageEntry struct {
 	Manifest *manifest.Manifest
 }
 
-// Manifest returns the manifest of the visible folder at path together with
-// the cleaned path. It is the read the pkg and proc families start from: they
-// operate on a folder the caller can see, and nothing else.
+// Manifest returns the manifest that speaks for the visible folder at path,
+// together with the folder that carries it. It is the read the pkg and proc
+// families start from: they operate on a folder the caller can see, and
+// nothing else.
+//
+// The folder is the one the manifest is in rather than the one that was named,
+// because the nearest manifest speaks for everything below it: pkg_build of a
+// folder inside a Package builds that Package, which is the same answer
+// fs_list gives about the same folder, see PLAN.md section 2.1.
 func (s *Service) Manifest(_ context.Context, path string) (*manifest.Manifest, string, *problem.Problem) {
 	clean, prob := s.resolve(path)
 	if prob != nil {
@@ -40,11 +46,11 @@ func (s *Service) Manifest(_ context.Context, path string) (*manifest.Manifest, 
 	if !info.IsDir() {
 		return nil, "", problem.InvalidPath(clean, "the path is a file, not a folder")
 	}
-	m, prob := s.folderManifest(clean)
+	m, folder, prob := s.visibleFolder(clean, nil)
 	if prob != nil {
 		return nil, "", prob
 	}
-	return m, clean, nil
+	return m, folder, nil
 }
 
 // Packages walks every visible folder under the roots and returns those whose

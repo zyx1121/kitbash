@@ -163,15 +163,44 @@ func permittedPath(permits manifest.Permits, name string, req mcp.Request) *prob
 		return problem.NotPermitted(name,
 			fmt.Sprintf("%s acts on a path and this Process is permitted none", name), PermitsPathFix)
 	}
-	path := argumentString(req, argument)
-	if path == "" {
-		return nil
-	}
-	if !permits.Allows(path) {
-		return problem.NotPermitted(path,
-			fmt.Sprintf("this Process may not name %s", path), PermitsPathFix)
+	// Every path the call names, not only the one the tool's first argument
+	// carries: fs_write takes a list, and a Process permitted one prefix could
+	// otherwise write every folder of its owner's home by putting the paths in
+	// files, where nothing would look at them.
+	for _, path := range append([]string{argumentString(req, argument)}, listedPaths(req)...) {
+		if path == "" {
+			continue
+		}
+		if !permits.Allows(path) {
+			return problem.NotPermitted(path,
+				fmt.Sprintf("this Process may not name %s", path), PermitsPathFix)
+		}
 	}
 	return nil
+}
+
+// listedPaths are the paths in the files argument of an fs_write, empty for
+// every other call. They are read as they arrived, like every other argument
+// here: an entry that does not decode is not a path this guard can clear, and
+// the tool refuses the call on its own terms afterwards.
+func listedPaths(req mcp.Request) []string {
+	call, ok := req.(*mcp.CallToolRequest)
+	if !ok || call.Params == nil || len(call.Params.Arguments) == 0 {
+		return nil
+	}
+	var arguments struct {
+		Files []struct {
+			Path string `json:"path"`
+		} `json:"files"`
+	}
+	if err := json.Unmarshal(call.Params.Arguments, &arguments); err != nil {
+		return nil
+	}
+	paths := make([]string, 0, len(arguments.Files))
+	for _, file := range arguments.Files {
+		paths = append(paths, file.Path)
+	}
+	return paths
 }
 
 // argumentString reads one string argument of a call, empty when the call

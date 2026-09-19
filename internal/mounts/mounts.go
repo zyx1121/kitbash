@@ -251,13 +251,15 @@ func (c *Checker) ResolveOne(instance string, d Declared) (Resolved, *problem.Pr
 			fmt.Sprintf("%s is not owned by %s, and a Process mounts its owner's own folders", d.Source, c.Owner),
 			"Mount a folder you own, or copy what the Process needs into one.")
 	}
-	// The folder and every folder between it and its root have to be visible.
-	// It is the fs family's own rule, read from the same function, because a
-	// Process being given a folder an agent cannot list would be progressive
-	// disclosure with a way around it, see PLAN.md section 2.1.
+	// The folder has to be one a manifest describes: its own, or one above it
+	// up to the root, which is what makes the folders inside a Package
+	// mountable without a manifest each. It is the fs family's own rule, read
+	// from the same function, because a Process being given a folder an agent
+	// cannot list would be progressive disclosure with a way around it, see
+	// PLAN.md section 2.1.
 	if _, blocked, visible := manifest.VisibleChain(root, rel); !visible {
 		return Resolved{}, problem.NotVisible(instance,
-			fmt.Sprintf("%s carries no kitbash.yaml with a name and a description, so nothing inside it can be mounted",
+			fmt.Sprintf("%s carries no kitbash.yaml with a name and a description, and neither does any folder above it, so nothing inside it can be mounted",
 				filepath.Join(root, blocked)),
 			"Write a kitbash.yaml with name and description into that folder, then run the Package again.")
 	}

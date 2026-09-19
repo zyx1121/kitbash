@@ -317,11 +317,19 @@ func TestListRootsShowsOnlyVisibleFolders(t *testing.T) {
 	if got := byName["handbook"].Description; got == "" {
 		t.Error("handbook has no description")
 	}
-	if got := byName["handbook"].Tags; len(got) != 2 {
-		t.Errorf("handbook tags are %v, want two", got)
+	// A root listing is path, name and description per folder and nothing
+	// else, which is what deciding which folder to enter takes, see
+	// TestRootListingIsSmall.
+	encoded, err := json.Marshal(byName["handbook"])
+	if err != nil {
+		t.Fatalf("encoding a folder entry: %v", err)
 	}
-	if byName["handbook"].Package {
-		t.Error("handbook has no deploy block, so it is not a package")
+	var fields map[string]any
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		t.Fatalf("decoding a folder entry: %v", err)
+	}
+	if len(fields) != 3 {
+		t.Errorf("a folder entry carries %v, want path, name and description only", fields)
 	}
 }
 
@@ -336,8 +344,21 @@ func TestListFolderHidesDotfilesAndInvisibleFolders(t *testing.T) {
 	if out.Manifest["name"] != "handbook" {
 		t.Errorf("manifest is %v, want the handbook manifest", out.Manifest)
 	}
-	if len(out.Folders) != 1 || out.Folders[0].Name != "policies" {
-		t.Errorf("subfolders are %+v, want policies only", out.Folders)
+	// policies carries its own manifest and is described by it; drafts and
+	// broken carry none that the surface reads, and are listed by their own
+	// name because handbook's manifest speaks for them, see PLAN.md 2.1.
+	folders := map[string]fs.FolderEntry{}
+	for _, folder := range out.Folders {
+		folders[folder.Name] = folder
+	}
+	if len(folders) != 3 {
+		t.Errorf("subfolders are %+v, want policies, drafts and broken", out.Folders)
+	}
+	if got := folders["policies"].Description; got == "" {
+		t.Error("policies carries a manifest of its own and is not described by it")
+	}
+	if got := folders["drafts"].Description; got != "" {
+		t.Errorf("drafts carries no manifest of its own and is described as %q", got)
 	}
 	names := map[string]fs.FileEntry{}
 	for _, file := range out.Files {
@@ -351,13 +372,7 @@ func TestListFolderHidesDotfilesAndInvisibleFolders(t *testing.T) {
 	if _, found := names[".secret"]; found {
 		t.Error("a dotfile appeared in the listing")
 	}
-	if got := names["README.md"].MediaType; got != "text/markdown" {
-		t.Errorf("README.md media type is %q, want text/markdown", got)
-	}
-	if got := names["logo.png"].MediaType; got != "image/png" {
-		t.Errorf("logo.png media type is %q, want image/png", got)
-	}
-	if names["README.md"].Size == 0 || names["README.md"].Modified == "" {
+	if names["README.md"].Size == 0 {
 		t.Errorf("README.md entry is incomplete: %+v", names["README.md"])
 	}
 }
@@ -727,15 +742,20 @@ func TestDotComponentsAreReserved(t *testing.T) {
 	}
 }
 
-func TestInvisibleAncestorHidesEverythingBelowIt(t *testing.T) {
+// TestAFolderWithNoManifestAnywhereAboveItIsInvisible is progressive
+// disclosure where it still bites: a top level folder that carries no manifest
+// is not on the surface, and neither is anything directly inside it. What
+// changed in M10 is that the rule stops at the nearest manifest rather than
+// taxing every folder below it, see PLAN.md section 2.1 and the fs tests.
+func TestAFolderWithNoManifestAnywhereAboveItIsInvisible(t *testing.T) {
 	f := newFixture(t)
 	s := connect(t, f)
 
-	inner := filepath.Join(f.org, "nomanifest", "inner")
+	folder := filepath.Join(f.org, "nomanifest")
 	cases := map[string]map[string]any{
-		"fs_list":    {"path": inner},
-		"fs_read":    {"path": filepath.Join(inner, "buried.md")},
-		"fs_history": {"path": filepath.Join(inner, "buried.md")},
+		"fs_list":    {"path": folder},
+		"fs_read":    {"path": filepath.Join(folder, "notes.md")},
+		"fs_history": {"path": filepath.Join(folder, "notes.md")},
 	}
 	for tool, args := range cases {
 		t.Run(tool, func(t *testing.T) {
@@ -746,26 +766,39 @@ func TestInvisibleAncestorHidesEverythingBelowIt(t *testing.T) {
 			if p.Status != 404 {
 				t.Errorf("status is %d, want 404", p.Status)
 			}
+			if p.Instance != folder {
+				t.Errorf("the problem names %s, want the folder a manifest has to go into, %s", p.Instance, folder)
+			}
 		})
 	}
 
+	t.Run("and it is not listed at its root", func(t *testing.T) {
+		res := call(t, s, "fs_list", map[string]any{"path": f.org})
+		ok(t, res, "fs_list")
+		for _, entry := range structured[fs.ListResult](t, res).Folders {
+			if entry.Path == folder {
+				t.Errorf("a folder with no manifest was listed: %+v", entry)
+			}
+		}
+	})
+
 	t.Run("fs_write needs a visible folder", func(t *testing.T) {
 		p := problemOf(t, call(t, s, "fs_write", map[string]any{
-			"path":    filepath.Join(f.org, "nomanifest", "note.md"),
+			"path":    filepath.Join(folder, "note.md"),
 			"content": "smuggled\n",
 			"message": "Smuggle a file in",
 		}))
 		if p.Slug() != problem.SlugNotVisible {
 			t.Errorf("slug is %s, want not-visible", p.Slug())
 		}
-		if p.Fix != "Write kitbash.yaml with name and description first" {
+		if p.Fix != "Write kitbash.yaml with name and description into that folder first" {
 			t.Errorf("fix is %q", p.Fix)
 		}
 	})
 
 	t.Run("fs_write of a manifest below an invisible folder is refused", func(t *testing.T) {
 		p := problemOf(t, call(t, s, "fs_write", map[string]any{
-			"path":    filepath.Join(inner, "kitbash.yaml"),
+			"path":    filepath.Join(folder, "inner", "kitbash.yaml"),
 			"content": "name: inner\ndescription: A manifest under a folder that has none.\n",
 			"message": "Rewrite the buried manifest",
 		}))

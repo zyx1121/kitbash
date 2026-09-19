@@ -12,10 +12,16 @@ repository.
 
 | Tool | What it does |
 |------|-------------|
-| `fs_list` | Visible folders and the files in one path, or the roots when no path is given |
+| `fs_list` | Visible folders and the files in one path, or the roots when no path is given. A root answers path, name and description per folder and no files; a folder answers its subfolders and its files as a name and a size |
 | `fs_read` | One file: text as text, PNG and JPEG as an image, PDF as extracted text |
-| `fs_write` | Create or replace one file and commit it to the enclosing repository |
+| `fs_write` | Create or replace one file, or up to 64 of them in `files`, and commit them to the enclosing repository as one commit |
 | `fs_history` | The commits that touched a path, newest first |
+
+Write every file of a Package in one `fs_write`: `files` takes a list of
+`{path, content}` under one top level folder with one `message`, and the whole
+list is one commit. A list is refused whole, so one path the caller may not
+write leaves nothing behind. `expectedSha` is the optimistic lock, read against
+the file for one path and against the repository's head for a list.
 
 ## pkg
 
@@ -23,9 +29,9 @@ Packages. A folder with a `deploy` block, built to or imported as an OCI image.
 
 | Tool | What it does |
 |------|-------------|
-| `pkg_build` | Build the Package at a path from its current commit. Returns the digest, the commit and the tail of the build log |
+| `pkg_build` | Build the Package at a path from its current commit. Returns the digest, the commit and the last 20 lines of the build log |
 | `pkg_import` | Wrap something external as a Package folder through a running import kit. Writes the folder, does not build |
-| `pkg_list` | Visible Packages with their latest digest and how many Processes each has |
+| `pkg_list` | Visible Packages: path, name and the digest of the latest build |
 | `pkg_inspect` | The manifest and the build history of one Package |
 
 ## proc
@@ -35,7 +41,7 @@ Processes. A Package running as a rootless container under the caller.
 | Tool | What it does |
 |------|-------------|
 | `proc_run` | Start a Process from a digest, or converge an existing one to it. With `expose: mcp` its tools join the surface |
-| `proc_list` | The caller's Processes, running or stopped |
+| `proc_list` | The caller's Processes, running or stopped. With a `package`, that Package's Processes in full; without one, a line each |
 | `proc_stop` | Stop a Process. It stays known, and its tools leave the surface |
 | `proc_logs` | The recent stdout and stderr of a Process |
 
@@ -96,10 +102,14 @@ Two roots: `/org`, which every member reads, and `/home/<caller>`, which is the
 caller's alone. No path outside them is reachable, and no member ever sees
 another member's home.
 
-- A folder is visible only when it carries a `kitbash.yaml` with a `name` and a
-  `description`, and so does every folder between it and its root. A folder
-  without a manifest does not exist as far as this surface is concerned. Write
-  the manifest first.
+- A folder is visible when it, or a folder between it and its root, carries a
+  `kitbash.yaml` with a `name` and a `description`, and the nearest of those
+  manifests speaks for it. The folders inside a Package, `src`, `public`,
+  `deploy`, need none of their own; a nested `kitbash.yaml` only begins a new
+  description where one is wanted. A folder with no manifest anywhere above it
+  does not exist as far as this surface is concerned, so a top level folder is
+  written manifest first. The same rule decides what a Process may be given as
+  a mount.
 - Paths are absolute. A path with `..` in it is `invalid-path`.
 - Symbolic links are never followed. Every open below a root resolves with
   `RESOLVE_NO_SYMLINKS` and `RESOLVE_BENEATH`, so a link swapped in during a

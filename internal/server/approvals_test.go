@@ -456,3 +456,83 @@ func gitLog(t *testing.T, repo, format string) string {
 	}
 	return strings.TrimSpace(string(out))
 }
+
+// A queued list is one approval, and approving it writes the whole Package as
+// one commit authored by the requester. Nothing about the list is privileged
+// by having been approved: every path is confined to the shared root first.
+func TestApproveExecutesAQueuedList(t *testing.T) {
+	tr := approving(t)
+	folder := filepath.Join(tr.root, "handbook")
+	input, _ := json.Marshal(map[string]any{
+		"files": []map[string]any{
+			{"path": filepath.Join(folder, "kitbash.yaml"), "content": handbookManifest},
+			{"path": filepath.Join(folder, "policies", "writing.md"), "content": "# Writing\n"},
+		},
+		"message": "Add the handbook",
+	})
+	queued := tr.daemon.AddApproval(teltest.Approval{
+		Requester: "member",
+		Tool:      telemetry.ToolFSWrite,
+		Input:     input,
+	})
+
+	res := call(t, tr.session, "approvals_approve", map[string]any{"id": queued.ID})
+	ok(t, res, "approvals_approve")
+	out := structured[approved](t, res)
+	var written struct {
+		Paths  []string  `json:"paths"`
+		Commit fs.Commit `json:"commit"`
+	}
+	if err := json.Unmarshal(out.Result, &written); err != nil {
+		t.Fatalf("the result is not an fs_write output: %v: %s", err, out.Result)
+	}
+	if len(written.Paths) != 2 {
+		t.Fatalf("the result names %v, want both paths", written.Paths)
+	}
+	if written.Commit.Author != "member" || !strings.Contains(written.Commit.Message, "Approved-by: tester") {
+		t.Errorf("the commit is %+v, want the requester as author and the trailer", written.Commit)
+	}
+	for _, path := range written.Paths {
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("%s was not written: %v", path, err)
+		}
+	}
+}
+
+// A queued list naming a path outside the shared root is not a call this
+// session executes, whichever entry carries it: the admin's roots include
+// their own home and the kernel would allow the write.
+func TestApproveRefusesAListThatReachesOutsideTheSharedRoot(t *testing.T) {
+	tr := approving(t)
+	folder := filepath.Join(tr.root, "handbook")
+	outside := filepath.Join(t.TempDir(), "elsewhere.md")
+	input, _ := json.Marshal(map[string]any{
+		"files": []map[string]any{
+			{"path": filepath.Join(folder, "kitbash.yaml"), "content": handbookManifest},
+			{"path": outside, "content": "not under the shared root\n"},
+		},
+		"message": "Add the handbook",
+	})
+	queued := tr.daemon.AddApproval(teltest.Approval{
+		Requester: "member",
+		Tool:      telemetry.ToolFSWrite,
+		Input:     input,
+	})
+
+	res := call(t, tr.session, "approvals_approve", map[string]any{"id": queued.ID})
+	ok(t, res, "approvals_approve")
+	out := structured[approved](t, res)
+	var p problem.Problem
+	if err := json.Unmarshal(out.Result, &p); err != nil {
+		t.Fatalf("the stored result is not a problem: %v: %s", err, out.Result)
+	}
+	if p.Slug() != problem.SlugBadRequest {
+		t.Errorf("the approval failed with %s, want bad-request", p.Slug())
+	}
+	if _, err := os.Stat(outside); err == nil {
+		t.Error("the refused approval wrote outside the shared root")
+	}
+	if _, err := os.Stat(filepath.Join(folder, "kitbash.yaml")); err == nil {
+		t.Error("the refused approval wrote the path it was allowed")
+	}
+}

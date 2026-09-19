@@ -56,8 +56,11 @@ const (
 	callsTool     = "runner_calls"
 )
 
-// fixtures are the files of the echo and runner Packages, written in this
-// order: the manifest first, because that is what makes the folder visible.
+// fixtures are the three files every fixture Package carries. writeFixture
+// walks the folder instead, because a Package is whatever is in it; this list
+// is what the two jobs that write a Package one file at a time iterate, the
+// mount fixtures and the upgrade half, whose writes are made by the previous
+// release.
 var fixtures = []string{"kitbash.yaml", "Dockerfile", "server.js"}
 
 // The import-cli kit and the CLI Package it drafts, which is the acceptance
@@ -281,16 +284,68 @@ func writeThePackage(t *testing.T, s *state) {
 }
 
 // writeFixture writes one fixture Package into Files as the session's member,
-// one file per commit, the manifest first because that is what makes the
-// folder visible.
+// every file of it in one fs_write and therefore in one commit. The echo
+// fixture carries a public/ folder with no manifest of its own, so this is the
+// M10 write shape end to end: the folders inside a Package are described by
+// the Package, and its files go in with it, see PLAN.md section 2.1.
 func writeFixture(t *testing.T, session *session, fixture, target string) {
 	t.Helper()
-	for _, name := range fixtures {
-		body, err := os.ReadFile(filepath.Join("fixtures", fixture, name))
-		if err != nil {
-			t.Fatalf("reading the fixture %s: %v", name, err)
+	root := filepath.Join("fixtures", fixture)
+	var files []map[string]any
+	if err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil || entry.IsDir() {
+			return err
 		}
-		writeFile(t, session, filepath.Join(target, name), string(body))
+		body, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		files = append(files, map[string]any{
+			"path":    filepath.Join(target, rel),
+			"content": string(body),
+		})
+		return nil
+	}); err != nil {
+		t.Fatalf("reading the %s fixture: %v", fixture, err)
+	}
+	if len(files) < 3 {
+		t.Fatalf("the %s fixture holds %d files, want the Package", fixture, len(files))
+	}
+
+	var out struct {
+		Paths  []string `json:"paths"`
+		Commit struct {
+			Sha    string `json:"sha"`
+			Author string `json:"author"`
+		} `json:"commit"`
+	}
+	session.ok("fs_write", map[string]any{
+		"files":   files,
+		"message": "Add the " + fixture + " Package",
+	}, &out)
+	if len(out.Paths) != len(files) {
+		t.Fatalf("fs_write wrote %v, want every file of the fixture", out.Paths)
+	}
+	if out.Commit.Author != session.user || len(out.Commit.Sha) != 40 {
+		t.Fatalf("fs_write committed %+v, want one commit by %s", out.Commit, session.user)
+	}
+	// Every file is in that one commit, including the one in the folder that
+	// carries no manifest.
+	for _, file := range files {
+		path := file["path"].(string)
+		var history struct {
+			Commits []struct {
+				Sha string `json:"sha"`
+			} `json:"commits"`
+		}
+		session.ok("fs_history", map[string]any{"path": path}, &history)
+		if len(history.Commits) != 1 || history.Commits[0].Sha != out.Commit.Sha {
+			t.Fatalf("the history of %s is %+v, want the one commit the list made", path, history.Commits)
+		}
 	}
 }
 
@@ -748,7 +803,7 @@ deploy:
 
 	// The Process is on proc_list with the kit that owns it, although nothing
 	// of it runs on this host: the registration is what knows it exists.
-	process, found := listed(t, s, out.ID)
+	process, found := listed(t, s, s.elsewherePath, out.ID)
 	if !found {
 		t.Fatalf("proc_list does not hold the Process %s the kit runs", out.ID)
 	}
@@ -778,7 +833,7 @@ func stopThroughTheRunKit(t *testing.T, s *state) {
 	if call.ID != s.elsewhereID {
 		t.Fatalf("the kit was asked to stop %s, want %s", call.ID, s.elsewhereID)
 	}
-	if _, found := listed(t, s, s.elsewhereID); found {
+	if _, found := listed(t, s, s.elsewherePath, s.elsewhereID); found {
 		t.Fatalf("proc_list still holds the stopped Process %s", s.elsewhereID)
 	}
 }
@@ -1247,13 +1302,16 @@ type listedProcess struct {
 	Runner  string `json:"runner"`
 }
 
-// listed is one Process of the admin's proc_list, by id.
-func listed(t *testing.T, s *state, id string) (listedProcess, bool) {
+// listed is one Process of the admin's proc_list, by id. It asks about the
+// Package, because that is the question proc_list answers in full: without one
+// the listing is a line per Process and carries neither the digest nor the
+// kit that owns it.
+func listed(t *testing.T, s *state, pkgPath, id string) (listedProcess, bool) {
 	t.Helper()
 	var out struct {
 		Processes []listedProcess `json:"processes"`
 	}
-	s.admin.ok("proc_list", map[string]any{}, &out)
+	s.admin.ok("proc_list", map[string]any{"package": pkgPath}, &out)
 	for _, process := range out.Processes {
 		if process.ID == id {
 			return process, true

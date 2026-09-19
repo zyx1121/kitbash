@@ -90,7 +90,7 @@ func (s *Service) Write(ctx context.Context, req WriteRequest) (*WriteResult, *p
 	}
 
 	folder := filepath.Dir(clean)
-	if prob := s.writeVisible(folder, filepath.Base(clean)); prob != nil {
+	if prob := s.writeVisible(folder, filepath.Base(clean), nil); prob != nil {
 		return nil, prob
 	}
 
@@ -206,20 +206,30 @@ func (s *Service) commitPaths(ctx context.Context, repo, message string, rels []
 	return commit, nil
 }
 
-// writeVisible applies the visibility rules to a write. Every ancestor of the
-// target folder must be visible. The folder itself must be visible too, unless
-// the caller is writing the manifest that brings it into the surface.
-func (s *Service) writeVisible(folder, name string) *problem.Problem {
-	if prob := s.ancestorsVisible(folder); prob != nil {
+// writeVisible applies the visibility rule to a write: the folder the file
+// lands in has to be visible, which it is when it or a folder above it carries
+// a manifest. A file inside a Package therefore needs no manifest beside it,
+// see PLAN.md section 2.1.
+//
+// A manifest is the exception, because it is what brings a folder into the
+// surface: what has to be visible for it is the folder it is written into,
+// so a new Package folder is written under a visible folder or under a root,
+// and not at the end of a path nobody can see.
+//
+// pending are the folders a manifest is written into by the same call, empty
+// for a write of one file. It is what lets one fs_write carry a Package's
+// kitbash.yaml and the files beneath it in any order.
+func (s *Service) writeVisible(folder, name string, pending map[string]bool) *problem.Problem {
+	target := folder
+	if name == manifest.FileName {
+		target = filepath.Dir(folder)
+	}
+	_, _, prob := s.visibleFolder(target, pending)
+	if prob == nil || name == manifest.FileName {
 		return prob
 	}
-	if s.isRoot(folder) || name == manifest.FileName {
-		return nil
-	}
-	if _, ok := s.visible(folder); !ok {
-		return notVisible(folder, "Write kitbash.yaml with name and description first")
-	}
-	return nil
+	return notVisible(prob.Instance,
+		"Write kitbash.yaml with name and description into that folder first")
 }
 
 // errNotRegular is the refusal of a target that exists but is not a plain

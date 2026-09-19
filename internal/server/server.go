@@ -93,8 +93,10 @@ func Register(s *mcp.Server, files *fs.Service) {
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "fs_list",
 		Description: "List what is visible at a path. With no path, returns the visible top level folders " +
-			"across /org and the caller's home. Inside a folder, returns visible subfolders (name and " +
-			"description only, no contents) and the files directly in it. Folders without a manifest are omitted.",
+			"across /org and the caller's home: one line of path, name and description each, no files. " +
+			"Inside a folder, returns its subfolders and the files directly in it, each file as a name and " +
+			"a size. A folder is visible when it or a folder above it carries a kitbash.yaml with a name " +
+			"and a description, so the folders inside a Package are listed and need no manifest of their own.",
 		InputSchema:  listInputSchema,
 		OutputSchema: listOutputSchema,
 	}, listHandler(files))
@@ -110,10 +112,14 @@ func Register(s *mcp.Server, files *fs.Service) {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "fs_write",
-		Description: "Create or replace one file and commit it to the enclosing top level repository, " +
-			"attributed to the caller. Writing kitbash.yaml into a new folder is how a folder becomes " +
-			"visible; the manifest is validated against spec/manifest.schema.json before commit. Binary " +
-			"content is base64. Pass expectedSha to refuse the write if the file changed since it was read. " +
+		Description: "Create or replace files and commit them to the enclosing top level repository, " +
+			"attributed to the caller. Either one file in path with content or contentBase64, or up to 64 " +
+			"of them in files, all under one top level folder; either way it is one commit, so write every " +
+			"file of a Package in one call. Writing kitbash.yaml into a new folder is how a folder becomes " +
+			"visible, and the folders inside it need none of their own; the manifest is validated against " +
+			"spec/manifest.schema.json before commit. Binary content is base64. Pass expectedSha to refuse " +
+			"the write if the file, or for a list the repository, changed since it was read. A list that " +
+			"names one path the caller may not write is refused whole and writes nothing. " +
 			"A member writing under /org does not fail: the call is queued for an admin and the result is a " +
 			"queued problem (202) whose instance is the approval id; approvals_list shows the outcome once " +
 			"an admin decides.",
@@ -139,12 +145,51 @@ type readInput struct {
 	Limit  *int64 `json:"limit,omitempty"`
 }
 
+// writeInput is fs_write's input in both of its forms: one file named by path,
+// or a list of them in files. The schema refuses a call that carries both, and
+// the handler refuses it again, because the input schema is the client's to
+// honour and this is the surface's own answer.
 type writeInput struct {
+	Path          string      `json:"path,omitempty"`
+	Content       *string     `json:"content,omitempty"`
+	ContentBase64 *string     `json:"contentBase64,omitempty"`
+	Files         []writeFile `json:"files,omitempty"`
+	Message       string      `json:"message"`
+	ExpectedSha   string      `json:"expectedSha,omitempty"`
+}
+
+// writeFile is one entry of fs_write's files.
+type writeFile struct {
 	Path          string  `json:"path"`
 	Content       *string `json:"content,omitempty"`
 	ContentBase64 *string `json:"contentBase64,omitempty"`
-	Message       string  `json:"message"`
-	ExpectedSha   string  `json:"expectedSha,omitempty"`
+}
+
+// entries turns the list form into what the fs family takes.
+func (in writeInput) entries() []fs.WriteFileEntry {
+	files := make([]fs.WriteFileEntry, 0, len(in.Files))
+	for _, f := range in.Files {
+		files = append(files, fs.WriteFileEntry{
+			Path:          f.Path,
+			Content:       f.Content,
+			ContentBase64: f.ContentBase64,
+		})
+	}
+	return files
+}
+
+// mixedForms is the refusal of a call that is both forms at once. Which files
+// such a call means is a guess, and a write is not a guess.
+func mixedForms(in writeInput) *problem.Problem {
+	if len(in.Files) == 0 {
+		return nil
+	}
+	if in.Path == "" && in.Content == nil && in.ContentBase64 == nil {
+		return nil
+	}
+	return problem.BadRequest(in.Path,
+		"this call carries both files and the one file form, and one write is one of the two",
+		"Send path with content, or send files and nothing else.")
 }
 
 type historyInput struct {
@@ -198,6 +243,20 @@ func readHandler(files *fs.Service) mcp.ToolHandlerFor[readInput, any] {
 
 func writeHandler(files *fs.Service) mcp.ToolHandlerFor[writeInput, any] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, in writeInput) (*mcp.CallToolResult, any, error) {
+		if prob := mixedForms(in); prob != nil {
+			return errorResult(prob), nil, nil
+		}
+		if len(in.Files) > 0 {
+			out, prob := files.WriteAll(ctx, fs.WriteAllRequest{
+				Files:       in.entries(),
+				Message:     in.Message,
+				ExpectedSha: in.ExpectedSha,
+			})
+			if prob != nil {
+				return errorResult(prob), nil, nil
+			}
+			return structuredResult(out)
+		}
 		out, prob := files.Write(ctx, fs.WriteRequest{
 			Path:          in.Path,
 			Content:       in.Content,
