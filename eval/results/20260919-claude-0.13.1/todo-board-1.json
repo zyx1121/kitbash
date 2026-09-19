@@ -1,0 +1,97 @@
+{
+ "agent": "claude",
+ "asks_user": false,
+ "check": {
+  "check": "http_ok",
+  "detail": "https://classmate-todo.bench-20260919-2334.kitbash.zyx.tw/ answered 200",
+  "passed": true,
+  "seen": {
+   "bytes": 4536,
+   "state": "running",
+   "status": 200,
+   "url": "https://classmate-todo.bench-20260919-2334.kitbash.zyx.tw/"
+  }
+ },
+ "class": "nothing",
+ "cost_usd": 0.43974140000000006,
+ "ended_at": "2026-09-19T15:45:13+00:00",
+ "error": null,
+ "exit_code": 0,
+ "id": "todo-board",
+ "inject_verified": null,
+ "injected_at": null,
+ "kitbash_calls": 15,
+ "kitbash_calls_by_tool": {
+  "fs_list": 4,
+  "fs_read": 5,
+  "fs_write": 2,
+  "pkg_build": 1,
+  "proc_logs": 1,
+  "proc_run": 1,
+  "users_me": 1
+ },
+ "kitbash_version": "0.13.1",
+ "member": "bench-20260919-2334",
+ "model": "claude-sonnet-5",
+ "passed": true,
+ "prompt": "Make a todo web app I can share with my classmates.",
+ "questions_asked": 0,
+ "rate_limited": false,
+ "result_text": "Everything works: add, list, toggle, and delete all round-trip correctly, and the list is back to empty and ready for real use.\n\nYour todo app is live and ready to share:\n\n**https://classmate-todo.bench-20260919-2334.kitbash.zyx.tw**\n\nIt's a single shared list \u2014 anyone with the link can add a todo (with their name), check items off, and delete them, and everyone sees the same list update (it polls every few seconds). Data persists across restarts since it's backed by a mounted volume.",
+ "run": 1,
+ "setup": null,
+ "started_at": "2026-09-19T15:42:57+00:00",
+ "stop_reason": "success",
+ "time_to_mitigate_ms": null,
+ "timed_out": false,
+ "tool_calls": 22,
+ "tool_errors": 1,
+ "tools": {
+  "Bash": 3,
+  "Read": 1,
+  "ToolSearch": 1,
+  "Write": 2,
+  "mcp__kitbash__fs_list": 4,
+  "mcp__kitbash__fs_read": 5,
+  "mcp__kitbash__fs_write": 2,
+  "mcp__kitbash__pkg_build": 1,
+  "mcp__kitbash__proc_logs": 1,
+  "mcp__kitbash__proc_run": 1,
+  "mcp__kitbash__users_me": 1
+ },
+ "turns": 23,
+ "usage": {
+  "cache_creation": {
+   "ephemeral_1h_input_tokens": 37413,
+   "ephemeral_5m_input_tokens": 0
+  },
+  "cache_creation_input_tokens": 37413,
+  "cache_read_input_tokens": 757507,
+  "inference_geo": "not_available",
+  "input_tokens": 34,
+  "iterations": [
+   {
+    "cache_creation": {
+     "ephemeral_1h_input_tokens": 459,
+     "ephemeral_5m_input_tokens": 0
+    },
+    "cache_creation_input_tokens": 459,
+    "cache_read_input_tokens": 57769,
+    "input_tokens": 2,
+    "output_tokens": 164,
+    "type": "message"
+   }
+  ],
+  "output_tokens": 13852,
+  "output_tokens_details": {
+   "thinking_tokens": 2804
+  },
+  "server_tool_use": {
+   "web_fetch_requests": 0,
+   "web_search_requests": 0
+  },
+  "service_tier": "standard",
+  "speed": "standard"
+ },
+ "wall_ms": 135935
+}

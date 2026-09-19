@@ -1,0 +1,15 @@
+name: {pkg}
+description: Bench fixture. A notes page that keeps nothing itself and reads the bench cache Process, deployed by the M11 harness.
+tags: [bench, fixture]
+
+deploy:
+  units:
+    - type: container
+      build: .
+      expose: http
+      port: 8080
+      restart: never
+      env:
+        CACHE_HOST: {dep_host}
+      health: { http: /healthz, interval: 30s }
+      limits: { cpu: "1", memory: "256Mi" }

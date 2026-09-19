@@ -1,0 +1,372 @@
+{
+  "version": 1,
+  "note": "Fifteen sentences in three classes. A sentence is what a member says; a check reads the outcome on the host and never the transcript. JSON rather than YAML because the harness is Python standard library only.",
+  "sentences": [
+    {
+      "id": "todo-board",
+      "class": "nothing",
+      "prompt": "Make a todo web app I can share with my classmates.",
+      "source": "M10, verbatim",
+      "check": {
+        "name": "http_ok",
+        "params": {
+          "scope": "new",
+          "path": "/",
+          "status": 200,
+          "min_bytes": 200
+        }
+      }
+    },
+    {
+      "id": "weather-job",
+      "class": "nothing",
+      "prompt": "Every morning at eight, fetch the weather for Hsinchu and post it as a new item on our class board: POST JSON {\"text\": \"<the forecast>\", \"author\": \"weather-bot\"} to https://todo.loki.kitbash.zyx.tw/api/todos.",
+      "source": "M10, verbatim. The board named in it is loki's own M10 Process, which is outside the round on purpose: the sentence is carried over word for word.",
+      "check": {
+        "name": "proc_scheduled",
+        "params": {
+          "scope": "new"
+        }
+      }
+    },
+    {
+      "id": "pdf-service",
+      "class": "nothing",
+      "prompt": "Set up a PDF conversion service my classmates can use to convert documents to PDF.",
+      "source": "M10, verbatim",
+      "check": {
+        "name": "http_ok",
+        "params": {
+          "scope": "new",
+          "path": "/",
+          "status": 200,
+          "min_bytes": 100
+        }
+      }
+    },
+    {
+      "id": "link-shortener",
+      "class": "nothing",
+      "prompt": "I keep sending my study group huge URLs. Make us a link shortener.",
+      "check": {
+        "name": "http_ok",
+        "params": {
+          "scope": "new",
+          "path": "/",
+          "status": 200,
+          "min_bytes": 100
+        }
+      }
+    },
+    {
+      "id": "notes-wiki",
+      "class": "nothing",
+      "prompt": "Set up a Markdown notes wiki for my study group where we can write pages and read each other's.",
+      "check": {
+        "name": "http_ok",
+        "params": {
+          "scope": "new",
+          "path": "/",
+          "status": 200,
+          "min_bytes": 100
+        }
+      }
+    },
+    {
+      "id": "repo-node",
+      "class": "repository",
+      "prompt": "Get https://github.com/docker/getting-started-app running so my classmates can use it.",
+      "source": "M10, verbatim",
+      "check": {
+        "name": "http_ok",
+        "params": {
+          "scope": "new",
+          "path": "/",
+          "status": 200,
+          "min_bytes": 200
+        }
+      }
+    },
+    {
+      "id": "repo-flask",
+      "class": "repository",
+      "prompt": "Get the Flask tutorial app at https://github.com/pallets/flask/tree/main/examples/tutorial running so my classmates can use it.",
+      "source": "M10, verbatim",
+      "check": {
+        "name": "http_ok",
+        "params": {
+          "scope": "new",
+          "path": "/",
+          "status": [
+            200,
+            302
+          ],
+          "min_bytes": 50
+        }
+      }
+    },
+    {
+      "id": "repo-flask-redis",
+      "class": "repository",
+      "prompt": "Get https://github.com/docker/awesome-compose/tree/master/flask-redis running so my classmates can use it.",
+      "source": "M10, verbatim. Two services in one compose file, which the M10 round folded into one container.",
+      "check": {
+        "name": "http_ok",
+        "params": {
+          "scope": "new",
+          "path": "/",
+          "status": 200,
+          "min_bytes": 5
+        }
+      }
+    },
+    {
+      "id": "repo-pgadmin",
+      "class": "repository",
+      "prompt": "Get https://github.com/docker/awesome-compose/tree/master/postgresql-pgadmin running so my classmates can use it.",
+      "why": "Chosen because it needs both things a laptop scaffold never needs: two environment values that are credentials (PGADMIN_DEFAULT_EMAIL and PGADMIN_DEFAULT_PASSWORD, which map onto secrets) and a volume for the database. It is the two service shape again, so it also reads on the gap M10 found.",
+      "check": {
+        "name": "http_ok",
+        "params": {
+          "scope": "new",
+          "path": "/",
+          "status": [
+            200,
+            302
+          ],
+          "min_bytes": 50
+        }
+      }
+    },
+    {
+      "id": "repo-linkding",
+      "class": "repository",
+      "prompt": "Get https://github.com/sissbruecker/linkding running so my classmates can use it.",
+      "why": "Chosen because it is one real service rather than a compose file and it is useless without both things a laptop scaffold never needs: a data volume, since its database is the whole application, and two environment values for the first account. One container isolates the volume and secret question from the two service question repo-pgadmin asks. It replaced docker/getting-started-app's neighbour filebrowser/filebrowser, which the first round found archived on 2026-09-01 with a final release that prints a wind down notice and exits, so the sentence could not be passed by any agent.",
+      "check": {
+        "name": "http_ok",
+        "params": {
+          "scope": "new",
+          "path": "/",
+          "status": [
+            200,
+            302
+          ],
+          "min_bytes": 50
+        }
+      }
+    },
+    {
+      "id": "fault-stopped",
+      "class": "fault",
+      "prompt": "The class board at {url} is down. Fix it.",
+      "setup": {
+        "fixture": "bench-board",
+        "package": "bench-board-stopped"
+      },
+      "inject": {
+        "kind": "podman",
+        "note": "The member's own container runtime stops the container. kitbashd is not asked, so the Process is registered and not running.",
+        "commands": [
+          "podman stop -t 2 kitbash-{pkg}-{pkg}"
+        ]
+      },
+      "check": {
+        "name": "all_of",
+        "params": {
+          "checks": [
+            {
+              "name": "http_ok",
+              "params": {
+                "process": "{pkg}",
+                "path": "/",
+                "status": 200,
+                "body_contains": [
+                  "bench-board"
+                ]
+              }
+            },
+            {
+              "name": "http_post_roundtrip",
+              "params": {
+                "process": "{pkg}",
+                "post_path": "/api/items",
+                "get_path": "/api/items"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "fault-mount",
+      "class": "fault",
+      "prompt": "Adding anything to our board at {url} fails. Sort it out.",
+      "setup": {
+        "fixture": "bench-board",
+        "package": "bench-board-mount",
+        "reset": [
+          "chattr -i /home/{member}/{pkg}-data/items.json 2>/dev/null || true",
+          "chmod 0644 /home/{member}/{pkg}-data/items.json 2>/dev/null || true"
+        ]
+      },
+      "inject": {
+        "kind": "root",
+        "note": "The one file the rw mount holds is made unwritable at the inode, so reads keep working and every write returns 500. Permission bits alone would not do it: a container's root is the member and overrides them. The round clears the flag again before it removes its member, because the archive users_remove makes chowns the home and an immutable file refuses that.",
+        "commands": [
+          "test -f /home/{member}/{pkg}-data/items.json || echo '[]' > /home/{member}/{pkg}-data/items.json",
+          "chown {member}:{member} /home/{member}/{pkg}-data/items.json",
+          "chmod 0444 /home/{member}/{pkg}-data/items.json",
+          "chattr +i /home/{member}/{pkg}-data/items.json"
+        ]
+      },
+      "check": {
+        "name": "http_post_roundtrip",
+        "params": {
+          "process": "{pkg}",
+          "post_path": "/api/items",
+          "get_path": "/api/items"
+        }
+      }
+    },
+    {
+      "id": "fault-secret",
+      "class": "fault",
+      "prompt": "Our key service at {url} stopped answering and will not come back up. Fix it.",
+      "setup": {
+        "fixture": "bench-keyed",
+        "package": "bench-keyed-secret",
+        "secrets": {
+          "BENCH_API_KEY": "bench-fixture-key"
+        }
+      },
+      "inject": {
+        "kind": "mcp",
+        "note": "The member's secret is dropped and the Process is stopped and started again, so the start fails naming the secret, which is what a revoked credential looks like from the surface.",
+        "calls": [
+          {
+            "tool": "secrets_remove",
+            "arguments": {
+              "name": "BENCH_API_KEY"
+            }
+          },
+          {
+            "tool": "proc_stop",
+            "arguments": {
+              "process": "{pkg}"
+            }
+          },
+          {
+            "tool": "proc_run",
+            "arguments": {
+              "package": "/home/{member}/{pkg}",
+              "name": "{pkg}"
+            },
+            "expect_error": true
+          }
+        ]
+      },
+      "check": {
+        "name": "http_ok",
+        "params": {
+          "process": "{pkg}",
+          "path": "/",
+          "status": 200,
+          "body_contains": [
+            "bench-keyed ok"
+          ]
+        }
+      }
+    },
+    {
+      "id": "fault-image",
+      "class": "fault",
+      "prompt": "The board at {url} vanished, nothing loads. Get it back.",
+      "setup": {
+        "fixture": "bench-board",
+        "package": "bench-board-image"
+      },
+      "inject": {
+        "kind": "podman",
+        "note": "The image is removed from the member's own store together with the container that ran it, so the Process has to be built again before it can run again.",
+        "commands": [
+          "podman stop -t 2 kitbash-{pkg}-{pkg} || true",
+          "podman rm -f kitbash-{pkg}-{pkg} || true",
+          "podman rmi -f $(podman images --filter label=kitbash.name={pkg} -q | tr '\\n' ' ') || true"
+        ]
+      },
+      "check": {
+        "name": "all_of",
+        "params": {
+          "checks": [
+            {
+              "name": "http_ok",
+              "params": {
+                "process": "{pkg}",
+                "path": "/",
+                "status": 200,
+                "body_contains": [
+                  "bench-board"
+                ]
+              }
+            },
+            {
+              "name": "http_post_roundtrip",
+              "params": {
+                "process": "{pkg}",
+                "post_path": "/api/items",
+                "get_path": "/api/items"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "fault-dependency",
+      "class": "fault",
+      "prompt": "Our notes page at {url} says it cannot reach its cache. Fix it.",
+      "setup": {
+        "fixture": "bench-notes",
+        "package": "bench-notes-dep",
+        "depends": {
+          "fixture": "bench-cache",
+          "package": "bench-cache-dep"
+        }
+      },
+      "inject": {
+        "kind": "podman",
+        "note": "The dependency, a second Process of the same member, is stopped. The notes page itself is untouched and answers 503.",
+        "commands": [
+          "podman stop -t 2 kitbash-{dep_pkg}-{dep_pkg}"
+        ]
+      },
+      "check": {
+        "name": "all_of",
+        "params": {
+          "checks": [
+            {
+              "name": "http_ok",
+              "params": {
+                "process": "{pkg}",
+                "path": "/",
+                "status": 200,
+                "body_contains": [
+                  "bench-notes"
+                ]
+              }
+            },
+            {
+              "name": "http_post_roundtrip",
+              "params": {
+                "process": "{pkg}",
+                "post_path": "/api/notes",
+                "get_path": "/api/notes"
+              }
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

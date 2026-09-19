@@ -1,0 +1,97 @@
+{
+ "agent": "claude",
+ "asks_user": false,
+ "check": {
+  "check": "http_ok",
+  "detail": "https://link-shortener.bench-20260919-2334.kitbash.zyx.tw/ answered 200",
+  "passed": true,
+  "seen": {
+   "bytes": 5158,
+   "state": "running",
+   "status": 200,
+   "url": "https://link-shortener.bench-20260919-2334.kitbash.zyx.tw/"
+  }
+ },
+ "class": "nothing",
+ "cost_usd": 0.6058002,
+ "ended_at": "2026-09-19T15:53:56+00:00",
+ "error": null,
+ "exit_code": 0,
+ "id": "link-shortener",
+ "inject_verified": null,
+ "injected_at": null,
+ "kitbash_calls": 15,
+ "kitbash_calls_by_tool": {
+  "fs_list": 4,
+  "fs_read": 4,
+  "fs_write": 3,
+  "pkg_build": 1,
+  "pkg_list": 1,
+  "proc_run": 1,
+  "users_me": 1
+ },
+ "kitbash_version": "0.13.1",
+ "member": "bench-20260919-2334",
+ "model": "claude-sonnet-5",
+ "passed": true,
+ "prompt": "I keep sending my study group huge URLs. Make us a link shortener.",
+ "questions_asked": 0,
+ "rate_limited": false,
+ "result_text": "Test data cleaned up, list is back to empty. Everything is verified end-to-end.\n\nYour link shortener is live at **https://link-shortener.bench-20260919-2334.kitbash.zyx.tw** \u2014 share that with the study group. Paste a long URL (optionally with a custom slug like `/notes`), get a short link back, and it 302-redirects with a click counter. Links persist across restarts and everyone who visits the page sees the shared list.",
+ "run": 1,
+ "setup": null,
+ "started_at": "2026-09-19T15:51:24+00:00",
+ "stop_reason": "success",
+ "time_to_mitigate_ms": null,
+ "timed_out": false,
+ "tool_calls": 31,
+ "tool_errors": 3,
+ "tools": {
+  "Bash": 12,
+  "Read": 1,
+  "ToolSearch": 2,
+  "Write": 1,
+  "mcp__kitbash__fs_list": 4,
+  "mcp__kitbash__fs_read": 4,
+  "mcp__kitbash__fs_write": 3,
+  "mcp__kitbash__pkg_build": 1,
+  "mcp__kitbash__pkg_list": 1,
+  "mcp__kitbash__proc_run": 1,
+  "mcp__kitbash__users_me": 1
+ },
+ "turns": 32,
+ "usage": {
+  "cache_creation": {
+   "ephemeral_1h_input_tokens": 44057,
+   "ephemeral_5m_input_tokens": 0
+  },
+  "cache_creation_input_tokens": 44057,
+  "cache_read_input_tokens": 1389791,
+  "inference_geo": "not_available",
+  "input_tokens": 52,
+  "iterations": [
+   {
+    "cache_creation": {
+     "ephemeral_1h_input_tokens": 283,
+     "ephemeral_5m_input_tokens": 0
+    },
+    "cache_creation_input_tokens": 283,
+    "cache_read_input_tokens": 64589,
+    "input_tokens": 2,
+    "output_tokens": 147,
+    "type": "message"
+   }
+  ],
+  "output_tokens": 15151,
+  "output_tokens_details": {
+   "thinking_tokens": 1852
+  },
+  "server_tool_use": {
+   "web_fetch_requests": 0,
+   "web_search_requests": 0
+  },
+  "service_tier": "standard",
+  "speed": "standard"
+ },
+ "wall_ms": 151976
+}
