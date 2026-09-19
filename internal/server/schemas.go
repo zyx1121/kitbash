@@ -86,7 +86,9 @@ var (
 	// fs_read declares no output schema. Its result is content blocks only, so
 	// a client that prefers structured content still shows the caller the file
 	// body. The metadata shape it returns as its trailing text block is
-	// fs.ReadMeta, and it is documented in spec/mcp-surface.yaml.
+	// fs.ReadMeta, and readMetaSchema below is that shape: it is not published
+	// as the tool's output schema, and it is declared here so the block a
+	// caller parses is held to spec/mcp-surface.yaml like every other answer.
 
 	writeInputSchema = json.RawMessage(`{
   "type": "object",
@@ -136,6 +138,19 @@ var (
   }
 }`)
 
+	readMetaSchema = json.RawMessage(`{
+  "description": "Content blocks only. fs_read declares no outputSchema and returns no structuredContent, because clients prefer structuredContent when it is present and would then show the caller the metadata instead of the file body. The first block is the file: text media types as a text block, image/png and image/jpeg as an image block. The trailing block is a text block holding this metadata object as JSON.",
+  "type": "object",
+  "required": ["path", "mediaType", "size"],
+  "properties": {
+    "path": { "type": "string" },
+    "mediaType": { "type": "string" },
+    "size": { "type": "integer" },
+    "sha": { "type": "string", "description": "Commit that last touched this file" },
+    "truncated": { "type": "boolean" }
+  }
+}`)
+
 	historyInputSchema = json.RawMessage(`{
   "type": "object",
   "additionalProperties": false,
@@ -170,33 +185,39 @@ const buildEntryDef = `{
   }
 }`
 
-const processLineDef = `{
+// processDef is one Process as proc_list answers about it, and it is one
+// shape rather than two: without a package the fields a line does not carry
+// are simply absent, so a listing of either kind is read against this. A
+// oneOf of two shapes would be a schema a full Process matches twice, see
+// spec/mcp-surface.yaml.
+const processDef = `{
   "type": "object",
-  "description": "One Process as proc_list answers without a package",
   "required": ["id", "name", "package", "state"],
   "properties": {
     "id": { "type": "string" },
     "name": { "type": "string" },
     "package": { "type": "string" },
-    "state": { "type": "string", "enum": ["starting", "running", "unhealthy", "stopped", "failed"] },
-    "expose": { "type": "string", "enum": ["mcp", "http", "none"] },
-    "url": { "type": "string", "description": "Where an http Process is served, when the host has a domain" }
-  }
-}`
-
-const processDef = `{
-  "type": "object",
-  "required": ["id", "name", "package", "digest", "state"],
-  "properties": {
-    "id": { "type": "string" },
-    "name": { "type": "string" },
-    "package": { "type": "string" },
-    "digest": { "type": "string" },
+    "digest": { "type": "string", "description": "Absent from a line" },
     "state": { "type": "string", "enum": ["starting", "running", "unhealthy", "stopped", "failed"] },
     "expose": { "type": "string", "enum": ["mcp", "http", "none"] },
     "url": { "type": "string", "description": "Where an http Process is served, when the host has a domain" },
     "startedAt": { "type": "string", "format": "date-time" },
+    "problem": { "type": "string", "description": "Why this Process is not running, when kitbashd could not bring it back" },
+    "fix": { "type": "string", "description": "What the owner can do about it" },
     "runner": { "type": "string", "description": "Package path of the run kit that owns this Process, absent when kitbashd runs it" },
+    "mounts": {
+      "type": "array",
+      "description": "The folders of Files this Process sees, as the registration kitbashd holds records them. Absent for a Process that declared none.",
+      "items": {
+        "type": "object",
+        "required": ["source", "target", "mode"],
+        "properties": {
+          "source": { "type": "string" },
+          "target": { "type": "string" },
+          "mode": { "type": "string", "enum": ["ro", "rw"] }
+        }
+      }
+    },
     "health": {
       "type": "object",
       "description": "The most recent health probe kitbashd ran, for a Process kitbashd runs itself whose manifest declares deploy.units[0].health.http. Absent until it has been probed once.",
@@ -330,9 +351,10 @@ var (
 
 	procListOutputSchema = json.RawMessage(`{
   "type": "object",
+  "description": "One line per Process without a package, and the full shape below with one.",
   "required": ["processes"],
   "properties": {
-    "processes": { "type": "array", "items": { "oneOf": [` + processLineDef + `, ` + processDef + `] } }
+    "processes": { "type": "array", "items": ` + processDef + ` }
   }
 }`)
 

@@ -480,3 +480,39 @@ func TestBuildLogTailIsTwentyLines(t *testing.T) {
 		t.Errorf("the log carries more than the last twenty lines: %q", out.Log)
 	}
 }
+
+// The byte cap drops whole lines. A log whose last twenty lines are over the
+// byte limit is answered with fewer lines, not with half of one: the first
+// line of the answer is the one a caller reads first, and half a message is
+// worse than one message fewer.
+func TestBuildLogTailCutsWholeLines(t *testing.T) {
+	f := newFixture(t)
+	folder := f.commit(t, "ffmpeg",
+		fs.File{Path: "kitbash.yaml", Content: text(containerManifest)},
+		fs.File{Path: "Containerfile", Content: text("FROM alpine\n")})
+	var log strings.Builder
+	// Twenty lines of 300 bytes is 6 KiB, three times the byte cap.
+	for i := range 40 {
+		fmt.Fprintf(&log, "step %02d %s\n", i, strings.Repeat("x", 290))
+	}
+	f.runner.Log = log.String()
+
+	out, prob := f.packages.Build(context.Background(), folder)
+	if prob != nil {
+		t.Fatalf("Build: %s", prob.Detail)
+	}
+	if len(out.Log) > pkg.LogTailBytes {
+		t.Errorf("the log is %d bytes, want at most %d", len(out.Log), pkg.LogTailBytes)
+	}
+	for _, line := range strings.Split(out.Log, "\n") {
+		if !strings.HasPrefix(line, "step ") {
+			t.Fatalf("a line of the tail begins mid message: %q", line)
+		}
+		if len(line) != len("step 00 ")+290 {
+			t.Fatalf("a line of the tail is %d bytes, want a whole one", len(line))
+		}
+	}
+	if !strings.Contains(out.Log, "step 39") {
+		t.Errorf("the log is %q, want the end of it", out.Log)
+	}
+}

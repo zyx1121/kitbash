@@ -599,9 +599,11 @@ families:
           A unit whose deploy.units[0].mounts declares folders of Files gets
           them as bind mounts, at most four, each one nosuid, nodev, noexec
           and non recursive. A source is a folder under the caller's own home
-          or a top level folder of /org, and the top level folder it sits in
-          has to carry a kitbash.yaml with a name and a description, so a
-          folder that is invisible to the surface is unmountable too. mode rw
+          or a top level folder of /org, and it has to be visible by the rule
+          the fs family reads by: it, or a folder between it and its root,
+          carries a kitbash.yaml with a name and a description, so the folders
+          inside a Package are mountable and a folder with no manifest
+          anywhere above it is not. mode rw
           is allowed only under the caller's own home: /org is read only for
           everyone, admins included, because an approval is how a member
           writes there. Mounts are independent of provides.permits, which
@@ -616,9 +618,8 @@ families:
           member's home, a source the caller does not own, or mode rw on /org
           are not-permitted; a source carrying .., one that resolves through a
           symlink, and one that is not a directory are invalid-path; a source
-          that carries no manifest with a name and a description, or that sits
-          below a folder that carries none, is not-visible; a target that is
-          relative, that is /, or that lands under /proc, /sys, /dev, /etc,
+          with no manifest describing it, its own or one above it, is
+          not-visible; a target that is relative, that is /, or that lands under /proc, /sys, /dev, /etc,
           /bin, /sbin, /usr, /lib or /lib64, and more than four mounts, are
           bad-request. A mount that is no longer legal at the next boot fails
           the restore, and proc_list reports that Process failed with the

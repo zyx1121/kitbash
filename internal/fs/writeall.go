@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -12,6 +14,14 @@ import (
 	"github.com/zyx1121/kitbash/internal/problem"
 	"github.com/zyx1121/kitbash/internal/telemetry"
 )
+
+// planned is one file of a list write after it was resolved and decoded: where
+// it lands, where that is in the repository, and what it will hold.
+type planned struct {
+	full string
+	rel  string
+	data []byte
+}
 
 // MaxWriteFiles and MaxWriteTotalBytes bound one fs_write that carries a list.
 // A Package is a handful of files that belong together, not a tree, and the
@@ -107,11 +117,6 @@ func (s *Service) WriteAll(ctx context.Context, req WriteAllRequest) (*WriteAllR
 	// Nothing below touches the filesystem. Every path is resolved, every
 	// content decoded and every manifest parsed first, so a list that is
 	// refused is a list that did not happen.
-	type planned struct {
-		full string
-		rel  string
-		data []byte
-	}
 	var (
 		repo    string
 		work    = make([]planned, 0, len(req.Files))
@@ -224,40 +229,150 @@ func (s *Service) WriteAll(ctx context.Context, req WriteAllRequest) (*WriteAllR
 		}
 	}
 
-	paths := make([]string, 0, len(work))
+	// What each path held before this call, so a refusal puts the folder back.
+	// The whole list is one commit, and a list that fails half way through
+	// would otherwise leave files nobody asked for and no commit naming them.
+	marks, prob := s.snapshot(plannedPaths(work))
+	if prob != nil {
+		return nil, prob
+	}
+	undo := func(prob *problem.Problem, staged bool) (*WriteAllResult, *problem.Problem) {
+		s.rollback(ctx, repo, marks, staged)
+		return nil, prob
+	}
+
+	written := make([]string, 0, len(work))
 	rels := make([]string, 0, len(work))
 	for _, p := range work {
 		if err := s.makeDir(filepath.Dir(p.full)); err != nil {
-			return nil, writeProblem(p.full, err)
+			return undo(writeProblem(p.full, err), false)
 		}
 		if err := s.writeFile(p.full, p.data); err != nil {
-			return nil, writeProblem(p.full, err)
+			return undo(writeProblem(p.full, err), false)
 		}
 		if err := s.share(p.full); err != nil {
-			return nil, writeProblem(p.full, err)
+			return undo(writeProblem(p.full, err), false)
 		}
-		paths = append(paths, p.full)
+		written = append(written, p.full)
 		rels = append(rels, p.rel)
 	}
 	if err := s.stage(ctx, repo, rels); err != nil {
-		return nil, gitProblem(repo, err)
+		return undo(gitProblem(repo, err), true)
 	}
 	if !s.staged(ctx, repo, rels) {
 		// Writing the same files twice is a no operation, so the call is
 		// idempotent the way the one file form is.
 		before, err := s.lastCommit(ctx, repo, rels[0])
 		if err != nil {
-			return nil, gitProblem(repo, err)
+			return undo(gitProblem(repo, err), true)
 		}
 		if before != nil {
-			return &WriteAllResult{Paths: paths, Commit: *before}, nil
+			return &WriteAllResult{Paths: written, Commit: *before}, nil
 		}
 	}
 	commit, err := s.commitPaths(ctx, repo, req.Message, rels, by)
 	if err != nil {
-		return nil, gitProblem(repo, err)
+		// The commit is what makes the write a version of Files. Without it
+		// the files are a change nobody made, so they go back too.
+		return undo(gitProblem(repo, err), true)
 	}
-	return &WriteAllResult{Paths: paths, Commit: *commit}, nil
+	return &WriteAllResult{Paths: written, Commit: *commit}, nil
+}
+
+// plannedPaths are the files a planned write lands on.
+func plannedPaths(work []planned) []string {
+	out := make([]string, 0, len(work))
+	for _, p := range work {
+		out = append(out, p.full)
+	}
+	return out
+}
+
+// mark is what one path held before a list write touched it: the bytes to put
+// back, or nothing, which means the file was not there and the rollback takes
+// it away again.
+type mark struct {
+	path   string
+	held   bool
+	before []byte
+}
+
+// snapshot reads what every path of a list holds now. It runs before anything
+// is written, so a refusal in the middle of the list is undone from what was
+// there rather than from what a later read would find.
+//
+// A path holding something this write could not put back is refused here
+// instead: a file over the one file limit, which nothing on this surface wrote,
+// and anything that is not a plain file, which fs_write refuses to replace
+// anyway.
+func (s *Service) snapshot(files []string) ([]mark, *problem.Problem) {
+	marks := make([]mark, 0, len(files))
+	for _, path := range files {
+		info, err := s.stat(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				marks = append(marks, mark{path: path})
+				continue
+			}
+			return nil, openProblem(path, err)
+		}
+		if !info.Mode().IsRegular() {
+			return nil, problem.InvalidPathFix(path, "the path is not a regular file",
+				"fs_write replaces plain files. Choose a path that is a file or does not exist yet.")
+		}
+		if info.Size() > MaxBytes {
+			return nil, problem.TooLarge(path,
+				fmt.Sprintf("the file this write replaces is %d bytes, over the %d byte limit, and a refused write has to be able to put it back", info.Size(), MaxBytes),
+				"Replace this file with its own fs_write.")
+		}
+		f, err := s.read(path)
+		if err != nil {
+			return nil, openProblem(path, err)
+		}
+		before, err := io.ReadAll(io.LimitReader(f, MaxBytes))
+		f.Close()
+		if err != nil {
+			return nil, openProblem(path, err)
+		}
+		marks = append(marks, mark{path: path, held: true, before: before})
+	}
+	return marks, nil
+}
+
+// rollback puts every path back the way snapshot found it and, when the index
+// already holds the write, takes it out of there too. It is best effort by
+// construction: it is running because something already failed, and the answer
+// the caller gets is that failure, not a second one. What it guarantees is the
+// sentence in spec/mcp-surface.yaml, that nothing of a refused list reaches the
+// disk.
+//
+// The folders the write created are left. A folder holds no content, git does
+// not record one, and removing a folder another call has meanwhile written
+// into would be a worse answer than an empty folder.
+func (s *Service) rollback(ctx context.Context, repo string, marks []mark, staged bool) {
+	if staged {
+		// The index holds paths that are about to stop existing. HEAD is what
+		// they are reset to, and a repository with no commit yet has none, so
+		// there the entries are simply dropped.
+		rels := make([]string, 0, len(marks))
+		for _, m := range marks {
+			if rel, err := filepath.Rel(repo, m.path); err == nil {
+				rels = append(rels, rel)
+			}
+		}
+		if head, err := s.headSha(ctx, repo); err == nil && head != "" {
+			_, _ = s.git(ctx, repo, append([]string{"reset", "--quiet", "HEAD", "--"}, rels...)...)
+		} else {
+			_, _ = s.git(ctx, repo, append([]string{"rm", "--quiet", "--cached", "--force", "--ignore-unmatch", "--"}, rels...)...)
+		}
+	}
+	for _, m := range marks {
+		if !m.held {
+			_ = s.remove(m.path)
+			continue
+		}
+		_ = s.writeFile(m.path, m.before)
+	}
 }
 
 // headOrNone names the head of a repository, or says it has none.

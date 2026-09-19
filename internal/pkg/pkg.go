@@ -638,14 +638,22 @@ func shortSha(sha string) string {
 	return sha
 }
 
-// tail is the end of the build log, bounded by lines and by bytes.
+// tail is the end of the build log, bounded by lines and by bytes. It cuts
+// whole lines at both limits: a byte cut through the middle of a line would
+// hand the caller half a message to read, and the first line of the answer is
+// the one they read first.
 func tail(log string) string {
 	lines := strings.Split(strings.TrimRight(log, "\n"), "\n")
 	if len(lines) > LogTailLines {
 		lines = lines[len(lines)-LogTailLines:]
 	}
+	for len(lines) > 1 && len(strings.Join(lines, "\n")) > LogTailBytes {
+		lines = lines[1:]
+	}
 	out := strings.Join(lines, "\n")
 	if len(out) > LogTailBytes {
+		// One line of its own is over the limit, so there is nothing to drop
+		// and the end of it is what is kept.
 		out = out[len(out)-LogTailBytes:]
 	}
 	return out

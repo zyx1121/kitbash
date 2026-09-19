@@ -36,7 +36,7 @@ func TestInitializeCarriesTheInstructions(t *testing.T) {
 		"/org", "kitbash.yaml", "pkg_build", "proc_run", "expose: mcp", "secrets_set",
 		"Folders inside a Package need no manifest of their own.",
 		"Write all files of a Package in one fs_write with files.",
-		"A mounted source folder needs its own kitbash.yaml.",
+		"A mount source is any folder a manifest above it describes.",
 	} {
 		if !strings.Contains(res.Instructions, want) {
 			t.Errorf("instructions no longer mention %q", want)

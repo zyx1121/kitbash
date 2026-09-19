@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -264,5 +265,123 @@ func TestWriteAllUnderTheSharedRootIsOneApproval(t *testing.T) {
 	}
 	if _, err := os.Stat(folder); err == nil {
 		t.Error("a queued list wrote something")
+	}
+}
+
+// gitStatus is the porcelain status of a repository, empty when the tree and
+// the index match HEAD.
+func gitStatus(t *testing.T, repo string) string {
+	t.Helper()
+	cmd := exec.Command("git", "-c", "safe.directory="+repo, "status", "--porcelain")
+	cmd.Dir = repo
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git status in %s: %v", repo, err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// A refusal the kernel makes in the middle of the list is still a list that
+// did not happen: the files written before it go back, so the repository is
+// what it was and spec/mcp-surface.yaml is telling the truth.
+func TestWriteAllPutsTheFolderBackWhenAWriteIsRefused(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes into a folder with no write bit, so there is nothing to refuse")
+	}
+	service, root := tree(t)
+	ctx := context.Background()
+	folder := filepath.Join(root, "app")
+
+	// A Package, and then a second write over it whose third file lands in a
+	// folder the caller may not write.
+	if _, prob := service.WriteAll(ctx, fs.WriteAllRequest{
+		Files: aPackage(folder), Message: "Add the app Package"}); prob != nil {
+		t.Fatalf("WriteAll: %s: %s", prob.Slug(), prob.Detail)
+	}
+	sealed := filepath.Join(folder, "sealed")
+	if err := os.MkdirAll(sealed, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(sealed, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(sealed, 0o755) })
+	before := gitStatus(t, folder)
+
+	_, prob := service.WriteAll(ctx, fs.WriteAllRequest{
+		Files: []fs.WriteFileEntry{
+			{Path: filepath.Join(folder, "server.js"), Content: text("console.log('changed')\n")},
+			{Path: filepath.Join(folder, "public", "about.html"), Content: text("<!doctype html>\n")},
+			{Path: filepath.Join(sealed, "third.txt"), Content: text("refused\n")},
+			{Path: filepath.Join(folder, "fourth.txt"), Content: text("fourth\n")},
+			{Path: filepath.Join(folder, "fifth.txt"), Content: text("fifth\n")},
+		},
+		Message: "Write five files, one of them into a sealed folder"})
+	if prob == nil {
+		t.Fatal("a write into a folder the caller may not write was accepted")
+	}
+	if prob.Slug() != problem.SlugNotPermitted {
+		t.Errorf("problem is %s, want not-permitted", prob.Slug())
+	}
+
+	// The two files written before the refusal are back the way they were, and
+	// the ones after it were never written.
+	body, err := os.ReadFile(filepath.Join(folder, "server.js"))
+	if err != nil {
+		t.Fatalf("reading the file the refused write replaced: %v", err)
+	}
+	if strings.Contains(string(body), "changed") {
+		t.Errorf("server.js holds %q, want what it held before the refused write", body)
+	}
+	for _, name := range []string{
+		filepath.Join("public", "about.html"), "fourth.txt", "fifth.txt",
+		filepath.Join("sealed", "third.txt"),
+	} {
+		if _, err := os.Stat(filepath.Join(folder, name)); err == nil {
+			t.Errorf("%s was left behind by a refused write", name)
+		}
+	}
+	if got := gitStatus(t, folder); got != before {
+		t.Errorf("the repository is %q after a refused write, want %q", got, before)
+	}
+}
+
+// The same guarantee when git is what fails: a list with no commit is a list
+// that did not happen, and the index does not keep it either.
+func TestWriteAllPutsTheFolderBackWhenTheCommitFails(t *testing.T) {
+	service, root := tree(t)
+	ctx := context.Background()
+	folder := filepath.Join(root, "app")
+
+	if _, prob := service.WriteAll(ctx, fs.WriteAllRequest{
+		Files: aPackage(folder), Message: "Add the app Package"}); prob != nil {
+		t.Fatalf("WriteAll: %s: %s", prob.Slug(), prob.Detail)
+	}
+	before := gitStatus(t, folder)
+
+	// A commit with an author that is not a member name is refused by the
+	// surface, so the failure is made by taking git's own refusal: an empty
+	// commit message is one git will not make a commit from.
+	_, prob := service.WriteAll(ctx, fs.WriteAllRequest{
+		Files: []fs.WriteFileEntry{
+			{Path: filepath.Join(folder, "server.js"), Content: text("console.log('changed')\n")},
+			{Path: filepath.Join(folder, "public", "about.html"), Content: text("<!doctype html>\n")},
+		},
+		Message: ""})
+	if prob == nil {
+		t.Fatal("a commit with no message was made")
+	}
+	body, err := os.ReadFile(filepath.Join(folder, "server.js"))
+	if err != nil {
+		t.Fatalf("reading the file the refused write replaced: %v", err)
+	}
+	if strings.Contains(string(body), "changed") {
+		t.Errorf("server.js holds %q, want what it held before the refused write", body)
+	}
+	if _, err := os.Stat(filepath.Join(folder, "public", "about.html")); err == nil {
+		t.Error("a file of the refused write was left behind")
+	}
+	if got := gitStatus(t, folder); got != before {
+		t.Errorf("the repository is %q after a refused commit, want %q", got, before)
 	}
 }

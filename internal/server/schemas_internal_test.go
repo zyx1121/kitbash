@@ -104,8 +104,13 @@ func TestFsSchemasMatchTheSurfaceSpecification(t *testing.T) {
 		{"fs", "fs_write", "output", string(writeOutputSchema)},
 		{"fs", "fs_history", "input", string(historyInputSchema)},
 		{"fs", "fs_history", "output", string(historyOutputSchema)},
+		// fs_read publishes no output schema, and the metadata block it
+		// returns instead is still an answer a caller parses.
+		{"fs", "fs_read", "output", string(readMetaSchema)},
+		{"pkg", "pkg_build", "output", string(pkgBuildOutputSchema)},
 		{"pkg", "pkg_list", "output", string(pkgListOutputSchema)},
 		{"proc", "proc_list", "input", string(procListInputSchema)},
+		{"proc", "proc_list", "output", string(procListOutputSchema)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.tool+" "+tc.side, func(t *testing.T) {
@@ -145,17 +150,44 @@ func resolve(t *testing.T, surface map[string]any, node any) any {
 }
 
 // matches holds one transcribed schema to the node of the specification it was
-// transcribed from.
+// transcribed from. Both sides are trimmed string by string first: a folded
+// block scalar in YAML ends with a newline and a JSON string does not, so a
+// description written across several lines of the specification is the same
+// description here.
 func matches(t *testing.T, transcribed string, want any) {
 	t.Helper()
-	specified := normalise(t, want)
+	specified := trimmed(normalise(t, want))
 	var got any
 	if err := json.Unmarshal([]byte(transcribed), &got); err != nil {
 		t.Fatalf("the transcribed schema is not JSON: %v", err)
 	}
+	got = trimmed(got)
 	if !reflect.DeepEqual(got, specified) {
 		t.Errorf("the transcribed schema is\n%s\nand the specification says\n%s",
 			pretty(t, got), pretty(t, specified))
+	}
+}
+
+// trimmed strips the whitespace a folded YAML scalar carries from every string
+// of a decoded document.
+func trimmed(value any) any {
+	switch v := value.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case map[string]any:
+		out := map[string]any{}
+		for key, child := range v {
+			out[key] = trimmed(child)
+		}
+		return out
+	case []any:
+		out := make([]any, 0, len(v))
+		for _, child := range v {
+			out = append(out, trimmed(child))
+		}
+		return out
+	default:
+		return value
 	}
 }
 

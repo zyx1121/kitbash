@@ -29,8 +29,8 @@ const Instructions = "This host runs kitbash, and it is where the work should ru
 	ExampleManifest +
 	ExampleContainerfile +
 	"\nFolders inside a Package need no manifest of their own. Write all files " +
-	"of a Package in one fs_write with files. A mounted source folder needs " +
-	"its own kitbash.yaml. Then pkg_build, proc_run, proc_logs. expose: mcp " +
+	"of a Package in one fs_write with files. A mount source is any folder a " +
+	"manifest above it describes. Then pkg_build, proc_run, proc_logs. expose: mcp " +
 	"puts the Process's declared tools on this surface, expose: http publishes " +
 	"a port on this host, expose: none is a job. Secrets never go into Files: " +
 	"secrets_set stores a value and the unit names it under secrets. tel_query " +
