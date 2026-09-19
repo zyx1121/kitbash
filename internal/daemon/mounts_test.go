@@ -201,7 +201,7 @@ func (h *harness) superviseWithMounts(container string, resolved []mounts.Resolv
 		Expose:       ExposeNone,
 		Mounts:       resolved,
 		RegisteredAt: time.Now().UTC(),
-	}, hash, 0); err != nil {
+	}, hash, store.Quota{}); err != nil {
 		h.t.Fatalf("RegisterProcess: %v", err)
 	}
 	return id

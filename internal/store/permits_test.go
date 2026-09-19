@@ -33,7 +33,7 @@ func TestProcessKeepsThePermitsItWasRegisteredWith(t *testing.T) {
 		Expose:       "mcp",
 		Permits:      want,
 		RegisteredAt: time.Now().UTC(),
-	}, hash, 0); err != nil {
+	}, hash, store.Quota{}); err != nil {
 		t.Fatalf("RegisterProcess: %v", err)
 	}
 
@@ -67,7 +67,7 @@ func TestProcessKeepsThePermitsItWasRegisteredWith(t *testing.T) {
 		Name:         "workflow",
 		Expose:       "mcp",
 		RegisteredAt: time.Now().UTC(),
-	}, hash, 0); err != nil {
+	}, hash, store.Quota{}); err != nil {
 		t.Fatalf("RegisterProcess again: %v", err)
 	}
 	after, found, err := st.Process(ctx, "01930000-0000-7000-8000-000000000001")
@@ -103,7 +103,7 @@ func TestARegistrationWrittenBeforePermitsExistedPermitsNothing(t *testing.T) {
 		Expose:       "mcp",
 		Permits:      manifest.Permits{Tools: []string{"fs_read"}},
 		RegisteredAt: time.Now().UTC(),
-	}, hash, 0); err != nil {
+	}, hash, store.Quota{}); err != nil {
 		t.Fatalf("RegisterProcess: %v", err)
 	}
 	if err := st.Close(); err != nil {

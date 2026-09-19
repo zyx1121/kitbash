@@ -693,7 +693,7 @@ func (s *Server) mintToken(ctx context.Context, p store.Process) (string, error)
 	// The record is written back as it was read, so nothing but the token
 	// hash changes: the limit is not applied, because replacing a Process is
 	// never a new one.
-	if err := s.store.RegisterProcess(ctx, p, hash, 0); err != nil {
+	if err := s.store.RegisterProcess(ctx, p, hash, store.Quota{}); err != nil {
 		return "", err
 	}
 	return token, nil

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"sync"
 	"time"
 
@@ -36,15 +37,35 @@ const (
 	AttrScheduleResult   = "kitbash.schedule.result"
 	AttrScheduleDuration = "kitbash.schedule.duration_ms"
 	AttrScheduleReason   = "kitbash.schedule.reason"
+	AttrScheduleError    = "kitbash.schedule.error"
 )
 
-// What one tick came to. A tick either ran the container to its exit, was
-// skipped, or could not be started at all; there is no fourth answer, and
-// "did it run this morning" is one tel_query for these words.
+// What one tick came to. The first three are the ordinary answers: the
+// container ran to its exit, the tick was skipped, or the run could not be
+// started at all. The last two are what a host says when it stopped being able
+// to speak for the run: this daemon was shutting down while the container was
+// running, and the runtime would not say what the container exited with.
+// "Did it run this morning" is one tel_query for these words.
 const (
 	ScheduleRan           = "ran"
 	ScheduleSkipped       = "skipped"
 	ScheduleFailedToStart = "failed_to_start"
+	ScheduleInterrupted   = "interrupted"
+	ScheduleLost          = "lost"
+)
+
+// scheduleGone is not one of them. It is what a run answers when the
+// registration was unregistered while the tick was reaching for it: there is
+// no Process for a record to be about, so nothing is written, see runJob.
+const scheduleGone = "gone"
+
+// The classes of a wait that failed, recorded as kitbash.schedule.error beside
+// the lost result. They are the runtime's failures and not the container's, so
+// they are a class rather than an exit status.
+const (
+	lostNoContainer = "no-container"
+	lostTimeout     = "timeout"
+	lostRuntime     = "runtime"
 )
 
 // Why a tick was skipped. A job whose previous run is still going is not run
@@ -76,6 +97,12 @@ const MaxScheduledRuns = 8
 // MaxProcessesPerMember, which bounds their registrations in all.
 const MaxScheduledPerMember = 32
 
+// MaxRunsPerMember is how many scheduled runs of one member go at once. It is
+// the member's share of MaxScheduledRuns: without it a member with eight jobs
+// that each take an hour holds the whole host, and every other member's tick
+// is skipped as busy for reasons that have nothing to do with them.
+const MaxRunsPerMember = 3
+
 // MaxRunTime is how long one run may take. A job that is still going after it
 // is stopped, because a daily job that runs for a day is a job that is never
 // not running, and the next tick would be skipped for ever.
@@ -93,6 +120,11 @@ const ScheduleIdleWait = time.Minute
 
 // ScheduleWriteTimeout bounds the write of one run's record.
 const ScheduleWriteTimeout = 5 * time.Second
+
+// noTickWait is how long a job whose expression names no date is left before
+// the daemon looks at it again. It is a day because the thing it says is a log
+// line, and a log line a day is a host an operator can read.
+const noTickWait = 24 * time.Hour
 
 // job is one registered schedule: what to run, when it is next due, and what
 // the run before this one came to.
@@ -126,6 +158,16 @@ type lastRun struct {
 	duration  time.Duration
 }
 
+// outcome is what one tick came to: the result, the status the entrypoint
+// exited with where there was one, and the one word that says why on a tick
+// that was skipped or a run this host lost track of.
+type outcome struct {
+	result string
+	code   int
+	reason string
+	class  string
+}
+
 // skipped is one tick that was not run, and why.
 type skipped struct {
 	job    job
@@ -137,11 +179,15 @@ type skipped struct {
 // holds are the registrations that declare a schedule, tracked as they arrive
 // and dropped as they go, the same way the prober holds what it probes.
 type scheduler struct {
-	maxRuns int
+	maxRuns  int
+	maxOwner int
 
 	mu      sync.Mutex
 	jobs    map[string]*job
 	running int
+	// perOwner is how many runs each member has going, which is what bounds
+	// one member's share of the host, see MaxRunsPerMember.
+	perOwner map[string]int
 
 	// changed wakes the loop when the set of jobs changed, so a job
 	// registered now is due at its own next tick rather than at the end of
@@ -149,14 +195,19 @@ type scheduler struct {
 	changed chan struct{}
 }
 
-func newScheduler(maxRuns int) *scheduler {
+func newScheduler(maxRuns, perOwner int) *scheduler {
 	if maxRuns <= 0 {
 		maxRuns = MaxScheduledRuns
 	}
+	if perOwner <= 0 {
+		perOwner = MaxRunsPerMember
+	}
 	return &scheduler{
-		maxRuns: maxRuns,
-		jobs:    map[string]*job{},
-		changed: make(chan struct{}, 1),
+		maxRuns:  maxRuns,
+		maxOwner: perOwner,
+		jobs:     map[string]*job{},
+		perOwner: map[string]int{},
+		changed:  make(chan struct{}, 1),
 	}
 }
 
@@ -242,39 +293,80 @@ func (sc *scheduler) untrack(id string) {
 // run, the ticks that were skipped with the reason for each, and how long the
 // loop may wait before it looks again.
 //
+// The jobs are walked in a fixed order, by the tick they were due at and then
+// by id, rather than in the order a map hands them over. When more are due
+// than the host will run, which job loses has to be the same answer every
+// time: otherwise the member whose tick is skipped is whoever the runtime
+// hashed last.
+//
 // Every due job's next tick is computed from now whether or not this one runs,
-// so a skipped tick costs one tick and not the schedule.
+// so a skipped tick costs one tick and not the schedule. A clock that moved
+// backwards is no reason to run a tick that was already taken: the next tick
+// is only ever moved forward.
 func (sc *scheduler) due(now time.Time) ([]job, []skipped, time.Duration) {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 	var run []job
 	var missed []skipped
 	wait := ScheduleIdleWait
-	for _, target := range sc.jobs {
+	for _, target := range sc.ordered() {
 		if target.next.After(now) {
 			if left := target.next.Sub(now); left < wait {
 				wait = left
 			}
 			continue
 		}
-		if next, ok := target.cron.Next(now); ok {
-			target.next = next
-			if left := next.Sub(now); left < wait {
-				wait = left
-			}
+		sc.reschedule(target, now)
+		if left := target.next.Sub(now); left > 0 && left < wait {
+			wait = left
 		}
 		switch {
 		case target.running:
 			missed = append(missed, skipped{job: *target, reason: SkipRunning, at: now})
-		case sc.running >= sc.maxRuns:
+		case sc.running >= sc.maxRuns, sc.perOwner[target.owner] >= sc.maxOwner:
 			missed = append(missed, skipped{job: *target, reason: SkipBusy, at: now})
 		default:
 			target.running = true
 			sc.running++
+			sc.perOwner[target.owner]++
 			run = append(run, *target)
 		}
 	}
 	return run, missed, wait
+}
+
+// ordered is the jobs in the order ticks are taken: the one due longest first,
+// and the lower id first where two are due at the same moment. It is the whole
+// of the fairness rule between two jobs of one member, and what makes the loser
+// of a busy host the same job on every run.
+func (sc *scheduler) ordered() []*job {
+	out := make([]*job, 0, len(sc.jobs))
+	for _, target := range sc.jobs {
+		out = append(out, target)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].next.Equal(out[j].next) {
+			return out[i].next.Before(out[j].next)
+		}
+		return out[i].id < out[j].id
+	})
+	return out
+}
+
+// reschedule moves one job to its next tick after now. A job whose expression
+// names no date the calendar has, which is what an hour that no longer comes
+// round looks like once a month field is read, is put a day out rather than
+// left due: a job that is due for ever is a job every pass of the loop tries
+// to run, and this way the daemon says so once a day instead.
+func (sc *scheduler) reschedule(target *job, now time.Time) {
+	next, ok := target.cron.Next(now)
+	if !ok {
+		logger.Printf("schedule: %q of the Process %s names no date this calendar has, so it is not due again today",
+			target.cron.Expr, target.id)
+		target.next = now.Add(noTickWait)
+		return
+	}
+	target.next = next
 }
 
 // finished records one run and reports whether it counts. It answers false for
@@ -282,7 +374,7 @@ func (sc *scheduler) due(now time.Time) ([]job, []skipped, time.Duration) {
 // kitbashd no longer holds: the run belongs to nothing, so nothing is recorded
 // about it. Either way the job stops being in flight and the host has one
 // fewer run going.
-func (sc *scheduler) finished(id string, run lastRun) bool {
+func (sc *scheduler) finished(id, owner string, run lastRun) bool {
 	sc.mu.Lock()
 	current, tracked := sc.jobs[id]
 	if tracked {
@@ -292,6 +384,12 @@ func (sc *scheduler) finished(id string, run lastRun) bool {
 	}
 	if sc.running > 0 {
 		sc.running--
+	}
+	if sc.perOwner[owner] > 0 {
+		sc.perOwner[owner]--
+		if sc.perOwner[owner] == 0 {
+			delete(sc.perOwner, owner)
+		}
 	}
 	sc.mu.Unlock()
 	if tracked {
@@ -396,50 +494,90 @@ func (s *Server) loadJobs(ctx context.Context) {
 // free the moment it hands the run over.
 func (s *Server) runScheduled(ctx context.Context, target job) {
 	started := s.now()
-	code, result := s.runJob(ctx, target)
-	run := lastRun{startedAt: started, exitCode: code, duration: s.now().Sub(started)}
-	if !s.jobs.finished(target.id, run) {
+	came := s.runJob(ctx, target)
+	run := lastRun{startedAt: started, exitCode: came.code, duration: s.now().Sub(started)}
+	tracked := s.jobs.finished(target.id, target.owner, run)
+	if !tracked {
 		// The job was unregistered while this run was going, which is a job
 		// nobody holds any more. What a record would say is that a Process
 		// that is not registered ran, so it is dropped, the same way a health
 		// reading of an unregistered Process is.
 		return
 	}
-	s.recordRun(ctx, target, result, "", code, started, run.duration)
+	if came.result == scheduleGone {
+		// The registration was gone before anything was started. There is no
+		// Process for a record to be about and no container was made.
+		return
+	}
+	s.recordRun(ctx, target, came, started, run.duration)
 }
 
 // runJob is one run: the container is made again from the registration, put
 // through the same four steps a start takes, and waited on until its
 // entrypoint exits.
 //
+// Everything up to the start happens under this Process's action lock, and the
+// registration is read inside it. A tick reads a row and then writes it back
+// when it mints the token of the run, so a proc_stop that landed in between
+// would be undone by the tick that raced it: under the lock the unregister is
+// either wholly before this read, which answers no row and runs nothing, or
+// wholly after the start, which is a run of a Process that was registered when
+// it began. The lock is released before the wait: a job that runs for an hour
+// must not be a Process its owner cannot stop for an hour.
+//
 // The container of the previous run is removed here and not when that run
 // ended, because proc_logs reads the last run: the logs of a job live in the
 // container until the next tick replaces it, see PLAN.md section 2.3.
-func (s *Server) runJob(ctx context.Context, target job) (int, string) {
+func (s *Server) runJob(ctx context.Context, target job) outcome {
+	unlock := s.actions.lock(target.id)
 	p, found, err := s.store.Process(ctx, target.id)
 	if err != nil || !found {
-		logger.Printf("schedule: the Process %s of %s is no longer registered, so its tick ran nothing",
+		unlock()
+		if err != nil {
+			logger.Printf("schedule: reading the Process %s of %s: %v", target.id, target.owner, err)
+			return outcome{result: ScheduleFailedToStart}
+		}
+		logger.Printf("schedule: the Process %s of %s was unregistered before its tick, so nothing ran",
 			target.id, target.owner)
-		return 0, ScheduleFailedToStart
+		return outcome{result: scheduleGone}
 	}
 	m, found, err := s.users.Lookup(ctx, p.Owner)
 	if err != nil || !found {
-		logger.Printf("schedule: %s owns the job %s and is not a member of this host: %v", p.Owner, p.ID, err)
-		return 0, ScheduleFailedToStart
-	}
-	// The run holds this Process's action lock while the container is made and
-	// started, so a proc_stop and a tick cannot take the runtime apart from
-	// two sides. It is released before the wait: a job that runs for an hour
-	// would otherwise be a Process its owner cannot stop for an hour.
-	unlock := s.actions.lock(p.ID)
-	if prob := s.startRun(ctx, p, m); prob != nil {
 		unlock()
-		logger.Printf("schedule: starting %s of %s: %s", p.Container, p.Owner, prob.Detail)
-		return 0, ScheduleFailedToStart
+		logger.Printf("schedule: %s owns the job %s and is not a member of this host: %v", p.Owner, p.ID, err)
+		return outcome{result: ScheduleFailedToStart}
 	}
+	hash, prob, gone := s.startRun(ctx, p, m)
 	unlock()
+	switch {
+	case gone:
+		logger.Printf("schedule: the Process %s of %s was unregistered while its tick was starting it",
+			p.ID, p.Owner)
+		return outcome{result: scheduleGone}
+	case prob != nil:
+		logger.Printf("schedule: starting %s of %s: %s", p.Container, p.Owner, prob.Detail)
+		return outcome{result: ScheduleFailedToStart}
+	}
 	logger.Printf("schedule: %s started %s for %s", p.ID, p.Container, p.Owner)
-	return s.waitForRun(ctx, p, m), ScheduleRan
+	came := s.waitForRun(ctx, p, m)
+	// The container is kept for proc_logs and its token is not: a container
+	// that has exited is not a producer, see PLAN.md section 2.4.
+	s.revokeRunToken(ctx, p, hash)
+	return came
+}
+
+// revokeRunToken ends the credential one run was given. The hash is named, so
+// a Process registered again while this run was going keeps the token that
+// registration minted.
+func (s *Server) revokeRunToken(ctx context.Context, p store.Process, hash string) {
+	if hash == "" {
+		return
+	}
+	revoke, cancel := context.WithTimeout(context.WithoutCancel(ctx), ScheduleWriteTimeout)
+	defer cancel()
+	if _, err := s.store.RevokeProcessToken(revoke, p.ID, hash); err != nil {
+		logger.Printf("schedule: revoking the token of the run of %s: %v", p.ID, err)
+	}
 }
 
 // startRun makes the container of one run and starts it. It is the start of
@@ -447,7 +585,7 @@ func (s *Server) runJob(ctx context.Context, target job) (int, string) {
 // and the mounts come from the registration, because a tick has no session
 // behind it, and everything after that is the same four steps, see
 // createVerifiedContainer.
-func (s *Server) startRun(ctx context.Context, p store.Process, m sysusers.Member) *problem.Problem {
+func (s *Server) startRun(ctx context.Context, p store.Process, m sysusers.Member) (string, *problem.Problem, bool) {
 	// Whatever the previous tick left is removed first: the container name is
 	// this job's, and a finished container of it is the logs proc_logs has
 	// been reading since that run ended.
@@ -457,7 +595,7 @@ func (s *Server) startRun(ctx context.Context, p store.Process, m sysusers.Membe
 	}
 	opts, prob := scheduleOptions("", p)
 	if prob != nil {
-		return prob
+		return "", prob, false
 	}
 	// The mounts and the secrets are resolved again, exactly as a start
 	// resolves them: what was true at registration is not what is true now,
@@ -465,12 +603,12 @@ func (s *Server) startRun(ctx context.Context, p store.Process, m sysusers.Membe
 	// that did not start, see mounts.go and secrets.go.
 	mounted, prob := s.revalidateMounts("", p, m)
 	if prob != nil {
-		return prob
+		return "", prob, false
 	}
 	opts.Mounts = mounts.Podman(mounted)
 	held, prob := s.resolveSecrets("", p)
 	if prob != nil {
-		return prob
+		return "", prob, false
 	}
 	leaf := s.processCgroup(ctx, m, p, limitsOf(opts.Memory, opts.CPUs, opts.PidsLimit))
 	if leaf != "" {
@@ -479,14 +617,23 @@ func (s *Server) startRun(ctx context.Context, p store.Process, m sysusers.Membe
 	p.Limits = store.Limits{Memory: p.Schedule.Memory, CPU: p.Schedule.CPU, Pids: opts.PidsLimit, Ceiling: leaf != ""}
 	// Every run gets a token of its own, the same as every start: the store
 	// keeps the hash alone, and the container of the run before this one is
-	// gone.
-	token, err := s.mintToken(ctx, p)
+	// gone. The write is an update and never an insert, so a registration that
+	// was deleted while this tick was reaching for it stays deleted and this
+	// run is the one that is abandoned, see store.UpdateProcessRun.
+	token, hash, err := store.NewToken()
 	if err != nil {
-		return problem.Internal("", err.Error(), "")
+		return "", problem.Internal("", err.Error(), ""), false
+	}
+	held_, err := s.store.UpdateProcessRun(ctx, p.ID, p.Limits, hash)
+	if err != nil {
+		return "", problem.Internal("", err.Error(), ""), false
+	}
+	if !held_ {
+		return "", nil, true
 	}
 	envFile, err := s.writeEnvFile(p, m, p.Schedule.Env, token, held)
 	if err != nil {
-		return problem.Internal("", err.Error(), "")
+		return hash, problem.Internal("", err.Error(), ""), false
 	}
 	defer func() {
 		if err := os.Remove(envFile); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -495,35 +642,59 @@ func (s *Server) startRun(ctx context.Context, p store.Process, m sysusers.Membe
 	}()
 	opts.EnvFile = envFile
 	if err := s.createVerifiedContainer(ctx, m, p, opts, leaf, mounted); err != nil {
-		return problem.Internal("", fmt.Sprintf("the container runtime could not run %s: %v", p.Container, err), "")
+		return hash, problem.Internal("",
+			fmt.Sprintf("the container runtime could not run %s: %v", p.Container, err), ""), false
 	}
-	return nil
+	return hash, nil, false
 }
 
 // waitForRun waits for the entrypoint of one run to exit and answers the
-// status it exited with. A run still going after MaxRunTime is stopped and
-// recorded with StoppedExitCode: the schedule is what starts this container
-// again, so a run that outlives its ceiling would skip every tick after it.
-func (s *Server) waitForRun(ctx context.Context, p store.Process, m sysusers.Member) int {
+// status it exited with and what became of the run.
+//
+// There are four ends to a wait and they are four different things to record.
+// The entrypoint exited, which is the ordinary one. The run outlived
+// MaxRunTime, so this host stopped it: the schedule is what starts this
+// container again, and a run that outlives its ceiling would skip every tick
+// after it, so it is recorded as a run with the status a killed container
+// carries. The daemon is stopping, which says nothing about the container: it
+// is still running and the next daemon reads it as the container of the last
+// run. And the runtime would not answer at all, which is a run this host has
+// lost track of rather than one that failed to start.
+func (s *Server) waitForRun(ctx context.Context, p store.Process, m sysusers.Member) outcome {
 	wait, cancel := context.WithTimeout(ctx, s.maxRunTime())
 	defer cancel()
 	code, err := s.runner.WaitContainer(wait, m, p.Container)
-	if err == nil {
-		return code
-	}
-	if ctx.Err() != nil {
-		// The daemon is stopping, not the run. The container keeps going and
-		// the next daemon reads it as the container of the last run, which is
-		// what proc_logs answers with.
+	switch {
+	case err == nil:
+		return outcome{result: ScheduleRan, code: code}
+	case ctx.Err() != nil:
 		logger.Printf("schedule: %s of %s was still running when this daemon stopped", p.Container, p.Owner)
-		return 0
+		return outcome{result: ScheduleInterrupted}
+	case errors.Is(wait.Err(), context.DeadlineExceeded):
+		logger.Printf("schedule: %s of %s ran longer than %s, stopping it", p.Container, p.Owner, s.maxRunTime())
+		if err := s.runner.Stop(context.WithoutCancel(ctx), m, p.Container, StopTimeout); err != nil &&
+			!errors.Is(err, sysusers.ErrNoContainer) {
+			logger.Printf("schedule: stopping %s of %s: %v", p.Container, p.Owner, err)
+		}
+		return outcome{result: ScheduleRan, code: StoppedExitCode}
+	default:
+		logger.Printf("schedule: waiting for %s of %s: %v", p.Container, p.Owner, err)
+		return outcome{result: ScheduleLost, class: lostClass(err)}
 	}
-	logger.Printf("schedule: %s of %s ran longer than %s, stopping it", p.Container, p.Owner, s.maxRunTime())
-	if err := s.runner.Stop(context.WithoutCancel(ctx), m, p.Container, StopTimeout); err != nil &&
-		!errors.Is(err, sysusers.ErrNoContainer) {
-		logger.Printf("schedule: stopping %s of %s: %v", p.Container, p.Owner, err)
+}
+
+// lostClass says why a wait failed, for the record a lost run writes. It is
+// the class and never the runtime's own words: those carry host paths and
+// container ids, which are the operator's and not a member's.
+func lostClass(err error) string {
+	switch {
+	case errors.Is(err, sysusers.ErrNoContainer):
+		return lostNoContainer
+	case errors.Is(err, sysusers.ErrTimeout):
+		return lostTimeout
+	default:
+		return lostRuntime
 	}
-	return StoppedExitCode
 }
 
 // maxRunTime is how long one run may take on this host. It is configurable for
@@ -575,7 +746,7 @@ func scheduleOptions(instance string, p store.Process) (podman.RunOptions, *prob
 // out: what a reader asks of these records is whether the job ran, and a skip
 // answers that with a reason.
 func (s *Server) recordSkip(ctx context.Context, target skipped) {
-	s.recordRun(ctx, target.job, ScheduleSkipped, target.reason, 0, target.at, 0)
+	s.recordRun(ctx, target.job, outcome{result: ScheduleSkipped, reason: target.reason}, target.at, 0)
 }
 
 // recordRun stores one tick as a metric and hands it to the fan out, which is
@@ -587,21 +758,26 @@ func (s *Server) recordSkip(ctx context.Context, target skipped) {
 // is kitbashd, because a tick is not something the container said about
 // itself; and the path is the Package folder, which is the file this run is
 // about.
-func (s *Server) recordRun(ctx context.Context, target job, result, reason string, code int,
-	at time.Time, took time.Duration) {
+func (s *Server) recordRun(ctx context.Context, target job, came outcome, at time.Time, took time.Duration) {
 	value := float64(notRanValue)
-	if result == ScheduleRan {
+	if came.result == ScheduleRan {
 		value = ranValue
 	}
 	other := map[string]any{
-		AttrScheduleResult:   result,
+		AttrScheduleResult:   came.result,
 		AttrScheduleDuration: took.Milliseconds(),
 	}
-	if result != ScheduleSkipped {
-		other[AttrScheduleExitCode] = code
+	// The exit status is on the records of a run that reached one. A skipped
+	// tick never started a container, and an interrupted or lost run has no
+	// status to report: a zero there would read as a run that succeeded.
+	if came.result == ScheduleRan {
+		other[AttrScheduleExitCode] = came.code
 	}
-	if reason != "" {
-		other[AttrScheduleReason] = reason
+	if came.reason != "" {
+		other[AttrScheduleReason] = came.reason
+	}
+	if came.class != "" {
+		other[AttrScheduleError] = came.class
 	}
 	export := store.Export{Metrics: []store.Metric{{
 		TimeNS: at.UnixNano(),

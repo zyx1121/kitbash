@@ -174,7 +174,7 @@ func TestUsersList(t *testing.T) {
 		Container:    "kitbash-echo-echo",
 		Expose:       ExposeNone,
 		RegisteredAt: time.Now().UTC(),
-	}, hash, 0); err != nil {
+	}, hash, store.Quota{}); err != nil {
 		t.Fatalf("RegisterProcess: %v", err)
 	}
 
@@ -288,7 +288,7 @@ func TestUsersRemove(t *testing.T) {
 	if err := h.store.RegisterProcess(ctx, store.Process{
 		ID: id, Owner: "alice", Package: "/home/alice/echo", Container: "kitbash-echo",
 		Expose: ExposeNone, RegisteredAt: time.Now().UTC(),
-	}, hash, 0); err != nil {
+	}, hash, store.Quota{}); err != nil {
 		t.Fatalf("RegisterProcess: %v", err)
 	}
 	if err := h.store.CreateApproval(ctx, store.Approval{
@@ -381,7 +381,7 @@ func TestUsersRemoveKeepsTheStoreUntilTheAccountIsGone(t *testing.T) {
 	if err := h.store.RegisterProcess(ctx, store.Process{
 		ID: id, Owner: "alice", Package: "/home/alice/echo", Container: "kitbash-echo",
 		Expose: ExposeNone, RegisteredAt: time.Now().UTC(),
-	}, hash, 0); err != nil {
+	}, hash, store.Quota{}); err != nil {
 		t.Fatalf("RegisterProcess: %v", err)
 	}
 	if err := h.store.CreateApproval(ctx, store.Approval{

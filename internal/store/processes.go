@@ -15,6 +15,7 @@ import (
 
 	"github.com/zyx1121/kitbash/internal/manifest"
 	"github.com/zyx1121/kitbash/internal/mounts"
+	"github.com/zyx1121/kitbash/internal/podman"
 )
 
 // SubscriptionTelemetry is the one subscription a manifest can declare, see
@@ -42,6 +43,21 @@ var ErrProcessOwned = errors.New("store: the Process id belongs to another membe
 // inside the transaction, so two sessions registering at once cannot both pass
 // a check and both write.
 var ErrTooManyProcesses = errors.New("store: the member has too many Processes registered")
+
+// ErrTooManyScheduled reports a member at their limit of jobs. It is a second
+// bound under the first: every job is a container the host starts by itself,
+// so what it costs is the ticker's time and not only a registration, see
+// daemon.MaxScheduledPerMember.
+var ErrTooManyScheduled = errors.New("store: the member has too many scheduled Processes registered")
+
+// Quota is what one member may hold, checked inside the transaction that
+// writes a registration: how many Processes, and how many of those may be
+// jobs. A zero field is no bound, which is what a caller replacing a record
+// passes, and a replacement is never refused by either.
+type Quota struct {
+	Processes int
+	Scheduled int
+}
 
 // Process is one registered Process: who runs it, what it runs, and what it
 // asked to receive. The token is not part of it; only the hash of the token
@@ -315,10 +331,10 @@ func HashToken(token string) string {
 // which is what makes a re-run of the same Process safe to repeat. The same id
 // held by another member is ErrProcessOwned.
 //
-// maxPerOwner bounds how many Processes one member may hold; zero means no
-// bound, which is what a caller not exercising the limit passes. A replacement
-// is not a new Process and is never refused by it.
-func (s *Store) RegisterProcess(ctx context.Context, p Process, tokenHash string, maxPerOwner int) error {
+// quota bounds how many Processes and how many jobs one member may hold; a
+// zero field is no bound, which is what a caller not exercising the limit
+// passes. A replacement is not a new Process and is never refused by either.
+func (s *Store) RegisterProcess(ctx context.Context, p Process, tokenHash string, quota Quota) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("store: begin: %w", err)
@@ -336,16 +352,32 @@ func (s *Store) RegisterProcess(ctx context.Context, p Process, tokenHash string
 	case owner != p.Owner:
 		return ErrProcessOwned
 	}
-	// The count is inside the transaction, so two sessions registering at the
-	// same moment cannot both read a count under the limit and both write.
-	if !replacing && maxPerOwner > 0 {
+	// The counts are inside the transaction, so two sessions registering at
+	// the same moment cannot both read a count under the limit and both write.
+	if !replacing && quota.Processes > 0 {
 		var held int
 		if err := tx.QueryRowContext(ctx,
 			"SELECT count(*) FROM processes WHERE owner = ?", p.Owner).Scan(&held); err != nil {
 			return fmt.Errorf("store: count the Processes of %s: %w", p.Owner, err)
 		}
-		if held >= maxPerOwner {
+		if held >= quota.Processes {
 			return ErrTooManyProcesses
+		}
+	}
+	// The jobs are counted the same way and in the same transaction. A
+	// registration that is not one is never refused by this, and one that
+	// replaces a job of the same id is not a new job: the id is excluded
+	// rather than the replacing flag read, because a Process that was not a
+	// job and is one now is a new job under an id the table already has.
+	if quota.Scheduled > 0 && p.Schedule.Declared() {
+		var held int
+		if err := tx.QueryRowContext(ctx,
+			"SELECT count(*) FROM processes WHERE owner = ? AND id != ? AND schedule != ''",
+			p.Owner, p.ID).Scan(&held); err != nil {
+			return fmt.Errorf("store: count the scheduled Processes of %s: %w", p.Owner, err)
+		}
+		if held >= quota.Scheduled {
+			return ErrTooManyScheduled
 		}
 	}
 
@@ -477,17 +509,49 @@ func (s *Store) ProcessCounts(ctx context.Context) (map[string]int, error) {
 	return counts, nil
 }
 
-// ScheduledCount is how many jobs one member holds registered, not counting
-// the id given, which is the registration about to replace itself. It is what
-// bounds the ticker per member, see internal/daemon.MaxScheduledPerMember.
-func (s *Store) ScheduledCount(ctx context.Context, owner, excluding string) (int, error) {
-	var held int
-	if err := s.db.QueryRowContext(ctx,
-		"SELECT count(*) FROM processes WHERE owner = ? AND id != ? AND schedule != ''",
-		owner, excluding).Scan(&held); err != nil {
-		return 0, fmt.Errorf("store: count the scheduled Processes of %s: %w", owner, err)
+// UpdateProcessRun writes the ceiling and the token of a Process that is
+// already registered, and reports whether there was one to write. It inserts
+// nothing: a scheduled run mints its token after it read the registration, and
+// the proc_stop that landed in between must stay deleted rather than be
+// written back by the tick it raced, see internal/daemon/schedule.go.
+//
+// Everything else about the row is left as it is, so this is the one write
+// that cannot resurrect a registration and cannot carry a stale field over
+// another writer's.
+func (s *Store) UpdateProcessRun(ctx context.Context, id string, limits Limits, tokenHash string) (bool, error) {
+	res, err := s.db.ExecContext(ctx,
+		"UPDATE processes SET limits = ?, token_hash = ? WHERE id = ?", limits.JSON(), tokenHash, id)
+	if err != nil {
+		return false, fmt.Errorf("store: record the run of %s: %w", id, err)
 	}
-	return held, nil
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("store: record the run of %s: %w", id, err)
+	}
+	return n > 0, nil
+}
+
+// RevokeProcessToken makes one token answer for nothing, without touching the
+// registration. It is what the end of a scheduled run calls: the container is
+// kept until the next tick so proc_logs can read it, and a container that has
+// exited is not a producer, so the token it was given dies with the run.
+//
+// The hash is named rather than the id alone, so a run that ended after its
+// Process was registered again revokes the token it was given and not the one
+// the new registration minted. The column is emptied rather than deleted: no
+// token hashes to the empty string, so an empty column is a registration
+// nothing can export as.
+func (s *Store) RevokeProcessToken(ctx context.Context, id, tokenHash string) (bool, error) {
+	res, err := s.db.ExecContext(ctx,
+		"UPDATE processes SET token_hash = '' WHERE id = ? AND token_hash = ?", id, tokenHash)
+	if err != nil {
+		return false, fmt.Errorf("store: revoke the token of %s: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("store: revoke the token of %s: %w", id, err)
+	}
+	return n > 0, nil
 }
 
 // Process reads one registered Process by id.
@@ -597,9 +661,7 @@ func scanProcess(row scanner) (Process, error) {
 		}
 	}
 	if scheduled != "" {
-		if err := json.Unmarshal([]byte(scheduled), &p.Schedule); err != nil {
-			return Process{}, fmt.Errorf("store: read the schedule of %s: %w", p.ID, err)
-		}
+		p.Schedule = readSchedule(p.ID, scheduled)
 	}
 	if permits != "" {
 		block, err := manifest.ParsePermits([]byte(permits))
@@ -609,6 +671,40 @@ func scanProcess(row scanner) (Process, error) {
 		p.Permits = block
 	}
 	return p, nil
+}
+
+// readSchedule reads the schedule column and answers the job it describes, or
+// no job at all. A column this release cannot read is not a failed listing: a
+// row written by something else, or by a release that spelled a schedule
+// differently, would otherwise stop every Process of this host from being
+// listed. It is said once per read and that Process is not a job until it is
+// registered again, which is the end of the two that cannot surprise a member.
+//
+// The expression and the ceiling are held to the same rules a registration is,
+// because this is where the ticker reads them: a row whose cron nothing can
+// parse is a job that would never fire, and one whose ceiling the runtime
+// would refuse is a job that would never start.
+func readSchedule(id, column string) Schedule {
+	var held Schedule
+	if err := json.Unmarshal([]byte(column), &held); err != nil {
+		logger.Printf("store: the schedule of %s is not readable, so it is not a job: %v", id, err)
+		return Schedule{}
+	}
+	if _, err := manifest.ParseCron(held.Cron); err != nil {
+		logger.Printf("store: the schedule of %s is not one this release reads, so it is not a job: %v", id, err)
+		return Schedule{}
+	}
+	if held.Memory != "" && !podman.ValidMemory(podman.MemoryLimit(held.Memory)) {
+		logger.Printf("store: the schedule of %s asks for memory %q, which is not a size the runtime takes",
+			id, held.Memory)
+		return Schedule{}
+	}
+	if held.CPU != "" && !podman.ValidCPUs(held.CPU) {
+		logger.Printf("store: the schedule of %s asks for cpu %q, which is not a number of cores",
+			id, held.CPU)
+		return Schedule{}
+	}
+	return held
 }
 
 // subscriptionList keeps the column a JSON array even when the Process

@@ -947,28 +947,53 @@ scheduled_processes:
   concurrency: >
     The runs of one job are serialised: a tick that arrives while the previous
     run is still going is skipped and recorded with the reason "running".
-    Across jobs a host runs at most 8 scheduled containers at once, and a tick
-    beyond that is skipped and recorded with the reason "busy". A run longer
-    than 6 hours is stopped with podman stop and recorded with exit code 137
-    and the result "ran": the container ran, and this host ended it.
+    Across jobs a host runs at most 8 scheduled containers at once and one
+    member at most 3 of those, and a tick beyond either is skipped and recorded
+    with the reason "busy": without the second bound a member with jobs enough
+    holds the whole host and every other member's tick is skipped for reasons
+    that have nothing to do with them. The jobs due at one moment are taken in
+    a fixed order, by the tick they were due at and then by id, so which job
+    loses on a busy host is the same answer every time. A run longer than 6
+    hours is stopped with podman stop and recorded with exit code 137 and the
+    result "ran": the container ran, and this host ended it.
   logs: >
     The container of a run is kept after it exits, which is what proc_logs
     reads, and removed at the next tick, which creates it again from the
     registration. A job whose first tick has not come has no container at all.
     proc_stop unregisters the schedule and removes whatever container the last
     run left.
+  tokens: >
+    Every run is given a Telemetry token of its own, minted when the container
+    is created and revoked when it exits. The container outlives the token
+    because proc_logs reads it, and a container that has exited is not a
+    producer: the registration stays, its token_hash is emptied, and an export
+    presented with the token of a run that ended is 401. The write that mints a
+    run's token is an update and never an insert, and it is made under that
+    Process's action lock, so a processes_unregister that lands between the
+    tick reading the registration and the run starting is not undone by the
+    tick that raced it: that run is abandoned before anything is created.
   records: >
     Each tick writes one metric record named kitbash.schedule, value 1 for a
     tick that ran the container and 0 for one that did not, carrying
     kitbash.user (the owner), kitbash.package, kitbash.process and
     kitbash.path (the Package folder), kitbash.producer = kitbashd,
-    kitbash.schedule.result, which is ran, skipped or failed_to_start,
-    kitbash.schedule.duration_ms, kitbash.schedule.exit_code on every tick that
-    was not skipped, and kitbash.schedule.reason on one that was. The record is
-    stored and fanned out like every other record, so tel_query answers "did it
-    run this morning" to the job's owner and to admins. A run whose job was
-    unregistered while it was going is recorded about nobody and dropped, the
-    same rule a health reading follows.
+    kitbash.schedule.result, kitbash.schedule.duration_ms,
+    kitbash.schedule.exit_code on a run that reached one, kitbash.schedule.reason
+    on a tick that was skipped, and kitbash.schedule.error on a run this host
+    lost track of. The result is one of five words: "ran", the container ran to
+    its exit or was stopped at the 6 hour ceiling; "skipped", the tick was not
+    taken, with the reason "running" or "busy"; "failed_to_start", the
+    container was never created, which a missing image, a mount that stopped
+    being legal and a secret the owner removed all are; "interrupted", the
+    daemon was stopping while the container was running, which says nothing
+    about the run; and "lost", the runtime would not say what the container
+    exited with, with kitbash.schedule.error carrying the class, "no-container",
+    "timeout" or "runtime". Only a run that ran carries an exit status: a zero
+    on the others would read as a run that succeeded. The record is stored and
+    fanned out like every other record, so tel_query answers "did it run this
+    morning" to the job's owner and to admins. A run whose job was unregistered
+    while it was going is recorded about nobody and dropped, the same rule a
+    health reading follows.
   limit: >
     A member holds at most 32 jobs, see processes_register.limit.
 

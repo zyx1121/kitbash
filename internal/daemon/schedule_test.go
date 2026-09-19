@@ -3,6 +3,8 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"os/user"
@@ -10,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zyx1121/kitbash/internal/cgroups"
+	"github.com/zyx1121/kitbash/internal/manifest"
 	"github.com/zyx1121/kitbash/internal/store"
 	"github.com/zyx1121/kitbash/internal/sysusers"
 	"github.com/zyx1121/kitbash/internal/uuid"
@@ -54,7 +58,7 @@ func (h *harness) scheduledProcess(owner, container, cron string) string {
 		Schedule:     store.Schedule{Cron: cron, Env: map[string]string{"CITY": "taipei"}},
 		FanoutSecret: "the-secret",
 		RegisteredAt: time.Now().UTC(),
-	}, hash, 0); err != nil {
+	}, hash, store.Quota{}); err != nil {
 		h.t.Fatalf("RegisterProcess: %v", err)
 	}
 	return id
@@ -572,4 +576,526 @@ func isCode(value any, want int) bool {
 	default:
 		return false
 	}
+}
+
+// envValue reads one KEY=value out of an environment file body.
+func envValue(body, key string) (string, bool) {
+	for _, line := range strings.Split(body, "\n") {
+		if name, value, found := strings.Cut(strings.TrimSpace(line), "="); found && name == key {
+			return value, true
+		}
+	}
+	return "", false
+}
+
+// The loop itself. Every other test here calls due and runScheduled by hand,
+// so this is the one that proves ScheduleLoop starts a container on its own,
+// at the tick and not before, and starts it once.
+func TestTheLoopStartsTheContainerOnItsOwn(t *testing.T) {
+	h, fake := supervised(t)
+	// The daemon's clock sits just before a minute boundary, so the loop has a
+	// tick to wait for that a test can afford to wait out.
+	base := time.Now()
+	boundary := base.Truncate(time.Minute).Add(time.Minute)
+	offset := boundary.Add(-300 * time.Millisecond).Sub(base)
+	h.server.now = func() time.Time { return time.Now().Add(offset) }
+
+	req := scheduleRegistration(everyMinute)
+	if _, res, body := h.register(req); res.StatusCode != http.StatusOK {
+		t.Fatalf("register status = %d, body %s", res.StatusCode, body)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.server.ScheduleLoop(ctx)
+	}()
+
+	waitFor(t, "the loop to start the container of the first tick", func() bool {
+		return len(fake.Runs()) > 0
+	})
+	if got := len(fake.Runs()); got != 1 {
+		t.Fatalf("the loop started %d containers, want exactly 1", got)
+	}
+	// And not again for the same minute.
+	time.Sleep(700 * time.Millisecond)
+	if got := len(fake.Runs()); got != 1 {
+		t.Errorf("the loop started %d containers, want 1: a tick is a minute", got)
+	}
+	waitFor(t, "the record of the run", func() bool { return len(h.scheduleRecords()) == 1 })
+	cancel()
+	if _, returned := recvWithin(done); !returned {
+		t.Errorf("waited %s for ScheduleLoop to return after the context was cancelled", waitBudget)
+	}
+}
+
+// A clock that moves backwards, which is what a correction does, must not take
+// a tick that was already taken, and one that jumps forward over four ticks
+// runs one.
+func TestAClockThatMovesDoesNotRunATickTwice(t *testing.T) {
+	h, fake := supervised(t)
+	req := scheduleRegistration(everyMinute)
+	if _, res, body := h.register(req); res.StatusCode != http.StatusOK {
+		t.Fatalf("register status = %d, body %s", res.StatusCode, body)
+	}
+	at := time.Now().UTC().Add(time.Hour).Truncate(time.Minute)
+	if run, _ := h.tick(at); len(run) != 1 {
+		t.Fatalf("%d jobs ran at the first tick, want 1", len(run))
+	}
+
+	run, missed := h.tick(at.Add(-5 * time.Minute))
+	if len(run) != 0 || len(missed) != 0 {
+		t.Errorf("after the clock went back the daemon ran %d and skipped %d ticks, want none of either",
+			len(run), len(missed))
+	}
+	// And forward again over four minutes: one tick, not four. Ticks are not
+	// made up, whichever way the clock moved.
+	if run, _ = h.tick(at.Add(4 * time.Minute)); len(run) != 1 {
+		t.Errorf("after the clock jumped forward the daemon ran %d ticks, want 1", len(run))
+	}
+	if got := len(fake.Runs()); got != 2 {
+		t.Errorf("the runtime made %d containers, want 2", got)
+	}
+}
+
+// The variables kitbashd speaks for are dropped at a tick, not only at a
+// start. The registration is a member's claim and it travels through a column,
+// so this is the one place a stored KITBASH_ name could reach podman.
+func TestTheEnvironmentOfATickDropsWhatKitbashdSpeaksFor(t *testing.T) {
+	h, fake := supervised(t)
+	req := scheduleRegistration(everyMinute)
+	req.Schedule.Env = map[string]string{
+		"CITY":               "taipei",
+		EnvTelemetryToken:    "stolen-token",
+		EnvUser:              "root",
+		EnvFanoutSecret:      "stolen-secret",
+		EnvProcess:           "0199a000-0000-7000-8000-0000000000ff",
+		EnvTelemetryEndpoint: "http://evil.invalid",
+	}
+	if _, res, body := h.register(req); res.StatusCode != http.StatusOK {
+		t.Fatalf("register status = %d, body %s", res.StatusCode, body)
+	}
+
+	h.tick(time.Now().Add(time.Hour))
+
+	runs := fake.Runs()
+	if len(runs) != 1 {
+		t.Fatalf("the tick made %d containers, want 1", len(runs))
+	}
+	env := runs[0].Env
+	for _, stolen := range []string{"stolen-token", "stolen-secret", "evil.invalid"} {
+		if strings.Contains(env, stolen) {
+			t.Errorf("the run carries %q out of the registration:\n%s", stolen, env)
+		}
+	}
+	if got, _ := envValue(env, EnvUser); got != h.user {
+		t.Errorf("%s = %q, want the owner %q", EnvUser, got, h.user)
+	}
+	if got, _ := envValue(env, EnvProcess); got != req.ID {
+		t.Errorf("%s = %q, want the Process the tick is of", EnvProcess, got)
+	}
+	if got, _ := envValue(env, "CITY"); got != "taipei" {
+		t.Errorf("CITY = %q, want the unit's own value", got)
+	}
+}
+
+// A tick runs as the owner, in that Process's cgroup, with the values the
+// owner holds now. A credential the owner took away is a run that does not
+// start rather than one that runs without it, and neither tick leaves an
+// environment file behind.
+func TestATickRunsAsTheOwnerWithTheirCurrentSecrets(t *testing.T) {
+	h, fake := supervised(t)
+	req := scheduleRegistration(everyMinute)
+	req.Secrets = []string{"ANTHROPIC_API_KEY"}
+	h.seedSecret(h.user, "ANTHROPIC_API_KEY", secretValue)
+	if _, res, body := h.register(req); res.StatusCode != http.StatusOK {
+		t.Fatalf("register status = %d, body %s", res.StatusCode, body)
+	}
+	at := time.Now().UTC().Add(time.Hour).Truncate(time.Minute)
+	h.tick(at)
+
+	runs := fake.Runs()
+	if len(runs) != 1 {
+		t.Fatalf("the tick made %d containers, want 1", len(runs))
+	}
+	if runs[0].Member != h.user {
+		t.Errorf("the tick ran the container as %q, want the owner %q", runs[0].Member, h.user)
+	}
+	if want := cgroups.Parent(h.user, req.ID); runs[0].Options.CgroupParent != want {
+		t.Errorf("cgroup parent = %q, want %q", runs[0].Options.CgroupParent, want)
+	}
+	if !strings.Contains(runs[0].Env, "ANTHROPIC_API_KEY="+secretValue) {
+		t.Errorf("the run was not given the owner's current value of the secret it declared")
+	}
+
+	res, body := h.do(http.MethodDelete, secretsPath+"/ANTHROPIC_API_KEY", "", nil)
+	if res.StatusCode != http.StatusNoContent && res.StatusCode != http.StatusOK {
+		t.Fatalf("removing the secret: %d %s", res.StatusCode, body)
+	}
+	h.tick(at.Add(time.Minute))
+	if got := len(fake.Runs()); got != 1 {
+		t.Errorf("the tick after the secret was removed made %d containers, want no more", got)
+	}
+	records := h.scheduleRecords()
+	if len(records) != 2 {
+		t.Fatalf("the two ticks wrote %d records, want 2", len(records))
+	}
+	if got := records[0].Attributes.Other[AttrScheduleResult]; got != ScheduleFailedToStart {
+		t.Errorf("the second tick is recorded %v, want %s", got, ScheduleFailedToStart)
+	}
+	// And no environment file of either tick is left on the host: each one
+	// holds a live token.
+	left, err := os.ReadDir(h.server.envDir)
+	if err == nil && len(left) != 0 {
+		names := make([]string, 0, len(left))
+		for _, entry := range left {
+			names = append(names, entry.Name())
+		}
+		t.Errorf("the ticks left %v behind, and an environment file holds a token", names)
+	}
+}
+
+// The race a tick runs, made deterministic: the ticker holds the job it took
+// from due, the member stops it, and the tick goes on with what it is holding.
+// The registration must stay deleted, because the write that mints a run's
+// token is an update and never an insert, and nothing may be started for a
+// Process nobody holds.
+func TestATickThatLostItsRegistrationResurrectsNothing(t *testing.T) {
+	h, fake := supervised(t)
+	req := scheduleRegistration(everyMinute)
+	if _, res, body := h.register(req); res.StatusCode != http.StatusOK {
+		t.Fatalf("register status = %d, body %s", res.StatusCode, body)
+	}
+	ctx := context.Background()
+	// What the ticker is holding when the tick is handed over.
+	run, _, _ := h.server.jobs.due(time.Now().Add(time.Hour))
+	if len(run) != 1 {
+		t.Fatalf("%d jobs were due, want 1", len(run))
+	}
+	res, body := h.do(http.MethodDelete, processesPath+"/"+req.ID, "", nil)
+	if res.StatusCode != http.StatusNoContent {
+		t.Fatalf("unregister status = %d, body %s", res.StatusCode, body)
+	}
+
+	h.server.runScheduled(ctx, run[0])
+
+	if _, found, _ := h.store.Process(ctx, req.ID); found {
+		t.Error("the tick put the registration proc_stop deleted back")
+	}
+	if got := len(fake.Runs()); got != 0 {
+		t.Errorf("the tick made %d containers for a Process that was unregistered, want none", got)
+	}
+	// And it asked the runtime for nothing at all: the registration is read
+	// under the lock, before the container of the previous run is removed, so
+	// a tick that lost its Process does nothing rather than most of it.
+	if got := len(fake.Removals()); got != 0 {
+		t.Errorf("the tick made %d runtime calls for a Process nobody holds, want none", got)
+	}
+	if got := len(h.scheduleRecords()); got != 0 {
+		t.Errorf("the tick wrote %d records about a Process nobody holds, want none", got)
+	}
+	// And the daemon that comes after this one holds no job.
+	h.server.loadJobs(ctx)
+	if got := h.server.jobs.count(); got != 0 {
+		t.Errorf("the next start of the daemon holds %d jobs, want none", got)
+	}
+}
+
+// And the two cannot interleave at all: unregistering takes the same action
+// lock a tick holds while it reads the registration and starts the run, so a
+// proc_stop is either wholly before a tick or wholly after it.
+func TestUnregisteringWaitsForTheActionLock(t *testing.T) {
+	h, _ := supervised(t)
+	req := scheduleRegistration(everyMinute)
+	if _, res, body := h.register(req); res.StatusCode != http.StatusOK {
+		t.Fatalf("register status = %d, body %s", res.StatusCode, body)
+	}
+
+	// A tick is reading this Process and about to mint the token of its run.
+	unlock := h.server.actions.lock(req.ID)
+	answered := make(chan int, 1)
+	go func() {
+		res, _ := h.do(http.MethodDelete, processesPath+"/"+req.ID, "", nil)
+		answered <- res.StatusCode
+	}()
+	select {
+	case status := <-answered:
+		t.Fatalf("the unregister answered %d while the lock was held, so it can land inside a tick", status)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	unlock()
+	status, returned := recvWithin(answered)
+	if !returned {
+		t.Fatalf("waited %s for the unregister to finish once the lock was free", waitBudget)
+	}
+	if status != http.StatusNoContent {
+		t.Fatalf("unregister status = %d", status)
+	}
+	if _, found, _ := h.store.Process(context.Background(), req.ID); found {
+		t.Error("the registration is still there after the unregister")
+	}
+}
+
+// Removing a member takes their jobs with them, and a tick that raced the
+// removal does not put one back: a job of an account this host no longer has
+// would start a container as nobody.
+func TestRemovingAMemberTakesTheirJobs(t *testing.T) {
+	fake := sysusers.NewFake()
+	h := serveWith(t, Options{
+		Admin:  func(*user.User) (bool, error) { return true, nil },
+		Users:  fake,
+		Runner: fake,
+	})
+	fake.Add(sysusers.Member{Name: h.user, UID: os.Getuid(), GID: os.Getgid()})
+	fake.Add(sysusers.Member{Name: builderName})
+	id := h.scheduledProcess(builderName, "kitbash-weather-kim", eightDaily)
+	h.server.loadJobs(context.Background())
+	if got := h.server.jobs.count(); got != 1 {
+		t.Fatalf("the daemon holds %d jobs, want 1", got)
+	}
+
+	res, body := h.do(http.MethodDelete, usersPath+"/"+builderName, "", nil)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("users_remove status = %d, body %s", res.StatusCode, body)
+	}
+
+	if got := h.server.jobs.count(); got != 0 {
+		t.Errorf("the daemon holds %d jobs of a member it no longer has", got)
+	}
+	if _, found, _ := h.store.Process(context.Background(), id); found {
+		t.Errorf("the registration of a removed member's job is still there")
+	}
+}
+
+// The token a run is given dies with the run. The container is kept so
+// proc_logs can read it, and a container that has exited is not a producer.
+func TestTheTokenOfARunIsRevokedWhenItEnds(t *testing.T) {
+	h, fake := supervised(t)
+	req := scheduleRegistration(everyMinute)
+	if _, res, body := h.register(req); res.StatusCode != http.StatusOK {
+		t.Fatalf("register status = %d, body %s", res.StatusCode, body)
+	}
+
+	h.tick(time.Now().Add(time.Hour))
+
+	token, found := envValue(fake.Runs()[0].Env, EnvTelemetryToken)
+	if !found || token == "" {
+		t.Fatalf("the run was given no %s", EnvTelemetryToken)
+	}
+	_, live, err := h.store.ProcessByToken(context.Background(), token)
+	if err != nil {
+		t.Fatalf("ProcessByToken: %v", err)
+	}
+	if live {
+		t.Error("the token minted for the run still answers after the run ended")
+	}
+	// The registration is untouched: the job is still a job.
+	held, found, err := h.store.Process(context.Background(), req.ID)
+	if err != nil || !found {
+		t.Fatalf("the registration is gone: %v, found %v", err, found)
+	}
+	if !held.Schedule.Declared() {
+		t.Error("revoking the run's token took the schedule with it")
+	}
+}
+
+// A wait that fails for a reason that is not the ceiling is a run this host
+// lost track of, with the class of the failure on the record: reading it as
+// the six hour stop would say the container ran for six hours and was killed.
+func TestAWaitThatFailsIsRecordedAsLost(t *testing.T) {
+	h, fake := supervised(t)
+	req := scheduleRegistration(everyMinute)
+	if _, res, body := h.register(req); res.StatusCode != http.StatusOK {
+		t.Fatalf("register status = %d, body %s", res.StatusCode, body)
+	}
+	fake.WaitErr = errors.New("podman wait: connection refused")
+
+	h.tick(time.Now().UTC().Add(time.Hour).Truncate(time.Minute))
+
+	records := h.scheduleRecords()
+	if len(records) != 1 {
+		t.Fatalf("the tick wrote %d records, want 1", len(records))
+	}
+	record := records[0]
+	if got := record.Attributes.Other[AttrScheduleResult]; got != ScheduleLost {
+		t.Errorf("%s = %v, want %s", AttrScheduleResult, got, ScheduleLost)
+	}
+	if got := record.Attributes.Other[AttrScheduleError]; got != lostRuntime {
+		t.Errorf("%s = %v, want %s", AttrScheduleError, got, lostRuntime)
+	}
+	if _, held := record.Attributes.Other[AttrScheduleExitCode]; held {
+		t.Errorf("a run nobody knows the end of carries an exit status: %v",
+			record.Attributes.Other[AttrScheduleExitCode])
+	}
+	if record.Value != notRanValue {
+		t.Errorf("value = %v, want %v", record.Value, float64(notRanValue))
+	}
+	// The container the runtime would not answer for is not stopped: nothing
+	// here knows what state it is in.
+	if got := len(fake.Stops()); got != 0 {
+		t.Errorf("a lost run stopped %d containers, want none", got)
+	}
+}
+
+// A daemon that is stopping while a container is running says so and nothing
+// more: the run is not over, and a record of a run that ended would be wrong
+// in both directions.
+func TestARunInterruptedByTheDaemonIsRecordedAsSuch(t *testing.T) {
+	h, fake := supervised(t)
+	req := scheduleRegistration(everyMinute)
+	fake.Waiting = map[string]chan int{req.Container: make(chan int)}
+	if _, res, body := h.register(req); res.StatusCode != http.StatusOK {
+		t.Fatalf("register status = %d, body %s", res.StatusCode, body)
+	}
+	run, _, _ := h.server.jobs.due(time.Now().Add(time.Hour))
+	if len(run) != 1 {
+		t.Fatalf("%d jobs were due, want 1", len(run))
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.server.runScheduled(ctx, run[0])
+	}()
+	waitFor(t, "the run to start", func() bool { return len(fake.Waits()) > 0 })
+
+	cancel()
+	if _, returned := recvWithin(done); !returned {
+		t.Fatalf("waited %s for the run to give up with the daemon", waitBudget)
+	}
+
+	records := h.scheduleRecords()
+	if len(records) != 1 {
+		t.Fatalf("the interrupted run wrote %d records, want 1", len(records))
+	}
+	if got := records[0].Attributes.Other[AttrScheduleResult]; got != ScheduleInterrupted {
+		t.Errorf("%s = %v, want %s", AttrScheduleResult, got, ScheduleInterrupted)
+	}
+	// The container was not stopped: the daemon is going, the run is not.
+	if got := len(fake.Stops()); got != 0 {
+		t.Errorf("a daemon that stopped also stopped %d containers of runs, want none", got)
+	}
+}
+
+// One member's jobs take their share of the host and no more, so another
+// member's tick is not skipped for reasons that have nothing to do with them.
+// The order is fixed too: which job loses is the same answer every time.
+func TestOneMemberTakesOnlyTheirShareOfTheHost(t *testing.T) {
+	fake := sysusers.NewFake()
+	h := serveWith(t, Options{
+		Admin:  func(*user.User) (bool, error) { return false, nil },
+		Users:  fake,
+		Runner: fake,
+	})
+	fake.Add(sysusers.Member{Name: h.user, UID: os.Getuid(), GID: os.Getgid()})
+	fake.Add(sysusers.Member{Name: builderName})
+	// The noisy member holds more jobs than their share, and every run of
+	// theirs is still going.
+	fake.Waiting = map[string]chan int{}
+	for i := range MaxRunsPerMember + 2 {
+		container := fmt.Sprintf("kitbash-weather-noisy%d", i)
+		fake.Waiting[container] = make(chan int)
+		h.scheduledProcess(h.user, container, everyMinute)
+	}
+	quiet := h.scheduledProcess(builderName, "kitbash-weather-quiet", everyMinute)
+	h.server.loadJobs(context.Background())
+
+	at := time.Now().UTC().Add(time.Hour).Truncate(time.Minute)
+	run, missed, _ := h.server.jobs.due(at)
+
+	var mine, theirs int
+	for _, target := range run {
+		if target.owner == h.user {
+			mine++
+		} else {
+			theirs++
+		}
+	}
+	if mine != MaxRunsPerMember {
+		t.Errorf("the noisy member took %d of the host's slots, want %d", mine, MaxRunsPerMember)
+	}
+	if theirs != 1 {
+		t.Errorf("the other member's job ran %d times, want 1: their tick is not the noisy member's fault", theirs)
+	}
+	for _, target := range missed {
+		if target.job.id == quiet {
+			t.Errorf("the other member's tick was skipped as %s while one member held the slots", target.reason)
+		}
+	}
+	if len(missed) != 2 {
+		t.Errorf("%d ticks were skipped, want the noisy member's two", len(missed))
+	}
+	for _, target := range missed {
+		if target.reason != SkipBusy {
+			t.Errorf("a tick beyond the member's share reads %q, want %q", target.reason, SkipBusy)
+		}
+	}
+	for _, held := range fake.Waiting {
+		close(held)
+	}
+}
+
+// The jobs due at one moment are taken in a fixed order, so which one loses on
+// a busy host does not depend on what the runtime hashed last.
+func TestTheJobsDueAtOneMomentAreTakenInAFixedOrder(t *testing.T) {
+	at := time.Now().UTC().Truncate(time.Minute)
+	cron, err := manifest.ParseCron(everyMinute)
+	if err != nil {
+		t.Fatalf("ParseCron: %v", err)
+	}
+	var seen []string
+	for range 8 {
+		sc := newScheduler(1, 8)
+		for _, id := range []string{"01930000-c", "01930000-a", "01930000-b"} {
+			sc.jobs[id] = &job{id: id, owner: "loki", cron: cron, next: at}
+		}
+		run, missed, _ := sc.due(at)
+		if len(run) != 1 || len(missed) != 2 {
+			t.Fatalf("%d ran and %d were skipped under a cap of 1", len(run), len(missed))
+		}
+		seen = append(seen, run[0].id)
+	}
+	for _, got := range seen {
+		if got != seen[0] {
+			t.Fatalf("the winner of a busy host is %v over eight passes, want the same job every time", seen)
+		}
+	}
+	if seen[0] != "01930000-a" {
+		t.Errorf("the job that ran is %q, want the lowest id of the three due at once", seen[0])
+	}
+}
+
+// A job whose expression names no date the calendar has is put a day out
+// rather than left due: a job that is due for ever is one every pass of the
+// loop tries to run.
+func TestAJobWithNoTickIsNotDueForEver(t *testing.T) {
+	h, fake := supervised(t)
+	// The 30th of February, which parses and matches no day.
+	cron, err := manifest.ParseCron("0 0 30 2 *")
+	if err != nil {
+		t.Fatalf("ParseCron: %v", err)
+	}
+	at := time.Now().UTC().Truncate(time.Minute)
+	h.server.jobs.jobs["01930000-0000-7000-8000-00000000000a"] = &job{
+		id: "01930000-0000-7000-8000-00000000000a", owner: h.user,
+		pkg: "/home/tester/weather", container: "kitbash-weather-weather",
+		cron: cron, next: at,
+	}
+
+	run, missed, wait := h.server.jobs.due(at)
+	if len(run) != 1 || len(missed) != 0 {
+		t.Fatalf("%d jobs ran and %d were skipped, want the one run", len(run), len(missed))
+	}
+	// The job is not due again at the next pass, which is the thing to prove.
+	h.server.jobs.finished(run[0].id, run[0].owner, lastRun{})
+	again, _, _ := h.server.jobs.due(at.Add(time.Minute))
+	if len(again) != 0 {
+		t.Errorf("the job is due again a minute later, so every pass of the loop would run it")
+	}
+	if wait < time.Minute {
+		t.Errorf("the loop would look again in %s, want it to wait", wait)
+	}
+	_ = fake
 }

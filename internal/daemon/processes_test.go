@@ -251,7 +251,7 @@ func TestRegisterAnotherOwnersIDConflicts(t *testing.T) {
 	if err := h.store.RegisterProcess(context.Background(), store.Process{
 		ID: req.ID, Owner: "someone-else", Package: "/home/someone-else/echo",
 		Expose: ExposeNone, RegisteredAt: time.Now(),
-	}, hash, 0); err != nil {
+	}, hash, store.Quota{}); err != nil {
 		t.Fatalf("RegisterProcess: %v", err)
 	}
 
@@ -330,7 +330,7 @@ func TestUnregisterAnotherOwnersProcessIsRefused(t *testing.T) {
 	if err := h.store.RegisterProcess(context.Background(), store.Process{
 		ID: id, Owner: "someone-else", Package: "/home/someone-else/echo",
 		Expose: ExposeNone, RegisteredAt: time.Now(),
-	}, hash, 0); err != nil {
+	}, hash, store.Quota{}); err != nil {
 		t.Fatalf("RegisterProcess: %v", err)
 	}
 	res, body := h.do(http.MethodDelete, processesPath+"/"+id, "", nil)
@@ -679,7 +679,7 @@ func (h *harness) addSubscriberWithSecret(owner string, admin bool, endpoint, se
 		Subscriptions: []string{store.SubscriptionTelemetry},
 		FanoutSecret:  secret,
 		RegisteredAt:  time.Now(),
-	}, hash, 0); err != nil {
+	}, hash, store.Quota{}); err != nil {
 		h.t.Fatalf("RegisterProcess: %v", err)
 	}
 	if err := h.server.LoadSubscribers(context.Background()); err != nil {

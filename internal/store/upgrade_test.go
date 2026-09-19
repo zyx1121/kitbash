@@ -361,7 +361,7 @@ func TestMigratedStoreTakesNewWork(t *testing.T) {
 				FanoutSecret: secret,
 				RegisteredAt: fixtureBase,
 			}
-			if err := s.RegisterProcess(ctx, want, hash, 0); err != nil {
+			if err := s.RegisterProcess(ctx, want, hash, store.Quota{}); err != nil {
 				t.Fatalf("RegisterProcess: %v", err)
 			}
 			got, found, err := s.ProcessByToken(ctx, token)

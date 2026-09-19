@@ -48,7 +48,7 @@ func (h *harness) registeredWith(owner, container string, limits store.Limits) s
 		// the one the registration already carries.
 		FanoutSecret: "fanout-secret-of-" + id,
 		RegisteredAt: time.Now().UTC(),
-	}, hash, 0); err != nil {
+	}, hash, store.Quota{}); err != nil {
 		h.t.Fatalf("RegisterProcess: %v", err)
 	}
 	// The store keeps only the hash, so the token itself is kept here: a test
@@ -239,7 +239,7 @@ func (h *harness) registeredByKit(owner, runner string) string {
 		Expose:       ExposeNone,
 		FanoutSecret: "fanout-secret-of-" + id,
 		RegisteredAt: time.Now().UTC(),
-	}, hash, 0); err != nil {
+	}, hash, store.Quota{}); err != nil {
 		h.t.Fatalf("RegisterProcess: %v", err)
 	}
 	h.tokens[id] = token

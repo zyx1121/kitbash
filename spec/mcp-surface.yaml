@@ -610,14 +610,17 @@ families:
           over when the entrypoint exits. Every tick writes one
           kitbash.schedule metric record, see tel_query. A tick that arrives
           while the previous run is still going is skipped and recorded, at
-          most eight scheduled runs go at once on a host and a tick beyond
-          that is skipped as busy, a run longer than six hours is stopped and
-          recorded with exit code 137, and ticks missed while the host was
-          down are not made up. Converging is the same rule as any Process:
+          most eight scheduled runs go at once on a host and at most three of
+          those are one member's, a tick beyond either is skipped as busy, a
+          run longer than six hours is stopped and recorded with exit code 137,
+          and ticks missed while the host was down are not made up. Converging is the same rule as any Process:
           the same Package, name and digest is the same job, a new digest
           replaces it. The dialect is *, a number, a range a-b, a step */s or
-          a-b/s and comma separated lists of those; names are not accepted and
-          day of week takes 0 to 7, both 0 and 7 meaning Sunday. A schedule on
+          a-b/s and comma separated lists of those; names are not accepted,
+          the expression is one line, and day of week takes 0 to 7, both 0 and
+          7 meaning Sunday. When both day fields are restricted a day matches
+          if either does, and a day field beginning with * is not a
+          restriction whatever step follows it. A schedule on
           a unit that is not expose: none, or beside health, restart or
           provides.subscriptions, is invalid-manifest; one on a unit that
           names a runner is not-permitted; and a member may hold 32 scheduled
@@ -708,6 +711,17 @@ families:
             endpoint: { type: string, description: "Internal URL when expose is http" }
             schedule: { type: string, description: "The cron expression this Process is a job of, absent for a Process that stays up" }
             nextRun: { type: string, format: date-time, description: "When kitbashd runs this job next, UTC" }
+            lastRun:
+              type: object
+              description: >
+                The run this job finished most recently. Absent until it has run once
+                under the daemon that is answering, which holds the runs it saw the way
+                it holds health readings.
+              required: [startedAt, exitCode, durationMs]
+              properties:
+                startedAt: { type: string, format: date-time }
+                exitCode: { type: integer }
+                durationMs: { type: integer }
             url: { type: string, description: "The address this Process is reached at from outside the host, https://<name>.<member>.<domain> or the hostname the unit declared. Absent on a host with no domain, which routes nothing" }
             tools: { type: array, items: { type: string }, description: "Surface tool names added when expose is mcp" }
             runner: { type: string, description: "Package path of the run kit that owns this Process, absent when kitbashd runs it" }
@@ -856,10 +870,12 @@ families:
           and kitbash.schedule, one per tick of a scheduled Process: asking
           whether a job ran this morning is
           {signal: metrics, process: <id>, since: <this morning>}, whose
-          records carry kitbash.schedule.result, ran, skipped or
-          failed_to_start, kitbash.schedule.exit_code,
-          kitbash.schedule.duration_ms and, on a skipped tick,
-          kitbash.schedule.reason, running or busy.
+          records carry kitbash.schedule.result, one of ran, skipped,
+          failed_to_start, interrupted and lost, kitbash.schedule.duration_ms,
+          kitbash.schedule.exit_code on a run that reached one,
+          kitbash.schedule.reason on a skipped tick, running or busy, and
+          kitbash.schedule.error on a lost one, no-container, timeout or
+          runtime.
         input:
           type: object
           additionalProperties: false

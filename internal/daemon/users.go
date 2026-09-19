@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -313,8 +314,17 @@ func (s *Server) removeUser(w http.ResponseWriter, r *http.Request, caller Calle
 	}
 	// Every registration is a live Telemetry token, and a token outliving the
 	// member it names is a producer nobody owns, see spec/kitbashd-api.yaml.
+	//
+	// The action lock of each of them is held across the delete, for the reason
+	// proc_stop holds one: a tick reads a registration and writes the token of
+	// its run back into it, so a delete that lands in between would be undone
+	// by the tick that raced it and this member's job would outlive their
+	// account, see schedule.go. Every other holder of one of these locks takes
+	// one at a time, so holding several here cannot wait on itself.
+	release := s.lockOwned(r.Context(), name)
 	ids, err := s.store.DeleteProcessesByOwner(r.Context(), name)
 	if err != nil {
+		release()
 		writeProblem(w, problem.Internal(r.URL.Path, err.Error(), ""))
 		return
 	}
@@ -332,6 +342,7 @@ func (s *Server) removeUser(w http.ResponseWriter, r *http.Request, caller Calle
 		s.jobs.untrack(id)
 		s.endMCPSessions(id)
 	}
+	release()
 	if _, err := s.store.DeleteApprovals(r.Context(), name); err != nil {
 		writeProblem(w, problem.Internal(r.URL.Path, err.Error(), ""))
 		return
@@ -418,4 +429,25 @@ func (s *Server) userProblem(r *http.Request, err error, name string) *problem.P
 func wrongMethod(r *http.Request, fix string) *problem.Problem {
 	return problem.NotFoundFix(r.URL.Path,
 		fmt.Sprintf("%s %s is not part of the kitbashd API", r.Method, r.URL.Path), fix)
+}
+
+// lockOwned takes the action lock of every Process one member holds and
+// answers what releases them all. A member whose registrations cannot be read
+// is removed anyway: the account is already gone by the time this runs, and a
+// lock nobody could take is not a reason to leave a registration behind.
+func (s *Server) lockOwned(ctx context.Context, owner string) func() {
+	list, err := s.store.Processes(ctx, owner)
+	if err != nil {
+		logger.Printf("users: reading the Processes of %s before removing them: %v", owner, err)
+		return func() {}
+	}
+	releases := make([]func(), 0, len(list))
+	for _, p := range list {
+		releases = append(releases, s.actions.lock(p.ID))
+	}
+	return func() {
+		for _, release := range releases {
+			release()
+		}
+	}
 }

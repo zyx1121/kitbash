@@ -43,10 +43,16 @@ type Cron struct {
 	month  uint64 // 1-12
 	dow    uint64 // 0-6, Sunday is 0
 
-	// domAny and dowAny are the fields that were written as *. When both day
+	// domAny and dowAny are the day fields that begin with *. When both day
 	// fields are restricted a day matches if either one does, which is what
 	// cron has always done and what "0 9 1 * 1" means: the first of the month
 	// and every Monday, not the Mondays that fall on the first.
+	//
+	// A field that begins with * is unrestricted for that rule whatever step
+	// follows it, which is what Vixie cron's DOM_STAR is: "0 9 */2 * 1" is
+	// every other day and Mondays read together, so it fires on Mondays and
+	// nothing else. Reading a step as a restriction would make it fire on
+	// every second day as well, which is not what any other cron does.
 	domAny bool
 	dowAny bool
 }
@@ -78,7 +84,7 @@ func ParseCron(expr string) (Cron, error) {
 		return Cron{}, fmt.Errorf("manifest: the schedule is %d bytes, over the %d a cron expression may be",
 			len(expr), MaxCronBytes)
 	}
-	parts := strings.Fields(expr)
+	parts := fields(expr)
 	if len(parts) != CronFields {
 		return Cron{}, fmt.Errorf("manifest: %q has %d fields, not the %d of minute hour day-of-month month day-of-week",
 			expr, len(parts), CronFields)
@@ -108,6 +114,34 @@ func ParseCron(expr string) (Cron, error) {
 	return c, nil
 }
 
+// fields splits an expression on the two characters that separate its fields.
+// It is not strings.Fields: a line break is not a separator here, because
+// spec/manifest.schema.json holds the whole expression to one line, and an
+// expression this parser read and the schema refused would be two readings of
+// one manifest.
+func fields(expr string) []string {
+	return strings.FieldsFunc(expr, func(r rune) bool { return r == ' ' || r == '\t' })
+}
+
+// number reads one field's number. It takes digits and nothing else: strconv
+// takes a sign, and "+5" is a minute the schema refuses and this would
+// otherwise accept, which is the same two readings.
+func number(text string) (int, bool) {
+	if text == "" || len(text) > 2 {
+		return 0, false
+	}
+	for _, r := range text {
+		if r < '0' || r > '9' {
+			return 0, false
+		}
+	}
+	n, err := strconv.Atoi(text)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
 // ValidCron reports whether an expression is one kitbashd runs, which is what
 // a caller that only has to decide asks.
 func ValidCron(expr string) bool {
@@ -133,8 +167,8 @@ func parseCronField(field string, f cronField) (uint64, bool, error) {
 		}
 		spec, step := entry, 1
 		if base, written, found := strings.Cut(entry, "/"); found {
-			n, err := strconv.Atoi(written)
-			if err != nil || n < 1 {
+			n, ok := number(written)
+			if !ok || n < 1 {
 				return refuse("the step after / is not a number of at least 1")
 			}
 			if n > f.max-f.min+1 {
@@ -145,11 +179,14 @@ func parseCronField(field string, f cronField) (uint64, bool, error) {
 		low, high := f.min, f.max
 		switch {
 		case spec == "*":
-			any = any || entry == "*"
+			// A field that begins with * is unrestricted for the either rule
+			// the two day fields are read by, whatever step follows it, see
+			// Cron.domAny.
+			any = true
 		default:
 			from, to, ranged := strings.Cut(spec, "-")
-			n, err := strconv.Atoi(from)
-			if err != nil {
+			n, ok := number(from)
+			if !ok {
 				return refuse(fmt.Sprintf("%q is not a number", from))
 			}
 			if n < f.min || n > f.max {
@@ -157,8 +194,8 @@ func parseCronField(field string, f cronField) (uint64, bool, error) {
 			}
 			low, high = n, n
 			if ranged {
-				m, err := strconv.Atoi(to)
-				if err != nil {
+				m, ok := number(to)
+				if !ok {
 					return refuse(fmt.Sprintf("%q is not a number", to))
 				}
 				if m < f.min || m > f.max {

@@ -285,3 +285,160 @@ func TestLogsOfAJobThatHasNotRunSayItHasNotRun(t *testing.T) {
 		t.Errorf("detail = %q, want it to say the job has not run yet", prob.Detail)
 	}
 }
+
+// A member who edits the expression and runs the Package again without
+// rebuilding has moved the job: the image did not change, so it is the same
+// Process under the same id, and what kitbashd holds is the new expression.
+// Converging on the digest alone would make the edit a silent no operation
+// that reported the new value back.
+func TestEditingTheExpressionMovesTheJob(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	folder := f.pack(t, "weather", jobManifest)
+	f.build(folder, "weather")
+
+	first, prob := f.processes.Run(ctx, folder, "", "")
+	if prob != nil {
+		t.Fatalf("first Run: %s", prob.Detail)
+	}
+
+	// An hour later, and nothing rebuilt.
+	f.pack(t, "weather", strings.Replace(jobManifest, `schedule: "0 8 * * *"`, `schedule: "0 9 * * *"`, 1))
+	second, prob := f.processes.Run(ctx, folder, "", "")
+	if prob != nil {
+		t.Fatalf("second Run: %s", prob.Detail)
+	}
+
+	if second.ID != first.ID {
+		t.Errorf("moving the job changed its id from %s to %s, want the same Process", first.ID, second.ID)
+	}
+	reg, held := f.daemon.Registration(second.ID)
+	if !held || reg.Schedule == nil {
+		t.Fatalf("the job is not registered")
+	}
+	if reg.Schedule.Cron != "0 9 * * *" {
+		t.Errorf("kitbashd holds %q after the member moved the job to %q", reg.Schedule.Cron, "0 9 * * *")
+	}
+	if second.Schedule != reg.Schedule.Cron {
+		t.Errorf("proc_run answered %q while the daemon holds %q", second.Schedule, reg.Schedule.Cron)
+	}
+	if second.NextRun == first.NextRun {
+		t.Errorf("the next tick did not move: %q", second.NextRun)
+	}
+	if got := len(f.daemon.Registrations()); got != 1 {
+		t.Errorf("the registry holds %d jobs, want 1", got)
+	}
+}
+
+// The environment and the ceiling are part of the job for the same reason: a
+// tick starts the container with what the registration carries, so a unit that
+// changed either is not converged.
+func TestEditingTheEnvironmentOfAJobRegistersItAgain(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	folder := f.pack(t, "weather", jobManifest)
+	f.build(folder, "weather")
+	if _, prob := f.processes.Run(ctx, folder, "", ""); prob != nil {
+		t.Fatalf("first Run: %s", prob.Detail)
+	}
+
+	f.pack(t, "weather", strings.Replace(jobManifest, "CITY: taipei", "CITY: tainan", 1))
+	second, prob := f.processes.Run(ctx, folder, "", "")
+	if prob != nil {
+		t.Fatalf("second Run: %s", prob.Detail)
+	}
+
+	reg, held := f.daemon.Registration(second.ID)
+	if !held || reg.Schedule == nil {
+		t.Fatalf("the job is not registered")
+	}
+	if reg.Schedule.Env["CITY"] != "tainan" {
+		t.Errorf("kitbashd holds the environment %+v after the unit changed it", reg.Schedule.Env)
+	}
+}
+
+// What proc_run answers about a job is what kitbashd holds and never what the
+// manifest on disk says: a daemon that read the expression differently, or
+// refused it, must not be reported back as though it had taken the member's
+// own words.
+func TestTheAnswerIsTheDaemonsAndNotTheManifests(t *testing.T) {
+	// proc_run answers what kitbashd stored, which is the expression as the
+	// daemon read it: a unit that spaced its fields differently is answered
+	// with the daemon's spelling and not with the file's.
+	spaced := newFixture(t)
+	folder := spaced.pack(t, "weather", strings.Replace(jobManifest, `"0 8 * * *"`, `"0   8 *	* *"`, 1))
+	spaced.build(folder, "weather")
+	run, prob := spaced.processes.Run(context.Background(), folder, "", "")
+	if prob != nil {
+		t.Fatalf("Run: %s", prob.Detail)
+	}
+	if run.Schedule != "0 8 * * *" {
+		t.Errorf("proc_run answered %q, want the expression as kitbashd holds it", run.Schedule)
+	}
+
+	// And a listing answers what the daemon holds, whatever the file says: a
+	// release that read the expression differently is reported as it read it.
+	f := newFixture(t)
+	ctx := context.Background()
+	plain := f.pack(t, "weather", jobManifest)
+	f.build(plain, "weather")
+	process, prob := f.processes.Run(ctx, plain, "", "")
+	if prob != nil {
+		t.Fatalf("Run: %s", prob.Detail)
+	}
+	reg, _ := f.daemon.Registration(process.ID)
+	reg.Schedule = &teltest.Schedule{Cron: "0 8 * * 1-5"}
+	reg.NextRun = "2026-09-21T08:00:00Z"
+	f.daemon.AddProcess(reg)
+
+	list, prob := f.processes.List(ctx)
+	if prob != nil {
+		t.Fatalf("List: %s", prob.Detail)
+	}
+	if len(list.Processes) != 1 {
+		t.Fatalf("the listing holds %d Processes, want the job", len(list.Processes))
+	}
+	if got := list.Processes[0].Schedule; got != "0 8 * * 1-5" {
+		t.Errorf("proc_list answered %q, want what kitbashd holds", got)
+	}
+	if got := list.Processes[0].NextRun; got != "2026-09-21T08:00:00Z" {
+		t.Errorf("proc_list answered the tick %q, want the daemon's", got)
+	}
+}
+
+// A container of this Package and name with no registration behind it is what
+// a host has after a job was unregistered and its container was left, and
+// after a daemon that never registered it. Running the Package again takes
+// that name back rather than reading a registration that is not there.
+func TestRunningAJobOverAContainerNothingHolds(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	folder := f.pack(t, "weather", jobManifest)
+	f.build(folder, "weather")
+	f.runner.AddContainer(podman.Container{
+		Name:     "kitbash-weather-weather",
+		State:    podman.StateExited,
+		ExitCode: 0,
+		Labels: map[string]string{
+			podman.LabelID:      "0199a000-0000-7000-8000-0000000000aa",
+			podman.LabelUser:    "tester",
+			podman.LabelPackage: folder,
+			podman.LabelName:    "weather",
+		},
+	})
+
+	process, prob := f.processes.Run(ctx, folder, "", "")
+	if prob != nil {
+		t.Fatalf("Run: %s", prob.Detail)
+	}
+	if process.State != proc.StateScheduled {
+		t.Errorf("state = %q, want %q", process.State, proc.StateScheduled)
+	}
+	containers, err := f.runner.Containers(ctx, nil, true)
+	if err != nil {
+		t.Fatalf("Containers: %v", err)
+	}
+	if len(containers) != 0 {
+		t.Errorf("the run left %d containers of the Process it took the name from, want none", len(containers))
+	}
+}

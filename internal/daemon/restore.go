@@ -502,7 +502,7 @@ func (s *Server) healCeiling(ctx context.Context, m sysusers.Member, p store.Pro
 	// The registration catches up only now: the ceiling is recorded, so the
 	// next boot takes the ordinary path, and the token is the one the new
 	// container is holding.
-	if err := s.store.RegisterProcess(ctx, ceilingWritten(p), hash, 0); err != nil {
+	if err := s.store.RegisterProcess(ctx, ceilingWritten(p), hash, store.Quota{}); err != nil {
 		// The container is up and the store missed the write. Saying so is the
 		// whole answer: the Process runs, its exports are refused until it is
 		// run again, and the next boot heals nothing because the container is
@@ -700,7 +700,7 @@ func (s *Server) remakeMounted(ctx context.Context, m sysusers.Member, p store.P
 	if err := s.createVerifiedContainer(make, m, p, opts, leaf, mounted); err != nil {
 		return err
 	}
-	if err := s.store.RegisterProcess(ctx, p, hash, 0); err != nil {
+	if err := s.store.RegisterProcess(ctx, p, hash, store.Quota{}); err != nil {
 		logger.Printf("restore: recording the token of %s: %v", p.ID, err)
 	}
 	return nil

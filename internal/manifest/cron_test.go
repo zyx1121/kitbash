@@ -33,12 +33,14 @@ func TestCronReadsEveryFieldKind(t *testing.T) {
 		{"a day of the month", "0 0 1 * *", at(2026, 9, 19, 9, 0), at(2026, 10, 1, 0, 0)},
 		{"a month", "0 0 1 1 *", at(2026, 9, 19, 9, 0), at(2027, 1, 1, 0, 0)},
 		{"a weekday", "30 6 * * 1", at(2026, 9, 19, 9, 0), at(2026, 9, 21, 6, 30)},
+		{"a step in the widest range", "0-59/60 * * * *", at(2026, 9, 19, 9, 30), at(2026, 9, 19, 10, 0)},
 		{"sunday written seven", "30 6 * * 7", at(2026, 9, 19, 9, 0), at(2026, 9, 20, 6, 30)},
 		{"sunday written zero", "30 6 * * 0", at(2026, 9, 19, 9, 0), at(2026, 9, 20, 6, 30)},
 		{"weekdays", "0 9 * * 1-5", at(2026, 9, 19, 9, 0), at(2026, 9, 21, 9, 0)},
 		// Both day fields restricted is the one rule of cron that is not a
 		// lookup: the day matches if either does.
 		{"either day field", "0 0 1 * 1", at(2026, 9, 19, 9, 0), at(2026, 9, 21, 0, 0)},
+		{"either day field, the month day next", "0 9 1 * 1", at(2026, 9, 30, 0, 0), at(2026, 10, 1, 9, 0)},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -54,6 +56,39 @@ func TestCronReadsEveryFieldKind(t *testing.T) {
 				t.Errorf("%q after %s = %s, want %s", c.expr, c.from, got, c.want)
 			}
 		})
+	}
+}
+
+// A day field that begins with * is unrestricted for the either rule whatever
+// step follows it, which is what every other cron does: "0 9 */2 * 1" is every
+// other day and Mondays read together, so it fires on Mondays and nothing
+// else. Reading the step as a restriction would fire it every second day too.
+func TestAStepInADayFieldIsStillAStar(t *testing.T) {
+	cron, err := manifest.ParseCron("0 9 */2 * 1")
+	if err != nil {
+		t.Fatalf("ParseCron: %v", err)
+	}
+	// Wednesday 2 September 2026 is a day the step matches and the weekday
+	// does not.
+	next, ok := cron.Next(at(2026, 9, 2, 0, 0))
+	if !ok {
+		t.Fatal("no tick")
+	}
+	if next.Weekday() != time.Monday {
+		t.Errorf("the next tick is %s, a %s; a day field beginning with * is not a restriction",
+			next, next.Weekday())
+	}
+	if !next.Equal(at(2026, 9, 7, 9, 0)) {
+		t.Errorf("the next tick is %s, want Monday 7 September at 09:00", next)
+	}
+	// The other way round is a restriction: a day of the month written out
+	// with a weekday is the either rule.
+	both, err := manifest.ParseCron("0 9 2 * 1")
+	if err != nil {
+		t.Fatalf("ParseCron: %v", err)
+	}
+	if next, _ := both.Next(at(2026, 9, 1, 0, 0)); !next.Equal(at(2026, 9, 2, 9, 0)) {
+		t.Errorf("0 9 2 * 1 from 1 September = %s, want the 2nd", next)
 	}
 }
 
@@ -168,6 +203,13 @@ func TestCronRefusesWhatItCannotRead(t *testing.T) {
 		{"a question mark", "0 8 ? * *"},
 		{"the last day", "0 8 L * *"},
 		{"a negative minute", "-5 8 * * *"},
+		// The two the schema's own pattern refuses, which this has to refuse
+		// as well or a manifest is read two ways.
+		{"a signed minute", "+5 8 * * *"},
+		{"a line break between fields", "0 8 * *\n*"},
+		{"a line break inside a field", "0 8 * * 1\n"},
+		{"unicode digits", "\u0665 8 * * *"},
+		{"a minute of three digits", "100 * * * *"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

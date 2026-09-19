@@ -171,6 +171,9 @@ type Options struct {
 	// stops it. Zero means MaxRunTime. It exists for tests, which cannot wait
 	// six hours to see a run stopped.
 	ScheduleMaxRun time.Duration
+	// ScheduleMaxPerMember caps how many scheduled runs one member has going
+	// at once, out of ScheduleMaxRuns. Zero means MaxRunsPerMember.
+	ScheduleMaxPerMember int
 	// OrgRoot is the shared root a mount source may name, /org on a kitbash
 	// host. Empty means mounts.OrgRoot. It exists for tests, which have no
 	// /org of their own to put a folder in.
@@ -351,7 +354,7 @@ func New(st *store.Store, opts Options) *Server {
 		actions:  newActionLock(),
 		fetches:  newFetchLock(),
 		probes:   newProber(opts.HealthMinInterval),
-		jobs:     newScheduler(opts.ScheduleMaxRuns),
+		jobs:     newScheduler(opts.ScheduleMaxRuns, opts.ScheduleMaxPerMember),
 
 		scheduleMaxRun: opts.ScheduleMaxRun,
 

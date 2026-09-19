@@ -360,8 +360,22 @@ var (
         "durationMs": { "type": "integer" }
       }
     },
+    "url": { "type": "string", "description": "The address this Process is reached at from outside the host, https://<name>.<member>.<domain> or the hostname the unit declared. Absent on a host with no domain, which routes nothing" },
     "tools": { "type": "array", "items": { "type": "string" }, "description": "Surface tool names added when expose is mcp" },
-    "runner": { "type": "string", "description": "Package path of the run kit that owns this Process, absent when kitbashd runs it" }
+    "runner": { "type": "string", "description": "Package path of the run kit that owns this Process, absent when kitbashd runs it" },
+    "mounts": {
+      "type": "array",
+      "description": "The folders of Files this Process sees, as kitbashd resolved them",
+      "items": {
+        "type": "object",
+        "required": ["source", "target", "mode"],
+        "properties": {
+          "source": { "type": "string", "description": "Absolute host path, resolved" },
+          "target": { "type": "string", "description": "Where the container sees it" },
+          "mode": { "type": "string", "enum": ["ro", "rw"] }
+        }
+      }
+    }
   }
 }`)
 

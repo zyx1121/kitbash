@@ -187,7 +187,7 @@ func TestDeleteApprovalsAndProcessesOfAMember(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewToken: %v", err)
 	}
-	if err := st.RegisterProcess(ctx, process(idOne, "alice", false), hash, 0); err != nil {
+	if err := st.RegisterProcess(ctx, process(idOne, "alice", false), hash, store.Quota{}); err != nil {
 		t.Fatalf("RegisterProcess: %v", err)
 	}
 
@@ -226,7 +226,7 @@ func TestRegistrationStoresTheContainerAndDigest(t *testing.T) {
 	p := process(idOne, "alice", false)
 	p.Container = "kitbash-echo-echo"
 	p.Digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-	if err := st.RegisterProcess(ctx, p, hash, 0); err != nil {
+	if err := st.RegisterProcess(ctx, p, hash, store.Quota{}); err != nil {
 		t.Fatalf("RegisterProcess: %v", err)
 	}
 	got, found, err := st.Process(ctx, idOne)
@@ -241,7 +241,7 @@ func TestRegistrationStoresTheContainerAndDigest(t *testing.T) {
 	// nothing at all.
 	p.Container = ""
 	p.Digest = ""
-	if err := st.RegisterProcess(ctx, p, hash, 0); err != nil {
+	if err := st.RegisterProcess(ctx, p, hash, store.Quota{}); err != nil {
 		t.Fatalf("re-register: %v", err)
 	}
 	got, _, err = st.Process(ctx, idOne)
@@ -292,7 +292,7 @@ func TestMigrationAddsTheM5Columns(t *testing.T) {
 	}
 	p := process(idOne, "alice", false)
 	p.Container = "kitbash-echo-echo"
-	if err := st.RegisterProcess(ctx, p, hash, 0); err != nil {
+	if err := st.RegisterProcess(ctx, p, hash, store.Quota{}); err != nil {
 		t.Fatalf("RegisterProcess after the migration: %v", err)
 	}
 	got, found, err := st.Process(ctx, idOne)

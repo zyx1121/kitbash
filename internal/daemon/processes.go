@@ -300,22 +300,17 @@ func (s *Server) registerProcess(w http.ResponseWriter, r *http.Request, caller 
 		writeProblem(w, prob)
 		return
 	}
-	// A job is bounded on its own as well as with the other registrations:
-	// every one of them is a container this host starts by itself, see
-	// schedule.go. The count is read here rather than inside the transaction
-	// that writes the row, so two sessions registering at the same moment can
-	// both pass it; what they cannot pass is MaxProcessesPerMember, which the
-	// store holds inside the transaction, so the ticker stays bounded either
-	// way.
-	if prob := s.scheduleQuota(r.Context(), r.URL.Path, p); prob != nil {
-		writeProblem(w, prob)
-		return
-	}
-	if err := s.store.RegisterProcess(r.Context(), p, hash, MaxProcessesPerMember); err != nil {
+	if err := s.store.RegisterProcess(r.Context(), p, hash, store.Quota{Processes: MaxProcessesPerMember, Scheduled: MaxScheduledPerMember}); err != nil {
 		if errors.Is(err, store.ErrProcessOwned) {
 			writeProblem(w, problem.ConflictFix(r.URL.Path,
 				fmt.Sprintf("the Process %s belongs to another member", req.ID),
 				"Register the Process under a new id."))
+			return
+		}
+		if errors.Is(err, store.ErrTooManyScheduled) {
+			writeProblem(w, problem.ConflictFix(r.URL.Path,
+				fmt.Sprintf("%s already has %d scheduled Processes registered", caller.User, MaxScheduledPerMember),
+				"Stop a scheduled Process you are no longer using, which unregisters it, then run this one."))
 			return
 		}
 		if errors.Is(err, store.ErrTooManyProcesses) {
@@ -389,27 +384,17 @@ func declaredSchedule(req *scheduleRequest) store.Schedule {
 	if req == nil {
 		return store.Schedule{}
 	}
-	return store.Schedule{Cron: req.Cron, Env: req.Env, Memory: req.Memory, CPU: req.CPU}
-}
-
-// scheduleQuota refuses a registration that would give one member more jobs
-// than this host runs for them. A registration replacing a job of theirs is
-// not a new one and is never refused by it, which is what the id excluded from
-// the count says.
-func (s *Server) scheduleQuota(ctx context.Context, instance string, p store.Process) *problem.Problem {
-	if !p.Schedule.Declared() {
-		return nil
+	held := store.Schedule{Cron: req.Cron, Env: req.Env, Memory: req.Memory, CPU: req.CPU}
+	// The expression is stored as this daemon read it, fields separated by one
+	// space, rather than as the member spaced them: what kitbashd holds is
+	// what it will run, and a listing that echoed the manifest's own spacing
+	// would be answering the file rather than the registry. The expression has
+	// already been parsed by validateSchedule, so a spelling that does not
+	// parse never reaches here.
+	if cron, err := manifest.ParseCron(req.Cron); err == nil {
+		held.Cron = cron.Expr
 	}
-	held, err := s.store.ScheduledCount(ctx, p.Owner, p.ID)
-	if err != nil {
-		return problem.Internal(instance, err.Error(), "")
-	}
-	if held >= MaxScheduledPerMember {
-		return problem.ConflictFix(instance,
-			fmt.Sprintf("%s already has %d scheduled Processes registered", p.Owner, MaxScheduledPerMember),
-			"Stop a scheduled Process you are no longer using, which unregisters it, then run this one.")
-	}
-	return nil
+	return held
 }
 
 // nextRun is when kitbashd will start one job, as the surface spells a time. A
@@ -503,6 +488,13 @@ func (s *Server) unregisterProcess(w http.ResponseWriter, r *http.Request, id st
 		return
 	}
 
+	// The action lock is held across the read, the delete and the untracking,
+	// because a tick of a scheduled Process reads its registration and writes
+	// the token of the run back into it: without this the unregister would be
+	// undone by the tick it raced, and the job would come back at the next
+	// start of the daemon, see schedule.go.
+	unlock := s.actions.lock(id)
+	defer unlock()
 	p, found, err := s.store.Process(r.Context(), id)
 	if err != nil {
 		writeProblem(w, problem.Internal(r.URL.Path, err.Error(), ""))

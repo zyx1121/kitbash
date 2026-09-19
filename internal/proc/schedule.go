@@ -55,17 +55,35 @@ func (s *Service) runJob(ctx context.Context, m *manifest.Manifest, folder strin
 				"Pass a different name to proc_run, or stop that Process first.")
 		}
 	}
+	declared := &telemetry.Schedule{
+		Cron:   unit.Schedule,
+		Env:    ownEnv(unit.Env),
+		Memory: unit.Limits.Memory,
+		CPU:    unit.Limits.CPU,
+	}
 	known := s.registered(ctx)
 	existing, isJob := s.heldJob(known, folder, name)
-	if existing != nil && isJob && existing.Digest == image.ID {
-		// Already converged: this job is registered for this digest and
-		// kitbashd is holding its schedule. Repeating the call changes
-		// nothing, which is the invariant in PLAN.md section 2.6.
-		return s.jobProcess(*existing, unit), nil
+	// The same job moved is the same Process: the image did not change, so it
+	// keeps its id and its records stay one Process's. Only a new digest
+	// replaces it, which is the rule every Process converges by.
+	moved := existing != nil && isJob && existing.Digest == image.ID
+	if moved && sameSchedule(existing.Schedule, declared) {
+		// Already converged: this job is registered for this digest, with this
+		// expression and this environment, and kitbashd is holding it.
+		// Repeating the call changes nothing, which is the invariant in
+		// PLAN.md section 2.6.
+		return s.jobProcess(*existing), nil
+	}
+	id := uuid.V7()
+	if moved {
+		id = existing.ID
 	}
 
 	var replaced *Process
-	if held != nil {
+	// A job that only moved keeps the container of its last run, which is what
+	// proc_logs is reading until the next tick replaces it. Anything else that
+	// holds this name goes.
+	if held != nil && !moved {
 		// Whatever holds this name goes: the container of the last run of a
 		// job being replaced, or the Process this Package used to be before
 		// its unit declared a schedule. Either way the name is this job's and
@@ -77,14 +95,13 @@ func (s *Service) runJob(ctx context.Context, m *manifest.Manifest, folder strin
 		}
 		s.unregister(ctx, previous.ID)
 	}
-	if existing != nil && (held == nil || existing.ID != held.Labels[podman.LabelID]) {
+	if existing != nil && existing.ID != id && (held == nil || existing.ID != held.Labels[podman.LabelID]) {
 		// The registration of the job this one replaces, when the container it
 		// named is already gone. A job that is registered twice would be run
 		// twice, so the old one goes before the new one is written.
 		s.unregister(ctx, existing.ID)
 	}
 
-	id := uuid.V7()
 	if prob := s.register(ctx, telemetry.Registration{
 		ID:        id,
 		Package:   folder,
@@ -98,33 +115,45 @@ func (s *Service) runJob(ctx context.Context, m *manifest.Manifest, folder strin
 		// The schedule carries what a start request would have carried: a tick
 		// has no session behind it, so the unit's own environment and its
 		// ceiling travel with the registration, see PLAN.md section 2.3.
-		Schedule: &telemetry.Schedule{
-			Cron:   unit.Schedule,
-			Env:    ownEnv(unit.Env),
-			Memory: unit.Limits.Memory,
-			CPU:    unit.Limits.CPU,
-		},
+		Schedule: declared,
 	}); prob != nil {
 		return nil, prob
 	}
-	process := Process{
-		ID:       id,
-		Name:     name,
-		Package:  folder,
-		Digest:   image.ID,
-		State:    StateScheduled,
-		Expose:   unit.Expose,
-		Schedule: unit.Schedule,
-		Replaced: replaced,
+	// What the member is told is what kitbashd is holding, and not what the
+	// manifest says: a schedule the daemon refused, or one it read differently,
+	// would otherwise be reported back as though it had been taken. The tick
+	// is the daemon's answer for the same reason, the clock being the host's.
+	entry, held_ := s.registered(ctx)[id]
+	if !held_ {
+		return nil, problem.Internal(folder,
+			fmt.Sprintf("kitbashd registered the job %s and does not list it", id),
+			"Call proc_list to see whether the job is registered, and run the Package again.")
 	}
-	// The tick is kitbashd's answer, not this session's: the expression is the
-	// member's and the clock is the host's, so what the member is told is what
-	// the daemon is holding.
-	if entry, ok := s.registered(ctx)[id]; ok {
-		process.NextRun = entry.NextRun
-		process.Mounts = entry.Mounts
-	}
+	process := *s.jobProcess(entry)
+	process.Replaced = replaced
 	return &process, nil
+}
+
+// sameSchedule reports whether a registration holds the job a unit declares:
+// the expression, the environment its runs are given and the ceiling they run
+// under. A unit whose schedule changed is not converged, whatever its image
+// did, because what kitbashd holds is what runs.
+func sameSchedule(held, declared *telemetry.Schedule) bool {
+	if held == nil || declared == nil {
+		return held == declared
+	}
+	if held.Cron != declared.Cron || held.Memory != declared.Memory || held.CPU != declared.CPU {
+		return false
+	}
+	if len(held.Env) != len(declared.Env) {
+		return false
+	}
+	for key, value := range declared.Env {
+		if held.Env[key] != value {
+			return false
+		}
+	}
+	return true
 }
 
 // heldJob is the caller's registration of one Package and name, and whether it
@@ -148,11 +177,14 @@ func scheduledEntry(entry telemetry.Registered) bool {
 	return entry.Schedule != nil && entry.Schedule.Cron != ""
 }
 
-// jobProcess is one registered job as the surface publishes it. The state is
-// scheduled whenever there is no container running: between its runs a job is
-// not stopped, it is waiting, and a member reading proc_list wants the next
-// tick rather than the exit of the last one.
-func (s *Service) jobProcess(entry telemetry.Registered, unit manifest.Unit) *Process {
+// jobProcess is one registered job as the surface publishes it, read from the
+// registration alone: the expression, the next tick and the last run are all
+// kitbashd's, so a member is told what the daemon holds and never what a
+// manifest on disk says today. The state is scheduled whenever there is no
+// container running: between its runs a job is not stopped, it is waiting, and
+// a member reading proc_list wants the next tick rather than the exit of the
+// last one.
+func (s *Service) jobProcess(entry telemetry.Registered) *Process {
 	process := Process{
 		ID:       entry.ID,
 		Name:     entry.Name,
@@ -166,9 +198,6 @@ func (s *Service) jobProcess(entry telemetry.Registered, unit manifest.Unit) *Pr
 		NextRun:  entry.NextRun,
 		LastRun:  lastRunOf(entry),
 		Schedule: scheduleOf(entry),
-	}
-	if unit.Scheduled() {
-		process.Schedule = unit.Schedule
 	}
 	if process.Expose == "" {
 		process.Expose = manifest.ExposeNone
@@ -212,7 +241,7 @@ func (s *Service) scheduledProcesses(known map[string]telemetry.Registered, list
 		if !scheduledEntry(entry) || here[entry.ID] || !s.ownedByCaller(entry) {
 			continue
 		}
-		out = append(out, *s.jobProcess(entry, manifest.Unit{}))
+		out = append(out, *s.jobProcess(entry))
 	}
 	return out
 }

@@ -666,6 +666,12 @@ func (d *Daemon) register(w http.ResponseWriter, r *http.Request) {
 	// clock is the host's.
 	if reg.Schedule != nil && reg.Schedule.Cron != "" {
 		if cron, err := manifest.ParseCron(reg.Schedule.Cron); err == nil {
+			// The expression is held as the daemon reads it, one space between
+			// fields, which is what the real one stores, see
+			// internal/daemon/processes.go.
+			held := *reg.Schedule
+			held.Cron = cron.Expr
+			reg.Schedule = &held
 			if next, ok := cron.Next(time.Now()); ok {
 				reg.NextRun = next.UTC().Format(time.RFC3339)
 			}
