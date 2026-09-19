@@ -219,16 +219,18 @@ func TestSurface(t *testing.T) {
 		{"a schema violation is a bad request", schemaViolation},
 		{"pkg_build builds it with rootless podman", buildThePackage},
 		{"proc_run starts it and echo_echo answers", runThePackage},
-		// The job is registered here and read at the end: a tick is a minute
-		// away and the steps in between cost more than that, so the wait at
-		// the end is a budget rather than a delay, see schedule_test.go.
-		{"a scheduled Package is registered and starts nothing", registerTheJob},
 		{"the second client calls it over /mcp", secondClient},
 		{"users_create adds a member", createAMember},
 		{"a member cannot list another home", anotherHome},
 		{"a member's write to /org is queued", queuedWrite},
 		{"the admin approves it and the member is the author", approveTheWrite},
 		{"tel_query returns the span and the build log", queryTelemetry},
+		// The job is registered here and read at the end: a tick is a minute
+		// away and the builds in between cost more than that, so the wait at
+		// the end is a budget rather than a delay. It comes after the query
+		// above because that one reads the newest build log of this member,
+		// and a build of this Package would be it, see schedule_test.go.
+		{"a scheduled Package is registered and starts nothing", registerTheJob},
 		{"the new member is served their own identity", theNewMember},
 		{"a run kit is built and joins the surface", buildTheRunKit},
 		{"proc_run dispatches to the run kit", dispatchToTheRunKit},
