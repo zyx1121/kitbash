@@ -90,8 +90,8 @@ A host whose cgroup filesystem is not version 2 or not writable runs that Proces
 A Process declares how it is exposed:
 
 - `mcp`: its tools appear on the user's MCP surface under the package namespace, for example `ffmpeg.transcode`.
-- `http`: it gets an internal port, optionally a hostname through the reverse proxy.
-- `none`: a batch job or a subscriber that only talks to Telemetry.
+- `http`: it gets an internal port and, when the host has a domain, a hostname with TLS: `<name>.<member>.<domain>` by default, or the `hostname` the unit declares. kitbashd is the reverse proxy, see below.
+- `none`: a batch job or a subscriber that only talks to Telemetry. With a `schedule` it is a job kitbashd starts on time, see below.
 
 **How `mcp` exposure works.** The image's entrypoint is a stdio MCP server. The Process runs it as PID 1 with stdin held open, which keeps the container alive and is the liveness signal. Every MCP session the owner opens execs one more instance of the same entrypoint inside the container and proxies calls to it, the same way an agent runs a stdio server on a laptop. The tools the surface publishes are the ones the manifest declares, with the manifest's schemas, so input is validated against the manifest before it reaches the container. A tool the server offers but the manifest does not declare is not on the surface. Tool names are `<package>_<tool>`; a Package whose name collides with a built in family (`fs`, `pkg`, `proc`, `tel`, `users`, `approvals`, `secrets`) cannot be run.
 
@@ -112,6 +112,10 @@ What crosses the wire once is the value of `secrets_set`, from the agent over SS
 So a Process is started in four steps rather than one. `podman create` makes the container with its mounts. `podman init` has the runtime build its rootfs and its bind mounts and leave its init process created, with the image's entrypoint not yet executed. kitbashd, as root, then asks the runtime which source is mounted at each target and in which mode, and stats each target through `/proc/<pid>/root`, which resolves in the container's own mount namespace, holding the device and inode it finds there to the ones the validation opened. Only then does `podman start` run the entrypoint. A mismatch, a container the runtime would not prepare, or a container with no process after it was prepared, is `not-permitted` with the detail "the mount source changed between validation and start", and that container is removed having executed nothing. There is no fallback: a container kitbashd cannot read is a container that does not start.
 
 The boot restore does the same, reading what the runtime calls a container as well as its process id, because a prepared container has a process and has run nothing. A Process that is running is read through the process it already has, because its namespace is the only witness of what it holds and this daemon did not make it. One found prepared is where a start pauses, so it is read the same way and then started. One in any other state is not started by name, because a start makes the bind mounts again and the entrypoint would be running before anything could read them: it is made again through the same four steps. The heal path is the same four steps too. What all of this protects is the `/org` approval trail and progressive disclosure.
+
+**How `http` exposure works.** Sharing a web application is giving someone its address, and the Process that serves it runs under the member who made it, because that is whose work it is. There is no shared identity to hand a service to and no second step after `proc_run`. kitbashd is the reverse proxy: it listens on 80 and 443, terminates TLS, and routes by host name to the port the Process's container publishes, the same port health probes are held to. The operator gives the host a domain once, `KITBASH_DOMAIN` at install, with a wildcard record for it and everything below it pointing at the host's public address, or at a gateway that forwards 80 and 443 to it; a host with no route from the outside has no domain and `http` Processes keep their internal port only, as today. With a domain, every `http` Process is `<name>.<member>.<domain>`: both labels are already valid DNS labels by the patterns the surface enforces, and the member's label is the attribution, visible in the address. A unit may declare `hostname` instead, one name the member owns whose record points at the same place, and kitbashd serves it when it does. Certificates come from ACME, one per host name, obtained when the name is first served or at start and renewed by the daemon; there is no wildcard certificate, because a wildcard covers one label and the default names have two. `proc_run` answers with `url`, `proc_list` shows it, and the proxy writes one span per request it forwards with the four attributes. A `hostname` that another Process on the host already serves is `conflict` at registration. The proxy is not a third built in: it is how the built in runner exposes what it runs, see section 3.
+
+**How a schedule works.** A unit with `expose: none` may declare `schedule`, five field cron syntax, read in UTC. `proc_run` registers the job and starts nothing; kitbashd starts the container at each tick as its owner, through the same four steps as any start, and the run ends when the entrypoint exits. A tick that arrives while the previous run is still executing is skipped and recorded. Every run writes one metric record `kitbash.schedule` carrying the four attributes, the exit code and whether the tick ran or was skipped, so "did it run this morning" is a `tel_query`. Ticks missed while the host was down are not made up: the next tick runs. `proc_logs` reads the last run. `proc_stop` unregisters the job, and a `schedule` on a unit with any other `expose` is `invalid-manifest`. Like the proxy, the scheduler is a way the built in runner starts what it runs, not a hook and not a third built in.
 
 **Every Process can be an agent.** The same MCP surface a member reaches over SSH is reachable from inside a Process: kitbashd serves MCP over streamable HTTP at `/mcp` on the Process receiver, authenticated by the Process token, and answers each session by running `kitbash-mcp` as the Process's owner and relaying to it. A Process therefore sees exactly what its owner sees, Files, Packages, Processes, Telemetry and the tools of the owner's other Processes, under the kernel's rules, with no code path of its own. Every span such a session records carries `kitbash.caller`, the calling Process id, so what a Process did on its owner's behalf is one query. The endpoint is given to every container as `KITBASH_MCP_ENDPOINT`.
 
@@ -172,7 +176,9 @@ deploy:
       build: .                # or image: docker.io/jrottenberg/ffmpeg@sha256:...
       builder: /org/nix-build # optional, the build kit that builds this unit, see section 3
       runner: /org/pve-runner # optional, the run kit that runs this Process, see section 3
-      expose: mcp
+      expose: mcp                 # or http, which gets <name>.<member>.<domain> with TLS, or none
+      # hostname: app.example.com # http only: a name the member owns instead of the default
+      # schedule: "0 8 * * *"     # none only: kitbashd starts the container at each tick, UTC
       secrets: [ANTHROPIC_API_KEY]   # names only; the member sets values with secrets_set, see section 2.3
       health: { http: /healthz, interval: 30s }  # probed and recorded, see section 2.4
       limits: { cpu: "1", memory: "512Mi" }
@@ -225,7 +231,7 @@ A kit is a Package that implements one or more of the five hooks in the lifecycl
 
 A kit installs the same way as any Package and is versioned, traced and removable the same way. kitbashd has no special knowledge of any installed kit. It only knows the hook contract.
 
-**Built in versus installed.** Exactly two things are built into kitbashd because the system cannot boot without them: the OCI build path and the rootless podman runner. Everything else, including the workflow engine and every import kit, is installed. This boundary is fixed. Adding a third built in requires changing this document first.
+**Built in versus installed.** Exactly two things are built into kitbashd because the system cannot boot without them: the OCI build path and the rootless podman runner. Everything else, including the workflow engine and every import kit, is installed. This boundary is fixed. Adding a third built in requires changing this document first. The reverse proxy and the scheduler of section 2.3 are not a third: they are two ways the built in runner exposes and starts what it runs, decided by the manifest and not by a hook, and a run kit that takes a Process elsewhere takes them with it.
 
 **Workflows are a kit.** A workflow engine is a Package that reads graph files from Files, calls tools on other Processes, and emits Telemetry, all through the MCP surface every Process can reach. The core does not know what a workflow is: the graph format, the templating between steps and the way one workflow names another are the engine's contract, published in its manifest and its prompt file, never in this document or the specs. A workflow that references another workflow is the engine's concern, resolved by schema compatibility of inputs and outputs.
 
@@ -317,12 +323,14 @@ kitbash-mcp talks to kitbashd over a unix socket, `/run/kitbash/kitbashd.sock`, 
 
 One break glass path exists for the operator: a serial console or a dedicated `ops` user with a real shell, disabled by default and enabled only from the console. Without it the first stuck machine is a reinstall.
 
+**What the surface says about itself.** The agents that connect are general ones, and a general agent asked for a web application scaffolds it on the laptop it runs on unless something tells it otherwise. So `kitbash-mcp` answers `initialize` with `instructions`, the one field of the protocol that lands in every client's system prompt without anyone asking for it, and that text is the whole deployment conversation: this host is where the work runs, Files under the member's home are the source, a `kitbash.yaml` with `build` and `expose` is all a Package needs, `pkg_build` then `proc_run` ships it, `http` gets an address, `schedule` runs on time, and nothing else has to be decided. What it says is measured, not written once: the M10 acceptance runs a clean agent against it and counts the tokens.
+
 ### 4.6 The three infrastructure layers
 
 Infrastructure is three layers, and the object model binds to the shape of an OCI image rather than to any layer's API.
 
 1. **Machine layer, Proxmox VE or any VM host.** Version 1 is one VM. kitbashd does not manage the hypervisor. A PVE runner kit can later treat a container or VM as a Process for workloads that need a GPU or Windows.
-2. **Unit layer, rootless podman.** The built in runner. Every Process is a container. A reverse proxy reads process metadata and gives `http` Processes a hostname.
+2. **Unit layer, rootless podman.** The built in runner. Every Process is a container. kitbashd is the reverse proxy that gives `http` Processes a hostname and a certificate, and the scheduler that starts a `schedule` unit on time, see 2.3.
 3. **Orchestration layer, Kubernetes.** Deferred. The triggers to adopt it are written down: more than one machine, a need for autoscaling, or a customer requirement. Adoption means one more run kit, not a schema change, because a Process already describes image, environment, ports, health and limits, which map one to one onto a Kubernetes Deployment.
 
 ### 4.7 Storage
@@ -377,6 +385,8 @@ Each milestone is done when its acceptance sentence is true on a real machine, n
 
 **M9 Secrets.** A member calls `secrets_set` with a name and a value, `secrets_list` shows the name and no value, a Package whose unit declares that name runs and its tool reads the variable, `proc_run` of the same Package under a second member who has not set it is refused naming the secret, and the span `secrets_set` recorded in Telemetry carries no value.
 
+**M10 Ship.** A clean Claude Code with the kitbash MCP server and nothing else configured is told three things by a member who names no tool, no host and no way of deploying: "make a todo web app I can share with my classmates", "every morning at eight fetch the weather and post it to the group", and "set up a PDF conversion service". The first appears at `https://<name>.<member>.<domain>` and opens in a browser, the second is a `kitbash.schedule` record at 08:00 UTC the next day, and the third is a URL a second member opens. The tokens the three conversations cost are counted against the same three tasks done on the laptop without kitbash, and the number is written down here.
+
 ### 5.4 Risks
 
 - Rootless podman on Alpine needs cgroups v2, subuid ranges and fuse-overlayfs configured correctly. This is M1 work and is the first thing to verify on real hardware.
@@ -392,7 +402,7 @@ The MCP tool surface is decided in `spec/mcp-surface.yaml`: seven families, `fs`
 - Import kits run under the member who imports. Whether an admin can run a kit once for every member is an M5 question.
 - Metrics: the store and the receiver accept them from M3; the first producers are the M4 kits.
 - Fan out is best effort. A subscriber that must not miss a record should read the store through `tel_query` and treat the push as a wake up.
-- Approvals cover `fs_write` and `pkg_import` into `/org`. Whether `proc_run` of an `/org` Package by a member should run as a shared Process rather than a private one is open; today it runs privately under the member.
+- Approvals cover `fs_write` and `pkg_import` into `/org`. `proc_run` of an `/org` Package runs privately under the member, and that is the decision, not an interim: a service is shared by its address, and it runs under whoever runs it. Whether a member's `mcp` Process should be able to publish its tools onto other members' surfaces is deferred until a case appears.
 - A Process acting as an agent has its owner's full surface. Narrowing what a Process may call (a per Process allow list in the manifest) is deferred until a kit needs less than its owner has.
 - A secret set through `secrets_set` passes through the agent that calls it, so the agent's context holds the value once. A path that keeps the value out of the agent, such as `ssh kitbash-mcp secrets set NAME` reading stdin, is deferred until a member asks for it.
 
