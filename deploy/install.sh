@@ -82,6 +82,78 @@ if [ -n "${KITBASH_APK:-}" ] && [ -f "$KITBASH_APK" ]; then
 fi
 command -v kitbash-mcp >/dev/null || log "warning: kitbash-mcp not installed yet; sshd ForceCommand will fail until it is"
 
+# 7b. The host's own domain, which is what turns the reverse proxy on. With one,
+#     every Process with expose: http is served at
+#     https://<name>.<member>.<domain>, or at the hostname its unit declared,
+#     and kitbashd is the reverse proxy in front of it (PLAN.md 2.3). Without
+#     one nothing is routed and an http Process keeps its internal port, which
+#     is how kitbash worked before the proxy existed.
+#
+#     KITBASH_TLS decides who holds the certificate. acme, the default with a
+#     domain, has kitbashd obtain one per host name, which needs 80 and 443
+#     reachable from the internet. gateway has it listen on 80 alone and trust
+#     the gateway in front of it, which is how a host behind one public address
+#     is put on the internet.
+#
+#     The settings are written to /etc/conf.d/kitbashd, which the OpenRC
+#     service exports, so a domain given once survives every boot and every
+#     upgrade. A variable that is not in this run's environment leaves the file
+#     alone: running install.sh again without KITBASH_DOMAIN does not take the
+#     domain away, and KITBASH_DOMAIN= does.
+confd=/etc/conf.d/kitbashd
+set_confd() {
+  [ -f "$confd" ] || : > "$confd"
+  # The key is replaced wherever it is, commented out or not, and written
+  # once at the end, so this is the same file after two runs as after one.
+  grep -v -E "^[[:space:]]*#?[[:space:]]*$1=" "$confd" > "$confd.kitbash-new" || true
+  printf '%s="%s"\n' "$1" "$2" >> "$confd.kitbash-new"
+  mv "$confd.kitbash-new" "$confd"
+}
+confd_value() {
+  [ -f "$confd" ] || return 0
+  sed -n "s/^[[:space:]]*$1=//p" "$confd" | tail -n 1 | sed 's/^"//; s/"$//'
+}
+if [ -n "${KITBASH_DOMAIN+set}" ]; then
+  log "writing KITBASH_DOMAIN to $confd"
+  set_confd KITBASH_DOMAIN "$KITBASH_DOMAIN"
+fi
+if [ -n "${KITBASH_TLS+set}" ]; then
+  log "writing KITBASH_TLS to $confd"
+  set_confd KITBASH_TLS "$KITBASH_TLS"
+fi
+#     The address the proxy is reached on from outside, which is what a unit's
+#     declared hostname is proved against: kitbashd resolves that name and
+#     serves it only when it points here. In gateway mode this host's own
+#     addresses are behind the gateway, so without this no declared hostname is
+#     served at all; names under KITBASH_DOMAIN are unaffected, because those
+#     are the host's own.
+if [ -n "${KITBASH_PUBLIC_ADDRESS+set}" ]; then
+  log "writing KITBASH_PUBLIC_ADDRESS to $confd"
+  set_confd KITBASH_PUBLIC_ADDRESS "$KITBASH_PUBLIC_ADDRESS"
+fi
+#     And, in gateway mode, the address the gateway forwards from, which the
+#     ruleset below narrows the accept on 80 to.
+if [ -n "${KITBASH_GATEWAY_ADDRESS+set}" ]; then
+  log "writing KITBASH_GATEWAY_ADDRESS to $confd"
+  set_confd KITBASH_GATEWAY_ADDRESS "$KITBASH_GATEWAY_ADDRESS"
+fi
+domain=$(confd_value KITBASH_DOMAIN)
+tls=$(confd_value KITBASH_TLS)
+gateway=$(confd_value KITBASH_GATEWAY_ADDRESS)
+if [ -n "$domain" ] && [ -z "$tls" ]; then
+  # A host with a domain and nothing said about TLS obtains its own
+  # certificates, which is the default PLAN.md 2.3 names.
+  set_confd KITBASH_TLS acme
+  tls=acme
+fi
+if [ -n "$domain" ]; then
+  case "$tls" in
+    acme|gateway) ;;
+    *) echo "kitbash: KITBASH_TLS is \"$tls\"; it is acme or gateway" >&2; exit 1 ;;
+  esac
+  log "serving http Processes under $domain, TLS $tls"
+fi
+
 # 8. kitbashd: the OTLP receiver and Telemetry store. It owns the socket every
 #    member session exports to, so it starts before sshd is reconfigured.
 if command -v kitbashd >/dev/null && [ -x /etc/init.d/kitbashd ]; then
@@ -195,8 +267,10 @@ cat > /etc/nftables.nft.kitbash-new <<'NFT'
 # loads them after this table and install.sh never touches them.
 #
 # One port is scoped here, TCP 4318, the Process receiver kitbashd binds on
-# every address. Everything else is as it was: the policy is accept and no
-# other port is decided. This is not a host firewall.
+# every address. A host that was given a domain also names 80, and in acme mode
+# 443, which is where kitbashd serves the reverse proxy of every http Process.
+# Everything else is as it was: the policy is accept and no other port is
+# decided. This is not a host firewall.
 
 # Replace this table and only this table. No flush ruleset: whatever else
 # holds rules on this host, a container runtime among them, stays.
@@ -210,6 +284,36 @@ table inet kitbash {
 		# SSH first, before any line in this file can drop a packet. The
 		# way back into the host never depends on a rule further down.
 		tcp dport 22 accept comment "SSH, the MCP transport and the way in"
+NFT
+#     The reverse proxy, and only on a host that has a domain. Without one
+#     kitbashd binds neither port, and a rule naming a listener that does not
+#     exist is a rule nobody can check. 443 is acme's alone: in gateway mode
+#     the gateway in front of this host holds the certificate and forwards
+#     to 80.
+if [ -n "$domain" ]; then
+  printf '\n\t\t# The reverse proxy of every http Process, see PLAN.md 2.3.\n' \
+    >> /etc/nftables.nft.kitbash-new
+  if [ "$tls" = gateway ] && [ -n "$gateway" ]; then
+    #   A gateway in front of this host is the only thing that reaches the
+    #   proxy, so the accept names it. The family of the rule follows the
+    #   family of the address: this is one inet table and ip saddr matches
+    #   IPv4 alone.
+    case "$gateway" in
+      *:*) family=ip6 ;;
+      *)   family=ip ;;
+    esac
+    printf '\t\ttcp dport 80 %s saddr %s accept comment "The reverse proxy, from the gateway alone"\n' \
+      "$family" "$gateway" >> /etc/nftables.nft.kitbash-new
+  else
+    printf '\t\ttcp dport 80 accept comment "The reverse proxy"\n' \
+      >> /etc/nftables.nft.kitbash-new
+  fi
+  if [ "$tls" = acme ]; then
+    printf '\t\ttcp dport 443 accept comment "The reverse proxy, which holds this host'"'"'s own certificates"\n' \
+      >> /etc/nftables.nft.kitbash-new
+  fi
+fi
+cat >> /etc/nftables.nft.kitbash-new <<'NFT'
 
 		# This also carries every Process to the receiver below: a
 		# rootless container reaches it as host.containers.internal,
@@ -255,7 +359,11 @@ fi
 #     that ends the run rather than warning. Everything before it is done and
 #     install.sh is idempotent: fix the cause and run it again.
 if rc-service -q nftables "$action"; then
-  log "nftables: 4318 is reachable over loopback only"
+  if [ -n "$domain" ]; then
+    log "nftables: 4318 is reachable over loopback only, and the reverse proxy is open"
+  else
+    log "nftables: 4318 is reachable over loopback only"
+  fi
 else
   echo "kitbash: loading /etc/nftables.nft failed; the ruleset that was running is still running and 4318 may be open" >&2
   exit 1

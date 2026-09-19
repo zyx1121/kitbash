@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/netip"
 	"os"
 	"os/signal"
 	"os/user"
@@ -20,6 +21,7 @@ import (
 	"syscall"
 
 	"github.com/zyx1121/kitbash/internal/daemon"
+	"github.com/zyx1121/kitbash/internal/manifest"
 	"github.com/zyx1121/kitbash/internal/secrets"
 	"github.com/zyx1121/kitbash/internal/store"
 	"github.com/zyx1121/kitbash/internal/sysusers"
@@ -38,6 +40,17 @@ const (
 	defaultSocket     = "/run/kitbash/kitbashd.sock"
 	defaultStore      = "/var/lib/kitbash/kitbashd.db"
 	defaultOTLPListen = "0.0.0.0:4318"
+)
+
+// The reverse proxy, as PLAN.md section 2.3 describes it. A host with no
+// domain binds neither of these: nothing is routed and an http Process keeps
+// its internal port, which is what every kitbash host did before the proxy
+// existed. With a domain, acme binds both and obtains certificates, gateway
+// binds 80 alone and trusts the gateway in front of it.
+const (
+	defaultProxyListen    = daemon.DefaultProxyListen
+	defaultProxyTLSListen = daemon.DefaultProxyTLSListen
+	defaultCerts          = daemon.DefaultCertDir
 )
 
 // defaultSecrets is where the values members set with secrets_set are kept, as
@@ -60,6 +73,19 @@ const (
 	otlpListenEnv = "KITBASH_OTLP_LISTEN"
 	noRestoreEnv  = "KITBASH_NO_RESTORE"
 	mcpBinaryEnv  = daemon.MCPBinaryEnv
+	// The proxy's own settings. deploy/install.sh writes the first two into
+	// /etc/conf.d/kitbashd, which the OpenRC service exports, so the operator
+	// gives the host a domain once and every boot after that has it.
+	domainEnv         = "KITBASH_DOMAIN"
+	tlsEnv            = "KITBASH_TLS"
+	proxyListenEnv    = "KITBASH_PROXY_LISTEN"
+	proxyTLSListenEnv = "KITBASH_PROXY_TLS_LISTEN"
+	certsEnv          = "KITBASH_CERTS"
+	// publicAddressEnv is the address the proxy is reached on from outside,
+	// which is what a unit's declared hostname is proved against. In gateway
+	// mode the host's own addresses are behind the gateway, so the operator
+	// names the public one here.
+	publicAddressEnv = daemon.PublicAddressEnv
 )
 
 // SocketGroup owns the socket with root, so every member may connect and
@@ -93,11 +119,30 @@ func run() error {
 		"kitbash-mcp to run as the owner for each MCP session of a Process")
 	noRestore := flag.Bool("no-restore", truthy(os.Getenv(noRestoreEnv)),
 		"do not start the registered Processes at boot")
+	domain := flag.String("domain", env(domainEnv, ""),
+		"domain every http Process is served under, empty for a host that routes nothing")
+	tlsMode := flag.String("tls", env(tlsEnv, daemon.TLSACME),
+		"how this host terminates TLS: acme obtains its own certificates, gateway trusts the one in front of it")
+	proxyListen := flag.String("proxy-listen", env(proxyListenEnv, defaultProxyListen),
+		"address the reverse proxy serves HTTP on, used only when a domain is set")
+	proxyTLSListen := flag.String("proxy-tls-listen", env(proxyTLSListenEnv, defaultProxyTLSListen),
+		"address the reverse proxy serves HTTPS on, used only with a domain in acme mode")
+	certs := flag.String("certs", env(certsEnv, defaultCerts),
+		"directory the certificates of acme mode are cached in")
+	publicAddress := flag.String("public-address", env(publicAddressEnv, ""),
+		"the address the proxy is reached on from outside, which a unit's declared hostname is proved against")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
 	if *showVersion {
 		fmt.Println(version)
 		return nil
+	}
+
+	// A domain that is not a name, and a mode this daemon does not have, are
+	// refused here rather than at the first request: a host told to serve a
+	// domain and serving nothing is worse than one that did not start.
+	if prob := checkProxySettings(*domain, *tlsMode, *publicAddress); prob != nil {
+		return prob
 	}
 
 	// The kitbash-mcp of every MCP session is run as a member, so the path is
@@ -154,15 +199,41 @@ func run() error {
 			return fmt.Errorf("listen on %s: %w", *otlpListen, err)
 		}
 	}
+	// The proxy's listeners are bound here, as root, with the rest of them.
+	// Nothing the proxy does afterwards needs root: it reads the routing
+	// table, opens loopback connections to a Process and writes the store,
+	// which is the daemon's own, see internal/daemon/proxy.go.
+	var proxyLn, proxyTLSLn net.Listener
+	if *domain != "" {
+		proxyLn, err = net.Listen("tcp", *proxyListen)
+		if err != nil {
+			ln.Close()
+			closeListener(otlpLn)
+			return fmt.Errorf("listen on %s: %w", *proxyListen, err)
+		}
+		if *tlsMode == daemon.TLSACME {
+			proxyTLSLn, err = net.Listen("tcp", *proxyTLSListen)
+			if err != nil {
+				ln.Close()
+				closeListener(otlpLn)
+				closeListener(proxyLn)
+				return fmt.Errorf("listen on %s: %w", *proxyTLSListen, err)
+			}
+		}
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	srv := daemon.New(st, daemon.Options{
-		Version:    version,
-		MCPBinary:  *mcpBinary,
-		NoRestore:  *noRestore,
-		SecretsDir: *secretsDir,
+		Version:       version,
+		MCPBinary:     *mcpBinary,
+		NoRestore:     *noRestore,
+		SecretsDir:    *secretsDir,
+		Domain:        *domain,
+		TLS:           *tlsMode,
+		CertDir:       *certs,
+		PublicAddress: *publicAddress,
 	})
 	defer srv.Close()
 	if _, err := srv.Sweep(ctx); err != nil {
@@ -190,7 +261,7 @@ func run() error {
 	// the other as if nothing happened.
 	serve, cancel := context.WithCancel(ctx)
 	defer cancel()
-	errs := make(chan error, 2)
+	errs := make(chan error, 4)
 	listeners := 1
 	go func() {
 		defer cancel()
@@ -205,6 +276,23 @@ func run() error {
 		logger.Printf("listening on %s and %s, store %s, version %s", *socket, *otlpListen, *storePath, version)
 	} else {
 		logger.Printf("listening on %s, store %s, version %s", *socket, *storePath, version)
+	}
+	if proxyLn != nil {
+		listeners++
+		go func() {
+			defer cancel()
+			errs <- srv.ServeProxy(serve, proxyLn)
+		}()
+	}
+	if proxyTLSLn != nil {
+		listeners++
+		go func() {
+			defer cancel()
+			errs <- srv.ServeProxyTLS(serve, proxyTLSLn)
+		}()
+	}
+	if proxyLn != nil {
+		logger.Printf("serving %s over %s, TLS %s", *domain, proxyAddresses(*proxyListen, proxyTLSLn, *proxyTLSListen), *tlsMode)
 	}
 
 	// Restore runs beside the listeners rather than before them: a host with
@@ -255,6 +343,42 @@ func clearLegacySubIDLock() {
 	if removed {
 		logger.Printf("removed the stale lock %s an older kitbash left behind; that name belongs to shadow-utils",
 			sysusers.LegacySubIDLock)
+	}
+}
+
+// checkProxySettings refuses a domain that is not a name and a TLS mode this
+// daemon does not have. A host with no domain is not checked: that is a host
+// that routes nothing, which is every kitbash host before the proxy existed.
+func checkProxySettings(domain, mode, publicAddress string) error {
+	if domain != "" && !manifest.ValidHostname(domain) {
+		return fmt.Errorf("%s is %q, which is not a domain; it is a lower case DNS name of at least two labels, such as kitbash.example.org",
+			domainEnv, domain)
+	}
+	if mode != daemon.TLSACME && mode != daemon.TLSGateway {
+		return fmt.Errorf("%s is %q; it is %s, which obtains this host's own certificates, or %s, which trusts the gateway in front of it",
+			tlsEnv, mode, daemon.TLSACME, daemon.TLSGateway)
+	}
+	if publicAddress != "" {
+		if _, err := netip.ParseAddr(publicAddress); err != nil {
+			return fmt.Errorf("%s is %q, which is not an address; it is the address the proxy is reached on from outside, such as 203.0.113.9",
+				publicAddressEnv, publicAddress)
+		}
+	}
+	return nil
+}
+
+// proxyAddresses is what the one start up line says about where the proxy is.
+func proxyAddresses(http string, tls net.Listener, tlsAddress string) string {
+	if tls == nil {
+		return http
+	}
+	return http + " and " + tlsAddress
+}
+
+// closeListener closes one that was opened, for a start that fails after it.
+func closeListener(ln net.Listener) {
+	if ln != nil {
+		ln.Close()
 	}
 }
 

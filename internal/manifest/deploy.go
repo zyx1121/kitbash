@@ -195,10 +195,15 @@ type Unit struct {
 	Runner  string
 	Expose  string
 	Port    int
-	Env     map[string]string
-	Health  map[string]any
-	Limits  Limits
-	Restart string
+	// Hostname is the one name this unit asks kitbashd to serve it under, in
+	// place of the <name>.<member>.<domain> the daemon derives. It is a name
+	// the member owns whose record points at this host, and it is served only
+	// when the host has a domain at all, see PLAN.md section 2.3.
+	Hostname string
+	Env      map[string]string
+	Health   map[string]any
+	Limits   Limits
+	Restart  string
 	// Mounts are the folders of Files this unit asks to see, at most four,
 	// see PLAN.md section 2.3. They are read as the manifest wrote them:
 	// kitbashd resolves them as root and is the one that decides.
@@ -347,6 +352,7 @@ func (m *Manifest) Unit() (Unit, bool) {
 		unit.Restart = restart
 	}
 	unit.Port = intOf(raw["port"])
+	unit.Hostname, _ = raw["hostname"].(string)
 	if env, ok := raw["env"].(map[string]any); ok {
 		unit.Env = map[string]string{}
 		for k, v := range env {

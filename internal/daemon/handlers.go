@@ -331,16 +331,19 @@ func (s *Server) retention(w http.ResponseWriter, r *http.Request) {
 // many copies are kept; lastBackupError is the reason the last attempt failed
 // and is absent while backups are working, see PLAN.md section 4.7.
 type healthResponse struct {
-	Version         string    `json:"version"`
-	Store           string    `json:"store"`
-	UptimeSeconds   int64     `json:"uptimeSeconds"`
-	Listeners       listeners `json:"listeners"`
-	Subscribers     int       `json:"subscribers"`
-	MCPSessions     int       `json:"mcpSessions"`
-	Probes          int       `json:"probes"`
-	LastBackup      string    `json:"lastBackup,omitempty"`
-	Backups         int       `json:"backups"`
-	LastBackupError string    `json:"lastBackupError,omitempty"`
+	Version       string    `json:"version"`
+	Store         string    `json:"store"`
+	UptimeSeconds int64     `json:"uptimeSeconds"`
+	Listeners     listeners `json:"listeners"`
+	Subscribers   int       `json:"subscribers"`
+	MCPSessions   int       `json:"mcpSessions"`
+	Probes        int       `json:"probes"`
+	// Routes is how many host names the reverse proxy serves, zero on a host
+	// with no domain, see proxy.go.
+	Routes          int    `json:"routes"`
+	LastBackup      string `json:"lastBackup,omitempty"`
+	Backups         int    `json:"backups"`
+	LastBackupError string `json:"lastBackupError,omitempty"`
 }
 
 // listeners are the addresses kitbashd is serving on, empty for one that is
@@ -348,6 +351,10 @@ type healthResponse struct {
 type listeners struct {
 	Socket string `json:"socket,omitempty"`
 	TCP    string `json:"tcp,omitempty"`
+	// Proxy and ProxyTLS are the reverse proxy's, empty on a host with no
+	// domain, which binds neither, see proxy.go.
+	Proxy    string `json:"proxy,omitempty"`
+	ProxyTLS string `json:"proxyTls,omitempty"`
 }
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
@@ -364,6 +371,7 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		Subscribers:     s.fanout.count(),
 		MCPSessions:     s.mcpSessions.count(),
 		Probes:          s.probes.count(),
+		Routes:          s.proxy.count(),
 		LastBackup:      backup.LastBackup,
 		Backups:         backup.Backups,
 		LastBackupError: backup.LastBackupError,

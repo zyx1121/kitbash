@@ -4,9 +4,23 @@
 # credentials, and on TCP 4318, the Process receiver, where the caller is the
 # bearer token kitbashd minted at registration. The host firewall scopes who
 # may reach that port; nothing here installs one.
+#
+# A host given a domain in /etc/conf.d/kitbashd also serves the reverse proxy
+# of every http Process, on 80 and, in acme mode, on 443, see PLAN.md
+# section 2.3.
 
 name="kitbashd"
 description="kitbash daemon: OTLP receiver and Telemetry store"
+
+# OpenRC sources /etc/conf.d/kitbashd before this script runs, which makes
+# every setting in it a shell variable of this script and not part of the
+# environment of the daemon this script starts. kitbashd reads its settings
+# from the environment, the same way a run outside a kitbash host does, so each
+# name is exported here. Exporting one that is unset sets nothing: the daemon
+# sees the variables the conf.d file names and no others.
+export KITBASH_DOMAIN KITBASH_TLS KITBASH_PROXY_LISTEN KITBASH_PROXY_TLS_LISTEN KITBASH_CERTS
+export KITBASH_PUBLIC_ADDRESS KITBASH_GATEWAY_ADDRESS
+export KITBASH_OTLP_LISTEN KITBASH_SECRETS KITBASH_STORE KITBASH_SOCKET KITBASH_NO_RESTORE
 
 supervisor="supervise-daemon"
 command="/usr/bin/kitbashd"
@@ -78,6 +92,11 @@ start_pre() {
 	# here as well means a host running an older binary still has it root owned
 	# and 0700, see PLAN.md section 2.3.
 	checkpath --directory --mode 0700 --owner root:root /var/lib/kitbash/secrets
+	# The certificates the proxy obtains in acme mode. A private key is the
+	# proof this host is the name it serves, so it is kept the way the store
+	# and the secrets are. kitbashd creates this one too; doing it here as well
+	# narrows one an earlier layout left looser, see PLAN.md section 2.3.
+	checkpath --directory --mode 0700 --owner root:root /var/lib/kitbash/certs
 	checkpath --file --mode 0640 --owner root:root /var/log/kitbashd.log
 	# / rshared and one /run/user directory per member, both of which live in
 	# tmpfs and are gone after a reboot. Boot restore starts each registered

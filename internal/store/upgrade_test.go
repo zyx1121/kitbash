@@ -246,6 +246,13 @@ func TestFixtureProcessesListWithTheNewColumnsDefaulted(t *testing.T) {
 				if len(p.Mounts) != 0 {
 					t.Errorf("%s carries the mounts %+v, want none: no release wrote them", p.ID, p.Mounts)
 				}
+				// The host name column arrives with the reverse proxy, so
+				// every fixture reads back without one: that Process is
+				// served under the name kitbashd derives, or under none at
+				// all on a host with no domain.
+				if p.Hostname != "" {
+					t.Errorf("%s carries the host name %q, want none: no release wrote one", p.ID, p.Hostname)
+				}
 			}
 
 			alpha, found, err := s.ProcessByToken(ctx, "fixture-token-alpha")
@@ -344,6 +351,7 @@ func TestMigratedStoreTakesNewWork(t *testing.T) {
 				ID: "01930000-0000-7000-8000-0000000000c1", Owner: "loki",
 				Package: "/org/handbook", Name: "handbook", Container: "kitbash-handbook-2",
 				Digest: "sha256:cccc", Expose: "mcp", Endpoint: "http://127.0.0.1:8082",
+				Hostname:      "status.example.org",
 				Subscriptions: []string{store.SubscriptionTelemetry},
 				Permits:       manifest.Permits{Tools: []string{"fs_read"}, Paths: []string{"/org"}},
 				Mounts: []mounts.Resolved{
@@ -363,6 +371,13 @@ func TestMigratedStoreTakesNewWork(t *testing.T) {
 			if got.Container != want.Container || got.Digest != want.Digest ||
 				got.FanoutSecret != secret || strings.Join(got.Permits.Tools, ",") != "fs_read" {
 				t.Errorf("the new registration reads back as %+v, want the columns it was written with", got)
+			}
+			// The host name is the column an upgraded store gained last. A
+			// Process that reads back without it is one whose address changes
+			// under it at the next boot, because the routing table is built
+			// from these rows, see internal/daemon/proxy.go.
+			if got.Hostname != want.Hostname {
+				t.Errorf("the new registration holds the host name %q, want %q", got.Hostname, want.Hostname)
 			}
 			// The mounts are the column an upgraded store gained last, and a
 			// Process that reads back without them is one that would come

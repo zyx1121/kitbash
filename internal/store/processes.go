@@ -58,12 +58,18 @@ type Process struct {
 	// the runtime holds it under and Digest the image it runs. The last two
 	// are what boot restore needs: with them kitbashd starts a Process again
 	// without reading a manifest, see spec/kitbashd-api.yaml.
-	Package       string    `json:"package"`
-	Name          string    `json:"name"`
-	Container     string    `json:"container"`
-	Digest        string    `json:"digest"`
-	Expose        string    `json:"expose"`
-	Endpoint      string    `json:"endpoint"`
+	Package   string `json:"package"`
+	Name      string `json:"name"`
+	Container string `json:"container"`
+	Digest    string `json:"digest"`
+	Expose    string `json:"expose"`
+	Endpoint  string `json:"endpoint"`
+	// Hostname is the name this Process's unit declared for itself, empty for
+	// one that declared none and is served under the name kitbashd derives.
+	// It travels with the registration because the routing table is rebuilt
+	// from these rows at every start: after a reboot nothing else remembers
+	// which name a Process holds, see PLAN.md section 2.3.
+	Hostname      string    `json:"hostname,omitempty"`
 	Subscriptions []string  `json:"subscriptions"`
 	RegisteredAt  time.Time `json:"registeredAt"`
 	// Runner is the Package path of the run kit that owns this Process, empty
@@ -329,20 +335,21 @@ func (s *Store) RegisterProcess(ctx context.Context, p Process, tokenHash string
 	// The fan out secret is replaced with the token, because the two are minted
 	// together: a container holding the old token holds the old secret.
 	if _, err := tx.ExecContext(ctx, `INSERT INTO processes
-		(id, owner, admin, package, name, container, digest, expose, endpoint,
+		(id, owner, admin, package, name, container, digest, expose, endpoint, hostname,
 		 subscriptions, runner, permits, limits, health, mounts, secrets, token_hash, fanout_secret, registered_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 			owner = excluded.owner, admin = excluded.admin, package = excluded.package,
 			name = excluded.name, container = excluded.container, digest = excluded.digest,
 			expose = excluded.expose, endpoint = excluded.endpoint,
+			hostname = excluded.hostname,
 			subscriptions = excluded.subscriptions, runner = excluded.runner,
 			permits = excluded.permits,
 			limits = excluded.limits, health = excluded.health,
 			mounts = excluded.mounts, secrets = excluded.secrets,
 			token_hash = excluded.token_hash,
 			fanout_secret = excluded.fanout_secret, registered_at = excluded.registered_at`,
-		p.ID, p.Owner, p.Admin, p.Package, p.Name, p.Container, p.Digest, p.Expose, p.Endpoint,
+		p.ID, p.Owner, p.Admin, p.Package, p.Name, p.Container, p.Digest, p.Expose, p.Endpoint, p.Hostname,
 		string(subscriptions), p.Runner, string(permits), limits, health, mounted, named, tokenHash, p.FanoutSecret,
 		p.RegisteredAt.UnixNano()); err != nil {
 		return fmt.Errorf("store: register the Process %s: %w", p.ID, err)
@@ -477,7 +484,7 @@ func (s *Store) Processes(ctx context.Context, owner string) ([]Process, error) 
 
 // processColumns is the one select every read of this table shares.
 const processColumns = `SELECT id, owner, admin, package, name, container, digest,
-	expose, endpoint, subscriptions, runner, permits, limits, health, mounts, secrets, fanout_secret, registered_at`
+	expose, endpoint, hostname, subscriptions, runner, permits, limits, health, mounts, secrets, fanout_secret, registered_at`
 
 // scanner is what both a single row and a row of a result set satisfy.
 type scanner interface {
@@ -489,7 +496,7 @@ func scanProcess(row scanner) (Process, error) {
 	var subscriptions, permits, limits, health, mounted, named string
 	var registered int64
 	if err := row.Scan(&p.ID, &p.Owner, &p.Admin, &p.Package, &p.Name, &p.Container, &p.Digest,
-		&p.Expose, &p.Endpoint, &subscriptions, &p.Runner, &permits, &limits, &health, &mounted,
+		&p.Expose, &p.Endpoint, &p.Hostname, &subscriptions, &p.Runner, &permits, &limits, &health, &mounted,
 		&named, &p.FanoutSecret,
 		&registered); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -594,8 +601,13 @@ func migrate(db *sql.DB) error {
 	// is given the member's values under. A registration written before them
 	// carries none, which is a Process given nothing beyond what kitbashd
 	// speaks for, the way every Process was.
+	// The host name arrives with the reverse proxy: the one name a unit
+	// declared for itself, which kitbashd serves in place of the name it
+	// derives. A registration written before it carries none, which is a
+	// Process served under the derived name and nothing else.
 	for _, column := range []string{
 		"container", "digest", "fanout_secret", "permits", "limits", "runner", "health", "mounts", "secrets",
+		"hostname",
 	} {
 		if err := addTextColumn(db, "processes", column); err != nil {
 			return err

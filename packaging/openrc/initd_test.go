@@ -6,6 +6,7 @@ package openrc
 import (
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -115,5 +116,57 @@ func TestTheRootlessPrerequisitesScriptParses(t *testing.T) {
 		if !strings.Contains(string(body), want) {
 			t.Errorf("%s does not carry %q, which rootless podman needs before any Process starts", prereqsPath, want)
 		}
+	}
+}
+
+// confdPath is the settings file the apk installs as /etc/conf.d/kitbashd.
+const confdPath = "kitbashd.confd"
+
+// OpenRC sources /etc/conf.d/kitbashd into the service script's own shell, and
+// a shell variable is not in the environment of the daemon that script starts.
+// kitbashd reads every setting from its environment, so a name the conf.d file
+// documents and the script does not export is a setting an operator writes and
+// nothing reads, see PLAN.md section 2.3.
+func TestTheServiceScriptExportsEverySettingTheConfdFileDocuments(t *testing.T) {
+	script, err := os.ReadFile(scriptPath)
+	if err != nil {
+		t.Fatalf("reading %s: %v", scriptPath, err)
+	}
+	settings, err := os.ReadFile(confdPath)
+	if err != nil {
+		t.Fatalf("reading %s: %v", confdPath, err)
+	}
+	named := regexp.MustCompile(`(?m)^#?(KITBASH_[A-Z_]+)=`).FindAllStringSubmatch(string(settings), -1)
+	if len(named) == 0 {
+		t.Fatalf("%s documents no setting at all", confdPath)
+	}
+	exported := map[string]bool{}
+	for _, line := range strings.Split(string(script), "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) == 0 || fields[0] != "export" {
+			continue
+		}
+		for _, name := range fields[1:] {
+			exported[name] = true
+		}
+	}
+	for _, match := range named {
+		if !exported[match[1]] {
+			t.Errorf("%s documents %s and %s does not export it, so kitbashd never reads it",
+				confdPath, match[1], scriptPath)
+		}
+	}
+}
+
+// The proxy keeps its certificates beside the store and the secrets, and a
+// private key is the proof this host is the name it serves, so the directory
+// is narrowed here as well as by the daemon.
+func TestTheServiceScriptNarrowsTheCertificateDirectory(t *testing.T) {
+	body, err := os.ReadFile(scriptPath)
+	if err != nil {
+		t.Fatalf("reading %s: %v", scriptPath, err)
+	}
+	if !strings.Contains(string(body), "--mode 0700 --owner root:root /var/lib/kitbash/certs") {
+		t.Errorf("%s does not make /var/lib/kitbash/certs root owned and 0700", scriptPath)
 	}
 }

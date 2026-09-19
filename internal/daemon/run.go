@@ -259,6 +259,16 @@ func (s *Server) startProcess(w http.ResponseWriter, r *http.Request, p store.Pr
 		writeProblem(w, prob)
 		return
 	}
+	// And the name the unit declared is proved again, for the same reason a
+	// secret is resolved again: what it points at is a fact about the world
+	// and not part of the registration. A name that stopped pointing here is a
+	// name this host would serve for nobody and, in acme mode, ask a
+	// certificate authority for, so the start is refused rather than made and
+	// the owner reads why, see hostnames.go.
+	if prob := s.proveHostname(r.Context(), r.URL.Path, p); prob != nil {
+		writeProblem(w, prob)
+		return
+	}
 
 	// The Process gets a cgroup of its own, with its ceiling written by root,
 	// and the container is created under it. A host that cannot place it runs
@@ -340,6 +350,11 @@ func (s *Server) startProcess(w http.ResponseWriter, r *http.Request, p store.Pr
 	if prob := s.trackProbeAs(r.Context(), m, p, r.URL.Path); prob != nil {
 		logger.Printf("health: not probing %s of %s: %s", p.ID, p.Owner, prob.Detail)
 	}
+	// And this is where the name this Process is served under gets the port to
+	// forward to: the container publishes one now, so the routing table reads
+	// it off the runtime rather than waiting for the next restore, see
+	// proxy.go.
+	s.trackRoute(r.Context(), m, p)
 	writeJSON(w, r.URL.Path, startResponse{ID: p.ID, Container: p.Container, ContainerID: id})
 }
 
@@ -351,6 +366,10 @@ func (s *Server) stopProcess(w http.ResponseWriter, r *http.Request, p store.Pro
 		writeProblem(w, s.runProblem(r, err, p, podman.RunOptions{}))
 		return
 	}
+	// The registration stands, so the name stands with it and answers 503:
+	// what a member reads at the address of a Process they stopped is that it
+	// is not running, not that the address is nobody's, see proxy.go.
+	s.trackRoute(r.Context(), m, p)
 	writeJSON(w, r.URL.Path, startResponse{ID: p.ID, Container: p.Container})
 }
 
@@ -367,6 +386,10 @@ func (s *Server) removeProcess(w http.ResponseWriter, r *http.Request, p store.P
 	if err := s.cgroups.RemoveProcess(r.Context(), m.Name, p.ID); err != nil {
 		logger.Printf("cgroups: the cgroup of %s could not be removed: %v", p.ID, err)
 	}
+	// There is no container to forward to any more. The registration may still
+	// be there for a moment, because the session unregisters after this, so
+	// the name is dropped here rather than left pointing at nothing.
+	s.proxy.untrack(p.ID)
 	writeJSON(w, r.URL.Path, startResponse{ID: p.ID, Container: p.Container})
 }
 

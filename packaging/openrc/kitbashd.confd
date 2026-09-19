@@ -1,0 +1,58 @@
+# /etc/conf.d/kitbashd: what this host tells kitbashd about itself.
+#
+# OpenRC sources this file before it starts the daemon, and the service script
+# exports every name below, so what is set here is what kitbashd reads from its
+# environment. deploy/install.sh writes KITBASH_DOMAIN and KITBASH_TLS here
+# when it is run with them set; everything else is a hand edit.
+#
+# Restart the daemon after a change: rc-service kitbashd restart.
+
+# The domain every http Process is served under, see PLAN.md section 2.3.
+# With one, a Process is reached at https://<name>.<member>.<domain>, or at the
+# hostname its unit declared, and kitbashd is the reverse proxy in front of it.
+# The DNS record for the domain and everything below it points at this host's
+# public address, or at a gateway that forwards 80 and 443 to it.
+#
+# Empty is a host with no route from the outside: nothing is routed and an
+# http Process keeps its internal port, which is how kitbash worked before the
+# proxy existed.
+#KITBASH_DOMAIN="kitbash.example.org"
+
+# How this host terminates TLS. acme, the default with a domain, listens on 80
+# and 443 and obtains one certificate per host name from Let's Encrypt, which
+# needs 80 and 443 reachable from the internet. gateway listens on 80 alone and
+# trusts the Host a gateway that already terminated TLS forwards, which is how
+# a host behind one public address is put on the internet.
+#KITBASH_TLS="acme"
+
+# The address the proxy is reached on from outside this host. It is what a
+# unit's declared hostname is proved against: kitbashd resolves that name and
+# serves it only when it points here. In gateway mode this host's own addresses
+# are behind the gateway, so a host that is not told this one serves no
+# declared hostname at all; under KITBASH_DOMAIN nothing changes, because those
+# names are the host's own.
+#KITBASH_PUBLIC_ADDRESS="203.0.113.9"
+
+# In gateway mode, the address the gateway forwards from. deploy/install.sh
+# narrows the nftables accept on 80 to it when it is set, so the proxy is
+# reachable through the gateway and from nowhere else.
+#KITBASH_GATEWAY_ADDRESS="203.0.113.10"
+
+# Where the proxy listens. Both are every interface by default, which is what a
+# host with a domain wants; name an address to narrow it.
+#KITBASH_PROXY_LISTEN=":80"
+#KITBASH_PROXY_TLS_LISTEN=":443"
+
+# Where the certificates of acme mode are cached, root owned and 0700.
+#KITBASH_CERTS="/var/lib/kitbash/certs"
+
+# The Process receiver, the address rootless containers export Telemetry to.
+# The nftables ruleset deploy/install.sh writes keeps it off the wire.
+#KITBASH_OTLP_LISTEN="0.0.0.0:4318"
+
+# Where the values members set with secrets_set are kept, and the store.
+#KITBASH_SECRETS="/var/lib/kitbash/secrets"
+#KITBASH_STORE="/var/lib/kitbash/kitbashd.db"
+
+# Bring the host up without starting the registered Processes.
+#KITBASH_NO_RESTORE="1"
