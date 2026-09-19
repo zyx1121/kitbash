@@ -43,8 +43,14 @@ What a round does, in order:
    configuration directory, one MCP server and no other, and a tool list.
 4. Verifies each run with the sentence's check, which reads the outcome on the
    host and never the transcript.
-5. Removes the member with `users_remove`, which takes their Processes, files
-   and secrets with them, and deletes the key.
+5. Stops the member's Processes, clears the immutable flag the mount fault
+   sets, removes the member with `users_remove`, which takes their Processes,
+   files and secrets with them, and deletes the key. The two steps before the
+   removal are there because of what the first round found: a removal of a
+   member holding seventeen Processes outruns `kitbash-mcp`'s client deadline,
+   and the archive it makes chowns the home, which an immutable file refuses.
+   A removal that answers an error is believed only after `users_list` is
+   asked, because the call can fail once the account is already gone.
 
 A round is resumable. A run whose row is already on disk is skipped, and the
 member and its key are named in `round.json`, so a round cut off by a usage

@@ -346,13 +346,32 @@ class Round:
         # the home by chowning it, which an immutable file refuses. The flag
         # the bench set is the bench's to clear.
         hostops.ssh(self.root_alias, "chattr -R -i /home/%s 2>/dev/null; true" % name)
+        # A removal of a member holding a round's worth of Processes takes
+        # longer than kitbash-mcp's client deadline, and the cancellation stops
+        # userdel halfway, so the Processes are stopped over the surface first.
+        try:
+            with self.session() as session:
+                for process in session.call("proc_list", {}).get("processes") or []:
+                    try:
+                        session.call("proc_stop", {"id": process["id"]})
+                    except mcp.McpError:
+                        pass
+        except Exception as exc:
+            self.log("could not stop the member's Processes first: %s" % str(exc)[:200])
         self.log("removing member %s, which takes its Processes, files and secrets with it" % name)
         try:
             answer = self.admin_call("users_remove", {"name": name})
             self.state["removed"] = answer
         except mcp.McpError as exc:
             self.log("users_remove refused: %s" % exc.detail[:300])
-            return
+            # The call can fail after the account is already gone, so what the
+            # listing says is what is believed.
+            if self.member_exists(name):
+                self.state["removal_failed"] = exc.detail[:300]
+                self.save_state()
+                return
+            self.log("the listing no longer has %s, so the removal did happen" % name)
+            self.state["removed"] = {"user": name, "note": "users_remove answered an error after the fact"}
         for suffix in ("", ".pub"):
             path = (self.state.get("key") or "") + suffix
             if path and os.path.exists(path):
