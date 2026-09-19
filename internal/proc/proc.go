@@ -46,13 +46,17 @@ const (
 
 // Process is one running or stopped Package.
 type Process struct {
-	ID        string   `json:"id"`
-	Name      string   `json:"name"`
-	Package   string   `json:"package"`
-	Digest    string   `json:"digest"`
-	State     string   `json:"state"`
-	Expose    string   `json:"expose,omitempty"`
-	Endpoint  string   `json:"endpoint,omitempty"`
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Package  string `json:"package"`
+	Digest   string `json:"digest"`
+	State    string `json:"state"`
+	Expose   string `json:"expose,omitempty"`
+	Endpoint string `json:"endpoint,omitempty"`
+	// URL is the address kitbashd's proxy serves an http Process at, when the
+	// host has a domain. It is empty on a host without one, and on every
+	// Process that is not exposed as http.
+	URL       string   `json:"url,omitempty"`
 	StartedAt string   `json:"startedAt,omitempty"`
 	Tools     []string `json:"tools,omitempty"`
 	// Problem is why a Process that is not running did not come back, as
@@ -98,6 +102,53 @@ type Health struct {
 // ListResult is the output of proc_list.
 type ListResult struct {
 	Processes []Process `json:"processes"`
+}
+
+// Line is one Process as proc_list answers when it was asked about no Package
+// in particular: enough to say what is running and to ask about one of them by
+// id. Everything else is the answer to a narrower question, which is proc_list
+// with a package, see PLAN.md section 4.5.
+type Line struct {
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Package string `json:"package"`
+	State   string `json:"state"`
+	Expose  string `json:"expose,omitempty"`
+	URL     string `json:"url,omitempty"`
+}
+
+// LinesResult is the output of proc_list without a package.
+type LinesResult struct {
+	Processes []Line `json:"processes"`
+}
+
+// Lines is this listing one line per Process.
+func (r *ListResult) Lines() *LinesResult {
+	out := &LinesResult{Processes: make([]Line, 0, len(r.Processes))}
+	for _, p := range r.Processes {
+		out.Processes = append(out.Processes, Line{
+			ID:      p.ID,
+			Name:    p.Name,
+			Package: p.Package,
+			State:   p.State,
+			Expose:  p.Expose,
+			URL:     p.URL,
+		})
+	}
+	return out
+}
+
+// OfPackage is this listing narrowed to one Package, in full. A path naming no
+// Process answers an empty listing rather than a problem: what a member asked
+// is which Processes that Package has, and none is an answer.
+func (r *ListResult) OfPackage(path string) *ListResult {
+	out := &ListResult{Processes: []Process{}}
+	for _, p := range r.Processes {
+		if p.Package == path {
+			out.Processes = append(out.Processes, p)
+		}
+	}
+	return out
 }
 
 // StopResult is the output of proc_stop.

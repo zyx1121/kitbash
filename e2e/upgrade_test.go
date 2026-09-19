@@ -118,7 +118,8 @@ func TestUpgradeCurrentRelease(t *testing.T) {
 			State   string `json:"state"`
 		} `json:"processes"`
 	}
-	admin.ok("proc_list", map[string]any{}, &list)
+	// With the Package, so the registration is read back in full.
+	admin.ok("proc_list", map[string]any{"package": want.Package}, &list)
 	var found bool
 	for _, process := range list.Processes {
 		if process.ID != want.ID {

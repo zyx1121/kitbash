@@ -197,22 +197,29 @@ $package_tools:
 $defs:
   folderEntry:
     type: object
-    required: [path, name, description]
+    required: [path, name]
     properties:
       path: { type: string }
       name: { type: string }
-      description: { type: string }
-      tags: { type: array, items: { type: string } }
-      package: { type: boolean, description: "true when the manifest carries a deploy block" }
+      description: { type: string, description: "From the folder's own kitbash.yaml; absent for a folder inside a Package, which the Package describes" }
   fileEntry:
     type: object
-    required: [path, name, size, mediaType]
+    required: [name, size]
     properties:
-      path: { type: string }
       name: { type: string }
       size: { type: integer }
-      mediaType: { type: string, description: "IANA media type guessed from extension and sniffing" }
-      modified: { type: string, format: date-time }
+  writeFile:
+    description: One file of an fs_write that carries a list. Exactly one of content and contentBase64 is set.
+    type: object
+    additionalProperties: false
+    required: [path]
+    oneOf:
+      - required: [content]
+      - required: [contentBase64]
+    properties:
+      path: { type: string, description: "Absolute path, under the same top level folder as every other file of this call" }
+      content: { type: string, description: "UTF-8 text" }
+      contentBase64: { type: string, contentEncoding: base64 }
   importFile:
     description: One file an import kit hands back. Exactly one of content and contentBase64 is set.
     type: object
@@ -291,12 +298,21 @@ families:
       fs_list:
         description: >
           List what is visible at a path. With no path, returns the visible top
-          level folders across /org and the caller's home. A root path itself is
-          the same roots view: /org and /home/<caller> carry no manifest and are
-          always listable, returning their visible children. Inside any other
-          folder, returns visible subfolders (name and description only, no
-          contents) and the files directly in it. Folders without a manifest are
-          omitted.
+          level folders across /org and the caller's home, one line of path,
+          name and description each and no files. A root path itself is the
+          same roots view of that root: /org and /home/<caller> carry no
+          manifest and are always listable, returning their visible children.
+          A top level folder is visible only by a manifest of its own, because
+          there is nothing above it to inherit one from.
+          Inside any other folder, returns its subfolders and the files
+          directly in it, each file as a name and a size. A folder is visible
+          when it or a folder above it carries a kitbash.yaml with a name and a
+          description, so the folders inside a Package are listed and need no
+          manifest of their own; one that carries a manifest is described by
+          it, and one that does not is listed by its own name. The manifest in
+          the answer is the one this folder carries itself, absent at the roots
+          and inside a Package. Every folder with no manifest anywhere above it
+          is omitted.
         input:
           type: object
           additionalProperties: false
@@ -304,12 +320,12 @@ families:
             path: { type: string, description: "Absolute folder path. Omit for the roots." }
         output:
           type: object
-          required: [path, folders, files]
+          required: [path, folders]
           properties:
             path: { type: string }
-            manifest: { description: "This folder's parsed kitbash.yaml, absent at the roots", type: object }
+            manifest: { description: "The kitbash.yaml this folder carries itself, absent at the roots and inside a Package", type: object }
             folders: { type: array, items: { $ref: "#/$defs/folderEntry" } }
-            files: { type: array, items: { $ref: "#/$defs/fileEntry" } }
+            files: { type: array, description: "The files directly in this folder, absent at the roots and for a folder that holds none", items: { $ref: "#/$defs/fileEntry" } }
         errors: [not-found, not-visible, not-permitted, invalid-path, internal]
 
       fs_read:
@@ -346,35 +362,68 @@ families:
 
       fs_write:
         description: >
-          Create or replace one file and commit it to the enclosing top level
-          repository, attributed to the caller. Writing kitbash.yaml into a new
-          folder is how a folder becomes visible; the manifest is validated
-          against spec/manifest.schema.json before commit. Binary content is
-          base64. Pass expectedSha to refuse the write if the file changed since
-          it was read.
+          Create or replace files and commit them to the enclosing top level
+          repository, attributed to the caller. Either one file named by path
+          with content or contentBase64, or up to 64 of them in files, all
+          under one top level folder and 16 MiB in total; either way the call
+          is one commit, because a Package is several files that belong
+          together and the history should say so. A call carrying both forms is
+          bad-request, and so is one whose files name two top level folders or
+          name one path twice.
+          Writing kitbash.yaml into a new folder is how a folder becomes
+          visible, and the folders inside it need no manifest of their own; a
+          manifest is written into a visible folder or into a root, and it is
+          validated against spec/manifest.schema.json before commit. A manifest
+          in the same list counts as written while the list is judged, so one
+          call writes a Package's kitbash.yaml and the files beneath it in any
+          order. Binary content is base64. Pass expectedSha to refuse the write
+          if the file, or for a list the repository's head, changed since it was
+          read.
+          A list is refused whole: one path the caller may not write is a call
+          that did not happen, and nothing of it reaches the disk.
           A member writing under /org does not fail: the call is queued for
-          an admin and the result is a queued problem (202) whose instance is
-          the approval id; approvals_list shows the outcome once an admin decides.
+          an admin as one approval whatever it carries, and the result is a
+          queued problem (202) whose instance is the approval id;
+          approvals_list shows the outcome once an admin decides.
         input:
           type: object
           additionalProperties: false
-          required: [path, message]
+          required: [message]
           oneOf:
-            - required: [content]
-            - required: [contentBase64]
+            - required: [path]
+              not: { required: [files] }
+              oneOf:
+                - required: [content]
+                - required: [contentBase64]
+            - required: [files]
+              not:
+                anyOf:
+                  - required: [path]
+                  - required: [content]
+                  - required: [contentBase64]
           properties:
             path: { type: string }
             content: { type: string, description: "UTF-8 text" }
             contentBase64: { type: string, contentEncoding: base64 }
+            files:
+              type: array
+              minItems: 1
+              maxItems: 64
+              description: "Several files as one commit, all under one top level folder, 16 MiB in total"
+              items: { $ref: "#/$defs/writeFile" }
             message: { type: string, minLength: 3, maxLength: 200, description: "Commit message, imperative mood" }
-            expectedSha: { type: string, description: "Last known commit sha for this file; optimistic lock" }
+            expectedSha: { type: string, description: "Last known commit sha; optimistic lock, read against the file for one path and against the repository head for a list" }
         output:
           type: object
-          required: [path, commit]
+          required: [commit]
+          oneOf:
+            - required: [path]
+            - required: [paths]
           properties:
-            path: { type: string }
+            path: { type: string, description: "The file that was written, for the one file form" }
+            paths: { type: array, items: { type: string }, description: "The files that were written, for a list" }
             commit: { $ref: "#/$defs/commit" }
-        errors: [bad-request, not-permitted, invalid-path, invalid-manifest, too-large, conflict, queued, internal]
+        errors: [bad-request, not-visible, not-permitted, invalid-path, invalid-manifest, too-large, conflict, queued, internal]
 
       fs_history:
         description: List commits that touched a path, newest first.
@@ -404,7 +453,8 @@ families:
           rootless container runtime. The digest is the OCI image ID. The image
           is labelled kitbash.path, kitbash.name, kitbash.commit and
           kitbash.user, which is the whole build record. Only the tail of the
-          build log is returned; the full log never leaves the host. A build
+          build log is returned, its last 20 lines and at most 2 KiB; the full
+          log never leaves the host. A build
           that runs and fails is bad-request carrying that same tail, because
           the build context is the caller's to fix; a runtime that will not run
           at all is internal. An uncommitted change under the path is conflict:
@@ -463,9 +513,13 @@ families:
         errors: [bad-request, not-found, not-permitted, invalid-path, invalid-manifest, conflict, too-large, queued, internal]
       pkg_list:
         description: >
-          Packages visible to the caller with their latest built digest, if
-          any. Walks the visible folders under /org and the caller's home and
-          keeps those whose manifest carries a deploy block.
+          Packages visible to the caller: path, name and the digest of the
+          latest build, if any. Walks the visible folders under /org and the
+          caller's home and keeps those whose manifest carries a deploy block,
+          and enters only folders that carry a manifest of their own, so the
+          folders inside a Package are not walked. When a Package was built is
+          pkg_inspect's answer and how many Processes it has is proc_list's, so
+          neither is repeated per Package here.
         input: { type: object, additionalProperties: false, properties: {} }
         output:
           type: object
@@ -479,9 +533,7 @@ families:
                 properties:
                   path: { type: string }
                   name: { type: string }
-                  digest: { type: string }
-                  builtAt: { type: string, format: date-time }
-                  running: { type: integer, description: "Number of Processes of this Package" }
+                  digest: { type: string, description: "The latest build, absent for a Package nothing has built" }
       pkg_inspect:
         description: >
           Manifest, build history and provenance of one Package. Builds are
@@ -614,7 +666,13 @@ families:
       proc_list:
         description: >
           Processes owned by the caller, running or stopped. Admins see all
-          from M5. The container runtime holds the state; a Process kitbashd
+          from M5. With a package it answers that Package's Processes in full,
+          and without one it answers every Process as a single line of id,
+          name, package, state, exposure and, for an http Process on a host
+          with a domain, its url, which is what naming one to ask about takes.
+          A package naming no Process answers an empty listing rather than a
+          problem. The runtime is read once either way.
+          The container runtime holds the state; a Process kitbashd
           could not bring back at the last boot is reported failed with
           problem and fix, because its container sits in the runtime looking
           like one on its way up, see restore in spec/kitbashd-api.yaml. A
@@ -623,23 +681,31 @@ families:
           mounts carries them as kitbashd resolved them, which is how a member
           reads what folders of Files their Process can see; one whose mount is
           no longer legal is reported failed with that as its problem.
-        input: { type: object, additionalProperties: false, properties: {} }
+        input:
+          type: object
+          additionalProperties: false
+          properties:
+            package: { type: string, description: "Package path. Omit for one line per Process." }
         output:
           type: object
           required: [processes]
+          description: >
+            One line per Process without a package, and the full shape below
+            with one.
           properties:
             processes:
               type: array
               items:
                 type: object
-                required: [id, name, package, digest, state]
+                required: [id, name, package, state]
                 properties:
                   id: { type: string }
                   name: { type: string }
                   package: { type: string }
-                  digest: { type: string }
+                  digest: { type: string, description: "Absent from a line" }
                   state: { type: string, enum: [starting, running, unhealthy, stopped, failed] }
                   expose: { type: string, enum: [mcp, http, none] }
+                  url: { type: string, description: "Where an http Process is served, when the host has a domain" }
                   startedAt: { type: string, format: date-time }
                   problem: { type: string, description: "Why this Process is not running, when kitbashd could not bring it back" }
                   fix: { type: string, description: "What the owner can do about it" }

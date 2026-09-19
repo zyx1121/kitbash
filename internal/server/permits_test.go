@@ -250,6 +250,40 @@ description: A folder the Process may see the name of and nothing else.
 	}), "fs_read")
 }
 
+// TestPermitsRefuseAListedPathOutsideThePrefixes is the same rule read over
+// fs_write's list: the paths are in files rather than in path, and a guard
+// that looked only at path would let a Process permitted one folder write
+// every folder of its owner's home in one call.
+func TestPermitsRefuseAListedPathOutsideThePrefixes(t *testing.T) {
+	n := serveNarrowed(t, func(w *whole) *manifest.Permits {
+		return &manifest.Permits{Tools: []string{"fs_write"}, Paths: []string{w.folder}}
+	})
+
+	outside := filepath.Join(n.root, "elsewhere", "notes.md")
+	p := refused(t, call(t, n.session, "fs_write", map[string]any{
+		"files": []map[string]any{
+			{"path": filepath.Join(n.folder, "inside.md"), "content": "allowed\n"},
+			{"path": outside, "content": "not for the Process\n"},
+		},
+		"message": "Write inside and outside at once",
+	}), server.PermitsPathFix)
+	if p.Instance != outside {
+		t.Errorf("instance is %q, want the path that was refused", p.Instance)
+	}
+	if _, err := os.Stat(filepath.Join(n.folder, "inside.md")); err == nil {
+		t.Error("the refused call wrote the file it was permitted")
+	}
+
+	// A list inside the prefix is written, so the guard narrows the call
+	// rather than closing the form.
+	ok(t, call(t, n.session, "fs_write", map[string]any{
+		"files": []map[string]any{
+			{"path": filepath.Join(n.folder, "inside.md"), "content": "allowed\n"},
+		},
+		"message": "Write one file inside the prefix",
+	}), "fs_write")
+}
+
 // TestPermitsWithoutAPathRefuseEveryToolThatTakesOne: a Package that says
 // which tools it wants and not where may call none of them on a path, and the
 // tools that name nothing are unaffected.

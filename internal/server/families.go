@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"path/filepath"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -21,8 +22,8 @@ func RegisterPackages(s *mcp.Server, packages *pkg.Service) {
 		Description: "Build the Package at path from its current commit with the caller's rootless container " +
 			"runtime. The digest is the OCI image ID. The image is labelled kitbash.path, kitbash.name, " +
 			"kitbash.commit and kitbash.user, which is the whole build record. Only the tail of the build log " +
-			"is returned; the full log never leaves the host. A build that runs and fails returns that same " +
-			"tail as a bad-request. kitbash builds from a commit, so an uncommitted change under the path is " +
+			"is returned, its last 20 lines; the full log never leaves the host. A build that runs and " +
+			"fails returns that same tail as a bad-request. kitbash builds from a commit, so an uncommitted change under the path is " +
 			"a conflict. Version 1 supports one container unit per Package. A unit with build is built from " +
 			"its context; a unit with image is pulled by digest and relabelled through a one line " +
 			"Containerfile so the result carries the same labels and its own image ID. A unit whose builder " +
@@ -45,9 +46,9 @@ func RegisterPackages(s *mcp.Server, packages *pkg.Service) {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "pkg_list",
-		Description: "Packages visible to the caller with their latest built digest, if any. Walks the " +
-			"visible folders under /org and the caller's home and keeps those whose manifest carries a " +
-			"deploy block.",
+		Description: "Packages visible to the caller: path, name and the digest of the latest build, if " +
+			"any. Walks the visible folders under /org and the caller's home and keeps those whose " +
+			"manifest carries a deploy block. pkg_inspect reads the build history of one of them.",
 		InputSchema:  pkgListInputSchema,
 		OutputSchema: pkgListOutputSchema,
 	}, packagesHandler(packages))
@@ -88,8 +89,11 @@ func RegisterProcesses(s *mcp.Server, processes *proc.Service, b *bridge.Bridge)
 	}, runHandler(processes, b))
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name:         "proc_list",
-		Description:  "Processes owned by the caller, running or stopped.",
+		Name: "proc_list",
+		Description: "Processes owned by the caller, running or stopped. With a package, only that " +
+			"Package's Processes, each in full: digest, when it started, why it is not running, its " +
+			"mounts and its last health probe. Without one, every Process as a single line of id, name, " +
+			"package, state and exposure, which is what naming one to ask about takes.",
 		InputSchema:  procListInputSchema,
 		OutputSchema: procListOutputSchema,
 	}, processesHandler(processes))
@@ -264,6 +268,12 @@ type importInput struct {
 }
 
 type emptyInput struct{}
+
+// packageInput is proc_list's optional filter: the Package whose Processes the
+// caller is asking about.
+type packageInput struct {
+	Package string `json:"package,omitempty"`
+}
 
 type runInput struct {
 	Package string `json:"package"`
@@ -490,13 +500,18 @@ func runHandler(processes *proc.Service, b *bridge.Bridge) mcp.ToolHandlerFor[ru
 	}
 }
 
-func processesHandler(processes *proc.Service) mcp.ToolHandlerFor[emptyInput, any] {
-	return func(ctx context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, any, error) {
+// processesHandler answers proc_list in its two shapes. The runtime is read
+// once either way: what a package narrows is the answer, not the work.
+func processesHandler(processes *proc.Service) mcp.ToolHandlerFor[packageInput, any] {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, in packageInput) (*mcp.CallToolResult, any, error) {
 		out, prob := processes.List(ctx)
 		if prob != nil {
 			return errorResult(prob), nil, nil
 		}
-		return structuredResult(out)
+		if in.Package != "" {
+			return structuredResult(out.OfPackage(filepath.Clean(in.Package)))
+		}
+		return structuredResult(out.Lines())
 	}
 }
 

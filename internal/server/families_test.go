@@ -319,3 +319,84 @@ func TestPkgImportWithoutAKitIsNotFound(t *testing.T) {
 		t.Errorf("fix is %q, want it to name an import kit", p.Fix)
 	}
 }
+
+// TestProcListAnswersLinesAndPackageDetail is every answer being the size of
+// the question, see PLAN.md section 4.5: without a package the listing is one
+// line per Process, and with one it is that Package's Processes in full.
+func TestProcListAnswersLinesAndPackageDetail(t *testing.T) {
+	w := newWhole(t)
+	s := connectWhole(t, w)
+
+	ok(t, call(t, s, "fs_write", map[string]any{
+		"files": []map[string]any{
+			{"path": filepath.Join(w.folder, "kitbash.yaml"), "content": packageManifest},
+			{"path": filepath.Join(w.folder, "Containerfile"), "content": "FROM alpine\n"},
+		},
+		"message": "Add the ffmpeg Package",
+	}), "fs_write")
+	built := structured[pkg.BuildResult](t, call(t, s, "pkg_build", map[string]any{"path": w.folder}))
+	res := call(t, s, "proc_run", map[string]any{"package": w.folder, "digest": built.Digest})
+	ok(t, res, "proc_run")
+	process := structured[proc.Process](t, res)
+
+	res = call(t, s, "proc_list", map[string]any{})
+	ok(t, res, "proc_list")
+	lines := structured[proc.LinesResult](t, res)
+	if len(lines.Processes) != 1 || lines.Processes[0].ID != process.ID {
+		t.Fatalf("proc_list is %+v, want one line for the one Process", lines.Processes)
+	}
+	if lines.Processes[0].Package != w.folder || lines.Processes[0].State != proc.StateRunning {
+		t.Errorf("the line is %+v, want it to name the Package and the state", lines.Processes[0])
+	}
+	body := textOf(t, res)
+	for _, absent := range []string{"digest", "startedAt", "tools"} {
+		if strings.Contains(body, absent) {
+			t.Errorf("a line carries %s: %s", absent, body)
+		}
+	}
+
+	res = call(t, s, "proc_list", map[string]any{"package": w.folder})
+	ok(t, res, "proc_list")
+	full := structured[proc.ListResult](t, res)
+	if len(full.Processes) != 1 || full.Processes[0].Digest != built.Digest {
+		t.Errorf("proc_list of the Package is %+v, want the Process in full", full.Processes)
+	}
+
+	// A Package with no Processes is an empty listing rather than a problem:
+	// none is an answer to which Processes it has.
+	res = call(t, s, "proc_list", map[string]any{"package": filepath.Join(w.root, "nothing")})
+	ok(t, res, "proc_list")
+	if got := structured[proc.ListResult](t, res); len(got.Processes) != 0 {
+		t.Errorf("proc_list of a Package with no Processes is %+v, want none", got.Processes)
+	}
+}
+
+// TestPkgListIsPathNameAndDigest holds pkg_list to what choosing a Package to
+// build or run takes. When it was built is pkg_inspect's answer and how many
+// Processes it has is proc_list's.
+func TestPkgListIsPathNameAndDigest(t *testing.T) {
+	w := newWhole(t)
+	s := connectWhole(t, w)
+
+	ok(t, call(t, s, "fs_write", map[string]any{
+		"files": []map[string]any{
+			{"path": filepath.Join(w.folder, "kitbash.yaml"), "content": packageManifest},
+			{"path": filepath.Join(w.folder, "Containerfile"), "content": "FROM alpine\n"},
+		},
+		"message": "Add the ffmpeg Package",
+	}), "fs_write")
+	built := structured[pkg.BuildResult](t, call(t, s, "pkg_build", map[string]any{"path": w.folder}))
+
+	res := call(t, s, "pkg_list", map[string]any{})
+	ok(t, res, "pkg_list")
+	list := structured[pkg.ListResult](t, res)
+	if len(list.Packages) != 1 || list.Packages[0].Digest != built.Digest {
+		t.Fatalf("pkg_list is %+v, want the built Package", list.Packages)
+	}
+	body := textOf(t, res)
+	for _, absent := range []string{"builtAt", "running"} {
+		if strings.Contains(body, absent) {
+			t.Errorf("pkg_list carries %s: %s", absent, body)
+		}
+	}
+}

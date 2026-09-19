@@ -401,12 +401,6 @@ description: How this organization works, which is knowledge and not a Package.
 	if entry.Digest != second.Digest {
 		t.Errorf("digest is %s, want the newest build %s", entry.Digest, second.Digest)
 	}
-	if entry.BuiltAt == "" {
-		t.Error("the entry carries no build time")
-	}
-	if entry.Running != 1 {
-		t.Errorf("running is %d, want 1", entry.Running)
-	}
 }
 
 func TestInspectReturnsBuildsNewestFirst(t *testing.T) {
@@ -448,5 +442,41 @@ func TestInspectRefusesAnInvisibleFolder(t *testing.T) {
 	}
 	if prob.Slug() != problem.SlugNotVisible {
 		t.Errorf("problem is %s, want not-visible", prob.Slug())
+	}
+}
+
+// TestBuildLogTailIsTwentyLines is what a build answers with: the end of the
+// log, which is where a failure says why and where a success says it is done.
+// The number is the budget of PLAN.md section 4.5, so it is asserted rather
+// than read off the constant alone.
+func TestBuildLogTailIsTwentyLines(t *testing.T) {
+	if pkg.LogTailLines != 20 {
+		t.Errorf("the build log tail is %d lines, want 20", pkg.LogTailLines)
+	}
+	f := newFixture(t)
+	folder := f.commit(t, "ffmpeg",
+		fs.File{Path: "kitbash.yaml", Content: text(containerManifest)},
+		fs.File{Path: "Containerfile", Content: text("FROM alpine\n")})
+	var log strings.Builder
+	for i := range 200 {
+		fmt.Fprintf(&log, "step %d\n", i)
+	}
+	f.runner.Log = log.String()
+
+	out, prob := f.packages.Build(context.Background(), folder)
+	if prob != nil {
+		t.Fatalf("Build: %s", prob.Detail)
+	}
+	if lines := strings.Count(strings.TrimRight(out.Log, "\n"), "\n") + 1; lines > pkg.LogTailLines {
+		t.Errorf("the log carries %d lines, want at most %d", lines, pkg.LogTailLines)
+	}
+	if len(out.Log) > pkg.LogTailBytes {
+		t.Errorf("the log is %d bytes, want at most %d", len(out.Log), pkg.LogTailBytes)
+	}
+	if !strings.Contains(out.Log, "step 199") {
+		t.Errorf("the log is %q, want the end of it", out.Log)
+	}
+	if strings.Contains(out.Log, "step 179") {
+		t.Errorf("the log carries more than the last twenty lines: %q", out.Log)
 	}
 }

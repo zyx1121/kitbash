@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -82,6 +83,64 @@ func TestUsersAndApprovalsSchemasMatchTheSurfaceSpecification(t *testing.T) {
 		t.Run(tc.tool+" "+tc.side, func(t *testing.T) {
 			matches(t, tc.got, dig(t, surface, "families", tc.family, "tools", tc.tool, tc.side))
 		})
+	}
+}
+
+// The fs family is this server's own, and the schemas below are the whole
+// wire contract of it, so they are diffed against spec/mcp-surface.yaml the
+// way the forwarded families are: a shape that changed in one place and not in
+// the other is a specification nobody can trust, see PLAN.md section 4.5.
+func TestFsSchemasMatchTheSurfaceSpecification(t *testing.T) {
+	surface := readSurface(t)
+	cases := []struct {
+		family string
+		tool   string
+		side   string
+		got    string
+	}{
+		{"fs", "fs_list", "input", string(listInputSchema)},
+		{"fs", "fs_list", "output", string(listOutputSchema)},
+		{"fs", "fs_write", "input", string(writeInputSchema)},
+		{"fs", "fs_write", "output", string(writeOutputSchema)},
+		{"fs", "fs_history", "input", string(historyInputSchema)},
+		{"fs", "fs_history", "output", string(historyOutputSchema)},
+		{"pkg", "pkg_list", "output", string(pkgListOutputSchema)},
+		{"proc", "proc_list", "input", string(procListInputSchema)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.tool+" "+tc.side, func(t *testing.T) {
+			matches(t, tc.got, resolve(t, surface, dig(t, surface, "families", tc.family, "tools", tc.tool, tc.side)))
+		})
+	}
+}
+
+// resolve replaces every {"$ref": "#/$defs/x"} with the definition it names.
+// The specification factors the shapes it repeats and the transcription writes
+// them out, so the two are compared as the documents a client reads.
+func resolve(t *testing.T, surface map[string]any, node any) any {
+	t.Helper()
+	switch value := normalise(t, node).(type) {
+	case map[string]any:
+		if ref, held := value["$ref"].(string); held {
+			name, found := strings.CutPrefix(ref, "#/$defs/")
+			if !found {
+				t.Fatalf("%s holds a reference this test cannot resolve: %s", surfacePath, ref)
+			}
+			return resolve(t, surface, dig(t, surface, "$defs", name))
+		}
+		out := map[string]any{}
+		for key, child := range value {
+			out[key] = resolve(t, surface, child)
+		}
+		return out
+	case []any:
+		out := make([]any, 0, len(value))
+		for _, child := range value {
+			out = append(out, resolve(t, surface, child))
+		}
+		return out
+	default:
+		return value
 	}
 }
 

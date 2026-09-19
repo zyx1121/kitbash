@@ -218,15 +218,20 @@ func LoadBelow(root, rel string) (*Manifest, error) {
 // returned when it is visible.
 func Visible(dir string) (*Manifest, bool) { return VisibleBelow(dir, ".") }
 
-// VisibleChain is the whole visibility rule: a folder is on the surface only
-// when it and every folder between it and its root carry a manifest with a
-// name and a description. Naming a folder deep inside an invisible one does not
-// defeat progressive disclosure, see PLAN.md section 2.1.
+// VisibleChain is the whole visibility rule: a folder is on the surface when
+// it, or any folder between it and its root, carries a manifest with a name
+// and a description, and the nearest of those manifests is the one that speaks
+// for it. The folders inside a Package, src, public, deploy, are part of what
+// the Package's manifest describes and need none of their own; a nested
+// kitbash.yaml only begins a new description where one is wanted. A folder
+// with no manifest anywhere above it does not exist as far as the surface is
+// concerned, see PLAN.md section 2.1.
 //
-// It answers the manifest of the folder itself, and, when the chain is broken,
-// the folder that broke it, relative to the root, so the caller names that one
-// rather than the one that was asked for. The check starts at the folder and
-// walks upwards, so the answer is the innermost invisible folder.
+// It answers the nearest manifest and the folder that carries it, relative to
+// the root, so a caller knows which folder is speaking. When there is none it
+// answers the top level folder the walk ended at instead, because that is the
+// folder a manifest has to be written into for anything below it to be
+// readable.
 //
 // The root itself carries no manifest and is not part of the chain: a root is
 // a folder the host configured, not one a caller wrote. rel of "." therefore
@@ -235,21 +240,42 @@ func Visible(dir string) (*Manifest, bool) { return VisibleBelow(dir, ".") }
 // It is one function because it is one rule: the fs family reads by it and a
 // Process is given a folder by it, and two implementations of it would be two
 // rules, see internal/mounts.
-func VisibleChain(root, rel string) (m *Manifest, blocked string, ok bool) {
+func VisibleChain(root, rel string) (m *Manifest, folder string, ok bool) {
+	return VisibleChainWith(root, rel, nil)
+}
+
+// VisibleChainWith is VisibleChain with the manifests a call is about to write
+// counted as present. carries reports whether a folder, named relative to the
+// root, gets a manifest from this call; a nil carries is the rule read against
+// the filesystem alone.
+//
+// It exists because one fs_write may hold the manifest of a Package and the
+// files beneath it, and the folder those files are in is visible because of a
+// manifest in the same call, see internal/fs. It is the same walk rather than
+// a second rule.
+func VisibleChainWith(root, rel string, carries func(rel string) bool) (m *Manifest, folder string, ok bool) {
 	rel = filepath.Clean(rel)
 	if rel == "." || rel == "" || rel == string(filepath.Separator) {
 		return nil, ".", false
 	}
-	m, ok = VisibleBelow(root, rel)
-	if !ok {
-		return nil, rel, false
-	}
-	for current := filepath.Dir(rel); current != "." && current != string(filepath.Separator); current = filepath.Dir(current) {
-		if _, up := VisibleBelow(root, current); !up {
+	current := rel
+	for {
+		if carries != nil && carries(current) {
+			// The manifest is not on disk yet, so there is none to read; what
+			// this says is that the folder is visible and which folder says so.
+			return nil, current, true
+		}
+		if m, held := VisibleBelow(root, current); held {
+			return m, current, true
+		}
+		parent := filepath.Dir(current)
+		if parent == "." || parent == string(filepath.Separator) {
+			// current is the top level folder, which is where a manifest has
+			// to go for anything below it to be on the surface.
 			return nil, current, false
 		}
+		current = parent
 	}
-	return m, "", true
 }
 
 // VisibleBelow is Visible for a folder named below a root, which is how the fs

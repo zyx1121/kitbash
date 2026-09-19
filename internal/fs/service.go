@@ -274,47 +274,63 @@ func symlinkRefused(instance, link string) *problem.Problem {
 		"Use the file itself instead of a link to it.")
 }
 
-// folderManifest returns the manifest of a visible folder. A folder is visible
-// only when it and every ancestor below its root carry a valid manifest:
-// progressive disclosure is not defeated by naming a folder deep inside an
-// invisible one. Roots carry no manifest and are always readable.
+// folderManifest returns the manifest that speaks for a visible folder. A
+// folder is visible when it, or a folder between it and its root, carries a
+// valid manifest, and the nearest one is what describes it: the folders inside
+// a Package need none of their own, see PLAN.md section 2.1. Progressive
+// disclosure is not defeated by naming a folder deep inside one that has no
+// manifest anywhere above it. Roots carry no manifest and are always readable.
 func (s *Service) folderManifest(dir string) (*manifest.Manifest, *problem.Problem) {
+	m, _, prob := s.visibleFolder(dir, nil)
+	return m, prob
+}
+
+// visibleFolder is folderManifest with the manifests this call is about to
+// write counted as present, keyed by absolute folder path. One fs_write holds
+// the manifest of a Package and the files beneath it, and the folder those
+// files are in is visible because of a manifest in the same call.
+//
+// It answers the folder the manifest is in as well. The manifest itself is nil
+// when the folder is a root, and when what made it visible is a manifest this
+// call has not written yet.
+func (s *Service) visibleFolder(dir string, pending map[string]bool) (*manifest.Manifest, string, *problem.Problem) {
 	if s.isRoot(dir) {
-		return nil, nil
+		return nil, dir, nil
 	}
 	root, rel, err := s.relative(dir)
 	if err != nil {
-		return nil, problem.InvalidPath(dir, "the path is outside its root")
+		return nil, "", problem.InvalidPath(dir, "the path is outside its root")
 	}
-	m, blocked, ok := manifest.VisibleChain(root, rel)
+	var carries func(string) bool
+	if len(pending) > 0 {
+		carries = func(rel string) bool { return pending[filepath.Join(root, rel)] }
+	}
+	m, folder, ok := manifest.VisibleChainWith(root, rel, carries)
 	if !ok {
-		return nil, notVisible(filepath.Join(root, blocked), "")
+		return nil, "", notVisible(filepath.Join(root, folder), "")
 	}
-	return m, nil
+	return m, filepath.Join(root, folder), nil
 }
 
-// ancestorsVisible checks every folder between dir and its root, dir excluded.
-// It is the same rule as folderManifest without the folder itself, which is
-// what a write that creates a folder asks: the folder does not exist yet, so
-// what has to be visible is everything above it.
+// ancestorsVisible checks the folder dir sits in, dir excluded. It is the same
+// rule as folderManifest one folder higher, which is what a write that creates
+// a folder asks: the folder does not exist yet, so what has to be visible is
+// what is above it.
 func (s *Service) ancestorsVisible(dir string) *problem.Problem {
-	root, ok := s.rootOf(dir)
-	if !ok {
+	if _, ok := s.rootOf(dir); !ok {
 		return problem.InvalidPath(dir, "the path is outside its root")
 	}
-	for current := filepath.Dir(dir); within(current, root) && current != root; current = filepath.Dir(current) {
-		if _, ok := s.visible(current); !ok {
-			return notVisible(current, "")
-		}
-	}
-	return nil
+	_, _, prob := s.visibleFolder(filepath.Dir(dir), nil)
+	return prob
 }
 
 // notVisible builds the problem every tool returns for a folder outside the
-// surface.
+// surface. The folder it names is the top level one the chain ended at, so the
+// fix names the folder a manifest has to be written into rather than the
+// folder that was asked for.
 func notVisible(dir, fix string) *problem.Problem {
 	return problem.NotVisible(dir,
-		"the folder carries no kitbash.yaml with a name and a description, so it is not part of the surface",
+		"this folder carries no kitbash.yaml with a name and a description, and neither does any folder above it, so it is not part of the surface",
 		fix)
 }
 
