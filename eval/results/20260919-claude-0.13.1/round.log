@@ -1,0 +1,93 @@
+2026-09-19T15:34:29+00:00 creating member bench-20260919-2334
+2026-09-19T15:35:01+00:00 member bench-20260919-2334 is still there, reusing it
+2026-09-19T15:35:02+00:00   deploying bench-board-stopped
+2026-09-19T15:35:02+00:00   build /home/bench-20260919-2334/bench-board-stopped
+2026-09-19T15:35:58+00:00 member bench-20260919-2334 is still there, reusing it
+2026-09-19T15:35:59+00:00   deploying bench-board-stopped
+2026-09-19T15:35:59+00:00   build /home/bench-20260919-2334/bench-board-stopped
+2026-09-19T15:36:08+00:00   deploying bench-board-mount
+2026-09-19T15:36:08+00:00   build /home/bench-20260919-2334/bench-board-mount
+2026-09-19T15:36:46+00:00 member bench-20260919-2334 is still there, reusing it
+2026-09-19T15:36:47+00:00   deploying bench-board-mount
+2026-09-19T15:36:47+00:00   build /home/bench-20260919-2334/bench-board-mount
+2026-09-19T15:37:02+00:00 member bench-20260919-2334 is still there, reusing it
+2026-09-19T15:37:03+00:00   deploying bench-keyed-secret
+2026-09-19T15:37:03+00:00   build /home/bench-20260919-2334/bench-keyed-secret
+2026-09-19T15:37:27+00:00   deploying bench-board-image
+2026-09-19T15:37:27+00:00   build /home/bench-20260919-2334/bench-board-image
+2026-09-19T15:37:59+00:00 member bench-20260919-2334 is still there, reusing it
+2026-09-19T15:38:00+00:00   deploying dependency bench-cache-dep
+2026-09-19T15:38:00+00:00   build /home/bench-20260919-2334/bench-cache-dep
+2026-09-19T15:38:01+00:00   deploying bench-notes-dep
+2026-09-19T15:38:01+00:00   fs_write said {"type":"https://kitbash.zyx.tw/errors/invalid-manifest","title":"Invalid manifest","status":422,"detail":"/deploy/units/0/env/CACHE_HOST: got object, want stri
+2026-09-19T15:38:01+00:00   build /home/bench-20260919-2334/bench-notes-dep
+2026-09-19T15:38:32+00:00 member bench-20260919-2334 is still there, reusing it
+2026-09-19T15:38:33+00:00   deploying dependency bench-cache-dep
+2026-09-19T15:38:33+00:00   build /home/bench-20260919-2334/bench-cache-dep
+2026-09-19T15:38:33+00:00   deploying bench-notes-dep
+2026-09-19T15:38:33+00:00   build /home/bench-20260919-2334/bench-notes-dep
+2026-09-19T15:42:57+00:00 member bench-20260919-2334 is still there, reusing it
+2026-09-19T15:42:57+00:00 round 20260919-claude-0.13.1: 15 sentences, k=1, agent claude, kitbash 0.13.1, member bench-20260919-2334
+2026-09-19T15:42:57+00:00 todo-board run 1: Make a todo web app I can share with my classmates.
+2026-09-19T15:45:14+00:00   passed: todo-board in 136s, 22 calls, 15 kitbash calls
+2026-09-19T15:45:14+00:00 weather-job run 1: Every morning at eight, fetch the weather for Hsinchu and post it as a new item on our cla
+2026-09-19T15:47:09+00:00   failed: weather-job in 93s, 16 calls, 13 kitbash calls
+2026-09-19T15:47:09+00:00   check said: no Process of this run carries a schedule
+2026-09-19T15:47:09+00:00 pdf-service run 1: Set up a PDF conversion service my classmates can use to convert documents to PDF.
+2026-09-19T15:51:24+00:00   passed: pdf-service in 254s, 27 calls, 13 kitbash calls
+2026-09-19T15:51:24+00:00 link-shortener run 1: I keep sending my study group huge URLs. Make us a link shortener.
+2026-09-19T15:53:57+00:00   passed: link-shortener in 152s, 31 calls, 15 kitbash calls
+2026-09-19T15:53:57+00:00 notes-wiki run 1: Set up a Markdown notes wiki for my study group where we can write pages and read each oth
+2026-09-19T15:56:44+00:00   passed: notes-wiki in 166s, 22 calls, 15 kitbash calls
+2026-09-19T15:56:44+00:00 repo-node run 1: Get https://github.com/docker/getting-started-app running so my classmates can use it.
+2026-09-19T16:02:25+00:00   passed: repo-node in 340s, 69 calls, 22 kitbash calls
+2026-09-19T16:02:25+00:00 repo-flask run 1: Get the Flask tutorial app at https://github.com/pallets/flask/tree/main/examples/tutorial
+2026-09-19T16:04:34+00:00   passed: repo-flask in 128s, 20 calls, 14 kitbash calls
+2026-09-19T16:04:34+00:00 repo-flask-redis run 1: Get https://github.com/docker/awesome-compose/tree/master/flask-redis running so my classm
+2026-09-19T16:07:40+00:00   passed: repo-flask-redis in 184s, 34 calls, 21 kitbash calls
+2026-09-19T16:07:40+00:00 repo-pgadmin run 1: Get https://github.com/docker/awesome-compose/tree/master/postgresql-pgadmin running so my
+2026-09-19T16:22:03+00:00   failed: repo-pgadmin in 834s, 96 calls, 75 kitbash calls
+2026-09-19T16:22:03+00:00   check said: no address answered as asked
+2026-09-19T16:22:03+00:00 repo-filebrowser run 1: Get https://github.com/filebrowser/filebrowser running so my classmates can use it.
+2026-09-19T16:26:20+00:00   failed: repo-filebrowser in 229s, 41 calls, 26 kitbash calls
+2026-09-19T16:26:20+00:00   check said: no address answered as asked
+2026-09-19T16:26:20+00:00 fault-stopped run 1: The class board at https://bench-board-stopped.bench-20260919-2334.kitbash.zyx.tw is down.
+2026-09-19T16:26:21+00:00   deploying bench-board-stopped
+2026-09-19T16:26:21+00:00   build /home/bench-20260919-2334/bench-board-stopped
+2026-09-19T16:27:20+00:00   passed: fault-stopped in 51s, 16 calls, 13 kitbash calls, mitigated in 49s
+2026-09-19T16:27:20+00:00 fault-mount run 1: Adding anything to our board at https://bench-board-mount.bench-20260919-2334.kitbash.zyx.
+2026-09-19T16:27:22+00:00   deploying bench-board-mount
+2026-09-19T16:27:22+00:00   build /home/bench-20260919-2334/bench-board-mount
+2026-09-19T16:30:39+00:00   passed: fault-mount in 192s, 24 calls, 18 kitbash calls, mitigated in 174s
+2026-09-19T16:30:39+00:00 fault-secret run 1: Our key service at https://bench-keyed-secret.bench-20260919-2334.kitbash.zyx.tw stopped a
+2026-09-19T16:30:40+00:00   deploying bench-keyed-secret
+2026-09-19T16:30:40+00:00   build /home/bench-20260919-2334/bench-keyed-secret
+2026-09-19T16:31:32+00:00   passed: fault-secret in 38s, 14 calls, 10 kitbash calls, mitigated in 32s
+2026-09-19T16:31:32+00:00 fault-image run 1: The board at https://bench-board-image.bench-20260919-2334.kitbash.zyx.tw vanished, nothin
+2026-09-19T16:31:33+00:00   deploying bench-board-image
+2026-09-19T16:31:33+00:00   build /home/bench-20260919-2334/bench-board-image
+2026-09-19T16:32:24+00:00   passed: fault-image in 43s, 17 calls, 13 kitbash calls, mitigated in 33s
+2026-09-19T16:32:24+00:00 fault-dependency run 1: Our notes page at https://bench-notes-dep.bench-20260919-2334.kitbash.zyx.tw says it canno
+2026-09-19T16:32:24+00:00   deploying dependency bench-cache-dep
+2026-09-19T16:32:25+00:00   build /home/bench-20260919-2334/bench-cache-dep
+2026-09-19T16:32:25+00:00   deploying bench-notes-dep
+2026-09-19T16:32:25+00:00   build /home/bench-20260919-2334/bench-notes-dep
+2026-09-19T16:33:25+00:00   passed: fault-dependency in 52s, 18 calls, 14 kitbash calls, mitigated in 33s
+2026-09-19T16:33:25+00:00 report written to /private/tmp/claude-501/-Users-loki/2165efcd-556e-4b44-9159-69d7bf38a71f/scratchpad/kb-eval/eval/results/20260919-claude-0.13.1/README.md
+2026-09-19T16:33:25+00:00 removing member bench-20260919-2334, which takes its Processes, files and secrets with it
+2026-09-19T16:33:31+00:00 users_remove refused: {"type":"https://kitbash.zyx.tw/errors/internal","title":"Internal error","status":500,"detail":"kitbash could not complete this call; the cause is recorded for administrators","instance":"users_remove","fix":"kitbashd is not running on this host; ask an administrator to start it."}
+2026-09-19T16:36:14+00:00 member bench-20260919-2334 is still there, reusing it
+2026-09-19T16:36:14+00:00 round 20260919-claude-0.13.1: 2 sentences, k=1, agent claude, kitbash 0.13.1, member bench-20260919-2334
+2026-09-19T16:36:14+00:00 weather-job run 1: Every morning at eight, fetch the weather for Hsinchu and post it as a new item on our cla
+2026-09-19T16:37:48+00:00   failed: weather-job in 71s, 14 calls, 10 kitbash calls
+2026-09-19T16:37:48+00:00   check said: no Process of this run carries a schedule
+2026-09-19T16:37:48+00:00 repo-linkding run 1: Get https://github.com/sissbruecker/linkding running so my classmates can use it.
+2026-09-19T16:45:21+00:00   passed: repo-linkding in 452s, 91 calls, 41 kitbash calls
+2026-09-19T16:45:21+00:00 report written to /private/tmp/claude-501/-Users-loki/2165efcd-556e-4b44-9159-69d7bf38a71f/scratchpad/kb-eval/eval/results/20260919-claude-0.13.1/README.md
+2026-09-19T16:45:21+00:00 keeping member bench-20260919-2334 as asked
+2026-09-19T16:46:32+00:00 member bench-20260919-2334 is still there, reusing it
+2026-09-19T16:46:32+00:00 round 20260919-claude-0.13.1: 1 sentences, k=1, agent claude, kitbash 0.13.1, member bench-20260919-2334
+2026-09-19T16:46:32+00:00 weather-job run 1: Every morning at eight, fetch the weather for Hsinchu and post it as a new item on our cla
+2026-09-19T16:48:04+00:00   passed: weather-job in 90s, 18 calls, 13 kitbash calls
+2026-09-19T16:48:04+00:00 report written to /private/tmp/claude-501/-Users-loki/2165efcd-556e-4b44-9159-69d7bf38a71f/scratchpad/kb-eval/eval/results/20260919-claude-0.13.1/README.md
+2026-09-19T16:48:04+00:00 keeping member bench-20260919-2334 as asked

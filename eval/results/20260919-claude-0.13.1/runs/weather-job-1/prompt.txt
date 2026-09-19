@@ -1,0 +1,1 @@
+Every morning at eight, fetch the weather for Hsinchu and post it as a new item on our class board: POST JSON {"text": "<the forecast>", "author": "weather-bot"} to https://todo.loki.kitbash.zyx.tw/api/todos.

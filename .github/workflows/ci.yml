@@ -32,6 +32,13 @@ jobs:
           path: bin/kitbashd-linux-amd64
           if-no-files-found: error
 
+      # The bench itself runs on an operator's machine beside the agents'
+      # credentials, PLAN.md 5.3. Its unit tests are the standard library, no
+      # network and no host, and they are what keeps eval/sentences.json and
+      # the row shape honest, so they run here.
+      - name: Test the bench
+        run: python3 -m unittest discover -s eval/tests -t eval/tests
+
   # The kits under deploy/org are JavaScript, so nothing in the Go job touches
   # them and until now no kit test ran on a push at all, issue #107.
   #

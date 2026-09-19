@@ -1,0 +1,18 @@
+# A round's own key and the agents' configuration directories never leave the
+# machine that ran the round. Rows, transcripts and the report do.
+results/*/id_ed25519
+results/*/id_ed25519.pub
+results/*/known_hosts
+results/*/ssh_config
+results/*/runs/*/cfg/
+results/*/runs/*/codex-home/
+__pycache__/
+
+# A run keeps its transcript; what the agent wrote on this machine does not
+# belong in the repository.
+results/*/runs/*/*
+!results/*/runs/*/stream.jsonl
+!results/*/runs/*/stderr.log
+!results/*/runs/*/prompt.txt
+!results/*/runs/*/last-message.txt
+!results/*/runs/*/mcp.json
