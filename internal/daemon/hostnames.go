@@ -54,9 +54,10 @@ func isAddressLiteral(name string) bool {
 	return net.ParseIP(name) != nil
 }
 
-// declaredHostname checks the name a unit declared against the two rules that
-// do not need the network: it may not be under this host's domain, and it may
-// not be an address. Both are invalid-manifest, because neither is a thing a
+// declaredHostname checks the name a unit declared against the rules that do
+// not need the network: it may not be under this host's domain, it may not be
+// an address, and a unit that declares subscriptions may not declare one at
+// all. All three are invalid-manifest, because none of them is a thing a
 // permission would make right: the manifest has to change.
 //
 // It runs at registration alone. What needs the network is proveHostname,
@@ -64,6 +65,11 @@ func isAddressLiteral(name string) bool {
 func (s *Server) declaredHostname(instance string, p store.Process) *problem.Problem {
 	if p.Hostname == "" {
 		return nil
+	}
+	if p.Subscribes() {
+		return problem.InvalidManifestFix(instance,
+			fmt.Sprintf("this unit declares the host name %s and a subscription, and a subscriber is a receiver for kitbashd and is not published", p.Hostname),
+			"Remove deploy.units[0].hostname, or remove provides.subscriptions from this Package. A subscriber keeps its port for the fan out alone and is served under no name.")
 	}
 	if isAddressLiteral(p.Hostname) {
 		return problem.InvalidManifestFix(instance,

@@ -173,9 +173,11 @@ func serveProxyingAs(t *testing.T, domain, mode string, admin bool) (*harness, *
 	return h, fake, names
 }
 
-// registerServed registers one Process with expose: http whose container
+// servedRequest is one registration with expose: http whose container
 // publishes the port its endpoint names, which is what the proxy forwards to.
-func (h *harness) registerServed(fake *sysusers.Fake, u *upstream, name, hostname string) processRequest {
+// A test that declares something else on it builds the request here and sends
+// it itself.
+func (h *harness) servedRequest(fake *sysusers.Fake, u *upstream, name string) processRequest {
 	h.t.Helper()
 	req := processRequest{
 		ID:        uuid.V7(),
@@ -185,17 +187,39 @@ func (h *harness) registerServed(fake *sysusers.Fake, u *upstream, name, hostnam
 		Digest:    testDigest,
 		Expose:    ExposeHTTP,
 		Endpoint:  u.server.URL,
-		Hostname:  hostname,
 	}
 	fake.Publish(req.Container, u.port(h.t))
 	// A published port is not enough: what the proxy forwards to is a running
 	// container, because a published port is creation configuration and
 	// survives a stop, see routePort.
 	fake.SetState(req.Container, podman.StateRunning)
+	return req
+}
+
+// registerServed registers one such Process.
+func (h *harness) registerServed(fake *sysusers.Fake, u *upstream, name, hostname string) processRequest {
+	h.t.Helper()
+	req := h.servedRequest(fake, u, name)
+	req.Hostname = hostname
 	if _, res, body := h.register(req); res.StatusCode != http.StatusOK {
 		h.t.Fatalf("register status = %d, body %s", res.StatusCode, body)
 	}
 	return req
+}
+
+// registeredHost registers one Process and answers the name kitbashd said it
+// serves it under, which is what proc_run turns into url.
+func (h *harness) registeredHost(req processRequest) string {
+	h.t.Helper()
+	_, res, body := h.register(req)
+	if res.StatusCode != http.StatusOK {
+		h.t.Fatalf("register status = %d, body %s", res.StatusCode, body)
+	}
+	var got processResponse
+	if err := json.Unmarshal(body, &got); err != nil {
+		h.t.Fatalf("body %q: %v", body, err)
+	}
+	return got.Host
 }
 
 // request sends one request through the proxy, as the wire would.
@@ -248,6 +272,14 @@ func TestTheHostNameOfAProcess(t *testing.T) {
 		}, testDomain, ""},
 		{"a Process a run kit owns is not served here", store.Process{
 			Owner: "loki", Name: "app", Expose: ExposeHTTP, Runner: "/org/pve-runner",
+		}, testDomain, ""},
+		{"a fan out receiver is not served at all", store.Process{
+			Owner: "loki", Name: "observe-count", Expose: ExposeHTTP,
+			Subscriptions: []string{store.SubscriptionTelemetry},
+		}, testDomain, ""},
+		{"and a name it declared is not served either", store.Process{
+			Owner: "loki", Name: "observe-count", Expose: ExposeHTTP,
+			Hostname: "records.example.org", Subscriptions: []string{store.SubscriptionTelemetry},
 		}, testDomain, ""},
 		{"a member whose account name is not a DNS label is not served", store.Process{
 			Owner: "loki-", Name: "app", Expose: ExposeHTTP,
@@ -1363,6 +1395,116 @@ func TestADerivedNameIsNotResolved(t *testing.T) {
 	}
 }
 
+// ------------------------------------------------------- the fan out receivers
+
+// A unit that declares provides.subscriptions is exposed over HTTP for one
+// reason, that kitbashd has a port to POST records to, so it is not a service
+// and it is not published: no name is answered for it, nothing is routed to
+// it, and the Process beside it that is a service still gets its own.
+func TestASubscriberIsNotPublished(t *testing.T) {
+	h, fake, _ := serveProxying(t, testDomain, TLSGateway)
+	up := newUpstream(t)
+	req := h.servedRequest(fake, up, "observe-count")
+	req.Subscriptions = []string{store.SubscriptionTelemetry}
+
+	if host := h.registeredHost(req); host != "" {
+		t.Errorf("the registration answered the name %q, want none: a subscriber has no url", host)
+	}
+	name := h.defaultName("observe-count")
+	if h.server.proxy.holds(name) {
+		t.Errorf("%s is on the routing table, want a receiver nobody is forwarded to", name)
+	}
+	if rec := h.request(http.MethodGet, name, "/v1/traces", nil); rec.Code != http.StatusNotFound {
+		t.Errorf("the name of a subscriber answered %d, want 404", rec.Code)
+	}
+	if up.received() != nil {
+		t.Error("a request off the proxy reached a fan out receiver")
+	}
+
+	// The regression beside it: an ordinary http Process is still served
+	// under the name it derives.
+	service := newUpstream(t)
+	if host := h.registeredHost(h.servedRequest(fake, service, testProcessName)); host != h.defaultName(testProcessName) {
+		t.Fatalf("an http Process was answered %q, want %s", host, h.defaultName(testProcessName))
+	}
+	if rec := h.request(http.MethodGet, h.defaultName(testProcessName), "/", nil); rec.Code != http.StatusOK {
+		t.Errorf("an http Process answered %d on its own name, want it served", rec.Code)
+	}
+}
+
+// And a receiver may not declare a name of its own: there is nothing to serve
+// it at, so the manifest is what has to change.
+func TestASubscriberMayNotDeclareAHostName(t *testing.T) {
+	h, fake, names := serveProxying(t, testDomain, TLSACME)
+	up := newUpstream(t)
+	// The member pointed the name here, so what refuses this is the
+	// subscription and not the proof.
+	names.points("records.example.org", testPublicAddress)
+	req := h.servedRequest(fake, up, "observe-count")
+	req.Hostname = "records.example.org"
+	req.Subscriptions = []string{store.SubscriptionTelemetry}
+
+	_, res, body := h.register(req)
+	if res.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, body %s, want 422", res.StatusCode, body)
+	}
+	p := h.problemOf(res, body)
+	if want := problem.Base + problem.SlugInvalidManifest; p.Type != want {
+		t.Errorf("type = %q, want %q", p.Type, want)
+	}
+	if !strings.Contains(p.Detail, "a subscriber is a receiver for kitbashd and is not published") {
+		t.Errorf("the problem does not say why: %s", p.Detail)
+	}
+	if h.server.proxy.holds("records.example.org") {
+		t.Error("a refused registration put its name on the routing table")
+	}
+}
+
+// A registration written before this rule existed is not published either: the
+// table is rebuilt from the registrations at every start, so a subscriber a
+// release that served one left behind leaves the table on the restart that
+// reads it, whether it took the derived name or declared one.
+func TestTheTableDoesNotPublishASubscriberFromAnOlderRelease(t *testing.T) {
+	h, fake, names := serveProxying(t, testDomain, TLSGateway)
+	up := newUpstream(t)
+	names.points("records.example.org", testPublicAddress)
+
+	derived := h.defaultName("observe-count")
+	for _, row := range []store.Process{
+		{Name: "observe-count", Container: "kitbash-observe-count-derived"},
+		{Name: "evaluate-latency", Container: "kitbash-evaluate-latency-declared", Hostname: "records.example.org"},
+	} {
+		fake.Publish(row.Container, up.port(t))
+		fake.SetState(row.Container, podman.StateRunning)
+		_, hash, err := store.NewToken()
+		if err != nil {
+			t.Fatalf("NewToken: %v", err)
+		}
+		row.ID = uuid.V7()
+		row.Owner = h.user
+		row.Package = "/org/" + row.Name
+		row.Digest = testDigest
+		row.Expose = ExposeHTTP
+		row.Endpoint = up.server.URL
+		row.Subscriptions = []string{store.SubscriptionTelemetry}
+		row.RegisteredAt = time.Now().UTC()
+		if err := h.store.RegisterProcess(context.Background(), row, hash, store.Quota{}); err != nil {
+			t.Fatalf("RegisterProcess: %v", err)
+		}
+	}
+
+	h.server.LoadRoutes(context.Background())
+
+	if count := h.server.proxy.count(); count != 0 {
+		t.Errorf("the table holds %d name(s), want none: both rows are receivers", count)
+	}
+	for _, name := range []string{derived, "records.example.org"} {
+		if h.server.proxy.holds(name) {
+			t.Errorf("%s is served after a restart, want a receiver nobody is forwarded to", name)
+		}
+	}
+}
+
 // ---------------------------------------------------------- what a client may spend
 
 // serveProxyingBudget is serveProxying with a budget small enough for a test
@@ -1683,5 +1825,11 @@ func TestTheNamesOneRegistrationHolds(t *testing.T) {
 		Owner: "loki", Name: "app", Expose: ExposeHTTP, Runner: "/org/pve-runner",
 	}, testDomain); len(got) != 0 {
 		t.Errorf("a Process a run kit owns holds %v, want no name here", got)
+	}
+	if got := heldNames(store.Process{
+		Owner: "loki", Name: "observe-count", Expose: ExposeHTTP,
+		Subscriptions: []string{store.SubscriptionTelemetry},
+	}, testDomain); len(got) != 0 {
+		t.Errorf("a fan out receiver holds %v, want no name: it is served under none", got)
 	}
 }

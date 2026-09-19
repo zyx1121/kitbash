@@ -360,7 +360,7 @@ var (
         "durationMs": { "type": "integer" }
       }
     },
-    "url": { "type": "string", "description": "The address this Process is reached at from outside the host, https://<name>.<member>.<domain> or the hostname the unit declared. Absent on a host with no domain, which routes nothing" },
+    "url": { "type": "string", "description": "The address this Process is reached at from outside the host, https://<name>.<member>.<domain> or the hostname the unit declared. Absent on a host with no domain, which routes nothing, and on a unit that declares subscriptions, which is a receiver for kitbashd and is not published" },
     "tools": { "type": "array", "items": { "type": "string" }, "description": "Surface tool names added when expose is mcp" },
     "runner": { "type": "string", "description": "Package path of the run kit that owns this Process, absent when kitbashd runs it" },
     "mounts": {

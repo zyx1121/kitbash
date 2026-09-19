@@ -327,7 +327,8 @@ func (p *proxy) count() int {
 // declared, or <name>.<member>.<domain>. It answers an empty string for every
 // Process that is not served at all, which is a host with no domain, a Process
 // that is not exposed over HTTP, one a run kit owns, because there is no
-// container of it here, and one whose name does not make a DNS name.
+// container of it here, a fan out receiver, because nothing about it is meant
+// for a browser, and one whose name does not make a DNS name.
 //
 // A member's account name and a Process name are both held to patterns the
 // surface enforces, so the derived name is almost always valid; almost is not
@@ -335,7 +336,7 @@ func (p *proxy) count() int {
 // Such a Process is not routed rather than routed under a name no resolver
 // answers.
 func hostFor(p store.Process, domain string) string {
-	if domain == "" || p.Expose != ExposeHTTP || p.Runner != "" {
+	if domain == "" || p.Expose != ExposeHTTP || p.Runner != "" || p.Subscribes() {
 		return ""
 	}
 	if p.Hostname != "" {
@@ -363,7 +364,8 @@ func defaultHost(name, owner, domain string) string {
 
 // heldNames is every name one registration claims: the declared one, whether
 // or not this host has a domain, and the derived one, which needs a domain to
-// exist at all. It is what a registration declaring a host name is checked
+// exist at all and which a fan out receiver never holds, because it is served
+// under no name. It is what a registration declaring a host name is checked
 // against, so two Processes never claim one name even on a host that routes
 // nothing yet.
 func heldNames(p store.Process, domain string) []string {
@@ -371,7 +373,7 @@ func heldNames(p store.Process, domain string) []string {
 	if p.Hostname != "" {
 		names = append(names, p.Hostname)
 	}
-	if p.Expose == ExposeHTTP && p.Runner == "" {
+	if p.Expose == ExposeHTTP && p.Runner == "" && !p.Subscribes() {
 		if derived := defaultHost(p.Name, p.Owner, domain); derived != "" && derived != p.Hostname {
 			names = append(names, derived)
 		}

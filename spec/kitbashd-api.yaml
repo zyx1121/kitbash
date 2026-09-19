@@ -1080,7 +1080,8 @@ reverse_proxy:
     mode, and a public address that is not an address, stop the daemon from
     starting rather than leaving it serving nothing.
   names: >
-    Every registered Process with expose: http and no runner is served at
+    Every registered Process with expose: http, no runner and no subscriptions
+    is served at
     <name>.<member>.<domain>, or at the hostname its unit declared, which is
     never a name under the domain and never an address, and which is served
     only while it resolves to an address of this host or to a CNAME of the
@@ -1092,7 +1093,12 @@ reverse_proxy:
     name ending in a hyphen would give, is not served rather than served under
     a name no resolver answers. The names travel with the registration, so the
     routing table is rebuilt from the registrations at every start and a
-    Process reachable before a reboot is reachable after one.
+    Process reachable before a reboot is reachable after one. A Process that
+    declares subscriptions is served under no name at all: it is exposed over
+    HTTP so this daemon has a port to POST records to, so it is a receiver for
+    kitbashd and is not published, it is answered no host, it is on no routing
+    table however it was registered, and a hostname declared on it is
+    invalid-manifest.
   forwarding: >
     A request is matched by its Host, port stripped and folded to lower case,
     held to what a DNS name may carry: a Host with a path, an at sign, a space
