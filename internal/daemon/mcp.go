@@ -564,6 +564,12 @@ func (s *Server) openMCPSession(ctx context.Context, id identity) (*mcpSession, 
 		return nil, problem.Internal(MCPPath, fmt.Sprintf("starting %s as %s: %v", s.mcpBinary, id.User, err), "")
 	}
 	server := mcp.NewServer(&mcp.Implementation{Name: "kitbash", Version: s.version}, &mcp.ServerOptions{
+		// What the child answered `initialize` with, forwarded the way its
+		// tools are. A Process reaches this surface through kitbash-mcp like
+		// its owner does, so it is told the same thing about the host and
+		// there is nothing here to keep in step by hand, see PLAN.md
+		// section 4.5.
+		Instructions: child.InitializeResult().Instructions,
 		// The transport asks for the session id right after it asks for the
 		// server, which is where a session becomes addressable.
 		GetSessionID: func() string {

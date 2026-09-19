@@ -48,6 +48,10 @@ const childLingers = "--kitbash-mcp-lingers"
 
 const childLingerFor = 8 * time.Second
 
+// childInstructions is what the fake answers initialize with, standing in for
+// the paragraph the real kitbash-mcp carries.
+const childInstructions = "This host runs kitbash, and the fake says so too."
+
 // TestMCPChildHelper is the fake kitbash-mcp. Under an ordinary test run it
 // does nothing; started with the marker it serves MCP over stdio, records the
 // environment it was given and notes when it exits, which is how the daemon
@@ -63,7 +67,12 @@ func TestMCPChildHelper(t *testing.T) {
 		os.Exit(1)
 	}
 
-	srv := mcp.NewServer(&mcp.Implementation{Name: "kitbash-mcp-fake", Version: "test"}, nil)
+	srv := mcp.NewServer(&mcp.Implementation{Name: "kitbash-mcp-fake", Version: "test"}, &mcp.ServerOptions{
+		// The real kitbash-mcp introduces the host here, see
+		// internal/server/instructions.go. The fake says something of its own
+		// so a test can tell forwarded text from text the daemon invented.
+		Instructions: childInstructions,
+	})
 	srv.AddTool(&mcp.Tool{
 		Name:         "fs_list",
 		Description:  "List the folders of the caller",
@@ -899,5 +908,22 @@ func TestMCPReceiverStopsWhileAChildLingers(t *testing.T) {
 	}
 	if n := m.live(t); n != 0 {
 		t.Errorf("health reports %d MCP sessions, want the slot back at once", n)
+	}
+}
+
+// TestMCPSessionForwardsTheInstructions is the Process side of PLAN.md section
+// 4.5: an agent inside a container is told what an agent outside one is told,
+// because the session it opens is a proxy of the same kitbash-mcp.
+func TestMCPSessionForwardsTheInstructions(t *testing.T) {
+	m := serveMCPDaemon(t, 0)
+	session := m.connect(t, nil)
+	defer session.Close()
+
+	res := session.InitializeResult()
+	if res == nil {
+		t.Fatal("initialize returned no result")
+	}
+	if res.Instructions != childInstructions {
+		t.Fatalf("instructions = %q, want the child's %q", res.Instructions, childInstructions)
 	}
 }
