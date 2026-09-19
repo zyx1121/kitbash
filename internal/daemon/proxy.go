@@ -102,10 +102,28 @@ const (
 	AttrResponseCode  = "http.response.status_code"
 	AttrURLPath       = "url.path"
 	AttrProxyHost     = "kitbash.host"
+	// AttrProxyAsk is true when the gateway's question about a name was
+	// answered yes, false when it was answered no, see serveAsk.
+	AttrProxyAsk = "kitbash.ask"
 	// AttrClientTraceparent is the trace context the client claimed, recorded
 	// as a claim and never adopted as this span's parent, see recordForward.
 	AttrClientTraceparent = "kitbash.client.traceparent"
 )
+
+// The path kitbashd answers on every name it serves, and the prefix that path
+// lives under. In gateway mode the prefix is reserved: a request for it is
+// answered here and never forwarded, whichever served name it arrived under,
+// so no Process can answer the gateway's question about a name it does not
+// own, see serveAsk.
+const (
+	AskPrefix = "/.kitbash/"
+	AskPath   = AskPrefix + "ask"
+)
+
+// AskDomainParam is the query parameter Caddy's on demand TLS asks with. The
+// name is Caddy's and not kitbash's: this endpoint exists to be the ask of an
+// on_demand_tls block.
+const AskDomainParam = "domain"
 
 // MaxClientTraceparent is how much of that header is kept. A traceparent is 55
 // characters; what is over that is not one, and a record is not a place to put
@@ -426,6 +444,23 @@ func (s *Server) serveProxy(w http.ResponseWriter, r *http.Request) {
 		}
 		defer s.proxy.inflight.release(key)
 	}
+	// The gateway's own question, answered before anything is read out of the
+	// Host. The gateway reaches this host at whatever address it was given,
+	// which is as often as not an address literal and never a served name, and
+	// the name it is asking about is in the query. The whole prefix is
+	// reserved rather than the one path: a Process that could answer under
+	// /.kitbash/ on its own name would be answering the gateway about a name
+	// it does not own.
+	if s.proxy.mode == TLSGateway && strings.HasPrefix(r.URL.Path, AskPrefix) {
+		if r.URL.Path == AskPath {
+			s.serveAsk(w, r)
+			return
+		}
+		writeProblem(w, problem.NotFoundFix(r.URL.Path,
+			"this path is kitbashd's own and is not served by any Process",
+			"Request a path of your own; kitbashd answers "+AskPrefix+" on every name it serves."))
+		return
+	}
 	host, ok := hostOf(r.Host)
 	if !ok {
 		// The Host itself is not repeated: it is a client's bytes and this is
@@ -454,6 +489,55 @@ func (s *Server) serveProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.forward(w, r, target, host)
+}
+
+// serveAsk answers the one question a gateway asks before it obtains a
+// certificate: is this a name kitbashd serves? Caddy's on_demand_tls asks it
+// with GET /.kitbash/ask?domain=<name> and obtains a certificate only on 200,
+// so a gateway in front of this host gets one certificate per served name and
+// asks the certificate authority for nothing else. It is the policy acme mode
+// enforces in certManager, asked over HTTP instead: the routing table decides
+// and nothing else does. A wildcard would not do: it covers one label and the
+// default names have two, see PLAN.md section 2.3.
+//
+// The table is the whole of the answer, whatever state the Process is in. A
+// member who stopped their Process still holds its name, and a certificate
+// left to lapse while it was down would make starting it again a wait for the
+// gateway rather than a start.
+//
+// Nothing is kept for a name nobody serves beyond reading it, no name is
+// resolved and no header is read: this is one parse and one map lookup, and
+// the gateway may ask as often as it likes.
+func (s *Server) serveAsk(w http.ResponseWriter, r *http.Request) {
+	start := s.now()
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		fmt.Fprintln(w, "This path answers GET.")
+		return
+	}
+	name, ok := hostOf(r.URL.Query().Get(AskDomainParam))
+	if !ok {
+		// Neither recorded nor repeated: what arrived is not a name, so it is
+		// not something this host has an answer about.
+		writeProblem(w, problem.BadRequest(r.URL.Path,
+			"this request asks about something that is not a host name",
+			"Ask with "+AskPath+"?"+AskDomainParam+"=<name>."))
+		return
+	}
+	held := s.proxy.holds(name)
+	if !held {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprintf(w, "%s is not a name this host serves.\n", name)
+		s.recordAsk(r, name, false, http.StatusNotFound, start, s.now())
+		return
+	}
+	// The answer is the status, so the gateway obtains the certificate and
+	// reads nothing else.
+	w.WriteHeader(http.StatusOK)
+	s.recordAsk(r, name, true, http.StatusOK, start, s.now())
 }
 
 // forward hands one request to the Process and records what happened.
@@ -624,6 +708,48 @@ func (w *recordingWriter) code() int {
 // is, a claim, in kitbash.client.traceparent, so a member whose own client
 // sent one can still follow it.
 func (s *Server) recordForward(r *http.Request, target route, host string, status int, start, end time.Time) {
+	s.recordProxySpan(r.Context(), host, status, store.Attributes{
+		User:     target.owner,
+		Package:  target.pkg,
+		Process:  target.id,
+		Path:     r.URL.Path,
+		Producer: InternalProducer,
+		Other:    proxyAttributes(r, host, status),
+	}, start, end)
+}
+
+// recordAsk writes the span the gateway's question produces, which is one per
+// question like one per forwarded request. It is kitbashd's own record and not
+// a member's: no Process served it, and the name asked about is as likely as
+// not a name nobody here holds. What it carries beyond the forwarded request's
+// attributes is kitbash.ask, the answer, so an operator reads how often the
+// gateway asks and about what.
+//
+// Nothing of the asker is recorded. A forwarded request carries the client's
+// traceparent as a claim because a member may want to follow their own client;
+// this is a gateway asking a yes or no about a name, and the headers it asked
+// with are not part of the answer.
+func (s *Server) recordAsk(r *http.Request, name string, held bool, status int, start, end time.Time) {
+	s.recordProxySpan(r.Context(), name, status, store.Attributes{
+		User:     InternalProducer,
+		Path:     r.URL.Path,
+		Producer: InternalProducer,
+		Other: map[string]any{
+			AttrRequestMethod: r.Method,
+			AttrResponseCode:  status,
+			AttrURLPath:       r.URL.Path,
+			AttrProxyHost:     name,
+			AttrProxyAsk:      held,
+		},
+	}, start, end)
+}
+
+// recordProxySpan mints the identity of one proxy span, writes it and fans it
+// out. It is what a forwarded request and an answered question have in common:
+// everything about either is already in the attributes, and what is left is a
+// trace of its own and the one write.
+func (s *Server) recordProxySpan(ctx context.Context, host string, status int,
+	attrs store.Attributes, start, end time.Time) {
 	traceID, err := randomID(traceIDBytes)
 	if err != nil {
 		logger.Printf("proxy: could not record a request for %s: %v", host, err)
@@ -635,22 +761,15 @@ func (s *Server) recordForward(r *http.Request, target route, host string, statu
 		return
 	}
 	export := store.Export{Spans: []store.Span{{
-		TraceID: traceID,
-		SpanID:  spanID,
-		Name:    ProxySpan,
-		StartNS: start.UnixNano(),
-		EndNS:   end.UnixNano(),
-		Status:  spanStatus(status),
-		Attributes: store.Attributes{
-			User:     target.owner,
-			Package:  target.pkg,
-			Process:  target.id,
-			Path:     r.URL.Path,
-			Producer: InternalProducer,
-			Other:    proxyAttributes(r, host, status),
-		},
+		TraceID:    traceID,
+		SpanID:     spanID,
+		Name:       ProxySpan,
+		StartNS:    start.UnixNano(),
+		EndNS:      end.UnixNano(),
+		Status:     spanStatus(status),
+		Attributes: attrs,
 	}}}
-	write, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), HealthWriteTimeout)
+	write, cancel := context.WithTimeout(context.WithoutCancel(ctx), HealthWriteTimeout)
 	defer cancel()
 	if err := s.store.Insert(write, export); err != nil {
 		logger.Printf("proxy: could not record a request for %s: %v", host, err)
