@@ -46,7 +46,7 @@ func New(version string, deps Deps) *mcp.Server {
 		Version:     version,
 		Title:       "kitbash",
 		Description: "Files, Packages, Processes and Telemetry for agents. M3 serves the fs, pkg, proc and tel families.",
-	}, nil)
+	}, &mcp.ServerOptions{Instructions: Instructions})
 	s.AddReceivingMiddleware(problemGuard)
 	if deps.Permits != nil {
 		// Between the two, so a refusal is still one span: tracing wraps it

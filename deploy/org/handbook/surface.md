@@ -185,4 +185,6 @@ its own. Every span it records carries `kitbash.caller`, which is how one query
 separates what a Process did from what the member did.
 
 Sessions there are capped at 8 per Process, a session idle for 10 minutes ends,
-and a POST without a session must be an `initialize`.
+and a POST without a session must be an `initialize`. That `initialize` answers
+with the same instructions a member's session is given, because the session is a
+proxy of the same `kitbash-mcp`.

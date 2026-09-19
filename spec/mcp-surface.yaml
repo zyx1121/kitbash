@@ -12,6 +12,10 @@
 # Besides the families below, every running Process with expose: mcp adds the
 # tools its manifest declares under <package>_<tool>, see $package_tools.
 #
+# initialize answers with instructions, the paragraph that tells a connecting
+# agent this host is where the work runs; the text is the Instructions constant
+# in internal/server/instructions.go and nowhere else.
+#
 # Conventions that hold for every tool:
 # - Input and output are JSON Schema 2020-12.
 # - Paths are absolute, rooted at /org or /home/<caller>. The caller never sees
