@@ -1,0 +1,3 @@
+Fixed. The board’s data file was refusing writes. I moved the saved items to writable persistent storage and redeployed the board.
+
+Verified that adding items succeeds and data survives a restart. Existing items are preserved; my test item was removed.

@@ -1,0 +1,8 @@
+Linkding is live: [Open your class bookmark manager](https://linkding.bench-20260920-0100.kitbash.zyx.tw).
+
+- Username: `admin`
+- Password: `wo3HZh4l0cuUjcTPu_nZPftFddRmR_c0`
+
+Change your password after signing in, then [create classmate accounts](https://linkding.bench-20260920-0100.kitbash.zyx.tw/admin/auth/user/add/). Keep the admin login private.
+
+Verified login, user administration, and health checks. Data persists across container restarts.

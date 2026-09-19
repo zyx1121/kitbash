@@ -1,0 +1,68 @@
+{
+ "agent": "codex",
+ "asks_user": false,
+ "check": {
+  "check": "http_ok",
+  "detail": "https://pdf-service.bench-20260920-0100.kitbash.zyx.tw/ answered 200",
+  "passed": true,
+  "seen": {
+   "bytes": 3452,
+   "state": "running",
+   "status": 200,
+   "url": "https://pdf-service.bench-20260920-0100.kitbash.zyx.tw/"
+  }
+ },
+ "class": "nothing",
+ "cost_usd": null,
+ "ended_at": "2026-09-19T17:10:52+00:00",
+ "error": null,
+ "exit_code": 0,
+ "id": "pdf-service",
+ "inject_verified": null,
+ "injected_at": null,
+ "kitbash_calls": 10,
+ "kitbash_calls_by_tool": {
+  "fs_list": 2,
+  "fs_read": 2,
+  "fs_write": 2,
+  "pkg_build": 1,
+  "proc_logs": 1,
+  "proc_run": 1,
+  "users_me": 1
+ },
+ "kitbash_version": "0.13.1",
+ "member": "bench-20260920-0100",
+ "model": "gpt-6-astra",
+ "passed": true,
+ "prompt": "Set up a PDF conversion service my classmates can use to convert documents to PDF.",
+ "questions_asked": 0,
+ "rate_limited": false,
+ "result_text": "Your service is live: [Open Class PDF](https://pdf-service.bench-20260920-0100.kitbash.zyx.tw).\n\nShare the link with your classmates. They can upload Word documents, spreadsheets, presentations, or text files and download a PDF.\n\n- Up to 20 MB per file.\n- Temporary files deleted after processing.\n- No account required.\n\nVerified the public page and successfully converted a test upload to PDF.",
+ "run": 1,
+ "setup": null,
+ "started_at": "2026-09-19T17:07:11+00:00",
+ "stop_reason": "completed",
+ "time_to_mitigate_ms": null,
+ "timed_out": false,
+ "tool_calls": 12,
+ "tool_errors": 2,
+ "tools": {
+  "command_execution": 2,
+  "kitbash__fs_list": 2,
+  "kitbash__fs_read": 2,
+  "kitbash__fs_write": 2,
+  "kitbash__pkg_build": 1,
+  "kitbash__proc_logs": 1,
+  "kitbash__proc_run": 1,
+  "kitbash__users_me": 1
+ },
+ "turns": 16,
+ "usage": {
+  "cache_write_input_tokens": 0,
+  "cached_input_tokens": 296320,
+  "input_tokens": 315477,
+  "output_tokens": 3810,
+  "reasoning_output_tokens": 41
+ },
+ "wall_ms": 220461
+}

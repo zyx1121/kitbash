@@ -1,0 +1,51 @@
+2026-09-19T17:00:48+00:00 creating member bench-20260920-0100
+2026-09-19T17:00:49+00:00 round 20260920-codex-0.13.1: 15 sentences, k=1, agent codex, kitbash 0.13.1, member bench-20260920-0100
+2026-09-19T17:00:49+00:00 todo-board run 1: Make a todo web app I can share with my classmates.
+2026-09-19T17:05:04+00:00   passed: todo-board in 255s, 11 calls, 9 kitbash calls
+2026-09-19T17:05:04+00:00 weather-job run 1: Every morning at eight, fetch the weather for Hsinchu and post it as a new item on our cla
+2026-09-19T17:07:11+00:00   passed: weather-job in 125s, 9 calls, 7 kitbash calls
+2026-09-19T17:07:11+00:00 pdf-service run 1: Set up a PDF conversion service my classmates can use to convert documents to PDF.
+2026-09-19T17:10:52+00:00   passed: pdf-service in 220s, 12 calls, 10 kitbash calls
+2026-09-19T17:10:52+00:00 link-shortener run 1: I keep sending my study group huge URLs. Make us a link shortener.
+2026-09-19T17:15:59+00:00   passed: link-shortener in 306s, 12 calls, 10 kitbash calls
+2026-09-19T17:15:59+00:00 notes-wiki run 1: Set up a Markdown notes wiki for my study group where we can write pages and read each oth
+2026-09-19T17:21:44+00:00   passed: notes-wiki in 343s, 18 calls, 14 kitbash calls
+2026-09-19T17:21:44+00:00 repo-node run 1: Get https://github.com/docker/getting-started-app running so my classmates can use it.
+2026-09-19T17:25:19+00:00   passed: repo-node in 214s, 20 calls, 15 kitbash calls
+2026-09-19T17:25:19+00:00 repo-flask run 1: Get the Flask tutorial app at https://github.com/pallets/flask/tree/main/examples/tutorial
+2026-09-19T17:27:26+00:00   failed: repo-flask in 105s, 14 calls, 0 kitbash calls
+2026-09-19T17:27:26+00:00   check said: no Process with an address was made by this run
+2026-09-19T17:27:26+00:00 repo-flask-redis run 1: Get https://github.com/docker/awesome-compose/tree/master/flask-redis running so my classm
+2026-09-19T17:29:41+00:00   passed: repo-flask-redis in 134s, 12 calls, 7 kitbash calls
+2026-09-19T17:29:41+00:00 repo-pgadmin run 1: Get https://github.com/docker/awesome-compose/tree/master/postgresql-pgadmin running so my
+2026-09-19T17:34:16+00:00   passed: repo-pgadmin in 274s, 32 calls, 21 kitbash calls
+2026-09-19T17:34:16+00:00 repo-linkding run 1: Get https://github.com/sissbruecker/linkding running so my classmates can use it.
+2026-09-19T17:38:28+00:00   passed: repo-linkding in 251s, 31 calls, 21 kitbash calls
+2026-09-19T17:38:28+00:00 fault-stopped run 1: The class board at https://bench-board-stopped.bench-20260920-0100.kitbash.zyx.tw is down.
+2026-09-19T17:38:28+00:00   deploying bench-board-stopped
+2026-09-19T17:38:28+00:00   build /home/bench-20260920-0100/bench-board-stopped
+2026-09-19T17:40:51+00:00   passed: fault-stopped in 126s, 12 calls, 9 kitbash calls, mitigated in 80s
+2026-09-19T17:40:51+00:00 fault-mount run 1: Adding anything to our board at https://bench-board-mount.bench-20260920-0100.kitbash.zyx.
+2026-09-19T17:40:52+00:00   deploying bench-board-mount
+2026-09-19T17:40:52+00:00   build /home/bench-20260920-0100/bench-board-mount
+2026-09-19T17:45:38+00:00   passed: fault-mount in 276s, 35 calls, 28 kitbash calls, mitigated in 221s
+2026-09-19T17:45:38+00:00 fault-secret run 1: Our key service at https://bench-keyed-secret.bench-20260920-0100.kitbash.zyx.tw stopped a
+2026-09-19T17:45:39+00:00   deploying bench-keyed-secret
+2026-09-19T17:45:39+00:00   build /home/bench-20260920-0100/bench-keyed-secret
+2026-09-19T17:46:41+00:00   failed: fault-secret in 20s, 3 calls, 2 kitbash calls
+2026-09-19T17:46:41+00:00   check said: no address answered as asked
+2026-09-19T17:46:41+00:00 fault-image run 1: The board at https://bench-board-image.bench-20260920-0100.kitbash.zyx.tw vanished, nothin
+2026-09-19T17:46:41+00:00   deploying bench-board-image
+2026-09-19T17:46:41+00:00   build /home/bench-20260920-0100/bench-board-image
+2026-09-19T17:47:23+00:00   failed: fault-image in 7s, 0 calls, 0 kitbash calls
+2026-09-19T17:47:23+00:00   check said: http_ok: no address answered as asked
+2026-09-19T17:47:23+00:00 fault-dependency run 1: Our notes page at https://bench-notes-dep.bench-20260920-0100.kitbash.zyx.tw says it canno
+2026-09-19T17:47:23+00:00   deploying dependency bench-cache-dep
+2026-09-19T17:47:23+00:00   build /home/bench-20260920-0100/bench-cache-dep
+2026-09-19T17:47:24+00:00   deploying bench-notes-dep
+2026-09-19T17:47:24+00:00   build /home/bench-20260920-0100/bench-notes-dep
+2026-09-19T17:48:05+00:00   failed: fault-dependency in 7s, 0 calls, 0 kitbash calls
+2026-09-19T17:48:05+00:00   check said: http_ok: no address answered as asked
+2026-09-19T17:48:05+00:00 report written to /private/tmp/claude-501/-Users-loki/2165efcd-556e-4b44-9159-69d7bf38a71f/scratchpad/kb-eval/eval/results/20260920-codex-0.13.1/README.md
+2026-09-19T17:48:07+00:00 removing member bench-20260920-0100, which takes its Processes, files and secrets with it
+2026-09-19T17:48:12+00:00 users_remove refused: {"type":"https://kitbash.zyx.tw/errors/internal","title":"Internal error","status":500,"detail":"kitbash could not complete this call; the cause is recorded for administrators","instance":"users_remove","fix":"kitbashd is not running on this host; ask an administrator to start it."}

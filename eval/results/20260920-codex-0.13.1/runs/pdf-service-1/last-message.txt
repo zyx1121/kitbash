@@ -1,0 +1,9 @@
+Your service is live: [Open Class PDF](https://pdf-service.bench-20260920-0100.kitbash.zyx.tw).
+
+Share the link with your classmates. They can upload Word documents, spreadsheets, presentations, or text files and download a PDF.
+
+- Up to 20 MB per file.
+- Temporary files deleted after processing.
+- No account required.
+
+Verified the public page and successfully converted a test upload to PDF.

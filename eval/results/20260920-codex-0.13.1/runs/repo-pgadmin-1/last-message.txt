@@ -1,0 +1,8 @@
+It’s running: [Open pgAdmin](https://postgresql-pgadmin.bench-20260920-0100.kitbash.zyx.tw).
+
+- **Login:** `classroom@example.com`
+- **Password:** `mUwfRyHxctS2X-7PFEXHekLJH5xY4HTB`
+
+Expand **Classroom → Classroom PostgreSQL**, then enter the database password: `iZefp5PxvvDKhJJ3ljIfVuOJcLW-FFIm`.
+
+Verified login, database access, and service health. Data persists across restarts. This login is the pgAdmin administrator; create individual classmate accounts through **User Management**.

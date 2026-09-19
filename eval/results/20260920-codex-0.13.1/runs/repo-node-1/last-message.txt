@@ -1,0 +1,3 @@
+It’s live: [Open the app](https://getting-started-app.bench-20260920-0100.kitbash.zyx.tw). Share that link with your classmates.
+
+Verified the page loads and tasks can be added, completed, and deleted. Persistent storage is configured. Everyone uses the same todo list, with no login required.

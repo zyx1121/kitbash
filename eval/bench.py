@@ -49,9 +49,20 @@ def command_run(options):
                 current.log("interrupted; the round is resumable with the same member")
                 current.save_state()
                 raise
+            except roundlib.UsageLimit as limit:
+                complete = False
+                current.log("the agent is out of allowance: %s" % limit)
+                current.log(
+                    "stopping here with member %s in place; run the same command again when the "
+                    "allowance is back and the round continues where it stopped" % current.state["member"]
+                )
+                break
             except Exception as exc:  # a broken sentence must not end the round
                 complete = False
                 current.log("%s run %d could not be run: %s: %s" % (sentence["id"], number, type(exc).__name__, exc))
+        else:
+            continue
+        break
     current.save_state()
     path = report.write(folder, current.state)
     current.log("report written to %s" % path)

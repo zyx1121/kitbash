@@ -113,6 +113,17 @@ def parse_claude_stream(path):
     return transcript
 
 
+# What a client says when the account has spent its allowance. A round that
+# reads one of these has nothing to measure and stops rather than spending its
+# remaining sentences on the same answer.
+LIMIT_PHRASES = ("usage limit", "rate limit", "rate_limit", "429", "quota")
+
+
+def is_limit(text):
+    lowered = (text or "").lower()
+    return any(phrase in lowered for phrase in LIMIT_PHRASES)
+
+
 CODEX_TOOL_ITEMS = ("mcp_tool_call", "command_execution", "file_change", "web_search", "patch_apply")
 
 
@@ -155,11 +166,11 @@ def parse_codex_stream(path):
             transcript["stop_reason"] = "failed"
             error = json.dumps(event.get("error") or {})
             transcript["error"] = error[:400]
-            if "rate limit" in error.lower() or "429" in error:
-                transcript["rate_limited"] = True
+            transcript["rate_limited"] = transcript["rate_limited"] or is_limit(error)
         elif kind == "error":
             transcript["stop_reason"] = "error"
             transcript["error"] = json.dumps(event)[:400]
+            transcript["rate_limited"] = transcript["rate_limited"] or is_limit(transcript["error"])
     transcript["tools"] = dict(tools)
     transcript["kitbash_calls"] = dict(kitbash)
     transcript["tool_calls"] = sum(tools.values())

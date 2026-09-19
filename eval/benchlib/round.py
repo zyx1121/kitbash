@@ -20,6 +20,10 @@ CHECK_DELAY = 10
 HEALTHY_SECONDS = 300
 
 
+class UsageLimit(Exception):
+    """The agent's account is out of allowance. Nothing was measured."""
+
+
 def now():
     return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
 
@@ -278,6 +282,12 @@ class Round:
         if injected_at and mitigation["first_pass"]:
             meta["time_to_mitigate_ms"] = int((mitigation["first_pass"] - injected_at) * 1000)
         transcript = adapter.parse(workdir)
+        if transcript.get("rate_limited") and not transcript.get("tool_calls"):
+            # No row: a run that never reached the host is not a result, and
+            # writing one would make the round unresumable at this sentence.
+            raise UsageLimit(
+                "%s run %d: %s" % (sentence["id"], number, (transcript.get("error") or "")[:200])
+            )
         row = rows.build_row(sentence, transcript, outcome, meta)
         with open(row_path, "w") as out:
             json.dump(row, out, indent=1, sort_keys=True)

@@ -1,0 +1,1 @@
+Get https://github.com/docker/awesome-compose/tree/master/postgresql-pgadmin running so my classmates can use it.

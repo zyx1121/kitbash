@@ -1,0 +1,3 @@
+Scheduled daily at **8:00 a.m. Taiwan time (Asia/Taipei)** to post Hsinchu’s forecast to your class board as `weather-bot`.
+
+Forecast fetching passed a dry run. The first scheduled post is September 20 at 8:00 a.m.

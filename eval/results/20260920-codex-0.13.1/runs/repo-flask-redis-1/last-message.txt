@@ -1,0 +1,5 @@
+It’s live! Share this with your classmates:
+
+[Open Flask Redis](https://flask-redis.bench-20260920-0100.kitbash.zyx.tw)
+
+Verified HTTPS access and that refreshing increments the shared counter. Redis has persistent storage, and Flask’s debugger is disabled. No installation needed.

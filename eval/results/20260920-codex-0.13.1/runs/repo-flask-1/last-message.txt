@@ -1,0 +1,10 @@
+The app is running:
+
+- **Classmates on the same network:** http://192.168.2.201:8080
+- **This computer:** http://localhost:8080
+
+They can register, log in, and publish posts. Keep this computer awake.
+
+Verified both addresses respond successfully; all 24 tutorial tests pass. Debug mode is disabled, and data persists across restarts.
+
+Restart instructions are in `RUNNING.md`. This setup provides local-network access; an internet-accessible URL still requires hosting or a tunnel.

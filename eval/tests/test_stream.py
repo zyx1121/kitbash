@@ -40,6 +40,25 @@ class ClaudeStream(unittest.TestCase):
             self.assertNotIn(forbidden, text)
 
 
+class CodexUsageLimit(unittest.TestCase):
+    """A round that reads this has nothing to measure and stops."""
+
+    def setUp(self):
+        self.transcript = rows.parse_codex_stream(os.path.join(FIXTURES, "codex-usage-limit.jsonl"))
+
+    def test_it_is_read_as_a_limit_and_not_as_a_result(self):
+        self.assertTrue(self.transcript["rate_limited"])
+        self.assertEqual(self.transcript["tool_calls"], 0)
+        self.assertEqual(self.transcript["stop_reason"], "failed")
+        self.assertIn("usage limit", self.transcript["error"].lower())
+
+    def test_the_phrases_a_limit_is_recognised_by(self):
+        self.assertTrue(rows.is_limit("You've hit your usage limit."))
+        self.assertTrue(rows.is_limit("rate limit exceeded"))
+        self.assertTrue(rows.is_limit("HTTP 429"))
+        self.assertFalse(rows.is_limit("the container could not be started"))
+
+
 class CodexStream(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
