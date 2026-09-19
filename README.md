@@ -124,12 +124,28 @@ name from Let's Encrypt, which needs both ports reachable from the internet.
 There is no wildcard certificate, because a wildcard covers one label and these
 names have two. `gateway` has kitbashd listen on 80 alone and trust the `Host`
 a gateway in front of it forwards, which is how a host behind one public
-address is put on the internet: the gateway holds a wildcard certificate for
-the domain and forwards everything under it. With Caddy:
+address is put on the internet: the gateway terminates TLS and kitbashd answers
+which names it serves, at `GET /.kitbash/ask?domain=<name>`, 200 for a name on
+its routing table and 404 for anything else. With Caddy:
 
 ```caddyfile
-*.kitbash.example { tls { dns cloudflare {env.CF_API_TOKEN} } reverse_proxy <host>:80 }
+{
+	on_demand_tls {
+		ask http://<host>:80/.kitbash/ask
+	}
+}
+https:// {
+	tls {
+		on_demand
+	}
+	reverse_proxy <host>:80
+}
 ```
+
+A catch all site is what makes every served name, default and declared, get its
+certificate the first time it is asked for, and the ask keeps the gateway from
+obtaining one for a name kitbashd does not serve. In this mode `/.kitbash/` is
+reserved on every served name: kitbashd answers it and no Process receives it.
 
 With a gateway, set `KITBASH_GATEWAY_ADDRESS` to the address it forwards from
 and install.sh narrows the accept on 80 to it, so the proxy is reachable

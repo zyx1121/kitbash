@@ -1039,7 +1039,24 @@ reverse_proxy:
     certificate, because a wildcard covers one label and the default names have
     two. Plain 80 answers the ACME challenge path and redirects everything else
     to https. In gateway mode kitbashd listens on 80 alone and the gateway in
-    front of the host holds the certificate.
+    front of the host holds the certificates, one per served name, see ask.
+  ask: >
+    In gateway mode the proxy listener answers GET /.kitbash/ask?domain=<name>,
+    which is the ask of Caddy's on_demand_tls: 200 with an empty body for a
+    name the routing table holds, 404 with a short body for any other name, 400
+    for a domain that is not a host name, read by the rule a request's Host is
+    read by, and 405 with Allow: GET for any other method. The gateway obtains
+    a certificate on 200 alone, so a catch all site there gets one certificate
+    per served name the first time that name is asked for and none for a name
+    this host does not serve, which is the policy acme mode enforces in its own
+    host policy. The routing table is the whole of the answer whatever state
+    the Process is in: a member who stopped their Process still holds its name,
+    and a certificate left to lapse while it was down would make starting it
+    again a wait for the gateway. Nothing is resolved, nothing is kept for a
+    name nobody serves and no header is read. The /.kitbash/ prefix is reserved
+    on every served name in this mode: a request for it is answered by kitbashd
+    and never forwarded, so no Process can answer the gateway about a name it
+    does not own. In acme mode the path is neither reserved nor answered.
   records: >
     Each forwarded request writes one span named proxy carrying kitbash.user
     (the owner), kitbash.package, kitbash.process and kitbash.path (the path
@@ -1048,7 +1065,12 @@ reverse_proxy:
     trace of its own: a traceparent off the internet is a stranger's claim, so
     it is never adopted as the parent and is recorded as
     kitbash.client.traceparent, at most 256 bytes. No body is read and no other
-    header is copied.
+    header is copied. An answered question writes one span named proxy as well,
+    carrying kitbash.host (the name it asked about), kitbash.ask (whether it
+    was answered yes), kitbash.user = kitbashd and no Process, because no
+    Process served it, plus the method, the status and the path. Nothing of the
+    asker is recorded, its traceparent included, and a question this daemon
+    refuses is not recorded at all.
   budget: >
     The proxy's listeners have a budget of their own, 4096 connections, so what
     the internet holds against them is never why a member's session cannot
