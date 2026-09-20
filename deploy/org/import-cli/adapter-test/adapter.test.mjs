@@ -19,11 +19,22 @@ import path from "node:path";
 import { createInterface } from "node:readline";
 import { after, before, test } from "node:test";
 
+import { draft } from "../generate.js";
+import { validate } from "../test/support.mjs";
+
 const here = import.meta.dirname;
 const adapterSource = path.join(here, "..", "adapter.js");
 const fakeCli = path.join(here, "fake-cli.mjs");
 const node = process.execPath;
 const MEBIBYTE = 1024 * 1024;
+
+// The two output schemas the kit generates, read out of a drafted Package
+// rather than written again here: what the adapter answers has to satisfy the
+// schema its own generator declared, and a copy in this file would only prove
+// it matches the copy, issue #114.
+const generated = JSON.parse(draft({ source: "cli:apk:jq" }).find((file) => file.path === "tools.json").content);
+const runOutputSchema = generated.tools.run.outputSchema;
+const probeOutputSchema = generated.tools.probe.outputSchema;
 
 // The folders the mounted adapter is told it has, made on this machine because
 // the check resolves them: realpath is the whole point of it, so a mount target
@@ -42,6 +53,10 @@ let siblingFile = "";
 // argv prefix per tool, options mapped to flags, positionals in argv order and
 // the two reserved inputs stdin and files. With mounts it carries the targets
 // the adapter reads a path argument against; without them every path is refused.
+//
+// Every entry but `plain` carries the generated output schema, which is what
+// makes the adapter answer structuredContent; `plain` is the hand edited
+// tools.json that dropped it and answers in text alone.
 const toolsDocument = ({ mounts = [] } = {}) => ({
   binary: fakeCli,
   ...(mounts.length > 0 ? { mounts } : {}),
@@ -223,13 +238,50 @@ const toolsDocument = ({ mounts = [] } = {}) => ({
       stdin: "stdin",
       outputs: [],
     },
+    // The tool whose entry claims its command prints JSON, which is the one
+    // thing about standard output a help text could not tell the generator. It
+    // spreads its argv so that one tool can run the fake CLI's JSON command and
+    // its prose command, which is the pair the claim has to survive.
+    parsed: {
+      inputSchema: {
+        type: "object",
+        properties: { args: { type: "array", items: { type: "string" } }, stdin: { type: "string" } },
+      },
+      argv: [node, fakeCli],
+      options: {},
+      positionals: ["args"],
+      spread: "args",
+      stdin: "stdin",
+      outputs: [],
+      stdoutJson: true,
+    },
+    // A hand edited entry that declares no output schema, which is the only way
+    // a generated Package answers in text alone.
+    plain: {
+      inputSchema: { type: "object", properties: {} },
+      argv: [node, fakeCli, "dump"],
+      options: {},
+      positionals: [],
+      stdin: null,
+      outputs: [],
+    },
     probe: { inputSchema: { type: "object", properties: {} }, probe: true },
   },
 });
 
+// Every tool of the fixture answers against the schema the kit generates,
+// except the one that is there to show what an entry without it does.
+const withSchemas = (document) => {
+  for (const [name, spec] of Object.entries(document.tools)) {
+    if (name === "plain") continue;
+    spec.outputSchema = spec.probe ? probeOutputSchema : runOutputSchema;
+  }
+  return document;
+};
+
 // startAdapter lays out one generated Package in a temporary directory and
 // runs it, and answers with the two calls a client makes and a way to stop it.
-function startAdapter(env = {}, document = toolsDocument()) {
+function startAdapter(env = {}, document = withSchemas(toolsDocument())) {
   const dir = mkdtempSync(path.join(tmpdir(), "kitbash-adapter-test-"));
   copyFileSync(adapterSource, path.join(dir, "adapter.js"));
   writeFileSync(path.join(dir, "tools.json"), JSON.stringify(document));
@@ -296,6 +348,22 @@ function payload(result) {
   return JSON.parse(result.content[0].text);
 }
 
+// The structured answer a tool with an output schema carries, issue #114: the
+// same object as the text block, and one the schema the kit generated accepts.
+// A result that lost its structuredContent, or one that drifted from the shape
+// the manifest declares, fails here rather than on a host.
+function structured(result, schema = runOutputSchema) {
+  const body = payload(result);
+  assert.ok(result.structuredContent, `the result carries no structuredContent: ${JSON.stringify(result).slice(0, 200)}`);
+  assert.deepEqual(result.structuredContent, body, "structuredContent and the text block are not the same answer");
+  assert.deepEqual(
+    validate(result.structuredContent, schema),
+    [],
+    `the structured answer does not satisfy the generated schema: ${JSON.stringify(result.structuredContent).slice(0, 200)}`,
+  );
+  return result.structuredContent;
+}
+
 // The RFC 9457 document an MCP error carries, checked for the shape the bridge
 // passes through unchanged.
 function problem(result) {
@@ -333,12 +401,12 @@ before(() => {
   writeFileSync(awayFile, "not in a mount");
   symlinkSync(awayFile, path.join(docsMount, "escape.txt"));
 
-  mounted = startAdapter({}, toolsDocument({
+  mounted = startAdapter({}, withSchemas(toolsDocument({
     mounts: [
       { target: docsMount, mode: "ro" },
       { target: outMount, mode: "rw" },
     ],
-  }));
+  })));
 });
 
 after(() => {
@@ -355,12 +423,16 @@ test("initialize and tools/list answer with what tools.json declares", async () 
   const listed = await adapter.request("tools/list", {});
   const names = listed.result.tools.map((tool) => tool.name).sort();
   assert.deepEqual(names, [
-    "absent", "concat", "convert", "dump", "fail", "flood", "fork", "hang", "link", "probe", "read", "run", "skip",
-    "spill", "upper",
+    "absent", "concat", "convert", "dump", "fail", "flood", "fork", "hang", "link", "parsed", "plain", "probe", "read",
+    "run", "skip", "spill", "upper",
   ]);
   const dump = listed.result.tools.find((tool) => tool.name === "dump");
   assert.equal(dump.description, "Print the arguments the adapter built.");
   assert.equal(dump.inputSchema.properties.filter.type, "string");
+  // An entry with an output schema publishes it, so a client that reaches this
+  // Package without the surface in front of it sees the same contract.
+  assert.deepEqual(dump.outputSchema, runOutputSchema);
+  assert.equal(listed.result.tools.find((tool) => tool.name === "plain").outputSchema, undefined);
 });
 
 test("options become flags: a boolean, a value and a repeated array", async () => {
@@ -650,7 +722,9 @@ test("output past the cap is truncated and flagged", async () => {
 test("a command that runs past the timeout is killed", async () => {
   const shortLived = startAdapter({ IMPORT_CLI_TIMEOUT_MS: "400" });
   try {
-    const body = payload(await shortLived.call("hang", {}));
+    // structured rather than payload: a killed command answers exitCode null,
+    // which is the branch the generated schema has to allow.
+    const body = structured(await shortLived.call("hang", {}));
     assert.equal(body.timedOut, true);
     assert.equal(body.exitCode, null);
     assert.equal(body.signal, "SIGKILL");
@@ -759,8 +833,89 @@ test("a binary that is not in the image is an internal problem", async () => {
 });
 
 test("probe reports the binary's help text and an empty version when it has none", async () => {
-  const body = payload(await adapter.call("probe", {}));
+  const body = structured(await adapter.call("probe", {}), probeOutputSchema);
   assert.match(body.help, /Usage: fake-cli/);
   assert.equal(body.version, "");
   assert.equal(typeof body.man, "string");
+});
+
+// ---------------------------------------------------------------------------
+// The structured answer, issue #114. A Package whose manifest declares an
+// output schema and whose adapter answers one text block is a promise the
+// bridge cannot check, because the bridge validates structuredContent and
+// passes prose through. Every branch of a call is checked against the schema
+// the kit generated rather than against a copy written here.
+
+test("a successful call answers structuredContent the generated schema accepts", async () => {
+  const body = structured(await adapter.call("dump", { filter: "." }));
+  assert.equal(body.exitCode, 0);
+  assert.equal(body.truncated, false);
+  assert.deepEqual(body.files, []);
+  assert.deepEqual(JSON.parse(body.stdout).args, ["."]);
+});
+
+test("a non zero exit answers structuredContent rather than an error", async () => {
+  const body = structured(await adapter.call("fail", {}));
+  assert.equal(body.exitCode, 3);
+  assert.equal(body.stderr.trim(), "fake-cli: the command refused.");
+});
+
+test("an output file read back inline is in the structured answer", async () => {
+  const body = structured(await adapter.call("upper", {
+    source: "notes.txt",
+    output: "shouted.txt",
+    files: [{ name: "notes.txt", contentBase64: Buffer.from("hello kitbash").toString("base64") }],
+  }));
+  assert.equal(body.files.length, 1);
+  assert.equal(body.files[0].name, "shouted.txt");
+  assert.equal(Buffer.from(body.files[0].contentBase64, "base64").toString(), "HELLO KITBASH");
+});
+
+test("an output left in a mount is in the structured answer as a path", async () => {
+  const source = path.join(docsMount, "doc.txt");
+  const dest = path.join(outMount, "structured.txt");
+  const body = structured(await mounted.call("convert", { source, dest }));
+  // The two forms of an output are one property of one schema, so the mount
+  // form has to satisfy the same document the inline form does.
+  assert.deepEqual(body.files, [{ name: "structured.txt", path: dest }]);
+});
+
+test("a note beside an output is in the structured answer", async () => {
+  const body = structured(await adapter.call("link", { target: awayFile, output: "escape.txt" }));
+  assert.deepEqual(body.files, []);
+  assert.equal(body.notes.length, 1);
+  assert.match(body.notes[0], /symbolic link/);
+});
+
+test("standard output is parsed into the answer only when the entry asks for it", async () => {
+  // fake-cli dump prints JSON, and both tools run it: what differs is the
+  // entry, which is where the claim that this command prints JSON lives.
+  const parsed = structured(await adapter.call("parsed", { args: ["dump", "."], stdin: "{}" }));
+  assert.deepEqual(parsed.stdoutJson.args, ["."]);
+  assert.equal(parsed.stdoutJson.stdin, "{}");
+  // The text is still the text: the parse is carried beside it, not instead.
+  assert.deepEqual(JSON.parse(parsed.stdout), parsed.stdoutJson);
+
+  // The same command through a tool whose entry does not claim JSON, which is
+  // every tool the generator drafts.
+  const untouched = structured(await adapter.call("dump", { filter: "." }));
+  assert.equal(untouched.stdoutJson, undefined);
+
+  // Output that is not JSON leaves the key out rather than reporting a failure
+  // the command never had.
+  const prose = structured(await adapter.call("parsed", { args: ["spill", "note.txt"] }));
+  assert.match(prose.stdout, /wrote 1 file/);
+  assert.equal(prose.stdoutJson, undefined);
+});
+
+test("a tool whose entry declares no output schema answers in text alone", async () => {
+  const result = await adapter.call("plain", {});
+  assert.equal(result.structuredContent, undefined);
+  assert.equal(payload(result).exitCode, 0);
+});
+
+test("a refusal is problem details and carries no structured answer", async () => {
+  const result = await adapter.call("upper", { source: "missing.txt", output: "out.txt" });
+  assert.equal(problem(result).status, 404);
+  assert.equal(result.structuredContent, undefined);
 });

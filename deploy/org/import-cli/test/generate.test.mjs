@@ -139,15 +139,96 @@ test("the draft's tools.json is the contract the adapter reads", () => {
     spread: "args",
     stdin: "stdin",
     outputs: [],
+    stdoutJson: false,
     inputSchema: tools.tools.run.inputSchema,
+    outputSchema: tools.tools.run.outputSchema,
   });
   assert.equal(tools.tools.probe.probe, true);
-  // Every entry carries the schema it is called with, because the adapter
-  // answers tools/list from this file and never reads the manifest.
+  // Every entry carries both schemas it is called with, because the adapter
+  // answers tools/list from this file, validates nothing against the manifest
+  // and never reads it.
   const declared = manifestOf(draft({ source: "cli:apk:jq@1.7.1" })).provides.tools;
   for (const tool of declared) {
     assert.deepEqual(tools.tools[tool.name].inputSchema, tool.input, `${tool.name} declares two different input schemas`);
+    assert.deepEqual(tools.tools[tool.name].outputSchema, tool.output, `${tool.name} declares two different output schemas`);
   }
+});
+
+// ---------------------------------------------------------------------------
+// The output schema, issue #114. A Package whose manifest declares a shape its
+// adapter does not answer is a promise nothing checks, so what the generator
+// declares is run against the answers the adapter really builds: the schema has
+// to accept every one of them and refuse what the adapter would never send.
+
+// The results adapter.js builds, one per branch of callTool: a success, a non
+// zero exit, an output read back inline, an output left in a mount with a note
+// beside it, a command killed by the timeout, and a command whose standard
+// output was parsed because its tool asked for it.
+const adapterAnswers = [
+  { exitCode: 0, stdout: "hello\n", stderr: "", files: [], truncated: false },
+  { exitCode: 3, stdout: "", stderr: "jq: the command refused.\n", files: [], truncated: false },
+  { exitCode: 0, stdout: "", stderr: "", files: [{ name: "out.json", contentBase64: "e30=" }], truncated: false },
+  {
+    exitCode: 0,
+    stdout: "",
+    stderr: "",
+    files: [{ name: "out.json", path: "/files/out/out.json" }],
+    truncated: false,
+    notes: ["link.json is a symbolic link and was not read back."],
+  },
+  { exitCode: null, stdout: "", stderr: "", files: [], truncated: true, signal: "SIGKILL", timedOut: true },
+  { exitCode: 0, stdout: '{"a":1}', stdoutJson: { a: 1 }, stderr: "", files: [], truncated: false },
+];
+
+// And what it never builds. Each of these is one way a Package could drift from
+// its manifest, which is what the bridge reports as an internal problem.
+const refusedAnswers = [
+  { exitCode: "0", stdout: "", stderr: "", files: [], truncated: false },
+  { exitCode: 0, stdout: "", files: [], truncated: false },
+  { exitCode: 0, stdout: "", stderr: "", files: [], truncated: false, surprise: "a key nothing declares" },
+  { exitCode: 0, stdout: "", stderr: "", files: [{ contentBase64: "e30=" }], truncated: false },
+  { exitCode: 0, stdout: "", stderr: "", files: [{ name: "out.json", size: 12 }], truncated: false },
+];
+
+test("every generated tool declares an output schema its adapter's answers satisfy", () => {
+  const sets = [
+    ["the draft", draft({ source: "cli:apk:jq" })],
+    ["the refined Package", refined({ source: "cli:apk:jq", parsed: jqParsed, help: jqHelp })],
+  ];
+  for (const [what, files] of sets) {
+    const declared = manifestOf(files).provides.tools;
+    const tools = toolsOf(files);
+    for (const tool of declared) {
+      assert.equal(tool.output.type, "object", `${what}: ${tool.name} declares no output object`);
+      assert.equal(tool.output.additionalProperties, false, `${what}: ${tool.name} leaves its output open`);
+      assert.deepEqual(tools.tools[tool.name].outputSchema, tool.output);
+
+      if (tool.name === "probe") {
+        assert.deepEqual(validate({ help: "usage", version: "", man: "" }, tool.output), []);
+        assert.notDeepEqual(validate({ help: "usage", version: "", man: "", extra: 1 }, tool.output), []);
+        continue;
+      }
+      for (const answered of adapterAnswers) {
+        assert.deepEqual(validate(answered, tool.output), [], `${what}: ${tool.name} refuses ${JSON.stringify(answered)}`);
+      }
+      for (const refused of refusedAnswers) {
+        assert.notDeepEqual(validate(refused, tool.output), [], `${what}: ${tool.name} accepts ${JSON.stringify(refused)}`);
+      }
+    }
+    // Which of the two forms of standard output a tool answers with is the
+    // caller's to turn on, and the generator could not read it out of a help
+    // text, so every tool is drafted with it off.
+    for (const [name, entry] of Object.entries(tools.tools)) {
+      if (entry.probe) continue;
+      assert.equal(entry.stdoutJson, false, `${what}: ${name} claims its command prints JSON`);
+    }
+  }
+
+  // And the note that says where to turn it on, because a tools.json key
+  // nothing points at is a key nobody finds.
+  const notes = fileNamed(refined({ source: "cli:apk:jq", parsed: jqParsed, help: jqHelp }), "NOTES.md").content;
+  assert.match(notes, /Whether `jq` prints JSON on standard output/);
+  assert.match(notes, /`"stdoutJson": false`/);
 });
 
 test("the refined jq Package has a filter positional and one tool per binary", () => {
