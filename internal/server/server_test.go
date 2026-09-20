@@ -138,6 +138,14 @@ func gitInit(t *testing.T, dir string) {
 		}
 	}
 	run("init", "--quiet", "--initial-branch=main")
+	// Recorded in the repository rather than passed to each command, so every
+	// git that ever runs here obeys it: the seed below, the service's own
+	// invocations and anything a test starts by hand. A commit otherwise ends
+	// by detaching maintenance, which packs objects after the parent exited,
+	// and TempDir then removes .git/objects underneath it, see issue #134.
+	run("config", "gc.auto", "0")
+	run("config", "maintenance.auto", "false")
+	run("config", "gc.autoDetach", "false")
 	run("add", "-A")
 	run("-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "Seed the fixture")
 }

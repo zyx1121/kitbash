@@ -204,6 +204,10 @@ def build_row(sentence, transcript, outcome, meta):
         "wall_ms": meta.get("wall_ms"),
         "passed": bool(outcome.get("passed")),
         "check": outcome,
+        # What the run showed beside the bar. An observation decides nothing:
+        # it is here so a round can count how many agents proved a job by
+        # posting to the board, see the weather job in sentences.json.
+        "observed": meta.get("observed"),
         "time_to_mitigate_ms": meta.get("time_to_mitigate_ms"),
         "injected_at": meta.get("injected_at"),
         "inject_verified": meta.get("inject_verified"),

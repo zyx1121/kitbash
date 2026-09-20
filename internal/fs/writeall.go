@@ -153,7 +153,7 @@ func (s *Service) WriteAll(ctx context.Context, req WriteAllRequest) (*WriteAllR
 		}
 		seen[clean] = true
 		if info, err := s.stat(clean); err == nil && info.IsDir() {
-			return nil, problem.InvalidPath(clean, "the path is a folder, not a file")
+			return nil, problem.InvalidPathFix(clean, folderDetail, folderWriteFix)
 		}
 		data, prob := payload(clean, WriteRequest{
 			Path:          clean,

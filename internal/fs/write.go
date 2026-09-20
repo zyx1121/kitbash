@@ -63,6 +63,17 @@ type WriteResult struct {
 	Commit Commit `json:"commit"`
 }
 
+// folderDetail says what is wrong with a path that names a folder, and the
+// two fixes say what to do about it per tool. The default advice of
+// invalid-path is about the shape of a path, which a path naming a folder
+// already has, so it costs the caller a retry and teaches nothing, see issue
+// #153.
+const (
+	folderDetail   = "this path is a folder"
+	folderReadFix  = "Call fs_list on it, or fs_read one of its files."
+	folderWriteFix = "A path names a file; to write into this folder, name the file."
+)
+
 // Write answers fs_write: it creates or replaces one file and commits it to
 // the enclosing top level repository, attributed to the caller.
 func (s *Service) Write(ctx context.Context, req WriteRequest) (*WriteResult, *problem.Problem) {
@@ -86,7 +97,7 @@ func (s *Service) Write(ctx context.Context, req WriteRequest) (*WriteResult, *p
 	// resolves below the root and refuses a link at any component, and the
 	// write further down refuses it again at the moment it opens the file.
 	if info, err := s.stat(clean); err == nil && info.IsDir() {
-		return nil, problem.InvalidPath(clean, "the path is a folder, not a file")
+		return nil, problem.InvalidPathFix(clean, folderDetail, folderWriteFix)
 	}
 
 	folder := filepath.Dir(clean)

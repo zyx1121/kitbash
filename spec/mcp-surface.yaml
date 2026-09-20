@@ -333,7 +333,9 @@ families:
           Read one file. Text media types return text content. image/png and
           image/jpeg return MCP image content. application/pdf returns extracted
           text in M1. Files larger than 1 MiB return too-large; use offset and
-          limit for text.
+          limit for text. A path that names a folder is invalid-path whose fix
+          names fs_list, which is the call that answers a folder, rather than
+          the advice about the shape of a path, which this path kept.
         input:
           type: object
           additionalProperties: false
@@ -381,6 +383,9 @@ families:
           read.
           A list is refused whole: one path the caller may not write is a call
           that did not happen, and nothing of it reaches the disk.
+          A path that names a folder, in either form, is invalid-path whose
+          fix says to name the file to write into it, rather than the advice
+          about the shape of a path, which this path kept.
           A member writing under /org does not fail: the call is queued for
           an admin as one approval whatever it carries, and the result is a
           queued problem (202) whose instance is the approval id;
@@ -747,10 +752,11 @@ families:
           Processes owned by the caller, running or stopped. Admins see all
           from M5. With a package it answers that Package's Processes in full,
           and without one it answers every Process as a single line of id,
-          name, package, state, exposure and, for an http Process on a host
-          with a domain, its url, which is what naming one to ask about takes.
-          A package naming no Process answers an empty listing rather than a
-          problem. The runtime is read once either way.
+          name, package, state, exposure, for an http Process on a host with a
+          domain its url, and for a job its schedule and nextRun, which is
+          what naming one to ask about takes and what confirming a registered
+          job takes. A package naming no Process answers an empty listing
+          rather than a problem. The runtime is read once either way.
           The container runtime holds the state; a Process kitbashd
           could not bring back at the last boot is reported failed with
           problem and fix, because its container sits in the runtime looking
@@ -793,8 +799,8 @@ families:
                   state: { type: string, enum: [starting, running, unhealthy, stopped, failed, scheduled] }
                   expose: { type: string, enum: [mcp, http, none] }
                   url: { type: string, description: "Where an http Process is served, when the host has a domain" }
-                  schedule: { type: string, description: "The cron expression this Process is a job of, absent for a Process that stays up" }
-                  nextRun: { type: string, format: date-time, description: "When kitbashd runs this job next, UTC" }
+                  schedule: { type: string, description: "The cron expression this Process is a job of, on a line as well as in full, absent for a Process that stays up" }
+                  nextRun: { type: string, format: date-time, description: "When kitbashd runs this job next, UTC, on a line as well as in full" }
                   lastRun:
                     type: object
                     description: >
@@ -846,9 +852,11 @@ families:
         errors: [not-found, not-permitted, invalid-manifest, internal]
       proc_logs:
         description: >
-          Recent stdout and stderr of a Process. Structured logs are in
-          Telemetry; this is the raw stream. For a scheduled Process it is the
-          last run: the container of a run is kept until the next tick replaces
+          Recent stdout and stderr of a Process, one array of lines
+          interleaved the way the runtime wrote them, so a Process that died
+          on stderr is read here rather than only through the runtime.
+          Structured logs are in Telemetry; this is the raw stream. For a
+          scheduled Process it is the last run: the container of a run is kept until the next tick replaces
           it, and a job whose first tick has not come has no output, which is
           not-found saying so.
         input: { type: object, additionalProperties: false, required: [id], properties: { id: { type: string }, lines: { type: integer, minimum: 1, default: 200, maximum: 5000 } } }

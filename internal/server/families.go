@@ -96,9 +96,10 @@ func RegisterProcesses(s *mcp.Server, processes *proc.Service, b *bridge.Bridge)
 		Description: "Processes owned by the caller, running or stopped. With a package, only that " +
 			"Package's Processes, each in full: digest, when it started, why it is not running, its " +
 			"mounts and its last health probe. Without one, every Process as a single line of id, name, " +
-			"package, state and exposure, which is what naming one to ask about takes. A scheduled Process " +
-			"is scheduled between its runs and running during one, and carries nextRun and, once it has run " +
-			"under this daemon, lastRun with the exit code and the duration.",
+			"package, state, exposure, the url of an http Process and, for a job, its schedule and " +
+			"nextRun, which is what naming one to ask about takes and what confirming a registered job " +
+			"takes. A scheduled Process is scheduled between its runs and running during one, and once it " +
+			"has run under this daemon it carries lastRun with the exit code and the duration.",
 		InputSchema:  procListInputSchema,
 		OutputSchema: procListOutputSchema,
 	}, processesHandler(processes))
@@ -116,9 +117,10 @@ func RegisterProcesses(s *mcp.Server, processes *proc.Service, b *bridge.Bridge)
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "proc_logs",
-		Description: "Recent stdout and stderr of a Process. Structured logs are in Telemetry; this is the " +
-			"raw stream. For a scheduled Process it is the last run, which is kept until the next tick " +
-			"replaces it.",
+		Description: "Recent stdout and stderr of a Process, one array of lines interleaved the way the " +
+			"runtime wrote them, so a Process that died on stderr is read here. Structured logs are in " +
+			"Telemetry; this is the raw stream. For a scheduled Process it is the last run, which is kept " +
+			"until the next tick replaces it.",
 		InputSchema:  procLogsInputSchema,
 		OutputSchema: procLogsOutputSchema,
 	}, logsHandler(processes))

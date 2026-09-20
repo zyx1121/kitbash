@@ -63,6 +63,63 @@ class SentenceFile(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(folder, "kitbash.yaml.tmpl")))
             self.assertIn("{url}", sentence["prompt"], "a fault names the address the user sees")
 
+    def test_every_setup_names_a_fixture_that_exists(self):
+        """A fault is not the only sentence that needs something deployed."""
+        for sentence in self.sentences:
+            setup = sentence.get("setup")
+            if not setup:
+                continue
+            folder = os.path.join(fixtures.FIXTURE_ROOT, setup["fixture"])
+            self.assertTrue(os.path.isdir(folder), "%s names %s" % (sentence["id"], folder))
+            self.assertTrue(setup.get("package"), sentence["id"])
+            self.assertRegex(setup["package"], r"^[a-z0-9]+(-[a-z0-9]+)*$", sentence["id"])
+
+    def test_no_prompt_names_an_address_outside_the_round(self):
+        """The bench writes into the round and nowhere else.
+
+        The M10 weather sentence named a member's own board and four rounds
+        posted onto it, which is the bench changing data it does not own. An
+        address on a kitbash host belongs to a round's member, so a prompt
+        reaches one through {url} or {dep_url} and never by name.
+        """
+        for sentence in self.sentences:
+            for address in re.findall(r"https?://[^\s\"]+", sentence["prompt"]):
+                self.assertNotIn(
+                    "kitbash", address,
+                    "%s names a kitbash address rather than the round's own: %s"
+                    % (sentence["id"], address),
+                )
+
+    def test_the_scheduled_job_posts_to_the_rounds_own_board(self):
+        job = [s for s in self.sentences if s["id"] == "weather-job"][0]
+        self.assertEqual(job["setup"]["fixture"], "bench-board")
+        self.assertIn("{url}/api/items", job["prompt"])
+
+    def test_the_scheduled_job_is_passed_on_the_registration(self):
+        """The first tick is the next morning, so no run can post within it.
+
+        An item on the board means the agent tested the job by hand, which is
+        worth recording and is not what the sentence asked for, so it is an
+        observation rather than the bar.
+        """
+        job = [s for s in self.sentences if s["id"] == "weather-job"][0]
+        self.assertEqual(list(check_names(job["check"])), ["proc_scheduled"])
+        self.assertEqual(job["observe"]["posted"]["name"], "http_item_posted")
+        self.assertEqual(job["observe"]["posted"]["params"]["process"], "{pkg}")
+
+    def test_every_observation_names_a_check_that_exists(self):
+        for sentence in self.sentences:
+            for name, spec in (sentence.get("observe") or {}).items():
+                self.assertTrue(name.strip(), sentence["id"])
+                for named in check_names(spec):
+                    self.assertIn(named, checks.REGISTRY, "%s observes %s" % (sentence["id"], named))
+
+    def test_no_observation_is_part_of_a_check(self):
+        """An observation decides nothing: the two are read from two keys."""
+        for sentence in self.sentences:
+            for spec in (sentence.get("observe") or {}).values():
+                self.assertNotIn(spec["name"], list(check_names(sentence["check"])), sentence["id"])
+
     def test_no_sentence_outside_a_fault_injects(self):
         for sentence in self.sentences:
             if sentence["class"] != "fault":

@@ -125,6 +125,31 @@ func theJobRan(t *testing.T, s *state) {
 		t.Fatalf("proc_list does not hold the job %s: %+v", s.tickerID, listed.Processes)
 	}
 
+	// And one line says it too: confirming a job is one call, not a listing
+	// followed by a second one about its Package, see issue #154.
+	var lines struct {
+		Processes []struct {
+			ID       string `json:"id"`
+			State    string `json:"state"`
+			Schedule string `json:"schedule"`
+			NextRun  string `json:"nextRun"`
+		} `json:"processes"`
+	}
+	s.admin.ok("proc_list", map[string]any{}, &lines)
+	var online bool
+	for _, p := range lines.Processes {
+		if p.ID != s.tickerID {
+			continue
+		}
+		online = true
+		if p.Schedule == "" || p.NextRun == "" {
+			t.Fatalf("the line of the job is %+v, want the schedule and the next tick on it", p)
+		}
+	}
+	if !online {
+		t.Fatalf("the one line listing does not hold the job %s: %+v", s.tickerID, lines.Processes)
+	}
+
 	// And the logs of a job are the last run's, which is the line that run
 	// printed before it exited.
 	var logs struct {
@@ -136,6 +161,12 @@ func theJobRan(t *testing.T, s *state) {
 	}
 	if !containsLine(logs.Lines, "ticked at") {
 		t.Fatalf("proc_logs answered %v, want the line the run printed", logs.Lines)
+	}
+	// Both streams of the run, not the first one: the runtime keeps stdout and
+	// stderr apart and proc_logs answers with what the container wrote on
+	// either, see issue #130.
+	if !containsLine(logs.Lines, "this line went to stderr") {
+		t.Fatalf("proc_logs answered %v, want the line the run printed on stderr", logs.Lines)
 	}
 }
 

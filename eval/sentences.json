@@ -20,12 +20,26 @@
     {
       "id": "weather-job",
       "class": "nothing",
-      "prompt": "Every morning at eight, fetch the weather for Hsinchu and post it as a new item on our class board: POST JSON {\"text\": \"<the forecast>\", \"author\": \"weather-bot\"} to https://todo.loki.kitbash.zyx.tw/api/todos.",
-      "source": "M10, verbatim. The board named in it is loki's own M10 Process, which is outside the round on purpose: the sentence is carried over word for word.",
+      "prompt": "Every morning at eight, fetch the weather for Hsinchu and post it as a new item on our class board: POST JSON {\"text\": \"<the forecast>\", \"author\": \"weather-bot\"} to {url}/api/items.",
+      "source": "M10, verbatim except the address. The M10 sentence named loki's own board, and the rounds posted onto it, which is a member's data written by the bench: the board is now the round's own bench-board fixture, deployed for this sentence the way a fault's is. The bar stays the registration, because the first tick is the next morning and no run lasts that long; the board is read for the record, so a row says whether this agent proved the job by posting to it by hand.",
+      "setup": {
+        "fixture": "bench-board",
+        "package": "bench-board-class"
+      },
       "check": {
         "name": "proc_scheduled",
         "params": {
           "scope": "new"
+        }
+      },
+      "observe": {
+        "posted": {
+          "name": "http_item_posted",
+          "params": {
+            "process": "{pkg}",
+            "path": "/api/items",
+            "author": "weather-bot"
+          }
         }
       }
     },
