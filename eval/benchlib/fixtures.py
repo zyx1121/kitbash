@@ -1,8 +1,11 @@
-"""The Processes a fault is injected against.
+"""The Processes a sentence is about before the agent starts.
 
 A fault sentence is only a fault if there is something to break, so the round
-deploys the thing itself, as the member, over the same surface an agent uses.
-The fixtures are four small Packages under eval/fixtures.
+deploys the thing itself, as the member, over the same surface an agent uses. A
+sentence that names an address gets the same deploy without the fault, so what
+it names is inside the round: the scheduled job posts onto a board deployed
+this way rather than onto somebody's own Process. The fixtures are four small
+Packages under eval/fixtures.
 """
 
 import os

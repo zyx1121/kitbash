@@ -41,6 +41,26 @@ func (c *CLI) run(ctx context.Context, args ...string) (string, error) {
 	return stdout.String(), nil
 }
 
+// combined executes one podman command and returns its two streams as the one
+// stream the runtime wrote, which is what reading a container's output means:
+// see Logs. The error carries the same text, redacted the way run's does, and
+// it is the whole output rather than stderr alone because there is no stderr
+// of podman's own to separate out any more.
+func (c *CLI) combined(ctx context.Context, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, Binary, args...)
+	var both bytes.Buffer
+	cmd.Stdout = &both
+	// The same writer, not a second one: os/exec gives the child one pipe for
+	// both descriptors when Stdout and Stderr are the same value, so the
+	// interleaving is the runtime's own.
+	cmd.Stderr = cmd.Stdout
+	if err := cmd.Run(); err != nil {
+		return both.String(), fmt.Errorf("podman %s: %v: %s", redact(args), err,
+			strings.TrimSpace(both.String()))
+	}
+	return both.String(), nil
+}
+
 // redact renders a command line with every environment value removed. The keys
 // stay, because which variable was set is what a reader of the log needs; the
 // values are the caller's secrets.
@@ -526,9 +546,17 @@ func (c *CLI) Remove(ctx context.Context, name string, force bool) error {
 	return err
 }
 
-// Logs returns the tail of a container's output.
+// Logs returns the tail of a container's output, stdout and stderr together.
+//
+// podman logs keeps the two streams apart: the container's stdout goes to
+// podman's stdout and its stderr to podman's stderr. run reads stdout alone
+// and hands stderr to the error path, so a Process that died on stderr had
+// nothing to show through proc_logs, see issue #130. Both descriptors are the
+// same writer here, which is also what keeps the order: one pipe means podman
+// writes the lines into it as it emits them, rather than two buffers a reader
+// would have to merge by guess.
 func (c *CLI) Logs(ctx context.Context, name string, tail int) ([]string, error) {
-	out, err := c.run(ctx, "logs", "--tail", strconv.Itoa(tail), name)
+	out, err := c.combined(ctx, "logs", "--tail", strconv.Itoa(tail), name)
 	if err != nil {
 		return nil, err
 	}

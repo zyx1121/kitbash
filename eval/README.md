@@ -63,7 +63,9 @@ sentence of the round has run; with `--only` or after a failure it stays.
 
 - **From nothing.** A web application, a scheduled job, a service, a link
   shortener and a notes wiki. The first three are M10's own sentences word for
-  word.
+  word, except the address the job posts to: M10 named a member's own board and
+  the rounds wrote onto it, so the job now posts to a `bench-board` the round
+  deploys for it, and the check reads the item off that board.
 - **From a repository.** Five real GitHub addresses and "get it running for my
   classmates", the shape EnvBench and SetupBench measure. Three are the ones
   M10 tried by hand. Two were added for what they need beyond a clone:
@@ -74,7 +76,9 @@ sentence of the round has run; with `--only` or after a failure it stays.
   ITBench measure. Each is injected by the harness against a Process the round
   deployed itself first, so a fault sentence is self contained: the fixture
   Packages are under `fixtures/`, the round writes, builds and runs them as the
-  member, waits until the address answers, and only then breaks it.
+  member, waits until the address answers, and only then breaks it. A sentence
+  outside this class may name a `setup` too, which is the same deploy without
+  the fault: the scheduled job posts onto a board deployed that way.
 
 Every sentence carries a `check`, a small function keyed by name in
 `benchlib/checks.py` with its parameters written beside it in the sentence
@@ -84,6 +88,7 @@ file:
 |---|---|
 | `http_ok` | the status and body of the address a Process of this run is served at |
 | `http_post_roundtrip` | an item posted to one path comes back from another |
+| `http_item_posted` | an item the run put on the round's own board is on it, by author |
 | `proc_running` | `proc_list` says a Process is up |
 | `proc_scheduled` | `proc_list` says a job is registered with a cron expression |
 | `tel_schedule` | a `kitbash.schedule` record exists since the round started |
@@ -162,7 +167,8 @@ python3 -m unittest discover -s eval/tests -t eval/tests
 ```
 
 No network, no host, no agent. They cover the sentence file (ids unique, every
-check name exists, every fault has an injection and a fixture to break), stream
+check name exists, every fault has an injection and a fixture to break, no
+prompt names an address outside the round), stream
 parsing on a captured transcript with its paths redacted, row computation,
 report rendering on fixture rows, and the questions asked heuristic on three
 answers.

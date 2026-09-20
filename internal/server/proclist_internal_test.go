@@ -137,6 +137,47 @@ func TestProcListOutputValidatesBothShapes(t *testing.T) {
 	}
 }
 
+// A line is one call's worth of answer, so a job's line carries the two fields
+// that say it is a job: without them an agent that has just registered one
+// reads scheduled and has to ask again by Package to learn what for, which is
+// the call issue #154 is about. They are absent from the line of a Process
+// that stays up, the way url is.
+func TestALineOfAJobCarriesItsScheduleAndNextRun(t *testing.T) {
+	lines := (&proc.ListResult{Processes: []proc.Process{aJob(), aProcess()}}).Lines()
+	encoded, err := json.Marshal(lines)
+	if err != nil {
+		t.Fatalf("encoding the lines: %v", err)
+	}
+	var decoded struct {
+		Processes []map[string]any `json:"processes"`
+	}
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("decoding the lines: %v", err)
+	}
+	if len(decoded.Processes) != 2 {
+		t.Fatalf("the listing has %d lines, want two", len(decoded.Processes))
+	}
+	job, running := decoded.Processes[0], decoded.Processes[1]
+	if job["schedule"] != aJob().Schedule {
+		t.Errorf("the line of a job carries schedule %v, want %q", job["schedule"], aJob().Schedule)
+	}
+	if job["nextRun"] != aJob().NextRun {
+		t.Errorf("the line of a job carries nextRun %v, want %q", job["nextRun"], aJob().NextRun)
+	}
+	for _, field := range []string{"schedule", "nextRun"} {
+		if _, carried := running[field]; carried {
+			t.Errorf("the line of a Process that stays up carries %s: %v", field, running[field])
+		}
+	}
+	// The line stays a line: the fields a member asks about one Package for
+	// are still only in the full shape.
+	for _, field := range []string{"digest", "lastRun", "mounts", "health"} {
+		if _, carried := job[field]; carried {
+			t.Errorf("a line carries %s, which is the answer to a narrower question", field)
+		}
+	}
+}
+
 // proc_run answers the same two shapes, so its own published schema is held to
 // both: a Process that is up and a job that is waiting.
 func TestProcRunOutputValidatesAProcessAndAJob(t *testing.T) {

@@ -31,8 +31,20 @@ class StubContext:
 
 
 class ProcScheduled(unittest.TestCase):
+    def test_a_line_that_carries_the_cron_is_read_off_one_call(self):
+        """What issue #154 fixed: the line carries schedule and nextRun."""
+        context = StubContext(
+            [{"id": "1", "name": "weather-poster", "package": "/home/bench-x/weather",
+              "state": "scheduled", "schedule": "0 8 * * *", "nextRun": "2026-09-20T08:00:00Z"}]
+        )
+        result = checks.proc_scheduled(context, {"scope": "new"})
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["seen"][0]["schedule"], "0 8 * * *")
+        # And no second call: the listing answered the question by itself.
+        self.assertEqual(context.calls, [])
+
     def test_a_one_line_listing_carries_the_state_and_not_the_cron(self):
-        """The bug the first round found: schedule is only in the full shape."""
+        """A host that predates the fix: the second call is the fallback."""
         context = StubContext(
             [{"id": "1", "name": "weather-poster", "package": "/home/bench-x/weather", "state": "scheduled"}],
             detailed={
@@ -62,6 +74,48 @@ class ProcScheduled(unittest.TestCase):
             pre_ids=["1"],
         )
         self.assertFalse(checks.proc_scheduled(context, {"scope": "new"})["passed"])
+
+
+class ItemPosted(unittest.TestCase):
+    """The board is read over HTTP, so the fetch is the one thing stubbed."""
+
+    def board(self, body, status=200):
+        original = checks.fetch
+        checks.fetch = lambda url, **kwargs: (status, body)
+        self.addCleanup(lambda: setattr(checks, "fetch", original))
+
+    def context(self):
+        return StubContext([{"id": "1", "name": "bench-board-class", "state": "running",
+                             "url": "https://bench-board-class.bench-x.kitbash.example"}])
+
+    def test_an_item_by_the_author_the_sentence_named_passes(self):
+        self.board('{"items": [{"text": "Hsinchu: 28C, showers", "author": "weather-bot"}]}')
+        result = checks.http_item_posted(
+            self.context(), {"process": "bench-board-class", "path": "/api/items", "author": "weather-bot"})
+        self.assertTrue(result["passed"], result["detail"])
+        self.assertEqual(result["seen"]["author"], "weather-bot")
+
+    def test_a_board_holding_somebody_elses_items_does_not_pass(self):
+        self.board('{"items": [{"text": "buy milk", "author": "bench"}]}')
+        result = checks.http_item_posted(
+            self.context(), {"process": "bench-board-class", "author": "weather-bot"})
+        self.assertFalse(result["passed"])
+        self.assertIn("weather-bot", result["detail"])
+
+    def test_an_empty_board_does_not_pass(self):
+        self.board('{"items": []}')
+        self.assertFalse(checks.http_item_posted(self.context(), {"process": "bench-board-class"})["passed"])
+
+    def test_an_item_with_no_text_is_not_an_item(self):
+        self.board('{"items": [{"text": "   ", "author": "weather-bot"}]}')
+        result = checks.http_item_posted(self.context(), {"process": "bench-board-class", "author": "weather-bot"})
+        self.assertFalse(result["passed"])
+
+    def test_a_board_that_is_not_JSON_fails_rather_than_raising(self):
+        self.board("<html>the board is down</html>", status=502)
+        result = checks.http_item_posted(self.context(), {"process": "bench-board-class"})
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["tried"][0]["status"], 502)
 
 
 class Candidates(unittest.TestCase):

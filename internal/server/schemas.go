@@ -201,8 +201,8 @@ const processDef = `{
     "state": { "type": "string", "enum": ["starting", "running", "unhealthy", "stopped", "failed", "scheduled"] },
     "expose": { "type": "string", "enum": ["mcp", "http", "none"] },
     "url": { "type": "string", "description": "Where an http Process is served, when the host has a domain" },
-    "schedule": { "type": "string", "description": "The cron expression this Process is a job of, absent for a Process that stays up" },
-    "nextRun": { "type": "string", "format": "date-time", "description": "When kitbashd runs this job next, UTC" },
+    "schedule": { "type": "string", "description": "The cron expression this Process is a job of, on a line as well as in full, absent for a Process that stays up" },
+    "nextRun": { "type": "string", "format": "date-time", "description": "When kitbashd runs this job next, UTC, on a line as well as in full" },
     "lastRun": {
       "type": "object",
       "description": "The run this job finished most recently. Absent until it has run once under the daemon that is answering, which holds the runs it saw the way it holds health readings.",

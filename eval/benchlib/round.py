@@ -196,6 +196,28 @@ class Round:
             self.log("  the fixture does not answer before the fault: %s" % healthy.get("detail"))
         return report
 
+    def setup_fixture(self, sentence, variables):
+        """Deploy what a sentence posts to, with nothing broken afterwards.
+
+        A fault deploys a fixture so there is something to break; this is the
+        same deploy without the fault, so a sentence that names an address
+        names one inside the round. Nothing else about the run changes: the
+        Process is registered before the agent starts, so it is not one of the
+        Processes the run made.
+        """
+        setup = sentence["setup"]
+        report = {"package": setup["package"], "fixture": setup["fixture"]}
+        self.log("  deploying %s" % setup["package"])
+        with self.session() as session:
+            fixtures.deploy(session, self.state["member"], setup["fixture"], setup["package"],
+                            variables, self.log)
+        spec = {"name": "http_ok", "params": {"process": setup["package"], "path": "/", "status": 200}}
+        healthy = fixtures.wait_healthy(self.context(variables=variables), spec, HEALTHY_SECONDS)
+        report["healthy_before"] = healthy
+        if not healthy.get("passed"):
+            self.log("  the fixture does not answer before the run: %s" % healthy.get("detail"))
+        return report
+
     def inject(self, sentence, variables):
         """Break it, over ssh or over the member's own surface."""
         inject = sentence["inject"]
@@ -252,6 +274,8 @@ class Round:
 
         setup_report = None
         injected_at = None
+        if sentence["class"] != "fault" and sentence.get("setup"):
+            setup_report = self.setup_fixture(sentence, variables)
         if sentence["class"] == "fault":
             setup_report = self.setup_fault(sentence, variables)
             done = self.inject(sentence, variables)

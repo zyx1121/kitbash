@@ -13,7 +13,7 @@ repository.
 | Tool | What it does |
 |------|-------------|
 | `fs_list` | Visible folders and the files in one path, or the roots when no path is given. A root answers path, name and description per folder and no files; a folder answers its subfolders and its files as a name and a size |
-| `fs_read` | One file: text as text, PNG and JPEG as an image, PDF as extracted text |
+| `fs_read` | One file: text as text, PNG and JPEG as an image, PDF as extracted text. A folder is `invalid-path` with a fix naming `fs_list` |
 | `fs_write` | Create or replace one file, or up to 64 of them in `files`, and commit them to the enclosing repository as one commit |
 | `fs_history` | The commits that touched a path, newest first |
 
@@ -41,9 +41,9 @@ Processes. A Package running as a rootless container under the caller.
 | Tool | What it does |
 |------|-------------|
 | `proc_run` | Start a Process from a digest, or converge an existing one to it. With `expose: mcp` its tools join the surface |
-| `proc_list` | The caller's Processes, running or stopped. With a `package`, that Package's Processes in full; without one, a line each |
+| `proc_list` | The caller's Processes, running or stopped. With a `package`, that Package's Processes in full; without one, a line each, carrying `url` for an http Process and `schedule` and `nextRun` for a job |
 | `proc_stop` | Stop a Process. It stays known, and its tools leave the surface |
-| `proc_logs` | The recent stdout and stderr of a Process |
+| `proc_logs` | The recent stdout and stderr of a Process, interleaved as the runtime wrote them |
 
 A unit with `expose: http` gets an address when the host has a domain:
 `proc_run` answers `url` and `proc_list` shows it, `https://<name>.<member>.<domain>`,
@@ -61,7 +61,9 @@ the Process keeps its internal port.
 A unit with `expose: none` may declare `schedule` in `deploy.units[]`, five cron
 fields read in UTC, and then it is a job: `proc_run` registers it, starts
 nothing, and answers `state: scheduled` with the `nextRun` kitbashd will start
-it at, which `proc_list` shows beside the `lastRun` of a job that has run.
+it at. A line of `proc_list` carries `schedule` and `nextRun`, so confirming a
+job is one call, and asking by `package` adds the `lastRun` of a job that has
+run.
 kitbashd starts the container at each tick as the owner, with the same
 environment, secrets, mounts and ceiling any start gets, and every tick writes
 one `kitbash.schedule` record, so "did it run this morning" is a `tel_query`.

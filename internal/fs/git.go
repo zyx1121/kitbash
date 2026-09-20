@@ -139,6 +139,23 @@ func (s *Service) repoDir(repo string) (string, func(), error) {
 	return name, func() { f.Close() }, nil
 }
 
+// gitNoBackgroundWork keeps every invocation to the work it was asked for.
+//
+// A commit ends by starting maintenance, which since git 2.0 is a detached
+// child that packs objects after the parent has exited. kitbash waits for the
+// child it started and nothing waits for that grandchild, so the write is
+// answered while something is still writing under .git/objects: in a test that
+// is a repository removed underneath a running gc, which is the flake of issue
+// #134, and on a host it is a member's repository packed by a process nobody
+// asked for. Both auto triggers are off, and a gc that some other rule does
+// start stays in the foreground, so the last git process this call spawns has
+// exited by the time it returns.
+var gitNoBackgroundWork = []string{
+	"-c", "gc.auto=0",
+	"-c", "maintenance.auto=false",
+	"-c", "gc.autoDetach=false",
+}
+
 // git runs one git command inside repo and returns its standard output.
 //
 // Its error carries git's standard error for the server log only. Never put
@@ -152,7 +169,8 @@ func (s *Service) git(ctx context.Context, repo string, args ...string) (string,
 		"-c", "safe.directory=" + repo,
 		"-c", "commit.gpgsign=false",
 		"-c", "advice.detachedHead=false",
-	}, args...)
+	}, gitNoBackgroundWork...)
+	full = append(full, args...)
 	cmd := exec.CommandContext(ctx, "git", full...)
 	// git resolves paths itself, so the one thing kitbash controls is which
 	// directory it starts in. Naming that directory by path would hand git a

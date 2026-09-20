@@ -142,10 +142,14 @@ type Line struct {
 	State   string `json:"state"`
 	Expose  string `json:"expose,omitempty"`
 	URL     string `json:"url,omitempty"`
-	// NextRun is when kitbashd runs a job next, which is the one thing a line
-	// about a scheduled Process has to carry: its state says it is waiting and
-	// this says what for.
-	NextRun string `json:"nextRun,omitempty"`
+	// Schedule is the cron expression a job runs on and NextRun the tick
+	// kitbashd will start it at. They are the two fields a line about a
+	// scheduled Process has to carry: its state says it is waiting, these say
+	// on what and what for, and without them confirming a job costs a second
+	// call, see issue #154. Both are absent for a Process that is not a job,
+	// the way url is absent for one that is not served.
+	Schedule string `json:"schedule,omitempty"`
+	NextRun  string `json:"nextRun,omitempty"`
 }
 
 // LinesResult is the output of proc_list without a package.
@@ -158,13 +162,14 @@ func (r *ListResult) Lines() *LinesResult {
 	out := &LinesResult{Processes: make([]Line, 0, len(r.Processes))}
 	for _, p := range r.Processes {
 		out.Processes = append(out.Processes, Line{
-			ID:      p.ID,
-			Name:    p.Name,
-			Package: p.Package,
-			State:   p.State,
-			Expose:  p.Expose,
-			URL:     p.URL,
-			NextRun: p.NextRun,
+			ID:       p.ID,
+			Name:     p.Name,
+			Package:  p.Package,
+			State:    p.State,
+			Expose:   p.Expose,
+			URL:      p.URL,
+			Schedule: p.Schedule,
+			NextRun:  p.NextRun,
 		})
 	}
 	return out

@@ -139,6 +139,53 @@ def http_post_roundtrip(ctx, params):
     return {"passed": False, "detail": "no address took an item and gave it back", "tried": tried}
 
 
+def _items(body):
+    """The items of a board, whichever of the two shapes it answers with."""
+    try:
+        decoded = json.loads(body or "")
+    except Exception:
+        return []
+    if isinstance(decoded, dict):
+        decoded = decoded.get("items")
+    return [item for item in decoded or [] if isinstance(item, dict)]
+
+
+def http_item_posted(ctx, params):
+    """An item the run put on the board is there, read off the board itself.
+
+    The board is the fixture this round deployed, never a member's own
+    Process: what a sentence asks an agent to post goes into the round and is
+    read back out of it here.
+    """
+    candidates = _candidates(ctx, params)
+    if not candidates:
+        return {"passed": False, "detail": "no Process with an address was made by this run"}
+    author = params.get("author")
+    contains = params.get("text_contains") or []
+    tried = []
+    for process in candidates:
+        url = ctx.url_of(process).rstrip("/") + params.get("path", "/api/items")
+        status, body = fetch(url)
+        items = _items(body)
+        for item in items:
+            text = str(item.get("text") or "").strip()
+            if author and item.get("author") != author:
+                continue
+            if not text or [m for m in contains if m.lower() not in text.lower()]:
+                continue
+            return {
+                "passed": True,
+                "detail": "%s carries an item by %s: %s" % (url, item.get("author"), text[:120]),
+                "seen": item,
+            }
+        tried.append({"url": url, "status": status, "items": len(items), "body": (body or "")[:200]})
+    return {
+        "passed": False,
+        "detail": "no item by %s is on the board" % (author or "this run"),
+        "tried": tried,
+    }
+
+
 def proc_running(ctx, params):
     """proc_list says the Process is up."""
     wanted = params.get("state", "running")
@@ -155,9 +202,10 @@ def proc_running(ctx, params):
 def proc_scheduled(ctx, params):
     """A job exists: a Process registered with a cron expression, waiting.
 
-    proc_list without a package answers one line per Process, and that line
-    carries the state and not the cron expression, so a Process whose state is
-    scheduled is read again by its Package to get the expression itself.
+    proc_list answers a line per Process, and since issue #154 that line
+    carries the cron expression and the next tick. A host that predates it
+    answers the state alone, so a Process that says scheduled and nothing else
+    is read again by its Package, which is the call the fix removes.
     """
     name = params.get("process")
     found = []
@@ -216,6 +264,7 @@ def all_of(ctx, params):
 REGISTRY = {
     "http_ok": http_ok,
     "http_post_roundtrip": http_post_roundtrip,
+    "http_item_posted": http_item_posted,
     "proc_running": proc_running,
     "proc_scheduled": proc_scheduled,
     "tel_schedule": tel_schedule,
