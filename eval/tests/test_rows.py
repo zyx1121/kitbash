@@ -54,6 +54,18 @@ class BuildRow(unittest.TestCase):
         self.assertEqual(row["time_to_mitigate_ms"], 165000)
         self.assertTrue(row["inject_verified"])
 
+    def test_an_observation_rides_beside_passed_and_not_in_it(self):
+        """The weather job's board: recorded, never the reason a row failed."""
+        meta = {"run": 1, "observed": {"posted": {"observed": False, "detail": "no item by weather-bot"}}}
+        row = rows.build_row(self.sentence, self.transcript, {"passed": True, "detail": "a job is registered"}, meta)
+        self.assertTrue(row["passed"])
+        self.assertFalse(row["observed"]["posted"]["observed"])
+        self.assertIn("weather-bot", row["observed"]["posted"]["detail"])
+
+    def test_a_row_without_observations_carries_none(self):
+        row = rows.build_row(self.sentence, self.transcript, {"passed": True}, {"run": 1})
+        self.assertIsNone(row["observed"])
+
     def test_the_result_text_is_cut(self):
         transcript = dict(self.transcript, result_text="x" * 5000)
         row = rows.build_row(self.sentence, transcript, {"passed": True}, {"run": 1})

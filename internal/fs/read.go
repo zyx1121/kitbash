@@ -64,8 +64,7 @@ func (s *Service) Read(ctx context.Context, path string, opts ReadOptions) (*Rea
 		// and this path is the right shape: it names a folder. Saying so, and
 		// naming the two calls that do work on a folder, is what saves the
 		// caller the retries the bench watched them spend, see issue #153.
-		return nil, problem.InvalidPathFix(clean, "this path is a folder",
-			"Call fs_list on it, or fs_read one of its files.")
+		return nil, problem.InvalidPathFix(clean, folderDetail, folderReadFix)
 	}
 	if !info.Mode().IsRegular() {
 		return nil, problem.InvalidPath(clean, "the path is not a regular file")

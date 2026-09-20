@@ -312,6 +312,7 @@ class Round:
         meta["ended_at"] = now()
 
         outcome = checks.run(context, check_spec, attempts=CHECK_ATTEMPTS, delay=CHECK_DELAY)
+        meta["observed"] = self.observe(sentence, variables, context)
         if injected_at and mitigation["first_pass"] is None and outcome.get("passed"):
             mitigation["first_pass"] = time.time()
         if injected_at and mitigation["first_pass"]:
@@ -341,6 +342,25 @@ class Round:
         if not row["passed"]:
             self.log("  check said: %s" % str(outcome.get("detail"))[:300])
         return row
+
+    def observe(self, sentence, variables, context):
+        """What a run showed beside the bar it is measured against.
+
+        An observation is a check that decides nothing: the weather job cannot
+        post inside a run, because its first tick is the next morning, so the
+        board is read to record whether the agent proved the job by hand
+        rather than to pass or fail the row. It runs once, after the outcome,
+        and a refusal is a false reading rather than an error.
+        """
+        watched = sentence.get("observe") or {}
+        if not watched:
+            return None
+        seen = {}
+        for name, spec in watched.items():
+            result = checks.run(context, self.resolve(spec, variables))
+            seen[name] = {"observed": bool(result.get("passed")), "detail": result.get("detail")}
+            self.log("  observed %s: %s" % (name, seen[name]["observed"]))
+        return seen
 
     def watch(self, context, check_spec, injected_at, mitigation, stop, handle):
         """Poll the check while the agent works, so mitigation has a time."""

@@ -383,6 +383,9 @@ families:
           read.
           A list is refused whole: one path the caller may not write is a call
           that did not happen, and nothing of it reaches the disk.
+          A path that names a folder, in either form, is invalid-path whose
+          fix says to name the file to write into it, rather than the advice
+          about the shape of a path, which this path kept.
           A member writing under /org does not fail: the call is queued for
           an admin as one approval whatever it carries, and the result is a
           queued problem (202) whose instance is the approval id;

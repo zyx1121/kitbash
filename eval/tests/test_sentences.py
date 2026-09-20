@@ -94,9 +94,31 @@ class SentenceFile(unittest.TestCase):
         job = [s for s in self.sentences if s["id"] == "weather-job"][0]
         self.assertEqual(job["setup"]["fixture"], "bench-board")
         self.assertIn("{url}/api/items", job["prompt"])
-        names = list(check_names(job["check"]))
-        self.assertIn("proc_scheduled", names)
-        self.assertIn("http_item_posted", names, "the check reads the item off the board")
+
+    def test_the_scheduled_job_is_passed_on_the_registration(self):
+        """The first tick is the next morning, so no run can post within it.
+
+        An item on the board means the agent tested the job by hand, which is
+        worth recording and is not what the sentence asked for, so it is an
+        observation rather than the bar.
+        """
+        job = [s for s in self.sentences if s["id"] == "weather-job"][0]
+        self.assertEqual(list(check_names(job["check"])), ["proc_scheduled"])
+        self.assertEqual(job["observe"]["posted"]["name"], "http_item_posted")
+        self.assertEqual(job["observe"]["posted"]["params"]["process"], "{pkg}")
+
+    def test_every_observation_names_a_check_that_exists(self):
+        for sentence in self.sentences:
+            for name, spec in (sentence.get("observe") or {}).items():
+                self.assertTrue(name.strip(), sentence["id"])
+                for named in check_names(spec):
+                    self.assertIn(named, checks.REGISTRY, "%s observes %s" % (sentence["id"], named))
+
+    def test_no_observation_is_part_of_a_check(self):
+        """An observation decides nothing: the two are read from two keys."""
+        for sentence in self.sentences:
+            for spec in (sentence.get("observe") or {}).values():
+                self.assertNotIn(spec["name"], list(check_names(sentence["check"])), sentence["id"])
 
     def test_no_sentence_outside_a_fault_injects(self):
         for sentence in self.sentences:

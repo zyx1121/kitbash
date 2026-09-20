@@ -14,7 +14,7 @@ repository.
 |------|-------------|
 | `fs_list` | Visible folders and the files in one path, or the roots when no path is given. A root answers path, name and description per folder and no files; a folder answers its subfolders and its files as a name and a size |
 | `fs_read` | One file: text as text, PNG and JPEG as an image, PDF as extracted text. A folder is `invalid-path` with a fix naming `fs_list` |
-| `fs_write` | Create or replace one file, or up to 64 of them in `files`, and commit them to the enclosing repository as one commit |
+| `fs_write` | Create or replace one file, or up to 64 of them in `files`, and commit them to the enclosing repository as one commit. A path that names a folder is `invalid-path`: name the file |
 | `fs_history` | The commits that touched a path, newest first |
 
 Write every file of a Package in one `fs_write`: `files` takes a list of

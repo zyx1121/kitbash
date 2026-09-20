@@ -65,7 +65,9 @@ sentence of the round has run; with `--only` or after a failure it stays.
   shortener and a notes wiki. The first three are M10's own sentences word for
   word, except the address the job posts to: M10 named a member's own board and
   the rounds wrote onto it, so the job now posts to a `bench-board` the round
-  deploys for it, and the check reads the item off that board.
+  deploys for it. The job passes on the registration, because its first tick is
+  the next morning; the board is read as an observation, so a row records
+  whether that agent proved the job by posting to it by hand.
 - **From a repository.** Five real GitHub addresses and "get it running for my
   classmates", the shape EnvBench and SetupBench measure. Three are the ones
   M10 tried by hand. Two were added for what they need beyond a clone:
@@ -93,6 +95,12 @@ file:
 | `proc_scheduled` | `proc_list` says a job is registered with a cron expression |
 | `tel_schedule` | a `kitbash.schedule` record exists since the round started |
 | `all_of` | every check in the list, the first failure being the reason |
+
+A sentence may also carry `observe`, a mapping of name to check that is read
+after the outcome and decides nothing. It lands on the row as
+`observed: {name: {observed, detail}}`, beside `passed` and never part of it,
+which is how a round reports something a run cannot be failed for, such as the
+weather job having posted to its board within the run.
 
 A check on a sentence the member wrote freely looks only at Processes that did
 not exist before the run, so the previous sentence's service cannot pass this
@@ -168,7 +176,8 @@ python3 -m unittest discover -s eval/tests -t eval/tests
 
 No network, no host, no agent. They cover the sentence file (ids unique, every
 check name exists, every fault has an injection and a fixture to break, no
-prompt names an address outside the round), stream
+prompt names an address outside the round, no observation is part of a check),
+stream
 parsing on a captured transcript with its paths redacted, row computation,
 report rendering on fixture rows, and the questions asked heuristic on three
 answers.
