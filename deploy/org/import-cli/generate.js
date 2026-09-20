@@ -28,9 +28,10 @@
 //         },
 //         "positionals": ["filter", "input"],  // input property names, in argv order; a property that names a file is written from files[] to a tmp path and the path is passed, and an array of them is one path per element
 //         "stdin": "stdin",                     // input property whose string goes to stdin, or null
-//         "outputs": ["output"]                 // positional property names naming files the adapter reads back after the run (base64 in result.files)
+//         "outputs": ["output"],                // positional property names naming files the adapter reads back after the run (base64 in result.files)
+//         "stdoutJson": false                   // true when this command prints JSON, which the adapter parses into stdoutJson beside the stdout string
 //       },
-//       "run":   {"argv": ["jq"], "options": {}, "positionals": ["args"], "spread": "args", "stdin": "stdin", "outputs": []},
+//       "run":   {"argv": ["jq"], "options": {}, "positionals": ["args"], "spread": "args", "stdin": "stdin", "outputs": [], "stdoutJson": false},
 //       "probe": {"probe": true}
 //     }
 //   }
@@ -43,15 +44,23 @@
 // and refused as `invalid-path` when it leaves every mount target, and an
 // output whose path is under a `ro` mount is refused as `not-permitted`.
 // Result shape from the adapter: `{exitCode, stdout, stderr, files: [{name,
-// contentBase64}]}` with the 8 MiB caps, and an output given as a path is left
-// where the command wrote it and reported as `{name, path}` with no content.
+// contentBase64}], truncated}` with the 8 MiB caps, and an output given as a
+// path is left where the command wrote it and reported as `{name, path}` with
+// no content. It is answered as `structuredContent` and as a text block holding
+// the same JSON, so a client that reads either is served. The schema closes the
+// shape with `additionalProperties: false`, so every key the adapter can write
+// is declared: `notes`, `signal`, `timedOut` and `stdoutJson` alongside the
+// five above.
 //
 // Two details this generator adds on top of that shape, neither of which
 // changes a key.
 //
-// Every tool entry also carries `inputSchema`, the same schema the manifest
-// declares, because the adapter answers tools/list from tools.json alone and
-// never parses YAML.
+// Every tool entry also carries `inputSchema` and `outputSchema`, the same two
+// schemas the manifest declares, because the adapter answers tools/list from
+// tools.json alone and never parses YAML. `outputSchema` is what makes the
+// adapter answer `structuredContent` as well as a text block, and what the
+// bridge validates that answer against, issue #114: an entry without one
+// answers in text alone and nothing is validated.
 //
 // And `repeat` says how an option of type `array` reaches argv. With
 // `"repeat": false` the flag is written once and every element follows it as
@@ -344,18 +353,32 @@ const stdinProperty = (binary) => ({
   maxLength: MAX_PAYLOAD,
 });
 
+// The answer every tool but probe carries, and the schema the adapter's
+// structuredContent is validated against on the way out, issue #114. The shape
+// is the adapter's and is fixed, so the schema closes it: a key the adapter
+// never writes is a Package answering something its manifest does not declare,
+// and the bridge is the right place to hear about it.
+//
+// exitCode is null for a command that was killed before it could exit, which is
+// what the timeout leaves, so the type carries both and signal and timedOut say
+// why. Nothing else is optional for the sake of a caller's convenience: files
+// and truncated are written on every run, and notes, signal, timedOut and
+// stdoutJson appear only when there is something to say.
 const runOutput = (binary) => ({
   type: "object",
-  required: ["exitCode", "stdout", "stderr"],
+  additionalProperties: false,
+  required: ["exitCode", "stdout", "stderr", "files", "truncated"],
   properties: {
-    exitCode: { type: "integer", description: `The status ${binary} exited with. A non zero status is reported, not raised.` },
+    exitCode: { type: ["integer", "null"], description: `The status ${binary} exited with, or null when it was killed before it could exit. A non zero status is reported, not raised.` },
     stdout: { type: "string", description: `What ${binary} wrote to standard output, truncated at ${MAX_PAYLOAD} bytes.` },
+    stdoutJson: { description: `What standard output parses to, present only when this tool's entry in tools.json carries "stdoutJson": true and ${binary} printed a JSON document. stdout keeps the text either way.` },
     stderr: { type: "string", description: `What ${binary} wrote to standard error, truncated at ${MAX_PAYLOAD} bytes.` },
     files: {
       type: "array",
       description: "The files named by this tool's outputs. An output named as a bare name is read back after the run and carries contentBase64; an output named as a path under a read write mount is left where the command wrote it and carries path instead, because the adapter never reads a file back out of a mount. An output the run did not produce is absent rather than empty.",
       items: {
         type: "object",
+        additionalProperties: false,
         required: ["name"],
         properties: {
           name: { type: "string" },
@@ -369,11 +392,15 @@ const runOutput = (binary) => ({
       description: "Present only when an output was named and deliberately not read back, one sentence per output, such as a symbolic link or something that is not a regular file. An empty result with a note here is not a failed run.",
       items: { type: "string" },
     },
+    truncated: { type: "boolean", description: `True when standard output or standard error reached the ${MAX_PAYLOAD} byte cap and the rest was dropped.` },
+    signal: { type: "string", description: "The signal the command was killed with, present only when it was killed." },
+    timedOut: { type: "boolean", description: "Present and true only when the command outlived the call's timeout and was killed with its process group." },
   },
 });
 
 const probeOutput = (binary) => ({
   type: "object",
+  additionalProperties: false,
   required: ["help", "version", "man"],
   properties: {
     help: { type: "string", description: `What ${binary} --help printed, or the error it printed instead.` },
@@ -477,6 +504,12 @@ function buildTool({ toolName, description, binary, argv, options, positionals, 
     properties,
   };
 
+  // One object, written twice: the manifest declares it and tools.json carries
+  // it, because the adapter answers structuredContent against the schema and
+  // reads no YAML. A schema in one file and an answer built from the other is
+  // the split issue #114 came out of.
+  const output = runOutput(binary);
+
   return {
     manifestTool: {
       name: toolName,
@@ -485,9 +518,21 @@ function buildTool({ toolName, description, binary, argv, options, positionals, 
       // a folder nobody can read.
       description: describe(description, `Runs the ${binary} command through this Package.`),
       input,
-      output: runOutput(binary),
+      output,
     },
-    entry: { argv, options: wiring, positionals: order, stdin: "stdin", outputs, inputSchema: input },
+    entry: {
+      argv,
+      options: wiring,
+      positionals: order,
+      stdin: "stdin",
+      outputs,
+      // What the generator cannot read out of a help text: whether this command
+      // prints JSON. false is the honest default, and NOTES.md says where to
+      // turn it on.
+      stdoutJson: false,
+      inputSchema: input,
+      outputSchema: output,
+    },
   };
 }
 
@@ -511,6 +556,8 @@ function baseTools(binary, mounts) {
     },
   };
   const probeInput = { type: "object", additionalProperties: false, properties: {} };
+  const runOut = runOutput(binary);
+  const probeOut = probeOutput(binary);
 
   return {
     manifestTools: [
@@ -518,18 +565,28 @@ function baseTools(binary, mounts) {
         name: "run",
         description: clip(`Run ${binary} with the arguments given, verbatim. Use it for anything the generated tools do not cover, and to check what a flag does before a schema is written for it.`),
         input: runInput,
-        output: runOutput(binary),
+        output: runOut,
       },
       {
         name: "probe",
         description: clip(`Report what ${binary} says about itself: its --help output, its --version output and its man page when the image carries one. Feed the answer back to the import-cli kit's refine tool.`),
         input: probeInput,
-        output: probeOutput(binary),
+        output: probeOut,
       },
     ],
     entries: {
-      run: { argv: [binary], options: {}, positionals: ["args"], spread: "args", stdin: "stdin", outputs: [], inputSchema: runInput },
-      probe: { probe: true, inputSchema: probeInput },
+      run: {
+        argv: [binary],
+        options: {},
+        positionals: ["args"],
+        spread: "args",
+        stdin: "stdin",
+        outputs: [],
+        stdoutJson: false,
+        inputSchema: runInput,
+        outputSchema: runOut,
+      },
+      probe: { probe: true, inputSchema: probeInput, outputSchema: probeOut },
     },
   };
 }
@@ -648,8 +705,18 @@ function callingContract(binary, toolNames) {
     "object:",
     "",
     "```json",
-    '{ "exitCode": 0, "stdout": "", "stderr": "", "files": [{ "name": "out.png", "contentBase64": "..." }] }',
+    '{ "exitCode": 0, "stdout": "", "stderr": "", "files": [{ "name": "out.png", "contentBase64": "..." }], "truncated": false }',
     "```",
+    "",
+    "It comes back as `structuredContent`, which kitbash validates against this",
+    "tool's output schema before the caller sees it, and as a text block holding",
+    "the same JSON for a client that shows text. A command killed by the call",
+    "timeout answers `exitCode` null with `signal` and `timedOut` beside it.",
+    "",
+    "A command that prints JSON can have it parsed for you: set `\"stdoutJson\":",
+    "true` on that tool in `tools.json`, and the result carries `stdoutJson` with",
+    "the parsed document beside the `stdout` text. Output that does not parse, or",
+    "a tool that did not ask, carries the string alone.",
     "",
     `A non zero \`exitCode\` is reported rather than raised, and \`stdout\`, \`stderr\``,
     `and every file are capped at ${MAX_PAYLOAD} bytes each way.`,
@@ -908,6 +975,9 @@ export function refined({ source, parsed, help = "", mounts }) {
       `- ${shortened.length} tool ${shortened.length === 1 ? "name was" : "names were"} too long to publish. A surface tool name is \`${name}_<tool>\` and is capped at ${MAX_SURFACE_NAME} characters, so a tool name of this Package has ${budget} to spend; the ones over it were truncated and given four characters of a hash of the name they would have had, such as \`${shortened[0].subcommand}\` becoming \`${shortened[0].toolName}\`. Rename this folder to something shorter and import again to get the full names back.`,
     );
   }
+  undecided.push(
+    `- Whether \`${binary}\` prints JSON on standard output. Every tool in tools.json carries \`"stdoutJson": false\`, so a result carries the text and nothing else. Set it to true on a tool whose command prints a JSON document and the adapter parses it into \`stdoutJson\` beside \`stdout\`, which the output schema already declares.`,
+  );
   if (subcommands.length > 0) {
     undecided.push(`- Every subcommand tool carries no flags of its own. The top level help lists subcommands and not their flags, so refine each subcommand separately by probing \`${binary} <subcommand> --help\` and editing its tool.`);
   }

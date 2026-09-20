@@ -276,7 +276,9 @@ means running the Package first.
 
 Then `jq_jq` with `{"filter": ".items | map(.name)", "stdin": "{...}",
 "compact_output": true}` answers `{"exitCode": 0, "stdout": "...", "stderr": "",
-"files": []}`. A non zero exit code is an answer and not an error.
+"files": [], "truncated": false}`, as `structuredContent` validated against the
+tool's output schema and as a text block carrying the same JSON. A non zero exit
+code is an answer and not an error.
 
 Read `NOTES.md` before trusting the schema. It lists what the generator could
 not decide: which apk release the constraint resolved to, whether an array

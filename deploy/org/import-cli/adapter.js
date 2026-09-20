@@ -20,6 +20,7 @@
 //     "tools": {
 //       "<toolName>": {
 //         "inputSchema": {...},                 // JSON schema for tools/list
+//         "outputSchema": {...},                // JSON schema for tools/list and for the structuredContent this file answers with; an entry without one answers in text alone
 //         "argv": ["jq"],                       // fixed prefix, binary then subcommand words
 //         "options": {                          // input property -> flag
 //           "<prop>": {"flag": "--compact-output", "takesValue": false, "type": "boolean"},
@@ -27,9 +28,10 @@
 //         },                                    // an array value with repeat true writes the flag before every element, and with repeat false writes the flag once followed by every element
 //         "positionals": ["filter", "input"],  // input property names, in argv order; a property whose schema has "format": "kitbash-file", on itself or on its items, takes a name of the reserved input `files`, which the adapter writes to a tmp dir and passes the path of, or an absolute path under one of the mount targets above, which it passes unchanged
 //         "stdin": "stdin",                     // input property whose string goes to stdin, or null
-//         "outputs": ["output"]                 // positional property names that name files the adapter reads back after the run (base64 in result.files), or leaves in place when they were given as a path under a rw mount
+//         "outputs": ["output"],                // positional property names that name files the adapter reads back after the run (base64 in result.files), or leaves in place when they were given as a path under a rw mount
+//         "stdoutJson": false                   // true when this command prints JSON, which this file parses into stdoutJson beside the stdout string
 //       },
-//       "run":   {"inputSchema": {...}, "argv": ["jq"], "options": {}, "positionals": ["args"], "spread": "args", "stdin": "stdin", "outputs": []},
+//       "run":   {"inputSchema": {...}, "argv": ["jq"], "options": {}, "positionals": ["args"], "spread": "args", "stdin": "stdin", "outputs": [], "stdoutJson": false},
 //       "probe": {"inputSchema": {"type":"object","properties":{}}, "probe": true}
 //     }
 //   }
@@ -75,6 +77,21 @@
 // door that stands open beside it. What matters is the fence the adapter does
 // hold: no shell, one temporary working directory, and a file name reduced to
 // one path component.
+//
+// A call is answered twice over: as `structuredContent`, which is the object
+// the bridge validates against the output schema the manifest declares, and as
+// a text block holding the same JSON, which is what a client that shows text
+// reads. A tool whose entry carries no `outputSchema` answers in text alone,
+// because a Package that promises a shape it does not send is the split issue
+// #114 was: one text block, an output schema in the manifest, and nothing
+// validated between them.
+//
+// `stdoutJson` is the one part of that object the command decides. A tool whose
+// entry says `"stdoutJson": true` has its standard output parsed as JSON, and
+// what it parses to is carried beside the text rather than instead of it, so a
+// caller reading `stdout` reads the same bytes either way. Output that does not
+// parse, which is what a command that failed printed, is simply absent: a
+// result is what happened and not an assertion about it.
 //
 // A command that exits non zero is a normal result carrying its exit code,
 // because a CLI reporting a failure is an answer and not a transport fault.
@@ -714,6 +731,29 @@ async function collectOutputs(spec, args, dir, mounted) {
 
 // ---------------------------------------------------------------- tools
 
+// answer is how every successful call leaves this file: the payload as JSON in
+// a text block, and the same object as structuredContent for a tool that
+// declares what its output looks like. The two are one object, so a client
+// reading either reads the same answer.
+function answer(spec, payload) {
+  const result = { content: [{ type: "text", text: JSON.stringify(payload) }] };
+  if (spec.outputSchema) result.structuredContent = payload;
+  return result;
+}
+
+// jsonStdout is the parsed form of what the command printed, for a tool whose
+// entry claims its command prints JSON. Anything that does not parse is left
+// out rather than reported: the string is already in the answer, and a command
+// that failed printed a message where its document would have been.
+function jsonStdout(spec, stdout) {
+  if (spec.stdoutJson !== true || stdout.trim() === "") return {};
+  try {
+    return { stdoutJson: JSON.parse(stdout) };
+  } catch {
+    return {};
+  }
+}
+
 // callTool runs one tool in a temporary directory of its own and removes that
 // directory whatever happened, so no call leaves state for the next one.
 async function callTool(name, args) {
@@ -725,7 +765,7 @@ async function callTool(name, args) {
   if (typeof args !== "object" || Array.isArray(args)) {
     throw badRequest("arguments must be a JSON object.", "Send the tool's input as an object.", name);
   }
-  if (spec.probe) return probe();
+  if (spec.probe) return probe(spec);
 
   // What the call carries is weighed before anything is written or decoded,
   // and the temporary directory is only made once the call is known to fit.
@@ -752,6 +792,7 @@ async function callTool(name, args) {
     const payload = {
       exitCode: result.exitCode,
       stdout: result.stdout,
+      ...jsonStdout(spec, result.stdout),
       stderr: result.stderr,
       files: collected.files,
       truncated: result.truncated,
@@ -763,7 +804,7 @@ async function callTool(name, args) {
     // the caller learns why.
     if (result.signal) payload.signal = result.signal;
     if (result.timedOut) payload.timedOut = true;
-    return { content: [{ type: "text", text: JSON.stringify(payload) }] };
+    return answer(spec, payload);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -794,7 +835,7 @@ async function textOf(command, argv, env) {
 // refines a manifest from, PLAN.md 3. A binary that has no man page, and an
 // image with no man command at all, answer with an empty man rather than an
 // error, because the refinement works from whichever of the three exists.
-async function probe() {
+async function probe(spec) {
   const binary = doc.binary;
   const help = await textOf(binary, ["--help"]);
   const version = await textOf(binary, ["--version"]);
@@ -807,7 +848,7 @@ async function probe() {
     MANWIDTH: "80",
     TERM: "dumb",
   });
-  return { content: [{ type: "text", text: JSON.stringify({ help, version, man }) }] };
+  return answer(spec, { help, version, man });
 }
 
 // listTools is tools.json in the shape tools/list wants, with the schemas the
@@ -820,6 +861,10 @@ function listTools() {
       inputSchema: spec.inputSchema ?? { type: "object", properties: {} },
     };
     if (typeof spec.description === "string" && spec.description !== "") tool.description = spec.description;
+    // Published so that a client reaching this Package without the surface in
+    // front of it knows the answer is structured, and so that what tools/list
+    // says and what a call returns come from the same file.
+    if (spec.outputSchema) tool.outputSchema = spec.outputSchema;
     return tool;
   });
 }
