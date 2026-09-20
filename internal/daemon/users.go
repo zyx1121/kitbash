@@ -200,6 +200,27 @@ func (s *Server) createUser(w http.ResponseWriter, r *http.Request, caller Calle
 		return
 	}
 
+	// A name whose removal did not finish is not a name to hand to somebody
+	// new. What is left of the old account is named on the row, and creating
+	// over it would give the new member whatever the failed step left: a
+	// home that was never archived, a cgroup that is still there, a
+	// directory of somebody else's secrets. The fix is one call, because
+	// users_remove of that name runs the job again.
+	if prob := s.notCreatable(r, req.Name); prob != nil {
+		writeProblem(w, prob)
+		return
+	}
+	// And whatever a removal that said it finished could not take. The
+	// values of the old account are the one thing here that a new member
+	// would be handed without asking for it, so the directory goes before
+	// the account exists rather than after, see PLAN.md section 2.3.
+	if err := s.secrets.RemoveMember(req.Name); err != nil {
+		writeProblem(w, problem.Internal(r.URL.Path,
+			fmt.Sprintf("the secrets left by an earlier %s could not be removed: %v", req.Name, err),
+			"Ask an operator to look at /var/lib/kitbash/secrets on this host."))
+		return
+	}
+
 	m, err := s.users.Create(r.Context(), sysusers.Spec{
 		Name:   req.Name,
 		SSHKey: req.SSHKey,
@@ -214,8 +235,9 @@ func (s *Server) createUser(w http.ResponseWriter, r *http.Request, caller Calle
 	// internal/cgroups.
 	s.memberCgroup(r.Context(), m)
 	// A name removed once and created again is a member of its own, so what
-	// this host remembers about the removal of the old one is not about them,
-	// see removal.go.
+	// this host remembers about the removal of the old one is not about them.
+	// Only a removal that finished is forgotten here; one that did not was
+	// refused above, see notCreatable.
 	if err := s.store.DeleteRemoval(r.Context(), m.Name); err != nil {
 		logger.Printf("users: the removal record of %s could not be forgotten: %v", m.Name, err)
 	}
@@ -298,9 +320,10 @@ func (s *Server) addKey(w http.ResponseWriter, r *http.Request, caller Caller, n
 	writeJSON(w, r.URL.Path, keyResponse{User: m.Name, Keys: m.Keys})
 }
 
-// removeUser takes a member away. Two refusals come before anything is done:
-// an admin may not remove themselves, and the last admin may not go, because a
-// host with no admin has no way back to one through this API.
+// removeUser takes a member away. Three refusals come before anything is done:
+// the host's own accounts are not members, an admin may not remove themselves,
+// and the last admin may not go, because a host with no admin has no way back
+// to one through this API.
 //
 // What the call does beyond refusing is start a job: the member is marked
 // removing, the answer is 202, and their containers, registrations, approvals,
@@ -308,6 +331,10 @@ func (s *Server) addKey(w http.ResponseWriter, r *http.Request, caller Caller, n
 // time. A removal is not the length of a request, and a member holding
 // seventeen Processes used to outrun the caller's deadline and leave half an
 // account behind, see removal.go and issue #152.
+//
+// The 202 is answered after every refusal and never before one, the second
+// call of an admin who asked twice included: a name this family would refuse
+// is refused whatever this host is in the middle of.
 func (s *Server) removeUser(w http.ResponseWriter, r *http.Request, caller Caller, name string) {
 	if prob := s.requireAdmin(r, caller, "remove a member"); prob != nil {
 		writeProblem(w, prob)
@@ -325,39 +352,49 @@ func (s *Server) removeUser(w http.ResponseWriter, r *http.Request, caller Calle
 			"Ask another administrator to remove this member."))
 		return
 	}
-	// A member the job is already working through is answered what they are:
-	// the call describes the state the caller asked for, so a second one is
-	// the same answer and not a second job.
-	if s.isRemoving(name) {
-		writeJSONStatus(w, r.URL.Path, http.StatusAccepted,
-			removeResponse{User: name, State: store.Removing})
-		return
-	}
 
 	target, found, err := s.users.Lookup(r.Context(), name)
 	if err != nil {
 		writeProblem(w, problem.Internal(r.URL.Path, err.Error(), ""))
 		return
 	}
-	// root is refused by name before anything else looks at it. The
-	// membership test below would refuse it too, but the account that runs
-	// this daemon is worth its own sentence.
+	// root is refused by name before anything else looks at it, a removal
+	// this host is already running included. The membership test below would
+	// refuse it too, but the account that runs this daemon is worth its own
+	// sentence.
 	if found && target.UID == 0 {
 		writeProblem(w, problem.NotPermitted(r.URL.Path,
 			fmt.Sprintf("%s is the host's own account and is not a member", name),
 			"Members are the accounts users_list answers with; the host's own accounts are not managed here."))
 		return
 	}
+	// What this host already remembers about the name. A removal that is
+	// running and one that ended failed are both names whose account may be
+	// gone already, because the account is the last step but one, so the call
+	// that answers the state and the call that runs the job again both have
+	// to reach past the membership test.
+	//
+	// Only a row this daemon wrote itself is that, and it wrote it for a name
+	// that passed every refusal here when the job started, root included, so
+	// this is not a way past any of them: a name nothing was ever started for
+	// has no row and is held to the test below.
+	removal, remembered, err := s.store.Removal(r.Context(), name)
+	if err != nil {
+		writeProblem(w, problem.Internal(r.URL.Path, err.Error(), ""))
+		return
+	}
+	underway := remembered && removal.State != store.Removed
+	retry := remembered && removal.State == store.Failed
 	// An account that is not a member of kitbash-users is not found as far as
 	// this family is concerned. Without this rule the path is a way to delete
 	// sshd, the build user or any other account on the host.
-	if !found || !target.IsMember() {
+	if !underway && (!found || !target.IsMember()) {
 		writeProblem(w, problem.NotFoundFix(r.URL.Path,
 			fmt.Sprintf("%s is not a member of this host", name),
 			"List the members to see which names exist."))
 		return
 	}
-	if target.Admin {
+	if found && target.Admin {
 		last, prob := s.lastAdmin(r, name)
 		if prob != nil {
 			writeProblem(w, prob)
@@ -370,28 +407,68 @@ func (s *Server) removeUser(w http.ResponseWriter, r *http.Request, caller Calle
 			return
 		}
 	}
-
 	// The mark is written before the answer, so a daemon that stops between
 	// the two takes the job up again at its next start rather than leaving a
-	// member an admin believes is going.
-	if _, err := s.store.BeginRemoval(r.Context(), name, s.now()); err != nil {
+	// member an admin believes is going. A member the job is already working
+	// through is marked already, and neither the row nor startRemoval writes
+	// a second time: the call describes the state the caller asked for, so a
+	// second one is the same answer and not a second job.
+	started, err := s.store.BeginRemoval(r.Context(), name, s.now())
+	if err != nil {
 		writeProblem(w, problem.Internal(r.URL.Path, err.Error(), ""))
 		return
 	}
-	logger.Printf("%s is removing the member %s", caller.User, name)
+	switch {
+	case !started:
+		logger.Printf("%s asked for the member %s again while the removal is running", caller.User, name)
+	case retry:
+		logger.Printf("%s is removing the member %s again, after the %s step failed",
+			caller.User, name, removal.Step)
+	default:
+		logger.Printf("%s is removing the member %s", caller.User, name)
+	}
 	s.startRemoval(name, caller.User)
 	writeJSONStatus(w, r.URL.Path, http.StatusAccepted, removeResponse{User: name, State: store.Removing})
 }
 
-// removed reports whether this host has removed one member, which is what
-// tells an account that is simply not described by the group database from one
-// that is gone.
+// removed reports whether this host has taken one member away, which is what
+// tells an account the group database simply does not describe from one that
+// is gone. A removal that ended failed counts: the caller here is one the host
+// could not look up, so whatever the failed step was, the account is not
+// there, and calling that a member would be this daemon speaking for an
+// account nothing on this host has.
 func (s *Server) removed(r *http.Request, name string) (bool, *problem.Problem) {
 	removal, held, err := s.store.Removal(r.Context(), name)
 	if err != nil {
 		return false, problem.Internal(r.URL.Path, err.Error(), "")
 	}
-	return held && removal.State == store.Removed, nil
+	return held && (removal.State == store.Removed || removal.State == store.Failed), nil
+}
+
+// notCreatable refuses a name whose removal did not finish. It names the step
+// that failed, because that is what an operator has to look at, and the fix is
+// users_remove of the same name, which runs the job again from the top: every
+// step is idempotent, so the one that failed is retried and the rest are no
+// work at all.
+func (s *Server) notCreatable(r *http.Request, name string) *problem.Problem {
+	removal, held, err := s.store.Removal(r.Context(), name)
+	if err != nil {
+		return problem.Internal(r.URL.Path, err.Error(), "")
+	}
+	if !held {
+		return nil
+	}
+	switch removal.State {
+	case store.Removing:
+		return problem.ConflictFix(r.URL.Path,
+			fmt.Sprintf("%s is being removed from this host", name),
+			"Call users_list to see how far the removal got, and create the member once it is done.")
+	case store.Failed:
+		return problem.ConflictFix(r.URL.Path,
+			fmt.Sprintf("the removal of the earlier %s did not finish: the %s step failed", name, removal.Step),
+			fmt.Sprintf("Call users_remove on %s to run the removal again, then create the member.", name))
+	}
+	return nil
 }
 
 // lastAdmin reports whether this member is the only administrator left.

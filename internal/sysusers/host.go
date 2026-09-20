@@ -28,6 +28,12 @@ const (
 	DefaultRunUser    = "/run/user"
 	DefaultArchive    = "/org/.archive"
 	DefaultProc       = "/proc"
+	// DefaultHomes is where a member's home is, which is read only when the
+	// account is gone and its home is not, see ArchiveHome. It is
+	// mounts.HomesRoot spelled twice rather than imported, the way
+	// sysusers.EnvCaller is: this package carries no dependency on the ones
+	// that read Files.
+	DefaultHomes = "/home"
 )
 
 // Modes of what a member owns. The home and the runtime directory are private
@@ -77,8 +83,13 @@ type Host struct {
 	SubIDLock string
 	// RunUser is where a member's XDG runtime directory goes.
 	RunUser string
-	// Archive is where a removed member's home is moved to.
+	// Archive is where a removed member's home is moved to, and Homes the
+	// root a member's home is under. The second is read only when the
+	// account is gone and its home is still there, which is where a removal
+	// that stopped between the userdel and the rename is taken up again: with
+	// no account there is nothing to read a home path off, see ArchiveHome.
 	Archive string
+	Homes   string
 	// Proc is the process filesystem, read to see whether a member still has
 	// anything running.
 	Proc string
@@ -100,6 +111,7 @@ func NewHost(runner Runner) *Host {
 		SubIDLock: DefaultSubIDLock,
 		RunUser:   DefaultRunUser,
 		Archive:   DefaultArchive,
+		Homes:     DefaultHomes,
 		Proc:      DefaultProc,
 		Runner:    runner,
 	}
@@ -217,6 +229,29 @@ func (h *Host) Remove(ctx context.Context, name string) (string, error) {
 		os.RemoveAll(filepath.Join(h.RunUser, strconv.Itoa(m.UID)))
 	}
 	return archived, nil
+}
+
+// ArchiveHome moves the home of one name whose account may already be gone. It
+// is the archive step of a removal on its own, which is what a job resumed
+// after a daemon stopped between the userdel and the rename needs: the account
+// is not there to read a home path off any more, so the name's own place under
+// the homes root is what is looked at.
+//
+// A home that is not there is nothing to move: the step answers where it would
+// have gone and calls itself done, which is what makes running the job again
+// no work rather than a failure.
+func (h *Host) ArchiveHome(ctx context.Context, name string) (string, error) {
+	if !ValidName(name) {
+		return "", fmt.Errorf("%w: %s", ErrName, name)
+	}
+	m, err := h.member(ctx, name)
+	if err == nil {
+		return h.archiveHome(m)
+	}
+	if !errors.Is(err, ErrNotFound) {
+		return "", err
+	}
+	return h.archiveHome(Member{Name: name, Home: filepath.Join(h.Homes, name)})
 }
 
 // endSessions kills what the member is running and waits for it to end. A

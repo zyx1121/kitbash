@@ -67,6 +67,10 @@ func (s *Server) secretsFamily(w http.ResponseWriter, r *http.Request) {
 			"Call GET to list your secrets, PUT on the name to set one, or DELETE on the name to remove one."))
 		return
 	}
+	if prob := s.notRemoving(r, caller.User, "read their secrets"); prob != nil {
+		writeProblem(w, prob)
+		return
+	}
 	held, err := s.secrets.List(caller.User)
 	if err != nil {
 		writeProblem(w, s.secretProblem(r, err, ""))
@@ -91,6 +95,14 @@ func (s *Server) secret(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, problem.NotFoundFix(r.URL.Path,
 			fmt.Sprintf("%s is not part of the kitbashd API", r.URL.Path),
 			"Call the secret's name, such as /kitbash/v1/secrets/ANTHROPIC_API_KEY."))
+		return
+	}
+	// The removal deletes this whole directory at its secrets step, so a
+	// value written while it runs is a value that outlives the account it
+	// belongs to and is handed to the next member created with that name,
+	// see removal.go and PLAN.md section 2.3.
+	if prob := s.notRemoving(r, caller.User, "set or remove a secret"); prob != nil {
+		writeProblem(w, prob)
 		return
 	}
 	switch r.Method {

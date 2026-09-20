@@ -75,6 +75,11 @@ const (
 const (
 	SkipRunning = "running"
 	SkipBusy    = "busy"
+	// SkipRemoving is a tick of a member kitbashd is removing. The job has
+	// already stopped and removed that container, or is about to, so a tick
+	// that started it again would be a container the removal walked past and
+	// a container running as an account that is going, see removal.go.
+	SkipRemoving = "removing"
 )
 
 // The value of the metric: a tick that ran the container, and one that did
@@ -480,9 +485,14 @@ func (s *Server) loadJobs(ctx context.Context) {
 	}
 	now := s.now()
 	for _, p := range list {
-		if scheduled(p) {
-			s.jobs.track(p, now)
+		// A member whose removal this boot is taking up again holds no jobs
+		// as far as the ticker is concerned: their registrations are the
+		// removal's to delete, and a tick before it gets there would start a
+		// container it has already stopped, see removal.go.
+		if !scheduled(p) || s.isRemoving(p.Owner) {
+			continue
 		}
+		s.jobs.track(p, now)
 	}
 	if held := s.jobs.count(); held > 0 {
 		logger.Printf("schedule: %d registered job(s)", held)
@@ -529,6 +539,15 @@ func (s *Server) runScheduled(ctx context.Context, target job) {
 // ended, because proc_logs reads the last run: the logs of a job live in the
 // container until the next tick replaces it, see PLAN.md section 2.3.
 func (s *Server) runJob(ctx context.Context, target job) outcome {
+	// A member being removed starts nothing. The removal stops and removes
+	// their containers and then unregisters the jobs, and a tick that landed
+	// between the two would hand the runtime a container the job has already
+	// walked past, see removal.go.
+	if s.isRemoving(target.owner) {
+		logger.Printf("schedule: %s is being removed from this host, so the tick of %s started nothing",
+			target.owner, target.id)
+		return outcome{result: ScheduleSkipped, reason: SkipRemoving}
+	}
 	unlock := s.actions.lock(target.id)
 	p, found, err := s.store.Process(ctx, target.id)
 	if err != nil || !found {

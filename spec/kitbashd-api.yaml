@@ -576,6 +576,17 @@ api:
     request: { name: "^[a-z][a-z0-9-]{1,31}$", sshKey: "one OpenSSH public key line", admin: false }
     response: { user: "name", uid: 1005, admin: false }
     authorization: admin only. Runs useradd -m -s /bin/sh -G kitbash-users, usermod -p '*', adds the member to kitbash-admin when admin is true, allocates a 65536 wide subuid and subgid range, writes authorized_keys 0600 in a 0700 .ssh, sets the home to 0700, creates /run/user/<uid> 0700 owned by the member.
+    behaviour: >
+      A name whose removal is still running, or did not finish, is conflict
+      naming the step that failed: what that step left is still on this host,
+      and creating over it would hand the new member a home that was never
+      archived or a directory of somebody else's secrets. users_remove of the
+      same name runs the job again, and every step is idempotent, so the one
+      that failed is retried and the rest are no work. A name whose removal
+      finished is created, and the secrets directory of the account that held
+      it is removed first whatever that removal said, because the values of an
+      old account are the one thing a new member would be handed without asking
+      for it.
     errors: [bad-request, not-permitted, conflict, internal]
   users_list:
     method: GET
@@ -624,18 +635,33 @@ api:
 
       Every step is idempotent and logged, and a step that fails is logged and
       the job goes on, so the state it ends in is removed, or failed carrying
-      the first step that failed. Both are read through users_list. The archive
-      step takes what it can: a name in the home it cannot give to root, an
-      immutable file or an odd mode, is logged and walked past, because the
-      account is already gone by then and one file is not a reason to leave a
-      home half moved. While the job runs the member takes no new work:
-      proc_run and the Process actions answer conflict for them.
+      the first step that failed. Both are read through users_list. The steps
+      are processes, registrations, approvals, builds, secrets, account,
+      archive and cgroups. The archive is its own step because the host deletes
+      the account and then moves the home: a job taken up again finds no
+      account, which is the userdel done rather than the whole step done, and
+      archives whatever home is left. It takes what it can while it is there: a
+      name in the home it cannot give to root, an immutable file or an odd
+      mode, is logged and walked past, because the account is already gone by
+      then and one file is not a reason to leave a home half moved.
+
+      While the job runs the member takes no new work: proc_run, the Process
+      actions, the whole secrets family and joining a session answer conflict
+      for them, and their scheduled jobs come off the ticker before anything is
+      stopped, so a tick that lands during a removal starts nothing and is
+      recorded as skipped with the reason removing. Files is not among them and
+      needs not be: a member's home is theirs by the kernel's rules and goes
+      with the account.
 
       A second call for a member already being removed answers 202 with the
-      same state rather than starting a second job; a name this host does not
-      have is not-found as before. The mark is a row in the store, so a daemon
-      that stopped in the middle of a removal takes it up again at its next
-      start, before it starts anything of that member's again.
+      same state rather than starting a second job, after every refusal and
+      never before one. A name this host does not have is not-found as before,
+      unless this host itself is in the middle of removing it or failed to,
+      because the account is the last step but one and the call that answers
+      the state, or runs the job again, has to reach past that test. The mark
+      is a row in the store, so a daemon that stopped in the middle of a
+      removal takes it up again at its next start, before it starts anything of
+      that member's again.
     errors: [not-permitted, not-found, conflict, internal]
   secrets_set:
     method: PUT
@@ -1146,6 +1172,26 @@ reverse_proxy:
     running is 503 with a short body. Everything else is forwarded to
     http://127.0.0.1:<published port> of that Process, over a connection that
     is refused unless it lands on a loopback address.
+
+    A forward nothing accepted the connection for is re-resolved before it is
+    answered: the runtime is asked what it calls that container, and a
+    container that is not running, or one the runtime does not have at all,
+    loses its port from the table and the request is answered 503, the same
+    short body a Process stopped with proc_stop gives. One that is running
+    keeps its 502, which is what a Process that is up and not answering is. A
+    container that died outside proc_stop, a crash or an OOM kill, otherwise
+    keeps the port it had and the honest answer would never arrive.
+
+    Two things bound what that costs. Only a dial failure asks: a connection
+    reset while the response was being read is a container that was there and
+    answered, and a timeout is a Process that is slow, so neither is a runtime
+    call. And the answer is asked once per route at a time and kept for 5 s, so
+    a 502 loop costs at most one podman inspect per name per 5 s whatever the
+    request rate, which is the internet's to set. A forward that had begun
+    answering is neither re-resolved nor answered again. The health probe does
+    the same on its own cadence for the Processes that declare a path,
+    dropping the port of a container it finds stopped and putting it back when
+    the container is running again.
   what_it_forwards_to: >
     The port is the runtime's answer and never the member's word, the rule
     health probes follow: the endpoint of the registration is held to the host

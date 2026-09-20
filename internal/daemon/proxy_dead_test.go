@@ -5,15 +5,20 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/user"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 
 	"github.com/zyx1121/kitbash/internal/podman"
 	"github.com/zyx1121/kitbash/internal/sysusers"
+	"github.com/zyx1121/kitbash/internal/uuid"
 )
 
 // A container that died outside proc_stop keeps the port its route was built
@@ -266,5 +271,262 @@ func TestARouteWithNoContainerIsNotReResolved(t *testing.T) {
 	h, _, _ := serveProxying(t, testDomain, TLSGateway)
 	if h.server.dropDeadRoute(context.Background(), route{id: "x", owner: h.user}) {
 		t.Error("a route with no container name was dropped, want it left alone")
+	}
+}
+
+// countingRunner counts how often the daemon asks the runtime about a
+// container, which is one podman inspect per call on a real host. Adopted from
+// the review of #159.
+type countingRunner struct {
+	*sysusers.Fake
+	inspects atomic.Int64
+}
+
+func (c *countingRunner) ContainerConfig(ctx context.Context, m sysusers.Member, container string) (sysusers.ContainerConfig, error) {
+	c.inspects.Add(1)
+	return c.Fake.ContainerConfig(ctx, m, container)
+}
+
+func serveCounted(t *testing.T) (*harness, *sysusers.Fake, *countingRunner) {
+	t.Helper()
+	fake := sysusers.NewFake()
+	counted := &countingRunner{Fake: fake}
+	h := serveWith(t, Options{
+		Admin:         func(*user.User) (bool, error) { return false, nil },
+		Users:         fake,
+		Runner:        counted,
+		Domain:        testDomain,
+		TLS:           TLSGateway,
+		CertDir:       filepath.Join(t.TempDir(), "certs"),
+		PublicAddress: testPublicAddress,
+		Resolver:      newZone(),
+	})
+	fake.Add(sysusers.Member{Name: h.user, UID: os.Getuid(), GID: os.Getgid()})
+	return h, fake, counted
+}
+
+// What a 502 costs. A container that is up and refusing connections is a 502
+// for as long as that lasts, and the request rate is the internet's to set:
+// without a window a caller holding the URL would set the rate this daemon
+// inspects containers at, one podman child per request. Adopted from the
+// review of #159.
+func TestARefusingContainerCostsOneInspectPerWindow(t *testing.T) {
+	h, fake, counted := serveCounted(t)
+	up := newUpstream(t)
+	h.registerServed(fake, up, testProcessName, "")
+	name := h.defaultName(testProcessName)
+	up.server.Close() // the application is gone, the container is not
+
+	counted.inspects.Store(0)
+	for range 50 {
+		if rec := h.request(http.MethodGet, name, "/", nil); rec.Code != http.StatusBadGateway {
+			t.Fatalf("status = %d, want 502", rec.Code)
+		}
+	}
+	if n := counted.inspects.Load(); n > 1 {
+		t.Errorf("50 refused requests cost %d runtime calls; a caller with the URL sets the rate", n)
+	}
+}
+
+// And what a 503 costs, on the answer that drops the port: the first request
+// asks and the rest read the table, because the port is gone by then.
+func TestADeadContainerCostsOneInspect(t *testing.T) {
+	h, fake, counted := serveCounted(t)
+	up := newUpstream(t)
+	req := h.registerServed(fake, up, testProcessName, "")
+	name := h.defaultName(testProcessName)
+	up.server.Close()
+	fake.SetState(req.Container, podman.StateExited)
+
+	counted.inspects.Store(0)
+	for range 21 {
+		if rec := h.request(http.MethodGet, name, "/", nil); rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503", rec.Code)
+		}
+	}
+	if n := counted.inspects.Load(); n > 1 {
+		t.Errorf("21 requests for a container that is gone cost %d runtime calls", n)
+	}
+}
+
+// A container the runtime does not have at all is a container that is not
+// running, which is what podman rm by the owner leaves behind. It is the
+// answer routePort gives no port for either. Adopted from the review of #159.
+func TestAContainerTheRuntimeDoesNotHaveLosesItsPort(t *testing.T) {
+	h, fake, counted := serveCounted(t)
+	up := newUpstream(t)
+	req := h.registerServed(fake, up, testProcessName, "")
+	name := h.defaultName(testProcessName)
+	up.server.Close()
+	fake.Missing = map[string]bool{req.Container: true}
+
+	counted.inspects.Store(0)
+	rec := h.request(http.MethodGet, name, "/", nil)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503 for a container the runtime does not have", rec.Code)
+	}
+	if port, held := h.server.proxy.portOf(req.ID); held && port != 0 {
+		t.Errorf("the route still carries port %d of a container that is gone", port)
+	}
+	for range 20 {
+		h.request(http.MethodGet, name, "/", nil)
+	}
+	if n := counted.inspects.Load(); n > 1 {
+		t.Errorf("21 requests for a gone container cost %d runtime calls", n)
+	}
+}
+
+// Concurrent refusals are one inspect: the first caller asks and the rest wait
+// for what it found rather than each starting a call of their own.
+func TestConcurrentRefusalsShareOneInspect(t *testing.T) {
+	h, fake, counted := serveCounted(t)
+	up := newUpstream(t)
+	req := h.registerServed(fake, up, testProcessName, "")
+	name := h.defaultName(testProcessName)
+	up.server.Close()
+	fake.SetState(req.Container, podman.StateExited)
+
+	counted.inspects.Store(0)
+	var wg sync.WaitGroup
+	for range 16 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			h.request(http.MethodGet, name, "/", nil)
+		}()
+	}
+	wg.Wait()
+	if n := counted.inspects.Load(); n > 1 {
+		t.Errorf("16 requests at once cost %d runtime calls, want the one they share", n)
+	}
+}
+
+// A route built again forgets what a re-resolve found about it: the table has
+// just been told what the runtime says, so an answer from before it is not
+// about the route that is there now. Without that, a container that came back
+// would go on being answered 503 from what the last inspect found, for as long
+// as the window lasts.
+func TestBuildingARouteAgainForgetsTheReResolve(t *testing.T) {
+	h, fake, counted := serveCounted(t)
+	up := newRestartableStub(t)
+	req := h.registerProbed(fake, up.url(), "/healthz", "30s")
+	fake.SetState(req.Container, podman.StateRunning)
+	h.server.trackRouteFor(context.Background(), h.process(req.ID))
+	name := h.defaultName(req.Name)
+
+	up.stop()
+	fake.SetState(req.Container, podman.StateExited)
+	if rec := h.request(http.MethodGet, name, "/", nil); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 once the container stopped", rec.Code)
+	}
+
+	// The container is running again and the route is built again, inside the
+	// window the answer above would otherwise stand for. The application is
+	// still not listening, so this request fails to dial as well and the
+	// answer has to come from a new inspect rather than the old one.
+	fake.SetState(req.Container, podman.StateRunning)
+	h.server.trackRouteFor(context.Background(), h.process(req.ID))
+	counted.inspects.Store(0)
+	rec := h.request(http.MethodGet, name, "/", nil)
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("status = %d, want 502: the container is running and the answer of the last inspect is stale", rec.Code)
+	}
+	if n := counted.inspects.Load(); n != 1 {
+		t.Errorf("the request cost %d runtime calls, want the one that reads the route as it is now", n)
+	}
+	if port, held := h.server.proxy.portOf(req.ID); !held || port == 0 {
+		t.Errorf("the route is %d, %t, want the port the rebuilt route carries", port, held)
+	}
+}
+
+// A connection this daemon did not fail to dial is not a container that is
+// gone: a Process that took the connection and reset it was there, and asking
+// the runtime about it would be a runtime call the request rate sets.
+func TestAResetThatIsNotADialIsNotReResolved(t *testing.T) {
+	h, fake, counted := serveCounted(t)
+	port := newResettingStub(t)
+	req := processRequest{
+		ID:        uuid.V7(),
+		Package:   "/org/sensorium",
+		Name:      testProcessName,
+		Container: "kitbash-reset-" + strings.Split(uuid.V7(), "-")[0],
+		Digest:    testDigest,
+		Expose:    ExposeHTTP,
+		Endpoint:  "http://127.0.0.1:" + strconv.Itoa(port),
+	}
+	fake.Publish(req.Container, port)
+	fake.SetState(req.Container, podman.StateRunning)
+	if _, res, body := h.register(req); res.StatusCode != http.StatusOK {
+		t.Fatalf("register status = %d, body %s", res.StatusCode, body)
+	}
+	// The container is gone as far as the runtime is concerned, so a
+	// re-resolve would drop the port: what keeps it is that this failure is
+	// not a dial.
+	fake.SetState(req.Container, podman.StateExited)
+
+	counted.inspects.Store(0)
+	rec := h.request(http.MethodGet, h.defaultName(testProcessName), "/", nil)
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("status = %d, want 502 for a Process that took the connection and reset it", rec.Code)
+	}
+	if n := counted.inspects.Load(); n != 0 {
+		t.Errorf("a reset that was not a dial cost %d runtime calls, want none", n)
+	}
+	if port, held := h.server.proxy.portOf(req.ID); !held || port == 0 {
+		t.Errorf("the route is %d, %t, want it untouched by a failure that was not a dial", port, held)
+	}
+}
+
+// newResettingStub takes every connection and resets it, which is what a
+// container that dies mid request leaves: a read that fails with the same
+// errno a refused dial does, on a connection something accepted.
+func newResettingStub(t *testing.T) int {
+	t.Helper()
+	ln, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.AcceptTCP()
+			if err != nil {
+				return
+			}
+			// Linger zero makes the close a reset rather than a shutdown, so
+			// the client reads ECONNRESET off a connection that was accepted.
+			conn.SetLinger(0)
+			conn.Close()
+		}
+	}()
+	return ln.Addr().(*net.TCPAddr).Port
+}
+
+// A forward that had begun answering is neither re-resolved nor answered
+// again: the status is on the wire already and a second WriteHeader is a log
+// line and nothing more.
+func TestAForwardThatBeganAnsweringIsNotAnsweredAgain(t *testing.T) {
+	h, fake, counted := serveCounted(t)
+	up := newUpstream(t)
+	req := h.registerServed(fake, up, testProcessName, "")
+	fake.SetState(req.Container, podman.StateExited)
+
+	rec := httptest.NewRecorder()
+	recorder := &recordingWriter{ResponseWriter: rec}
+	recorder.WriteHeader(http.StatusOK)
+	target, _ := h.server.proxy.lookup(h.defaultName(testProcessName))
+	r := httptest.NewRequest(http.MethodGet, "http://kitbash/", nil)
+	r = r.WithContext(context.WithValue(r.Context(), routeKey{}, target))
+
+	counted.inspects.Store(0)
+	h.server.forwardFailed(recorder, r, &net.OpError{Op: "dial", Err: syscall.ECONNREFUSED})
+	if recorder.code() != http.StatusOK {
+		t.Errorf("the recorded status is %d, want the 200 that was already written", recorder.code())
+	}
+	if rec.Body.Len() != 0 {
+		t.Errorf("a second body of %q was written after the answer had begun", rec.Body.String())
+	}
+	if n := counted.inspects.Load(); n != 0 {
+		t.Errorf("a forward that had begun answering cost %d runtime calls, want none", n)
 	}
 }

@@ -168,7 +168,9 @@ func RegisterUsers(s *mcp.Server, client *telemetry.Client) {
 		Name: "users_create",
 		Description: "Create a member with an SSH public key, a private home and a subordinate id range, " +
 			"through kitbashd. Admin only. The member can connect immediately; their home is a root for " +
-			"Files and starts empty.",
+			"Files and starts empty. A name whose removal is still running or did not finish is a " +
+			"conflict naming the step that failed, because what that step left is still on this host: " +
+			"users_remove of the same name runs the job again.",
 		InputSchema:  usersCreateInputSchema,
 		OutputSchema: usersCreateOutputSchema,
 	}, createUserHandler(client))
@@ -195,10 +197,11 @@ func RegisterUsers(s *mcp.Server, client *telemetry.Client) {
 		Name: "users_remove",
 		Description: "Start removing a member. Admin only. It answers at once with the state removing, " +
 			"and kitbashd does the work on its own time: their Processes stop and are unregistered, " +
-			"their sessions end, their home is archived under /org/.archive/<name> where the surface " +
-			"cannot see it, and the account is deleted. users_list carries how far it got, and calling " +
-			"this again while it runs is the same answer. An admin cannot remove themselves or the last " +
-			"admin.",
+			"their jobs come off the scheduler, their sessions end, their secrets are deleted, their " +
+			"home is archived under /org/.archive/<name> where the surface cannot see it, and the " +
+			"account is deleted. users_list carries how far it got, removed or failed with the step " +
+			"that failed; calling this again is the same answer while it runs and runs the job again " +
+			"once it has failed. An admin cannot remove themselves or the last admin.",
 		InputSchema:  usersRemoveInputSchema,
 		OutputSchema: usersRemoveOutputSchema,
 	}, removeUserHandler(client))

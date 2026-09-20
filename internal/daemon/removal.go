@@ -39,6 +39,7 @@ const (
 	StepBuilds        = "builds"
 	StepSecrets       = "secrets"
 	StepAccount       = "account"
+	StepArchive       = "archive"
 	StepCgroups       = "cgroups"
 )
 
@@ -130,24 +131,35 @@ func (s *Server) removeMember(name, by string) {
 		}
 	}
 
-	// The containers first, as their owner, because the account they run
-	// under has to still be there. They are stopped and removed at once, a
-	// few at a time, each one under the action lock of its own Process for
-	// the reason proc_stop holds one: a tick that read this registration must
-	// not be starting the container this is removing, see schedule.go.
 	list, err := s.store.Processes(ctx, name)
 	if err != nil {
 		failed(StepProcesses, err)
 	}
+	// The jobs come off the ticker before anything is stopped. A tick of one
+	// of them while the containers are being removed would start a container
+	// this job has already walked past, and the ticker asks isRemoving as
+	// well, so this is the second of the two rather than the only one, see
+	// schedule.go. The names go at the same time: a name forwarding to the
+	// port of a container that is being removed is a forward to a port the
+	// next member's container may be given.
+	for _, p := range list {
+		s.jobs.untrack(p.ID)
+		s.proxy.untrack(p.ID)
+	}
+
+	// The containers next, as their owner, because the account they run under
+	// has to still be there. They are stopped and removed at once, a few at a
+	// time, each one under the action lock of its own Process for the reason
+	// proc_stop holds one: a tick that read this registration must not be
+	// starting the container this is removing, see schedule.go.
 	if len(list) > 0 {
 		s.removeContainers(ctx, name, list, failed)
 	}
 
-	// Their registrations, which is what revokes every Telemetry token they
-	// hold: a token outliving the member it names is a producer nobody owns.
-	// The names, the jobs, the probes and the fan out go with them, because
-	// each one is a way this daemon would go on speaking for an account it no
-	// longer has, see users.go.
+	// Then the registrations, which is what revokes every Telemetry token
+	// they hold: a token outliving the member it names is a producer nobody
+	// owns. The probes and the fan out go with them, because each one is a
+	// way this daemon would go on speaking for an account it no longer has.
 	for _, p := range list {
 		s.untrackProcess(p.ID)
 	}
@@ -177,15 +189,26 @@ func (s *Server) removeMember(name, by string) {
 
 	// The home and the account, which is the step the whole job was made for:
 	// it is minutes of work on a large home and it is what a client deadline
-	// used to cut in half. An account this host no longer has is this step
-	// done rather than this step failed, which is what makes the job safe to
-	// run again after a restart.
+	// used to cut in half.
+	//
+	// An account this host no longer has is not this step done. The host
+	// deletes the account and moves the home in that order, so a daemon that
+	// stopped between the two left an account that is gone and a home that is
+	// still there, and reading the missing account as nothing left to do
+	// would leave that home where the next member of that name would find it.
+	// So the archive is asked for on its own, which is the step that is left.
 	moved, err := s.users.Remove(ctx, name)
 	switch {
 	case err == nil:
 		archived = moved
 	case errors.Is(err, sysusers.ErrNotFound):
-		logger.Printf("users: removing %s: the account was already gone", name)
+		logger.Printf("users: removing %s: the account is already gone, archiving whatever home is left", name)
+		moved, err := s.users.ArchiveHome(ctx, name)
+		if err != nil {
+			failed(StepArchive, err)
+		} else {
+			archived = moved
+		}
 	default:
 		failed(StepAccount, err)
 	}

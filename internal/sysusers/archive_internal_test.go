@@ -1,6 +1,8 @@
 package sysusers
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -109,5 +111,60 @@ func TestChownTreeCountsWhatItCouldNotTake(t *testing.T) {
 	stageChown(t, "immutable.txt")
 	if left := chownTree(m.Home, 0, 0); left != 1 {
 		t.Errorf("chownTree left %d names, want the one it may not take", left)
+	}
+}
+
+// A removal deletes the account and then moves the home, so a daemon that
+// stopped between the two left an account that is gone and a home that is
+// still there. The archive step is asked for on its own to take that up: with
+// no account there is nothing to read a home path off, so the name's own place
+// under the homes root is what is looked at.
+func TestArchiveHomeTakesUpAHomeADeletedAccountLeft(t *testing.T) {
+	dir := t.TempDir()
+	homes := filepath.Join(dir, "home")
+	if err := os.MkdirAll(filepath.Join(homes, "alice", "notes"), 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(homes, "alice", "notes", "plan.md"),
+		[]byte("what alice wrote"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	// The account is gone: the passwd file this host reads has no alice.
+	passwd := filepath.Join(dir, "passwd")
+	if err := os.WriteFile(passwd, []byte("root:x:0:0::/root:/bin/sh\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	h := &Host{Archive: filepath.Join(dir, "archive"), Homes: homes, Passwd: passwd,
+		Group: filepath.Join(dir, "group")}
+	stageChown(t, "")
+
+	target, err := h.ArchiveHome(context.Background(), "alice")
+	if err != nil {
+		t.Fatalf("ArchiveHome: %v", err)
+	}
+	if target != filepath.Join(h.Archive, "alice") {
+		t.Errorf("the home went to %q, want it under the archive", target)
+	}
+	if _, err := os.Lstat(filepath.Join(target, "notes", "plan.md")); err != nil {
+		t.Errorf("what the deleted account left is not in the archive: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(homes, "alice")); !os.IsNotExist(err) {
+		t.Errorf("the home is still where the deleted account left it: %v", err)
+	}
+
+	// And running it again is no work rather than a failure, which is what
+	// makes the whole job safe to take up twice.
+	if _, err := h.ArchiveHome(context.Background(), "alice"); err != nil {
+		t.Errorf("the second ArchiveHome: %v, want it to find nothing to move", err)
+	}
+}
+
+// A name that is not a member name never reaches the filesystem: this is the
+// one call that builds a home path from a name rather than reading one off an
+// account.
+func TestArchiveHomeRefusesAName(t *testing.T) {
+	h := &Host{Archive: t.TempDir(), Homes: t.TempDir()}
+	if _, err := h.ArchiveHome(context.Background(), "../root"); !errors.Is(err, ErrName) {
+		t.Errorf("ArchiveHome of a path = %v, want ErrName", err)
 	}
 }

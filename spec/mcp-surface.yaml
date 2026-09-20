@@ -956,7 +956,9 @@ families:
           Create a member with an SSH public key, a private home and a
           subordinate id range, through kitbashd. Admin only. The member can
           connect immediately; their home is a root for Files and starts
-          empty.
+          empty. A name whose removal is still running or did not finish is
+          conflict naming the step that failed, because what that step left is
+          still on this host: users_remove of the same name runs the job again.
         input: { type: object, additionalProperties: false, required: [name, sshKey], properties: { name: { type: string, pattern: "^[a-z][a-z0-9-]{1,31}$" }, sshKey: { type: string, maxLength: 4096, description: "One OpenSSH public key line" }, admin: { type: boolean, default: false } } }
         output: { type: object, required: [user, uid, admin], properties: { user: { type: string }, uid: { type: integer }, admin: { type: boolean } } }
         errors: [bad-request, not-permitted, conflict, internal]
@@ -979,13 +981,16 @@ families:
         description: >
           Start removing a member. Admin only. It answers at once with the
           state removing and kitbashd does the work on its own time: their
-          Processes stop and are unregistered, their sessions end, their
-          secrets are deleted, their home is archived under /org/.archive/<name>
-          where the surface cannot see it, and the account is deleted. A
-          removal is not the length of a request, and a member holding a dozen
-          Processes used to outrun the caller's deadline. users_list carries
-          how far it got, and calling this again while it runs is the same
-          answer. An admin cannot remove themselves or the last admin.
+          Processes stop and are unregistered, their jobs come off the
+          scheduler, their sessions end, their secrets are deleted, their home
+          is archived under /org/.archive/<name> where the surface cannot see
+          it, and the account is deleted. A removal is not the length of a
+          request, and a member holding a dozen Processes used to outrun the
+          caller's deadline. users_list carries how far it got, removed or
+          failed with the step that failed, and calling this again is the same
+          answer while it runs and runs the job again once it has failed. While
+          it runs that member takes no new work. An admin cannot remove
+          themselves or the last admin.
         input: { type: object, additionalProperties: false, required: [name], properties: { name: { type: string, pattern: "^[a-z][a-z0-9-]{1,31}$" } } }
         output: { type: object, required: [user, state], properties: { user: { type: string }, state: { type: string, enum: [removing] } } }
         errors: [not-permitted, not-found, conflict, internal]
