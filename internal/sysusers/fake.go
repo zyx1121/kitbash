@@ -43,8 +43,12 @@ type Fake struct {
 	// StartErrs are containers Start refuses by name, whatever made them,
 	// which StartErr does not cover: that one is about a container this fake
 	// did not make.
-	StartErrs          map[string]error
-	StopErr            error
+	StartErrs map[string]error
+	StopErr   error
+	// StopGate holds every Stop until it is closed, which is how a test
+	// stages a removal that is still in the middle of its work: the job is
+	// stopping containers and the next call has to find it there.
+	StopGate           chan struct{}
 	RemoveContainerErr error
 	RemoveAllErr       error
 	CopyErr            error
@@ -610,7 +614,17 @@ func (f *Fake) Renames() []RenameCall {
 }
 
 // Stop records a stop as one member.
-func (f *Fake) Stop(_ context.Context, m Member, container string, timeout int) error {
+func (f *Fake) Stop(ctx context.Context, m Member, container string, timeout int) error {
+	f.mu.Lock()
+	gate := f.StopGate
+	f.mu.Unlock()
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.Missing[container] {

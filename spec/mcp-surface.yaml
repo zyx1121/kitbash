@@ -961,9 +961,14 @@ families:
         output: { type: object, required: [user, uid, admin], properties: { user: { type: string }, uid: { type: integer }, admin: { type: boolean } } }
         errors: [bad-request, not-permitted, conflict, internal]
       users_list:
-        description: All members with uid, admin flag, key count and running Process count. Admin only.
+        description: >
+          All members with uid, admin flag, key count and running Process
+          count, and every removal this host remembers. Admin only. A member
+          being removed is listed with state removing until the job kitbashd
+          runs for them is done; the removals carry where each one got to,
+          removed or failed with the step that failed, see users_remove.
         input: { type: object, additionalProperties: false, properties: {} }
-        output: { type: object, required: [users], properties: { users: { type: array, items: { type: object, required: [user, uid, admin], properties: { user: { type: string }, uid: { type: integer }, admin: { type: boolean }, keys: { type: integer }, processes: { type: integer } } } } } }
+        output: { type: object, required: [users, removals], properties: { users: { type: array, items: { type: object, required: [user, uid, admin], properties: { user: { type: string }, uid: { type: integer }, admin: { type: boolean }, keys: { type: integer }, processes: { type: integer }, state: { type: string, enum: [removing] } } } }, removals: { type: array, items: { type: object, required: [user, state, startedAt], properties: { user: { type: string }, state: { type: string, enum: [removing, removed, failed] }, step: { type: string }, archived: { type: string }, startedAt: { type: string, format: date-time }, finishedAt: { type: string, format: date-time } } } } } }
         errors: [not-permitted, internal]
       users_add_key:
         description: Add an SSH public key to a member. Admin only. A key already present is not added twice.
@@ -972,13 +977,17 @@ families:
         errors: [bad-request, not-permitted, not-found, internal]
       users_remove:
         description: >
-          Remove a member. Admin only. Their Processes stop and are
-          unregistered, their sessions end, their home is archived under
-          /org/.archive/<name> where the surface cannot see it, and the
-          account is deleted. An admin cannot remove themselves or the last
-          admin.
+          Start removing a member. Admin only. It answers at once with the
+          state removing and kitbashd does the work on its own time: their
+          Processes stop and are unregistered, their sessions end, their
+          secrets are deleted, their home is archived under /org/.archive/<name>
+          where the surface cannot see it, and the account is deleted. A
+          removal is not the length of a request, and a member holding a dozen
+          Processes used to outrun the caller's deadline. users_list carries
+          how far it got, and calling this again while it runs is the same
+          answer. An admin cannot remove themselves or the last admin.
         input: { type: object, additionalProperties: false, required: [name], properties: { name: { type: string, pattern: "^[a-z][a-z0-9-]{1,31}$" } } }
-        output: { type: object, required: [user, archived], properties: { user: { type: string }, archived: { type: string } } }
+        output: { type: object, required: [user, state], properties: { user: { type: string }, state: { type: string, enum: [removing] } } }
         errors: [not-permitted, not-found, conflict, internal]
 
   # ---------------------------------------------------------------- approvals (M5)

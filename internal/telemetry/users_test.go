@@ -59,10 +59,13 @@ func TestUsersCallsReachTheDaemonAndComeBackVerbatim(t *testing.T) {
 	if prob != nil {
 		t.Fatalf("RemoveUser: %s", prob.Detail)
 	}
-	var archive map[string]any
-	json.Unmarshal(removed, &archive)
-	if archive["archived"] != "/org/.archive/member" {
-		t.Errorf("users_remove answered %v, want the archive path", archive)
+	var removal map[string]any
+	json.Unmarshal(removed, &removal)
+	// The daemon answers 202 and removes the member on its own time, so what
+	// comes back is the state and not the archive path, see
+	// internal/daemon/removal.go.
+	if removal["user"] != "member" || removal["state"] != "removing" {
+		t.Errorf("users_remove answered %v, want the member removing", removal)
 	}
 
 	// The bodies above went over the socket rather than being answered here.

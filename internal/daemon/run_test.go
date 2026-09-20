@@ -750,10 +750,7 @@ func TestRemovingAMemberRemovesTheirCgroup(t *testing.T) {
 	fake.Add(sysusers.Member{Name: h.user, Admin: true})
 	fake.Add(sysusers.Member{Name: "alice", UID: 1005})
 
-	res, body := h.do(http.MethodDelete, usersPath+"/alice", "", nil)
-	if res.StatusCode != http.StatusOK {
-		t.Fatalf("users_remove = %d %s, want 200", res.StatusCode, body)
-	}
+	h.removeMember("alice")
 	removals := h.cgroups.Removals()
 	if len(removals) != 1 || removals[0].Name != "alice" || removals[0].ID != "" {
 		t.Errorf("the removals are %+v, want alice's whole cgroup", removals)

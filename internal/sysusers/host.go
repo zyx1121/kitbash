@@ -690,7 +690,7 @@ func (h *Host) archiveHome(m Member) (string, error) {
 	if err := os.Chmod(h.Archive, ArchiveMode); err != nil {
 		return "", fmt.Errorf("sysusers: narrow %s: %w", h.Archive, err)
 	}
-	if err := os.Chown(h.Archive, 0, 0); err != nil {
+	if err := lchown(h.Archive, 0, 0); err != nil {
 		return "", fmt.Errorf("sysusers: give %s to root: %w", h.Archive, err)
 	}
 
@@ -709,8 +709,12 @@ func (h *Host) archiveHome(m Member) (string, error) {
 	if err := os.Rename(m.Home, target); err != nil {
 		return "", fmt.Errorf("sysusers: archive the home of %s: %w", m.Name, err)
 	}
-	if err := chownTree(target, 0, 0); err != nil {
-		return "", err
+	if left := chownTree(target, 0, 0); left > 0 {
+		// The home is moved, which is what the archive is for, and what is
+		// left is a count an operator can act on. It is not a failure: the
+		// account is gone and the tree is out of every root the surface
+		// reads, see issue #152.
+		logger.Printf("archiving the home of %s: %d name(s) stayed with the uid that owned them", m.Name, left)
 	}
 	if err := os.Chmod(target, ArchiveMode); err != nil {
 		return "", fmt.Errorf("sysusers: narrow %s: %w", target, err)
@@ -797,18 +801,37 @@ func exitCode(err error, code int) bool {
 	return exit.ExitCode() == code
 }
 
+// lchown is how the archive takes ownership of what it moved, without
+// following a link out of the tree. It is a variable so a test can stage a
+// name this daemon may not take, which is what an immutable file is on a real
+// host and what nothing inside a temporary directory can be made into.
+var lchown = os.Lchown
+
 // chownTree gives a whole directory to one owner, without following a link out
 // of it: the tree came from a member's home and every name in it was theirs.
-func chownTree(root string, uid, gid int) error {
-	return filepath.Walk(root, func(path string, _ os.FileInfo, err error) error {
+//
+// A name it cannot take is logged and walked past rather than returned. A home
+// carries whatever its member put in it, an immutable file and a mode nothing
+// else on the host has included, and the account that owned it is already gone
+// by the time this runs: a removal that stopped on one file would leave a
+// deleted account, a half moved home and an admin holding an error about a
+// file, see issue #152. It answers how many names it could not take, which is
+// what the caller says once rather than once per name.
+func chownTree(root string, uid, gid int) int {
+	left := 0
+	filepath.Walk(root, func(path string, _ os.FileInfo, err error) error {
 		if err != nil {
-			return err
+			logger.Printf("archiving %s: it could not be read: %v", path, err)
+			left++
+			return nil
 		}
-		if err := os.Lchown(path, uid, gid); err != nil {
-			return fmt.Errorf("sysusers: give %s to %d:%d: %w", path, uid, gid, err)
+		if err := lchown(path, uid, gid); err != nil {
+			logger.Printf("archiving %s: it could not be given to %d:%d: %v", path, uid, gid, err)
+			left++
 		}
 		return nil
 	})
+	return left
 }
 
 // ensureRuntimeDir creates /run/user/<uid> for one member. rootless podman

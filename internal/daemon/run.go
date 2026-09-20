@@ -156,6 +156,10 @@ func (s *Server) processAction(w http.ResponseWriter, r *http.Request, id, actio
 			fmt.Sprintf("Call POST %s instead.", r.URL.Path)))
 		return
 	}
+	if prob := s.notRemoving(r, caller.User, "run a Process"); prob != nil {
+		writeProblem(w, prob)
+		return
+	}
 	p, m, prob := s.owned(r, caller, id)
 	if prob != nil {
 		writeProblem(w, prob)

@@ -169,7 +169,10 @@ func (d *Daemon) addKey(w http.ResponseWriter, r *http.Request) {
 	write(w, Response{Status: http.StatusOK, ContentType: "application/json", Body: string(answer)})
 }
 
-// removeUser answers users_remove, admin only.
+// removeUser answers users_remove, admin only. The daemon answers 202 and
+// removes the member on its own time, so the fake answers the same shape: the
+// member is gone from the list as far as a test is concerned, because the fake
+// has no job to run, see internal/daemon/removal.go.
 func (d *Daemon) removeUser(w http.ResponseWriter, r *http.Request) {
 	d.wait()
 	name := r.PathValue("name")
@@ -189,8 +192,8 @@ func (d *Daemon) removeUser(w http.ResponseWriter, r *http.Request) {
 	}
 	d.members = append(d.members[:index], d.members[index+1:]...)
 	d.mu.Unlock()
-	answer, _ := json.Marshal(map[string]any{"user": name, "archived": "/org/.archive/" + name})
-	write(w, Response{Status: http.StatusOK, ContentType: "application/json", Body: string(answer)})
+	answer, _ := json.Marshal(map[string]any{"user": name, "state": "removing"})
+	write(w, Response{Status: http.StatusAccepted, ContentType: "application/json", Body: string(answer)})
 }
 
 // member finds one member by name. The caller holds the lock.

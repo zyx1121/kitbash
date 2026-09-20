@@ -1,13 +1,13 @@
 package daemon
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 
 	"github.com/zyx1121/kitbash/internal/problem"
+	"github.com/zyx1121/kitbash/internal/store"
 	"github.com/zyx1121/kitbash/internal/sysusers"
 )
 
@@ -53,11 +53,20 @@ type memberResponse struct {
 	Keys      int    `json:"keys"`
 	Home      string `json:"home"`
 	Processes int    `json:"processes"`
+	// State is removing for a member whose removal job is still running and
+	// empty for every other member. An account being taken away is still an
+	// account on this host, so it is listed, and what it is listed as is what
+	// is happening to it, see removal.go.
+	State string `json:"state,omitempty"`
 }
 
-// userList is what users_list answers.
+// userList is what users_list answers: every member, and every removal this
+// host remembers. The second is how a removal that is over is read, because
+// the member it was about is not a member any more: one that finished is
+// removed and one that did not is failed with the step that failed.
 type userList struct {
-	Users []memberResponse `json:"users"`
+	Users    []memberResponse `json:"users"`
+	Removals []store.Removal  `json:"removals"`
 }
 
 // keyResponse is what users_add_key answers.
@@ -66,11 +75,14 @@ type keyResponse struct {
 	Keys int    `json:"keys"`
 }
 
-// removeResponse is what users_remove answers: where the home went, so an
-// admin who deleted the wrong member knows where to find it.
+// removeResponse is what users_remove answers: the member and the state their
+// removal is in, which is removing, because the work is a job kitbashd runs
+// for itself and the answer is 202, see removal.go. Where the home went is
+// read through users_list once the job has moved it, because the archive is a
+// step of the job and not of this call.
 type removeResponse struct {
-	User     string `json:"user"`
-	Archived string `json:"archived"`
+	User  string `json:"user"`
+	State string `json:"state"`
 }
 
 // usersFamily answers POST and GET on /kitbash/v1/users.
@@ -149,6 +161,22 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request, caller Caller) {
 	if found {
 		out.UID = m.UID
 		out.Groups = m.Groups
+		writeJSON(w, r.URL.Path, out)
+		return
+	}
+	// Unless the account was removed. A session open across a removal keeps
+	// its uid for as long as it runs, and this host has answered the removal
+	// already: the member is gone, so the honest answer about them is that
+	// there is none, and not the identity of an account nothing on this host
+	// has any more, see removal.go.
+	if gone, prob := s.removed(r, caller.User); prob != nil {
+		writeProblem(w, prob)
+		return
+	} else if gone {
+		writeProblem(w, problem.NotFoundFix(r.URL.Path,
+			fmt.Sprintf("%s is not a member of this host", caller.User),
+			"Ask an administrator to create a member for this uid."))
+		return
 	}
 	writeJSON(w, r.URL.Path, out)
 }
@@ -185,6 +213,12 @@ func (s *Server) createUser(w http.ResponseWriter, r *http.Request, caller Calle
 	// Process is placed without waiting for the next daemon start, see
 	// internal/cgroups.
 	s.memberCgroup(r.Context(), m)
+	// A name removed once and created again is a member of its own, so what
+	// this host remembers about the removal of the old one is not about them,
+	// see removal.go.
+	if err := s.store.DeleteRemoval(r.Context(), m.Name); err != nil {
+		logger.Printf("users: the removal record of %s could not be forgotten: %v", m.Name, err)
+	}
 	logger.Printf("%s created the member %s (uid %d, admin %t)", caller.User, m.Name, m.UID, m.Admin)
 	writeJSON(w, r.URL.Path, userResponse{User: m.Name, UID: m.UID, Admin: m.Admin})
 }
@@ -205,16 +239,35 @@ func (s *Server) listUsers(w http.ResponseWriter, r *http.Request, caller Caller
 		writeProblem(w, problem.Internal(r.URL.Path, err.Error(), ""))
 		return
 	}
-	out := userList{Users: make([]memberResponse, 0, len(members))}
+	removals, err := s.store.Removals(r.Context())
+	if err != nil {
+		writeProblem(w, problem.Internal(r.URL.Path, err.Error(), ""))
+		return
+	}
+	state := map[string]string{}
+	for _, removal := range removals {
+		state[removal.Name] = removal.State
+	}
+	out := userList{
+		Users:    make([]memberResponse, 0, len(members)),
+		Removals: removals,
+	}
+	if out.Removals == nil {
+		out.Removals = []store.Removal{}
+	}
 	for _, m := range members {
-		out.Users = append(out.Users, memberResponse{
+		row := memberResponse{
 			User:      m.Name,
 			UID:       m.UID,
 			Admin:     m.Admin,
 			Keys:      m.Keys,
 			Home:      m.Home,
 			Processes: counts[m.Name],
-		})
+		}
+		if state[m.Name] == store.Removing {
+			row.State = store.Removing
+		}
+		out.Users = append(out.Users, row)
 	}
 	writeJSON(w, r.URL.Path, out)
 }
@@ -248,6 +301,13 @@ func (s *Server) addKey(w http.ResponseWriter, r *http.Request, caller Caller, n
 // removeUser takes a member away. Two refusals come before anything is done:
 // an admin may not remove themselves, and the last admin may not go, because a
 // host with no admin has no way back to one through this API.
+//
+// What the call does beyond refusing is start a job: the member is marked
+// removing, the answer is 202, and their containers, registrations, approvals,
+// builds, secrets, home and account are taken away by kitbashd on its own
+// time. A removal is not the length of a request, and a member holding
+// seventeen Processes used to outrun the caller's deadline and leave half an
+// account behind, see removal.go and issue #152.
 func (s *Server) removeUser(w http.ResponseWriter, r *http.Request, caller Caller, name string) {
 	if prob := s.requireAdmin(r, caller, "remove a member"); prob != nil {
 		writeProblem(w, prob)
@@ -263,6 +323,14 @@ func (s *Server) removeUser(w http.ResponseWriter, r *http.Request, caller Calle
 		writeProblem(w, problem.ConflictFix(r.URL.Path,
 			fmt.Sprintf("%s may not remove themselves", caller.User),
 			"Ask another administrator to remove this member."))
+		return
+	}
+	// A member the job is already working through is answered what they are:
+	// the call describes the state the caller asked for, so a second one is
+	// the same answer and not a second job.
+	if s.isRemoving(name) {
+		writeJSONStatus(w, r.URL.Path, http.StatusAccepted,
+			removeResponse{User: name, State: store.Removing})
 		return
 	}
 
@@ -303,75 +371,27 @@ func (s *Server) removeUser(w http.ResponseWriter, r *http.Request, caller Calle
 		}
 	}
 
-	// The host goes first: the containers stop, the sessions end, the account
-	// is deleted and the home is archived. Only then does the store forget the
-	// member, because a registration deleted for an account that is still
-	// there is a Process whose Telemetry token was revoked for nothing.
-	archived, err := s.users.Remove(r.Context(), name)
+	// The mark is written before the answer, so a daemon that stops between
+	// the two takes the job up again at its next start rather than leaving a
+	// member an admin believes is going.
+	if _, err := s.store.BeginRemoval(r.Context(), name, s.now()); err != nil {
+		writeProblem(w, problem.Internal(r.URL.Path, err.Error(), ""))
+		return
+	}
+	logger.Printf("%s is removing the member %s", caller.User, name)
+	s.startRemoval(name, caller.User)
+	writeJSONStatus(w, r.URL.Path, http.StatusAccepted, removeResponse{User: name, State: store.Removing})
+}
+
+// removed reports whether this host has removed one member, which is what
+// tells an account that is simply not described by the group database from one
+// that is gone.
+func (s *Server) removed(r *http.Request, name string) (bool, *problem.Problem) {
+	removal, held, err := s.store.Removal(r.Context(), name)
 	if err != nil {
-		writeProblem(w, s.userProblem(r, err, name))
-		return
+		return false, problem.Internal(r.URL.Path, err.Error(), "")
 	}
-	// Every registration is a live Telemetry token, and a token outliving the
-	// member it names is a producer nobody owns, see spec/kitbashd-api.yaml.
-	//
-	// The action lock of each of them is held across the delete, for the reason
-	// proc_stop holds one: a tick reads a registration and writes the token of
-	// its run back into it, so a delete that lands in between would be undone
-	// by the tick that raced it and this member's job would outlive their
-	// account, see schedule.go. Every other holder of one of these locks takes
-	// one at a time, so holding several here cannot wait on itself.
-	release := s.lockOwned(r.Context(), name)
-	ids, err := s.store.DeleteProcessesByOwner(r.Context(), name)
-	if err != nil {
-		release()
-		writeProblem(w, problem.Internal(r.URL.Path, err.Error(), ""))
-		return
-	}
-	for _, id := range ids {
-		s.fanout.untrack(id)
-		s.probes.untrack(id)
-		// The names their Processes held go with the account. A name left on
-		// the routing table would answer for a member this host no longer has,
-		// and it would answer by forwarding to a host port their container has
-		// freed, which is a port the next member's container may be given, see
-		// proxy.go.
-		s.proxy.untrack(id)
-		// And the jobs they registered: a tick of a member this host no longer
-		// has would start a container as nobody, see schedule.go.
-		s.jobs.untrack(id)
-		s.endMCPSessions(id)
-	}
-	release()
-	if _, err := s.store.DeleteApprovals(r.Context(), name); err != nil {
-		writeProblem(w, problem.Internal(r.URL.Path, err.Error(), ""))
-		return
-	}
-	// Their build records go with their image store: a row naming an account
-	// that is gone would send the next fetch to a member this host no longer
-	// has, see builds.go.
-	if _, err := s.store.DeleteBuildsByBuilder(r.Context(), name); err != nil {
-		writeProblem(w, problem.Internal(r.URL.Path, err.Error(), ""))
-		return
-	}
-	// The values they set with secrets_set go with the account. They are the
-	// member's own and nobody inherits them, and a directory left behind would
-	// hand them to the next account created with that name, see PLAN.md
-	// section 2.3.
-	if err := s.secrets.RemoveMember(name); err != nil {
-		// The account is already gone, so this is reported rather than
-		// returned: the member was removed, and a directory this daemon could
-		// not take away is the operator's to look at.
-		logger.Printf("secrets: the secrets of %s could not be removed: %v", name, err)
-	}
-	// Their containers are gone, so the cgroups those containers ran in go
-	// too. One that is still busy is left for the next boot rather than
-	// holding up an account that is already deleted.
-	if err := s.cgroups.RemoveMember(r.Context(), name); err != nil {
-		logger.Printf("cgroups: the cgroup of %s could not be removed: %v", name, err)
-	}
-	logger.Printf("%s removed the member %s, home archived at %s", caller.User, name, archived)
-	writeJSON(w, r.URL.Path, removeResponse{User: name, Archived: archived})
+	return held && removal.State == store.Removed, nil
 }
 
 // lastAdmin reports whether this member is the only administrator left.
@@ -429,25 +449,4 @@ func (s *Server) userProblem(r *http.Request, err error, name string) *problem.P
 func wrongMethod(r *http.Request, fix string) *problem.Problem {
 	return problem.NotFoundFix(r.URL.Path,
 		fmt.Sprintf("%s %s is not part of the kitbashd API", r.Method, r.URL.Path), fix)
-}
-
-// lockOwned takes the action lock of every Process one member holds and
-// answers what releases them all. A member whose registrations cannot be read
-// is removed anyway: the account is already gone by the time this runs, and a
-// lock nobody could take is not a reason to leave a registration behind.
-func (s *Server) lockOwned(ctx context.Context, owner string) func() {
-	list, err := s.store.Processes(ctx, owner)
-	if err != nil {
-		logger.Printf("users: reading the Processes of %s before removing them: %v", owner, err)
-		return func() {}
-	}
-	releases := make([]func(), 0, len(list))
-	for _, p := range list {
-		releases = append(releases, s.actions.lock(p.ID))
-	}
-	return func() {
-		for _, release := range releases {
-			release()
-		}
-	}
 }

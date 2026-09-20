@@ -94,9 +94,9 @@ Members. Linux users with SSH keys. Admin only except `users_me`.
 |------|-------------|
 | `users_me` | Who the caller is and which groups they are in |
 | `users_create` | Create a member with a key, a private home and a subordinate id range |
-| `users_list` | Every member with uid, admin flag, key count and Process count |
+| `users_list` | Every member with uid, admin flag, key count and Process count, and how far each removal got |
 | `users_add_key` | Add an SSH public key to a member |
-| `users_remove` | Stop the member's Processes, archive their home and delete the account |
+| `users_remove` | Start removing a member: kitbashd stops their Processes, archives their home and deletes the account on its own time |
 
 ## approvals
 

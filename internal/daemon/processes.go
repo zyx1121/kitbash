@@ -227,6 +227,10 @@ func (s *Server) registerProcess(w http.ResponseWriter, r *http.Request, caller 
 		writeProblem(w, prob)
 		return
 	}
+	if prob := s.notRemoving(r, caller.User, "register a Process"); prob != nil {
+		writeProblem(w, prob)
+		return
+	}
 
 	token, hash, err := store.NewToken()
 	if err != nil {

@@ -250,10 +250,7 @@ func TestARemovedMembersNameIsNoLongerAsked(t *testing.T) {
 		t.Fatalf("before the removal the gateway was answered %d about %s, want 200", rec.Code, name)
 	}
 
-	res, body := h.do(http.MethodDelete, usersPath+"/alice", "", nil)
-	if res.StatusCode != http.StatusOK {
-		t.Fatalf("users_remove status = %d, body %s", res.StatusCode, body)
-	}
+	h.removeMember("alice")
 	if rec := h.ask(http.MethodGet, name); rec.Code != http.StatusNotFound {
 		t.Errorf("the gateway was answered %d about %s once the member was gone, want 404", rec.Code, name)
 	}

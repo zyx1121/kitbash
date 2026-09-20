@@ -315,6 +315,13 @@ type Server struct {
 	restoreMu       sync.Mutex
 	restoreProblems map[string]restoreProblem
 
+	// removing is the members a removal job is running for right now, which is
+	// what every path that would give one of them new work asks before it
+	// takes any, see removal.go. It is the memory half of the removals table:
+	// the row survives a restart and this does not have to.
+	removingMu sync.Mutex
+	removing   map[string]struct{}
+
 	// bound is what health reports as its listeners, written when a listener
 	// starts serving and read by every health request.
 	boundMu sync.Mutex
@@ -372,6 +379,7 @@ func New(st *store.Store, opts Options) *Server {
 
 		noRestore:       opts.NoRestore,
 		restoreProblems: map[string]restoreProblem{},
+		removing:        map[string]struct{}{},
 	}
 	if s.runner == nil {
 		s.runner = sysusers.NewPodman()
@@ -415,6 +423,10 @@ func New(st *store.Store, opts Options) *Server {
 	if s.resolver == nil {
 		s.resolver = net.DefaultResolver
 	}
+	// The proxy's error handler is the Server's: a forward that was refused
+	// asks the runtime whether the container is still there, which is a
+	// question the routing table alone cannot answer, see forwardFailed.
+	s.proxy.forwarder.ErrorHandler = s.forwardFailed
 	s.started = s.now()
 	// The certificates of acme mode are the daemon's own: the directory is
 	// made here, at start, rather than on the first request for a name, so an

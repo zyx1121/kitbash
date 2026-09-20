@@ -580,8 +580,17 @@ api:
   users_list:
     method: GET
     path: /kitbash/v1/users
-    response: { users: [{ user, uid, admin, keys, home, processes }] }
+    response: { users: [{ user, uid, admin, keys, home, processes, state }], removals: [{ user, state, step, archived, startedAt, finishedAt }] }
     authorization: admin only.
+    behaviour: >
+      A member whose removal job is still running carries state removing and
+      is listed like any other member, because an account being taken away is
+      still an account on this host. The removals are every removal this host
+      remembers, which is how one that is over is read: the member it was
+      about is not a member any more, so it is not in users. A removal is
+      removing, removed, or failed carrying the step that failed on it, which
+      is the word an admin reads to know what is left to do by hand. A name
+      created again forgets the removal of the account that held it before.
   users_me:
     method: GET
     path: /kitbash/v1/users/me
@@ -596,8 +605,37 @@ api:
   users_remove:
     method: DELETE
     path: /kitbash/v1/users/{name}
-    response: { user, archived: "/org/.archive/<name>" }
-    authorization: admin only; an admin cannot remove themselves or the last admin. Stops and removes the member's kitbash containers as the member, deletes their registrations, approvals and build records, kills their processes, moves the home to /org/.archive/<name> owned by root 0700, removes their secrets directory under /var/lib/kitbash/secrets, deletes the account and its subordinate ranges.
+    response: { user, state: removing }
+    status: 202
+    authorization: admin only; an admin cannot remove themselves or the last admin.
+    behaviour: >
+      The call starts a job and does not do the work. It refuses what it has
+      always refused, marks the member removing, and answers 202 with that
+      state; kitbashd then stops and removes the member's containers as the
+      member, a few at a time and each under the action lock of its own
+      Process, untracks their names, jobs, probes and fan out, deletes their
+      registrations, which revokes every Telemetry token they hold, deletes
+      their approvals and build records, removes their secrets directory under
+      /var/lib/kitbash/secrets, moves the home to /org/.archive/<name> owned by
+      root 0700, deletes the account and its subordinate ranges, and removes
+      their cgroup subtree. A removal is not the length of a request: a member
+      holding a dozen Processes used to outrun the caller's deadline, and the
+      cancellation left an account deleted and a home half archived.
+
+      Every step is idempotent and logged, and a step that fails is logged and
+      the job goes on, so the state it ends in is removed, or failed carrying
+      the first step that failed. Both are read through users_list. The archive
+      step takes what it can: a name in the home it cannot give to root, an
+      immutable file or an odd mode, is logged and walked past, because the
+      account is already gone by then and one file is not a reason to leave a
+      home half moved. While the job runs the member takes no new work:
+      proc_run and the Process actions answer conflict for them.
+
+      A second call for a member already being removed answers 202 with the
+      same state rather than starting a second job; a name this host does not
+      have is not-found as before. The mark is a row in the store, so a daemon
+      that stopped in the middle of a removal takes it up again at its next
+      start, before it starts anything of that member's again.
     errors: [not-permitted, not-found, conflict, internal]
   secrets_set:
     method: PUT

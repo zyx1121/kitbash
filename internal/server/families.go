@@ -174,8 +174,11 @@ func RegisterUsers(s *mcp.Server, client *telemetry.Client) {
 	}, createUserHandler(client))
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name:         "users_list",
-		Description:  "All members with uid, admin flag, key count and running Process count. Admin only.",
+		Name: "users_list",
+		Description: "All members with uid, admin flag, key count and running Process count, and every " +
+			"removal this host remembers. Admin only. A member being removed is listed with state " +
+			"removing until the job kitbashd runs for them is done; the removals carry where each one " +
+			"got to, removed or failed with the step that failed.",
 		InputSchema:  usersListInputSchema,
 		OutputSchema: usersListOutputSchema,
 	}, listUsersHandler(client))
@@ -190,9 +193,12 @@ func RegisterUsers(s *mcp.Server, client *telemetry.Client) {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "users_remove",
-		Description: "Remove a member. Admin only. Their Processes stop and are unregistered, their " +
-			"sessions end, their home is archived under /org/.archive/<name> where the surface cannot see " +
-			"it, and the account is deleted. An admin cannot remove themselves or the last admin.",
+		Description: "Start removing a member. Admin only. It answers at once with the state removing, " +
+			"and kitbashd does the work on its own time: their Processes stop and are unregistered, " +
+			"their sessions end, their home is archived under /org/.archive/<name> where the surface " +
+			"cannot see it, and the account is deleted. users_list carries how far it got, and calling " +
+			"this again while it runs is the same answer. An admin cannot remove themselves or the last " +
+			"admin.",
 		InputSchema:  usersRemoveInputSchema,
 		OutputSchema: usersRemoveOutputSchema,
 	}, removeUserHandler(client))
