@@ -856,10 +856,7 @@ func TestRemovingAMemberTakesTheirJobs(t *testing.T) {
 		t.Fatalf("the daemon holds %d jobs, want 1", got)
 	}
 
-	res, body := h.do(http.MethodDelete, usersPath+"/"+builderName, "", nil)
-	if res.StatusCode != http.StatusOK {
-		t.Fatalf("users_remove status = %d, body %s", res.StatusCode, body)
-	}
+	h.removeMember(builderName)
 
 	if got := h.server.jobs.count(); got != 0 {
 		t.Errorf("the daemon holds %d jobs of a member it no longer has", got)

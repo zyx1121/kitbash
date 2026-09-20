@@ -69,6 +69,15 @@ type RestoreCounts struct {
 // rootless podman serialises its own store per user anyway, and starting one
 // member's containers must not be held up by another member's.
 func (s *Server) Restore(ctx context.Context) RestoreCounts {
+	// A member this host was removing when it stopped is taken up again
+	// first, before anything of theirs is started: the job is what deletes
+	// their registrations, and a boot that started their containers again
+	// while it ran would hand the job containers it has already walked past,
+	// see removal.go.
+	removing := map[string]bool{}
+	for _, name := range s.resumeRemovals(ctx) {
+		removing[name] = true
+	}
 	if s.noRestore {
 		logger.Printf("restore: skipped, the daemon was started with restore off")
 		// The table is still built. It says what is reachable, which on a host
@@ -88,6 +97,12 @@ func (s *Server) Restore(ctx context.Context) RestoreCounts {
 	now := s.now()
 	byOwner := map[string][]store.Process{}
 	for _, p := range list {
+		// A member whose removal is being taken up again is left to the job:
+		// their registrations are its to delete and their containers its to
+		// stop.
+		if removing[p.Owner] {
+			continue
+		}
 		// A Process a run kit owns is not this daemon's to start. It carries
 		// no container name either, so it is answered before the check below
 		// that would unregister it as a registration naming nothing.

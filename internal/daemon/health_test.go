@@ -742,10 +742,7 @@ func TestRemovingAMemberStopsProbingTheirProcesses(t *testing.T) {
 		t.Fatalf("%d Processes are probed, want the one of alice", n)
 	}
 
-	res, body := h.do(http.MethodDelete, usersPath+"/alice", "", nil)
-	if res.StatusCode != http.StatusOK {
-		t.Fatalf("remove status = %d, body %s", res.StatusCode, body)
-	}
+	h.removeMember("alice")
 	if n := h.server.probes.count(); n != 0 {
 		t.Errorf("%d Processes of a removed member are still probed", n)
 	}

@@ -581,7 +581,23 @@ const memberDef = `{
     "uid": { "type": "integer" },
     "admin": { "type": "boolean" },
     "keys": { "type": "integer" },
-    "processes": { "type": "integer" }
+    "processes": { "type": "integer" },
+    "state": { "type": "string", "enum": ["removing"] }
+  }
+}`
+
+// removalDef is one removal users_list carries: a member this host is taking
+// away, or has taken away, and the step that failed if one did.
+const removalDef = `{
+  "type": "object",
+  "required": ["user", "state", "startedAt"],
+  "properties": {
+    "user": { "type": "string" },
+    "state": { "type": "string", "enum": ["removing", "removed", "failed"] },
+    "step": { "type": "string" },
+    "archived": { "type": "string" },
+    "startedAt": { "type": "string", "format": "date-time" },
+    "finishedAt": { "type": "string", "format": "date-time" }
   }
 }`
 
@@ -650,9 +666,10 @@ var (
 
 	usersListOutputSchema = json.RawMessage(`{
   "type": "object",
-  "required": ["users"],
+  "required": ["users", "removals"],
   "properties": {
-    "users": { "type": "array", "items": ` + memberDef + ` }
+    "users": { "type": "array", "items": ` + memberDef + ` },
+    "removals": { "type": "array", "items": ` + removalDef + ` }
   }
 }`)
 
@@ -686,10 +703,10 @@ var (
 
 	usersRemoveOutputSchema = json.RawMessage(`{
   "type": "object",
-  "required": ["user", "archived"],
+  "required": ["user", "state"],
   "properties": {
     "user": { "type": "string" },
-    "archived": { "type": "string" }
+    "state": { "type": "string", "enum": ["removing"] }
   }
 }`)
 

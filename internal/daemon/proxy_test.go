@@ -1146,10 +1146,7 @@ func TestRemovingAMemberTakesTheirNamesOffTheTable(t *testing.T) {
 		t.Fatalf("before the removal %s answered %d, want it served", name, rec.Code)
 	}
 
-	res, body := h.do(http.MethodDelete, usersPath+"/alice", "", nil)
-	if res.StatusCode != http.StatusOK {
-		t.Fatalf("users_remove status = %d, body %s", res.StatusCode, body)
-	}
+	h.removeMember("alice")
 	if left, held := h.server.proxy.lookup(name); held {
 		t.Errorf("%s is still routed to 127.0.0.1:%d after the member was removed", name, left.port)
 	}

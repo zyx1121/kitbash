@@ -502,6 +502,40 @@ func (s *Server) probeOnce(ctx context.Context, target probe) {
 		return
 	}
 	s.recordHealth(ctx, target, healthy, status, at)
+	s.reroute(ctx, target, healthy)
+}
+
+// reroute keeps the routing table honest about a container that started or
+// stopped outside proc_run and proc_stop. The probe is the only thing on this
+// host that asks a Process whether it is there on a cadence, so it is what
+// notices a container that was killed, crashed or was stopped by its owner
+// with podman, and the one that notices it running again, see issue #149.
+//
+// The runtime is asked only when the probe and the table disagree: a Process
+// that answers and holds no port, or one that does not answer and holds one.
+// While a Process is up and answering this costs nothing, and it is the
+// probe's own goroutine that pays for it when it is not, so there is no loop
+// here of its own.
+//
+// What it asks is trackRoute, which reads the container state the way every
+// other route is built, so a container that is not running loses its port and
+// one that is running gets it back. A Process that is up and merely unhealthy
+// keeps its port: the probe says what the application answered and the route
+// says what the runtime holds, and only the second decides what is forwarded
+// to.
+func (s *Server) reroute(ctx context.Context, target probe, healthy bool) {
+	if !s.proxy.enabled() {
+		return
+	}
+	port, held := s.proxy.portOf(target.id)
+	if !held || healthy == (port != 0) {
+		return
+	}
+	p, found, err := s.store.Process(ctx, target.id)
+	if err != nil || !found {
+		return
+	}
+	s.trackRouteFor(ctx, p)
 }
 
 // request runs one probe and reports whether the Process is healthy and what

@@ -583,10 +583,7 @@ func TestUsersRemoveTakesTheMembersSecrets(t *testing.T) {
 	h.seedSecret("alice", "ANTHROPIC_API_KEY", "alice-"+secretValue)
 	h.seedSecret("bob", "ANTHROPIC_API_KEY", "bob-"+secretValue)
 
-	res, body := h.do(http.MethodDelete, usersPath+"/alice", "", nil)
-	if res.StatusCode != http.StatusOK {
-		t.Fatalf("remove = %d %s, want 200", res.StatusCode, body)
-	}
+	h.removeMember("alice")
 	if _, err := os.Stat(filepath.Join(h.secretsDir, "alice")); !os.IsNotExist(err) {
 		t.Errorf("the secrets of a removed member are still there: %v", err)
 	}

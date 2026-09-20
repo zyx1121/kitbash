@@ -34,6 +34,9 @@ type Fake struct {
 	AddKeyErr error
 	RemoveErr error
 	ListErr   error
+	// ArchiveErr makes the archive step fail on its own, which is a removal
+	// that deleted the account and could not move the home.
+	ArchiveErr error
 	// StartErr, RunErr, InitErr, StopErr, RemoveContainerErr, RemoveAllErr and
 	// CopyErr make the runtime fail on demand. RunErr is the create, which is
 	// the call that makes a container.
@@ -43,8 +46,12 @@ type Fake struct {
 	// StartErrs are containers Start refuses by name, whatever made them,
 	// which StartErr does not cover: that one is about a container this fake
 	// did not make.
-	StartErrs          map[string]error
-	StopErr            error
+	StartErrs map[string]error
+	StopErr   error
+	// StopGate holds every Stop until it is closed, which is how a test
+	// stages a removal that is still in the middle of its work: the job is
+	// stopping containers and the next call has to find it there.
+	StopGate           chan struct{}
 	RemoveContainerErr error
 	RemoveAllErr       error
 	CopyErr            error
@@ -108,6 +115,10 @@ type Fake struct {
 	// is one created under no cgroup parent of its own.
 	Configs map[string]ContainerConfig
 
+	// Archived are the names ArchiveHome was called for, which is the archive
+	// step of a removal taken up on its own.
+	Archived []string
+
 	// Created, AddedKeys and Removed record what the caller asked for, and
 	// Started, Ran, Stopped, RemovedContainers, RemovedFor and Copied what
 	// the runtime was asked to do.
@@ -123,6 +134,10 @@ type Fake struct {
 	RemovedContainers []StopCall
 	RemovedFor        []string
 	Copied            []CopyCall
+
+	// stopping counts the Stop calls waiting on StopGate, which is what tells
+	// a test that a caller has reached the containers.
+	stopping int
 
 	members map[string]*fakeMember
 	nextUID int
@@ -343,6 +358,22 @@ func (f *Fake) Remove(_ context.Context, name string) (string, error) {
 	}
 	f.Removed = append(f.Removed, name)
 	delete(f.members, name)
+	dir := f.ArchiveDir
+	if dir == "" {
+		dir = DefaultArchive
+	}
+	return path.Join(dir, name), nil
+}
+
+// ArchiveHome records the archive of a home whose account may already be gone,
+// which is the step a resumed removal takes up on its own.
+func (f *Fake) ArchiveHome(_ context.Context, name string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.ArchiveErr != nil {
+		return "", f.ArchiveErr
+	}
+	f.Archived = append(f.Archived, name)
 	dir := f.ArchiveDir
 	if dir == "" {
 		dir = DefaultArchive
@@ -610,7 +641,26 @@ func (f *Fake) Renames() []RenameCall {
 }
 
 // Stop records a stop as one member.
-func (f *Fake) Stop(_ context.Context, m Member, container string, timeout int) error {
+func (f *Fake) Stop(ctx context.Context, m Member, container string, timeout int) error {
+	f.mu.Lock()
+	gate := f.StopGate
+	f.mu.Unlock()
+	if gate != nil {
+		f.mu.Lock()
+		f.stopping++
+		f.mu.Unlock()
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			f.mu.Lock()
+			f.stopping--
+			f.mu.Unlock()
+			return ctx.Err()
+		}
+		f.mu.Lock()
+		f.stopping--
+		f.mu.Unlock()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.Missing[container] {
@@ -684,6 +734,14 @@ func (f *Fake) Waits() []StopCall {
 	out := make([]StopCall, len(f.Waited))
 	copy(out, f.Waited)
 	return out
+}
+
+// Stopping reports whether a Stop is waiting on StopGate, which is how a test
+// knows a caller has reached the containers without waiting for one to finish.
+func (f *Fake) Stopping() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.stopping > 0
 }
 
 // SetState stages what the runtime says one container is doing, for a test

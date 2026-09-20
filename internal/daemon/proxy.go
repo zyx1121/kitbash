@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/crypto/acme/autocert"
@@ -91,6 +92,14 @@ const ProxyReadHeaderTimeout = 10 * time.Second
 // stopping does not wait out a download.
 const ProxyShutdownTimeout = 5 * time.Second
 
+// ReResolveWindow is how long the answer of one re-resolve stands. A container
+// that is up and refusing connections is a 502 for as long as that lasts, and
+// what arrives is the internet's to decide: without a window a caller holding
+// the URL would set the rate this daemon inspects containers at, which is one
+// podman child per request. One inspect per name per window is the whole cost,
+// whatever the request rate, see forwardFailed.
+const ReResolveWindow = 5 * time.Second
+
 // ProxySpan is the name of the span one forwarded request writes.
 const ProxySpan = "proxy"
 
@@ -149,6 +158,83 @@ type route struct {
 	port      int
 }
 
+// reResolver is what bounds a failed forward. The routing table alone cannot
+// say whether a container is still there, and the answer costs a runtime call,
+// so it is asked once per route at a time and the answer stands for
+// ReResolveWindow: concurrent refusals wait for the call already going rather
+// than starting one each, and everything that arrives after it reads what that
+// call found.
+type reResolver struct {
+	mu      sync.Mutex
+	answers map[string]*reResolveAnswer
+}
+
+// reResolveAnswer is what one re-resolve of one route found, and whether the
+// call it is about has finished.
+type reResolveAnswer struct {
+	// ready is closed when the call has answered, and nil after that, which
+	// is what tells a caller that has to wait from one that can read.
+	ready   chan struct{}
+	dropped bool
+	until   time.Time
+}
+
+// resolve answers whether this route's port was dropped, asking at most once
+// per route per window. ask is the question, called by one caller at a time
+// and not at all while an answer is fresh.
+func (r *reResolver) resolve(id string, now time.Time, ask func() bool) bool {
+	r.mu.Lock()
+	if held := r.answers[id]; held != nil {
+		if held.ready != nil {
+			// A call is going. Its answer is this caller's answer: two
+			// requests that arrive together are one inspect.
+			ready := held.ready
+			r.mu.Unlock()
+			<-ready
+			r.mu.Lock()
+			dropped := false
+			if after := r.answers[id]; after != nil {
+				dropped = after.dropped
+			}
+			r.mu.Unlock()
+			return dropped
+		}
+		if now.Before(held.until) {
+			dropped := held.dropped
+			r.mu.Unlock()
+			return dropped
+		}
+	}
+	mine := &reResolveAnswer{ready: make(chan struct{})}
+	r.answers[id] = mine
+	r.mu.Unlock()
+
+	dropped := ask()
+
+	r.mu.Lock()
+	ready := mine.ready
+	mine.dropped, mine.until, mine.ready = dropped, now.Add(ReResolveWindow), nil
+	r.mu.Unlock()
+	close(ready)
+	return dropped
+}
+
+// forget drops what is remembered about one route, which is what building
+// that route again does: the table has just been told what the runtime says,
+// so the answer of a call made before it is not about this route any more.
+func (r *reResolver) forget(id string) {
+	r.mu.Lock()
+	delete(r.answers, id)
+	r.mu.Unlock()
+}
+
+// forgetAll drops the lot, which a reload does: the table it was about is gone.
+func (r *reResolver) forgetAll() {
+	r.mu.Lock()
+	r.answers = map[string]*reResolveAnswer{}
+	r.mu.Unlock()
+}
+
 // proxy holds the routing table and the two things built from it: the client
 // that forwards a request and, in acme mode, the certificates. Everything here
 // is read on the request path, so the lock is a read write one and the table is
@@ -176,6 +262,9 @@ type proxy struct {
 
 	mu     sync.RWMutex
 	routes map[string]route
+
+	// resolves bounds what a forward that failed costs, see reResolver.
+	resolves *reResolver
 
 	forwarder *httputil.ReverseProxy
 	// certs is the ACME client, nil in gateway mode and on a host with no
@@ -206,6 +295,7 @@ func newProxy(opts Options) *proxy {
 		maxConns:   opts.ProxyMaxConnections,
 		perAddress: opts.ProxyPerAddress,
 		routes:     map[string]route{},
+		resolves:   &reResolver{answers: map[string]*reResolveAnswer{}},
 	}
 	if p.maxConns <= 0 {
 		p.maxConns = ProxyMaxConnections
@@ -275,11 +365,45 @@ func (p *proxy) untrack(id string) {
 }
 
 // dropID removes every name one Process holds. The caller holds the lock.
+//
+// What a re-resolve found about this Process goes with them: a route written
+// again is the runtime's answer of a moment ago, so a call made before it has
+// nothing to say about the route that is there now.
 func (p *proxy) dropID(id string) {
 	for host, held := range p.routes {
 		if held.id == id {
 			delete(p.routes, host)
 		}
+	}
+	p.resolves.forget(id)
+}
+
+// portOf is the port one Process's name forwards to and whether the table
+// holds a name for it at all. A port of zero is a name that answers 503.
+func (p *proxy) portOf(id string) (int, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, held := range p.routes {
+		if held.id == id {
+			return held.port, true
+		}
+	}
+	return 0, false
+}
+
+// dropPort takes the port off every name one Process holds and leaves the
+// names, which is what a container that is not running any more leaves behind:
+// the registration stands, so the name stands and answers 503, and nothing is
+// forwarded to a port the container has freed.
+func (p *proxy) dropPort(id string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for host, held := range p.routes {
+		if held.id != id || held.port == 0 {
+			continue
+		}
+		held.port = 0
+		p.routes[host] = held
 	}
 }
 
@@ -294,6 +418,7 @@ func (p *proxy) reload(routes []route) {
 	p.mu.Lock()
 	p.routes = table
 	p.mu.Unlock()
+	p.resolves.forgetAll()
 }
 
 // lookup answers which Process serves one name.
@@ -484,13 +609,21 @@ func (s *Server) serveProxy(w http.ResponseWriter, r *http.Request) {
 		// container publishes nothing, so there is nowhere to forward to. That
 		// is a different answer from a name nobody holds, and it is the one a
 		// member reads when they stopped their own Process.
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		fmt.Fprintf(w, "%s is registered on this host and its Process is not running.\n", host)
+		writeStopped(w, host)
 		s.recordForward(r, target, host, http.StatusServiceUnavailable, s.now(), s.now())
 		return
 	}
 	s.forward(w, r, target, host)
+}
+
+// writeStopped is the answer for a name this host serves whose Process is not
+// running. It is one body and one status wherever that is found: at the table,
+// where the port is already zero, and at a forward that found the container
+// gone since, see forwardFailed.
+func writeStopped(w http.ResponseWriter, host string) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusServiceUnavailable)
+	fmt.Fprintf(w, "%s is registered on this host and its Process is not running.\n", host)
 }
 
 // serveAsk answers the one question a gateway asks before it obtains a
@@ -623,6 +756,98 @@ func (p *proxy) forwardedProto(in *http.Request) string {
 	// given is still https, because that is what the gateway holds the
 	// certificate for; what the Process is told is what arrived.
 	return "http"
+}
+
+// forwardFailed answers a forward that did not reach the Process. It is the
+// proxy's error handler, set on the forwarder once the Server exists, because
+// the one thing it does beyond answering is ask the runtime a question.
+//
+// A container that died outside proc_stop keeps the port it had: the state is
+// read when the route is built, at a registration, a start and a restore, and
+// nothing rebuilds it when a container is killed, crashes or is stopped by its
+// owner with podman. The port is then a port nothing is bound to, so the
+// connection is refused by the kernel and the honest answer is not 502.
+//
+// So a forward nothing accepted the connection for is re-resolved: the runtime
+// is asked what it calls that container, and a container that is not running,
+// or one the runtime does not have at all, loses its port here and answers
+// 503, the same answer a Process stopped with proc_stop gives. One that is
+// running keeps its 502, because a Process that is up and not answering is
+// what 502 is for.
+//
+// Two things bound it. Only a dial failure asks: a connection reset while the
+// response was being read is a container that was there and answered, and a
+// timeout is a Process that is slow. And the answer is asked once per route
+// per ReResolveWindow, so a 502 loop costs one inspect per window per name
+// whatever arrives, see reResolver and issue #149.
+func (s *Server) forwardFailed(w http.ResponseWriter, r *http.Request, err error) {
+	// A forward that had begun answering is neither re-resolved nor answered
+	// again: the status is on the wire already, and a second WriteHeader is a
+	// log line and nothing more.
+	if recorder, ok := w.(*recordingWriter); ok && recorder.wrote {
+		logger.Printf("proxy: the Process serving %s stopped answering mid response: %v", r.Host, err)
+		return
+	}
+	target, held := r.Context().Value(routeKey{}).(route)
+	if held && dialRefused(err) && s.dropDeadRoute(r.Context(), target) {
+		writeStopped(w, target.host)
+		return
+	}
+	s.proxy.upstreamFailed(w, r, err)
+}
+
+// dropDeadRoute asks the runtime whether one route's container is still
+// running and takes the port off the table when it is not. It reports whether
+// the route is one this request answers 503 for.
+//
+// The question goes through the re-resolver, so what it costs is bounded by
+// the window and not by the request rate.
+func (s *Server) dropDeadRoute(ctx context.Context, target route) bool {
+	if target.container == "" {
+		return false
+	}
+	return s.proxy.resolves.resolve(target.id, s.now(), func() bool {
+		return s.containerStopped(ctx, target)
+	})
+}
+
+// containerStopped is the one runtime call a re-resolve makes, and what it
+// does with the answer.
+//
+// A container the runtime does not have is a container that is not running,
+// which is what podman rm by the owner leaves behind, and it is the answer
+// routePort gives no port for either. A runtime that would not answer at all
+// leaves the table as it is: what the port says is the last thing this daemon
+// knew, and 502 is the honest answer to a forward that failed for a reason
+// nothing here could read.
+func (s *Server) containerStopped(ctx context.Context, target route) bool {
+	m, found, err := s.users.Lookup(ctx, target.owner)
+	if err != nil || !found {
+		return false
+	}
+	config, err := s.runner.ContainerConfig(ctx, m, target.container)
+	switch {
+	case errors.Is(err, sysusers.ErrNoContainer):
+	case err != nil:
+		return false
+	case config.State == podman.StateRunning:
+		return false
+	}
+	logger.Printf("proxy: the container of %s is not running any more, %s answers 503 until it is started again",
+		target.id, target.host)
+	s.proxy.dropPort(target.id)
+	return true
+}
+
+// dialRefused reports whether a forward failed because nothing accepted the
+// connection, which is the one failure a container that is gone produces and
+// the only one worth a runtime call.
+func dialRefused(err error) bool {
+	var op *net.OpError
+	if !errors.As(err, &op) || op.Op != "dial" {
+		return false
+	}
+	return errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET)
 }
 
 // upstreamFailed answers a Process that could not be reached or that closed

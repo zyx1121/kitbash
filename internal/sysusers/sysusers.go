@@ -119,6 +119,11 @@ type System interface {
 	// Remove stops the member's Processes, ends their sessions, archives
 	// their home and deletes the account. It answers where the home went.
 	Remove(ctx context.Context, name string) (archived string, err error)
+	// ArchiveHome moves the home of a name whose account is already gone,
+	// which is where a removal that stopped between the userdel and the
+	// rename is taken up again. A home that is not there is nothing to move
+	// and not a failure: the call describes the state it wants.
+	ArchiveHome(ctx context.Context, name string) (archived string, err error)
 	// List answers every member of kitbash-users.
 	List(ctx context.Context) ([]Member, error)
 	// Lookup answers one member by name, found false when there is none.

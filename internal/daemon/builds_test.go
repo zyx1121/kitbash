@@ -341,10 +341,7 @@ func TestRemovingAMemberRemovesTheirBuilds(t *testing.T) {
 	h, fake := sharing(t, true)
 	h.recordFor(builderName, "/org/ffmpeg", testCommit, testDigest)
 
-	res, body := h.do(http.MethodDelete, usersPath+"/"+builderName, "", nil)
-	if res.StatusCode != http.StatusOK {
-		t.Fatalf("remove = %d %s, want 200", res.StatusCode, body)
-	}
+	h.removeMember(builderName)
 	if len(fake.Removed) != 1 {
 		t.Fatalf("the host removed %v, want the one member", fake.Removed)
 	}

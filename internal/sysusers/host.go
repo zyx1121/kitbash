@@ -28,6 +28,12 @@ const (
 	DefaultRunUser    = "/run/user"
 	DefaultArchive    = "/org/.archive"
 	DefaultProc       = "/proc"
+	// DefaultHomes is where a member's home is, which is read only when the
+	// account is gone and its home is not, see ArchiveHome. It is
+	// mounts.HomesRoot spelled twice rather than imported, the way
+	// sysusers.EnvCaller is: this package carries no dependency on the ones
+	// that read Files.
+	DefaultHomes = "/home"
 )
 
 // Modes of what a member owns. The home and the runtime directory are private
@@ -77,8 +83,13 @@ type Host struct {
 	SubIDLock string
 	// RunUser is where a member's XDG runtime directory goes.
 	RunUser string
-	// Archive is where a removed member's home is moved to.
+	// Archive is where a removed member's home is moved to, and Homes the
+	// root a member's home is under. The second is read only when the
+	// account is gone and its home is still there, which is where a removal
+	// that stopped between the userdel and the rename is taken up again: with
+	// no account there is nothing to read a home path off, see ArchiveHome.
 	Archive string
+	Homes   string
 	// Proc is the process filesystem, read to see whether a member still has
 	// anything running.
 	Proc string
@@ -100,6 +111,7 @@ func NewHost(runner Runner) *Host {
 		SubIDLock: DefaultSubIDLock,
 		RunUser:   DefaultRunUser,
 		Archive:   DefaultArchive,
+		Homes:     DefaultHomes,
 		Proc:      DefaultProc,
 		Runner:    runner,
 	}
@@ -217,6 +229,29 @@ func (h *Host) Remove(ctx context.Context, name string) (string, error) {
 		os.RemoveAll(filepath.Join(h.RunUser, strconv.Itoa(m.UID)))
 	}
 	return archived, nil
+}
+
+// ArchiveHome moves the home of one name whose account may already be gone. It
+// is the archive step of a removal on its own, which is what a job resumed
+// after a daemon stopped between the userdel and the rename needs: the account
+// is not there to read a home path off any more, so the name's own place under
+// the homes root is what is looked at.
+//
+// A home that is not there is nothing to move: the step answers where it would
+// have gone and calls itself done, which is what makes running the job again
+// no work rather than a failure.
+func (h *Host) ArchiveHome(ctx context.Context, name string) (string, error) {
+	if !ValidName(name) {
+		return "", fmt.Errorf("%w: %s", ErrName, name)
+	}
+	m, err := h.member(ctx, name)
+	if err == nil {
+		return h.archiveHome(m)
+	}
+	if !errors.Is(err, ErrNotFound) {
+		return "", err
+	}
+	return h.archiveHome(Member{Name: name, Home: filepath.Join(h.Homes, name)})
 }
 
 // endSessions kills what the member is running and waits for it to end. A
@@ -690,7 +725,7 @@ func (h *Host) archiveHome(m Member) (string, error) {
 	if err := os.Chmod(h.Archive, ArchiveMode); err != nil {
 		return "", fmt.Errorf("sysusers: narrow %s: %w", h.Archive, err)
 	}
-	if err := os.Chown(h.Archive, 0, 0); err != nil {
+	if err := lchown(h.Archive, 0, 0); err != nil {
 		return "", fmt.Errorf("sysusers: give %s to root: %w", h.Archive, err)
 	}
 
@@ -709,8 +744,12 @@ func (h *Host) archiveHome(m Member) (string, error) {
 	if err := os.Rename(m.Home, target); err != nil {
 		return "", fmt.Errorf("sysusers: archive the home of %s: %w", m.Name, err)
 	}
-	if err := chownTree(target, 0, 0); err != nil {
-		return "", err
+	if left := chownTree(target, 0, 0); left > 0 {
+		// The home is moved, which is what the archive is for, and what is
+		// left is a count an operator can act on. It is not a failure: the
+		// account is gone and the tree is out of every root the surface
+		// reads, see issue #152.
+		logger.Printf("archiving the home of %s: %d name(s) stayed with the uid that owned them", m.Name, left)
 	}
 	if err := os.Chmod(target, ArchiveMode); err != nil {
 		return "", fmt.Errorf("sysusers: narrow %s: %w", target, err)
@@ -797,18 +836,37 @@ func exitCode(err error, code int) bool {
 	return exit.ExitCode() == code
 }
 
+// lchown is how the archive takes ownership of what it moved, without
+// following a link out of the tree. It is a variable so a test can stage a
+// name this daemon may not take, which is what an immutable file is on a real
+// host and what nothing inside a temporary directory can be made into.
+var lchown = os.Lchown
+
 // chownTree gives a whole directory to one owner, without following a link out
 // of it: the tree came from a member's home and every name in it was theirs.
-func chownTree(root string, uid, gid int) error {
-	return filepath.Walk(root, func(path string, _ os.FileInfo, err error) error {
+//
+// A name it cannot take is logged and walked past rather than returned. A home
+// carries whatever its member put in it, an immutable file and a mode nothing
+// else on the host has included, and the account that owned it is already gone
+// by the time this runs: a removal that stopped on one file would leave a
+// deleted account, a half moved home and an admin holding an error about a
+// file, see issue #152. It answers how many names it could not take, which is
+// what the caller says once rather than once per name.
+func chownTree(root string, uid, gid int) int {
+	left := 0
+	filepath.Walk(root, func(path string, _ os.FileInfo, err error) error {
 		if err != nil {
-			return err
+			logger.Printf("archiving %s: it could not be read: %v", path, err)
+			left++
+			return nil
 		}
-		if err := os.Lchown(path, uid, gid); err != nil {
-			return fmt.Errorf("sysusers: give %s to %d:%d: %w", path, uid, gid, err)
+		if err := lchown(path, uid, gid); err != nil {
+			logger.Printf("archiving %s: it could not be given to %d:%d: %v", path, uid, gid, err)
+			left++
 		}
 		return nil
 	})
+	return left
 }
 
 // ensureRuntimeDir creates /run/user/<uid> for one member. rootless podman

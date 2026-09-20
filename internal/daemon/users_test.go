@@ -33,6 +33,45 @@ func serveUsers(t *testing.T, admin bool) (*harness, *sysusers.Fake) {
 	return h, fake
 }
 
+// removeMember removes one member through the API and waits for the job to
+// finish. A test that asserts on what is left has to wait: the call answers
+// 202 and kitbashd does the work on its own time, see removal.go.
+func (h *harness) removeMember(name string) store.Removal {
+	h.t.Helper()
+	res, body := h.do(http.MethodDelete, usersPath+"/"+name, "", nil)
+	if res.StatusCode != http.StatusAccepted {
+		h.t.Fatalf("users_remove status = %d, want 202, body %s", res.StatusCode, body)
+	}
+	var got removeResponse
+	if err := json.Unmarshal(body, &got); err != nil {
+		h.t.Fatalf("body %q: %v", body, err)
+	}
+	if got.User != name || got.State != store.Removing {
+		h.t.Fatalf("users_remove answered %+v, want %s removing", got, name)
+	}
+	return h.removalOf(name)
+}
+
+// removalOf waits for one member's removal to reach a state that is not
+// removing, and answers it.
+func (h *harness) removalOf(name string) store.Removal {
+	h.t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		removal, held, err := h.store.Removal(context.Background(), name)
+		if err != nil {
+			h.t.Fatalf("Removal: %v", err)
+		}
+		if held && removal.State != store.Removing {
+			return removal
+		}
+		if time.Now().After(deadline) {
+			h.t.Fatalf("the removal of %s is %+v, want it finished", name, removal)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
 // publicKey is one well formed OpenSSH key line, built rather than pasted so
 // the test says what the format is. The comment tells two keys apart.
 func publicKey(comment string) string {
@@ -298,16 +337,12 @@ func TestUsersRemove(t *testing.T) {
 		t.Fatalf("CreateApproval: %v", err)
 	}
 
-	res, body := h.do(http.MethodDelete, usersPath+"/alice", "", nil)
-	if res.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, body %s", res.StatusCode, body)
+	removal := h.removeMember("alice")
+	if removal.State != store.Removed || removal.Step != "" {
+		t.Errorf("the removal is %+v, want it removed with no step left", removal)
 	}
-	var got removeResponse
-	if err := json.Unmarshal(body, &got); err != nil {
-		t.Fatalf("body %q: %v", body, err)
-	}
-	if got.User != "alice" || got.Archived != "/org/.archive/alice" {
-		t.Errorf("response = %+v, want alice archived under /org/.archive", got)
+	if removal.Archived != "/org/.archive/alice" {
+		t.Errorf("the home went to %q, want /org/.archive/alice", removal.Archived)
 	}
 	if len(fake.Removed) != 1 || fake.Removed[0] != "alice" {
 		t.Errorf("the host removed %v, want alice", fake.Removed)
@@ -324,7 +359,7 @@ func TestUsersRemove(t *testing.T) {
 		t.Errorf("approvals = %+v, want none left for a removed member", pending)
 	}
 
-	res, body = h.do(http.MethodDelete, usersPath+"/alice", "", nil)
+	res, body := h.do(http.MethodDelete, usersPath+"/alice", "", nil)
 	if res.StatusCode != http.StatusNotFound {
 		t.Errorf("second remove status = %d, body %s", res.StatusCode, body)
 	}
@@ -364,10 +399,11 @@ func TestUsersOnlyTouchMembers(t *testing.T) {
 	}
 }
 
-// TestUsersRemoveKeepsTheStoreUntilTheAccountIsGone is the order removal
-// follows: the host first, the store second. A registration deleted for an
-// account that is still there is a Process whose token was revoked for nothing.
-func TestUsersRemoveKeepsTheStoreUntilTheAccountIsGone(t *testing.T) {
+// TestUsersRemoveRecordsTheStepThatFailed is what a job that could not finish
+// leaves behind: every other step is done, the state is failed and it names
+// the step, so an admin reads through users_list what is left on this host by
+// hand rather than reading the daemon log, which is the operator's.
+func TestUsersRemoveRecordsTheStepThatFailed(t *testing.T) {
 	h, fake := serveUsers(t, true)
 	fake.Add(sysusers.Member{Name: "alice", UID: 1005})
 	fake.RemoveErr = errors.New("userdel: alice is currently used by process 941")
@@ -384,23 +420,29 @@ func TestUsersRemoveKeepsTheStoreUntilTheAccountIsGone(t *testing.T) {
 	}, hash, store.Quota{}); err != nil {
 		t.Fatalf("RegisterProcess: %v", err)
 	}
-	if err := h.store.CreateApproval(ctx, store.Approval{
-		ID: uuid.V7(), Requester: "alice", Tool: store.ToolFSWrite,
-		Input: json.RawMessage(`{"path":"/org/handbook/x.md"}`), RequestedAt: time.Now().UTC(),
-	}, 0); err != nil {
-		t.Fatalf("CreateApproval: %v", err)
+
+	removal := h.removeMember("alice")
+	if removal.State != store.Failed || removal.Step != StepAccount {
+		t.Errorf("the removal is %+v, want it failed at the %s step", removal, StepAccount)
+	}
+	// The steps before it ran, which is what "a step that fails is logged and
+	// the job goes on" means.
+	if _, found, err := h.store.Process(ctx, id); err != nil || found {
+		t.Errorf("the Process of a removed member is still registered (%t, %v)", found, err)
 	}
 
-	res, body := h.do(http.MethodDelete, usersPath+"/alice", "", nil)
-	if res.StatusCode != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want 500, body %s", res.StatusCode, body)
+	// And an admin reads it back.
+	res, body := h.do(http.MethodGet, usersPath, "", nil)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("users_list status = %d, body %s", res.StatusCode, body)
 	}
-	if _, found, err := h.store.Process(ctx, id); err != nil || !found {
-		t.Errorf("the Process was unregistered for an account that is still there (%t, %v)", found, err)
+	var listed userList
+	if err := json.Unmarshal(body, &listed); err != nil {
+		t.Fatalf("body %q: %v", body, err)
 	}
-	left, err := h.store.Approvals(ctx, "alice", "")
-	if err != nil || len(left) != 1 {
-		t.Errorf("approvals = %d, %v, want the one that was queued", len(left), err)
+	if len(listed.Removals) != 1 || listed.Removals[0].State != store.Failed ||
+		listed.Removals[0].Step != StepAccount {
+		t.Errorf("users_list carries %+v, want alice failed at the %s step", listed.Removals, StepAccount)
 	}
 }
 
@@ -444,10 +486,7 @@ func TestUsersRemoveRefusesTheLastAdmin(t *testing.T) {
 
 	// A second admin makes the first removable.
 	fake.Add(sysusers.Member{Name: "carol", Admin: true})
-	res, body = h.do(http.MethodDelete, usersPath+"/alice", "", nil)
-	if res.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200, body %s", res.StatusCode, body)
-	}
+	h.removeMember("alice")
 	if len(fake.Removed) != 1 || fake.Removed[0] != "alice" {
 		t.Errorf("the host removed %v, want alice", fake.Removed)
 	}

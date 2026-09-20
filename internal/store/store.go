@@ -344,6 +344,15 @@ CREATE TABLE IF NOT EXISTS processes (
   registered_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS removals (
+  name        TEXT    PRIMARY KEY,
+  state       TEXT    NOT NULL DEFAULT 'removing',
+  step        TEXT    NOT NULL DEFAULT '',
+  archived    TEXT    NOT NULL DEFAULT '',
+  started_at  INTEGER NOT NULL,
+  finished_at INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS builds (
   id         INTEGER PRIMARY KEY,
   path       TEXT    NOT NULL,
@@ -395,6 +404,8 @@ CREATE INDEX IF NOT EXISTS metrics_internal ON metrics(internal, time_ns);
 
 CREATE INDEX IF NOT EXISTS processes_owner ON processes(owner);
 CREATE UNIQUE INDEX IF NOT EXISTS processes_token ON processes(token_hash);
+
+CREATE INDEX IF NOT EXISTS removals_state ON removals(state);
 
 CREATE UNIQUE INDEX IF NOT EXISTS builds_unique ON builds(path, commit_sha, digest);
 CREATE INDEX IF NOT EXISTS builds_path        ON builds(path, commit_sha);

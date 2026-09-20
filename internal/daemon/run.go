@@ -156,6 +156,10 @@ func (s *Server) processAction(w http.ResponseWriter, r *http.Request, id, actio
 			fmt.Sprintf("Call POST %s instead.", r.URL.Path)))
 		return
 	}
+	if prob := s.notRemoving(r, caller.User, "run a Process"); prob != nil {
+		writeProblem(w, prob)
+		return
+	}
 	p, m, prob := s.owned(r, caller, id)
 	if prob != nil {
 		writeProblem(w, prob)
@@ -442,6 +446,12 @@ func (s *Server) joinSession(w http.ResponseWriter, r *http.Request) {
 	if caller.Peer.PID <= 0 {
 		writeProblem(w, problem.Internal(r.URL.Path,
 			fmt.Sprintf("the connection of %s carries no process id", caller.User), ""))
+		return
+	}
+	// A session placed in the cgroup of a member being removed is a session
+	// in a tree the removal is about to take away, see removal.go.
+	if prob := s.notRemoving(r, caller.User, "open a session"); prob != nil {
+		writeProblem(w, prob)
 		return
 	}
 	m, found, err := s.users.Lookup(r.Context(), caller.User)

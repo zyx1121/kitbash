@@ -36,13 +36,20 @@ func writeProblem(w http.ResponseWriter, p *problem.Problem) {
 
 // writeJSON renders one API response.
 func writeJSON(w http.ResponseWriter, instance string, body any) {
+	writeJSONStatus(w, instance, http.StatusOK, body)
+}
+
+// writeJSONStatus is writeJSON with the status named, which one call needs:
+// users_remove answers 202, because what it starts is a job kitbashd runs for
+// itself and not work the caller waits out, see removal.go.
+func writeJSONStatus(w http.ResponseWriter, instance string, status int, body any) {
 	b, err := json.Marshal(body)
 	if err != nil {
 		writeProblem(w, problem.Internal(instance, fmt.Sprintf("encode response: %v", err), ""))
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
+	w.WriteHeader(status)
 	w.Write(b)
 }
 
