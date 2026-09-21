@@ -1,0 +1,16 @@
+{
+ "admin": "kitbash-mcp",
+ "agent": "claude",
+ "alias": "bench-member",
+ "domain": "kitbash.zyx.tw",
+ "host": "kitbash-mcp",
+ "k": 1,
+ "key": "/private/tmp/claude-501/-Users-loki/f5281e9a-06aa-456e-b443-a27778f9de6c/scratchpad/kitbash-m12/eval/results/20260921-claude-0.15.0/id_ed25519",
+ "kitbash_version": "0.15.0",
+ "member": "bench-20260921-1403",
+ "member_created_at": "2026-09-21T06:03:13+00:00",
+ "round": "20260921-claude-0.15.0",
+ "ssh_config": "/private/tmp/claude-501/-Users-loki/f5281e9a-06aa-456e-b443-a27778f9de6c/scratchpad/kitbash-m12/eval/results/20260921-claude-0.15.0/ssh_config",
+ "started_at": "2026-09-21T06:03:13+00:00",
+ "uid": 1008
+}
