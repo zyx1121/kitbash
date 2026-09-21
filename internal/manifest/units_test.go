@@ -29,7 +29,7 @@ deploy:
 func TestUnitsReadsEveryUnit(t *testing.T) {
 	m, err := manifest.Parse([]byte(twoUnits(
 		"      name: web\n      expose: http\n      port: 8080\n",
-		"      name: cache\n      command: [redis-server, --save, \"\"]\n")))
+		"      name: cache\n      command: [redis-server, --save, \"60 1\"]\n")))
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
@@ -46,8 +46,26 @@ func TestUnitsReadsEveryUnit(t *testing.T) {
 	if units[0].Expose != manifest.ExposeHTTP || units[1].Expose != manifest.ExposeNone {
 		t.Errorf("the exposures are %q and %q, want the face and a unit behind it", units[0].Expose, units[1].Expose)
 	}
-	if len(units[1].Command) != 3 || units[1].Command[0] != "redis-server" {
+	if len(units[1].Command) != 3 || units[1].Command[0] != "redis-server" || units[1].Command[2] != "60 1" {
 		t.Errorf("the command is %v, want the words the unit declared", units[1].Command)
+	}
+}
+
+// A unit behind the face may write expose: none out loud, which is the same
+// as omitting the key: the face is the unit that declares mcp or http.
+func TestASidecarMayDeclareExposeNone(t *testing.T) {
+	m, err := manifest.Parse([]byte(twoUnits(
+		"      name: web\n      expose: http\n      port: 8080\n",
+		"      name: cache\n      expose: none\n")))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	units, err := m.Units()
+	if err != nil {
+		t.Fatalf("Units: %v", err)
+	}
+	if units[1].Expose != manifest.ExposeNone {
+		t.Errorf("the sidecar is exposed as %q, want none", units[1].Expose)
 	}
 }
 
@@ -73,10 +91,14 @@ func TestUnitsRefusals(t *testing.T) {
 			"      name: web\n", "      name: cache\n",
 			"exactly one unit declares expose",
 		},
-		"two units declare expose": {
+		"every unit is expose none": {
+			"      name: web\n      expose: none\n", "      name: cache\n      expose: none\n",
+			"none of these units does",
+		},
+		"two units declare a face": {
 			"      name: web\n      expose: http\n      port: 8080\n",
-			"      name: cache\n      expose: none\n",
-			"web and cache declare it",
+			"      name: cache\n      expose: mcp\n",
+			"web and cache do",
 		},
 		"a name the shape refuses": {
 			"      name: Web\n      expose: http\n", "      name: cache\n",
@@ -187,9 +209,17 @@ func TestUnitCommand(t *testing.T) {
 	if got := strings.Join(units[0].Command, " "); got != "node server.js --port 8080" {
 		t.Errorf("the command is %q, want the words the unit declared", got)
 	}
-	// An empty list is a unit that declares a command and gives none, which is
-	// a container with nothing to run.
-	if _, err := manifest.Parse([]byte(unitWith("      command: []\n"))); err == nil {
-		t.Error("a manifest with an empty command was accepted")
+	// The shapes a command may not have, each of them what the daemon refuses
+	// on the way in as well, so fs_write and proc_run agree.
+	for name, block := range map[string]string{
+		"an empty list":               "      command: []\n",
+		"an empty word":               "      command: [node, \"\"]\n",
+		"a word too long":             "      command: [\"" + strings.Repeat("a", 4097) + "\"]\n",
+		"too many words":              "      command: [" + strings.Repeat("word, ", 64) + "word]\n",
+		"a word that is not a string": "      command: [7]\n",
+	} {
+		if _, err := manifest.Parse([]byte(unitWith(block))); err == nil {
+			t.Errorf("a manifest with %s was accepted", name)
+		}
 	}
 }

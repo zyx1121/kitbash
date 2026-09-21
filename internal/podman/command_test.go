@@ -15,13 +15,13 @@ func TestRunArgsCarriesTheCommandAfterTheImage(t *testing.T) {
 		Detach:      true,
 		Interactive: true,
 		Publish:     []PortMapping{{HostPort: 40275, ContainerPort: 8080}},
-		Command:     []string{"redis-server", "--save", ""},
+		Command:     []string{"redis-server", "--save", "60 1"},
 	}, nil)
 	want := []string{
 		"run", "--name", "kitbash-board-board", "--detach", "--interactive",
 		"--publish", "127.0.0.1:40275:8080",
 		"sha256:abc",
-		"redis-server", "--save", "",
+		"redis-server", "--save", "60 1",
 	}
 	if strings.Join(args, "|") != strings.Join(want, "|") {
 		t.Errorf("RunArgs is\n%s\nwant\n%s", strings.Join(args, "|"), strings.Join(want, "|"))

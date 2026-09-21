@@ -22,7 +22,7 @@ deploy:
     - name: cache
       type: container
       image: docker.io/library/redis@sha256:` + redisDigest + `
-      command: [redis-server, --save, ""]
+      command: [redis-server, --save, "60 1"]
 `
 
 const redisDigest = "1111111111111111111111111111111111111111111111111111111111111111"

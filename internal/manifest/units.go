@@ -22,6 +22,11 @@ func ValidUnitName(name string) bool { return unitName.MatchString(name) }
 // share a name, and exactly one of them declares the exposure that is the
 // Process's face, see PLAN.md section 5.6.
 //
+// A face is mcp or http. `expose: none` is what a unit behind the face
+// declares, which is the same thing as declaring nothing: a sidecar that
+// writes it out loud is not a second face, and a Package where every unit is
+// none has nobody to answer for it.
+//
 // A Package with one unit is left as it was. Its name is optional, because the
 // Package is what that unit is called, and its exposure defaults to none the
 // way the schema says, because that is how every manifest written before this
@@ -56,7 +61,7 @@ func checkUnits(raw map[string]any) []string {
 		default:
 			seen[name] = i + 1
 		}
-		if _, declared := unit["expose"]; declared {
+		if expose, _ := unit["expose"].(string); expose == ExposeMCP || expose == ExposeHTTP {
 			faces = append(faces, unitLabel(unit, i))
 		}
 	}
@@ -66,11 +71,11 @@ func checkUnits(raw map[string]any) []string {
 	}
 	if len(faces) == 0 {
 		messages = append(messages,
-			"/deploy/units: exactly one unit declares expose, which is the face of the Process, and none of these units declares it")
+			"/deploy/units: exactly one unit declares expose as mcp or http, which is the face of the Process, and none of these units does")
 	}
 	if len(faces) > 1 {
 		messages = append(messages, fmt.Sprintf(
-			"/deploy/units: exactly one unit declares expose, which is the face of the Process, and %s declare it",
+			"/deploy/units: exactly one unit declares expose as mcp or http, which is the face of the Process, and %s do",
 			joinNames(faces)))
 	}
 	sort.Strings(messages)

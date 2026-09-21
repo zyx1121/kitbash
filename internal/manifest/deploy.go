@@ -98,14 +98,13 @@ func ValidSecretName(name string) bool { return secretName.MatchString(name) }
 
 // checkSecrets is the part of the secrets rule no JSON Schema can express: a
 // name the unit's own environment also sets, and a name kitbashd speaks for.
-// The shape
-// of a name, the count and the duplicates are in spec/manifest.schema.json,
-// which has already run when this does.
+// The shape of a name, the count and the duplicates are in
+// spec/manifest.schema.json, which has already run when this does.
 //
 // A collision is refused rather than resolved because either resolution is a
 // surprise: dropping the secret starts a Process without the credential it
-// declared, and dropping the env entry drops a line of the manifest that is
-// written in front of the member. Both names are theirs to change.
+// declared, and dropping the environment entry drops a line of the manifest
+// that is written in front of the member. Both names are theirs to change.
 func checkSecrets(raw map[string]any) []string {
 	var messages []string
 	for i, unit := range units(raw) {
@@ -228,9 +227,8 @@ type Unit struct {
 	// Secrets are the environment variable names this unit needs and does not
 	// get from the image, from Environment or from kitbashd, at most
 	// MaxSecrets of them. Only the names are here and only the names ever
-	// travel: the
-	// values live with kitbashd, and a start resolves each name to the
-	// owner's current value, see PLAN.md section 2.3.
+	// travel: the values live with kitbashd, and a start resolves each name
+	// to the owner's current value, see PLAN.md section 2.3.
 	Secrets []string
 	Raw     map[string]any
 }

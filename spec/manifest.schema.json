@@ -196,8 +196,8 @@
         },
         "command": {
           "type": "array",
-          "description": "The command the container runs, in place of the CMD of its image, as compose spells it. It is a list of arguments and not a shell line: the words are passed to the image's entrypoint as they are written. A unit that wants the image's own command declares none.",
-          "items": { "type": "string" },
+          "description": "The command the container runs, in place of the CMD of its image, as compose spells it. It is a list of arguments and not a shell line: the words are passed to the image's entrypoint as they are written. A credential belongs in secrets instead, because these words go on podman's command line, where anyone on the host reads them in ps and the container runtime keeps them with the container. A unit that wants the image's own command declares none.",
+          "items": { "type": "string", "minLength": 1, "maxLength": 4096 },
           "minItems": 1,
           "maxItems": 64
         },

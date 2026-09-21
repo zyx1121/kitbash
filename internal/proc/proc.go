@@ -814,6 +814,7 @@ func startOptions(opts podman.RunOptions) telemetry.StartOptions {
 		Restart:   opts.Restart,
 		CPU:       opts.CPUs,
 		Memory:    opts.Memory,
+		Command:   opts.Command,
 	}
 	for _, port := range opts.Publish {
 		out.Publish = append(out.Publish, telemetry.PortMapping{

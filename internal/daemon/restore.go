@@ -453,11 +453,14 @@ func (s *Server) healCeiling(ctx context.Context, m sysusers.Member, p store.Pro
 		Publish:      config.Publish,
 		Mounts:       mounts.Podman(mounted),
 		CgroupParent: parent,
-		// What the container was made to run is read back from the container
-		// rather than from a manifest, the same as its ports: a heal makes the
-		// container this Process has again, and a unit's command is part of
-		// what that container is.
-		Command: config.Command,
+	}
+	// What the container was made to run is read back from the container
+	// rather than from a manifest, the same as its ports: a heal makes the
+	// container this Process has again, and a unit's command is part of what
+	// that container is. Only onto the image it was read off, though: on
+	// another digest those words are as likely to be the old image's own CMD.
+	if config.Image == image {
+		opts.Command = config.Command
 	}
 	// No limits are put on the command line and none are written into the
 	// ceiling: this Process was registered without any, so what it gains here
@@ -685,7 +688,14 @@ func (s *Server) remakeMounted(ctx context.Context, m sysusers.Member, p store.P
 		Memory:       podman.MemoryLimit(p.Limits.Memory),
 		CPUs:         p.Limits.CPU,
 		PidsLimit:    p.Limits.Pids,
-		Command:      config.Command,
+	}
+	// What the old container was made to run comes back with it, but only
+	// onto the image it was read off: a registration that moved to another
+	// digest is a Process whose command is that image's business, and the
+	// words podman reported are as likely to be the old image's own CMD as
+	// anything the unit declared.
+	if config.Image == image {
+		opts.Command = config.Command
 	}
 	if leaf != "" {
 		opts.CgroupParent = cgroups.Parent(m.Name, p.ID)

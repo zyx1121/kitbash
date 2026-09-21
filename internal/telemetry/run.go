@@ -76,6 +76,10 @@ type StartOptions struct {
 	Memory    string            `json:"memory,omitempty"`
 	PidsLimit int               `json:"pidsLimit,omitempty"`
 	Publish   []PortMapping     `json:"publish,omitempty"`
+	// Command is what the unit declared its container runs in place of the
+	// command of its image. It is the one thing in this body that lands on
+	// podman's command line, which is where the words after an image go.
+	Command []string `json:"command,omitempty"`
 }
 
 // PortMapping is one published port. A host port of zero leaves the choice to
