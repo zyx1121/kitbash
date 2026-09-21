@@ -408,9 +408,21 @@ func (s *Server) startProcess(w http.ResponseWriter, r *http.Request, p store.Pr
 func (s *Server) stopProcess(w http.ResponseWriter, r *http.Request, p store.Process, m sysusers.Member) {
 	// A Process of several units is one pod, so it is stopped as one: every
 	// container in it is given the same grace, and none of them is left
-	// running beside a face that is down, see PLAN.md section 5.6.
+	// running beside a face that is down.
+	//
+	// And the pod goes with the stop, which is where a pod differs from the
+	// single container a Package of one unit is. A stopped container keeps
+	// its name for proc_logs and the next run of that Package removes it by
+	// name; a stopped pod keeps its name and its published port as well, and
+	// podman refuses to create a pod under a name that is taken, so a pod
+	// left behind is a Package that cannot be run again. The containers go
+	// with it, see PLAN.md section 5.6.
 	if p.Composition.Declared() {
 		if err := s.runner.StopPod(r.Context(), m, p.Composition.Pod, StopTimeout); err != nil && !isNoPod(err) {
+			writeProblem(w, s.runProblem(r, err, p, podman.RunOptions{}))
+			return
+		}
+		if err := s.runner.RemovePod(r.Context(), m, p.Composition.Pod, true); err != nil && !isNoPod(err) {
 			writeProblem(w, s.runProblem(r, err, p, podman.RunOptions{}))
 			return
 		}

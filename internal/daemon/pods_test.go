@@ -307,16 +307,22 @@ func TestStoppingAPodStopsEveryUnit(t *testing.T) {
 	if n := len(fake.PodStops()); n != 1 {
 		t.Errorf("the pod was stopped %d times, want once", n)
 	}
-	if res, body := h.postJSON(http.MethodPost, processesPath+"/"+id+"/remove", nil); res.StatusCode != http.StatusOK {
-		t.Fatalf("remove = %d %s, want 200", res.StatusCode, body)
-	}
+	// The pod goes with the stop: a stopped pod holds its name and its
+	// published port, and podman refuses a pod under a name that is taken,
+	// so the next run of this Package could not make it again.
 	removals := fake.PodRemovals()
 	if len(removals) != 1 || !removals[0].Force {
 		t.Errorf("the pod removals are %+v, want one forced removal", removals)
 	}
 	state, err := fake.PodState(context.Background(), sysusers.Member{Name: h.user}, "kitbash-board-board")
 	if !errors.Is(err, sysusers.ErrNoPod) {
-		t.Errorf("the pod is %q after a removal, want it gone: %v", state, err)
+		t.Errorf("the pod is %q after a stop, want it gone: %v", state, err)
+	}
+	for _, name := range []string{"kitbash-board-board-web", "kitbash-board-board-cache"} {
+		config, err := fake.ContainerConfig(context.Background(), sysusers.Member{Name: h.user}, name)
+		if err == nil && config.Image != "" {
+			t.Errorf("%s is still on the host after a stop: %+v", name, config)
+		}
 	}
 }
 

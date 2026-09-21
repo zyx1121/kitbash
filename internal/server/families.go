@@ -81,7 +81,8 @@ func RegisterProcesses(s *mcp.Server, processes *proc.Service, b *bridge.Bridge)
 			"share the pod's network namespace and reach each other on localhost, the pod publishes the " +
 			"port of the unit that declares expose mcp or http, each unit carries its own image, " +
 			"environment, command, mounts, secrets and limits, and the Process is running when every unit " +
-			"is. Before the container starts the " +
+			"is. proc_stop of such a Process stops the pod and removes it with every container in it. " +
+			"Before the container starts the " +
 			"Process is registered with kitbashd, which mints its Telemetry token; the container receives " +
 			"KITBASH_TELEMETRY_ENDPOINT, KITBASH_TELEMETRY_TOKEN, KITBASH_PROCESS, KITBASH_PACKAGE and " +
 			"KITBASH_USER. A Process whose manifest declares subscriptions: [telemetry] with expose: http " +

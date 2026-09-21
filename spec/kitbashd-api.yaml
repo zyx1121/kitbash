@@ -892,8 +892,12 @@ restore:
     namespace, start. Every unit is created and verified before any of them is
     started, and the face is started last. A failure at any point removes the
     pod and every container in it, so a Process is all of its units or none of
-    them on this host. processes_stop stops the pod and processes_remove
-    removes it with every container in it.
+    them on this host. processes_stop stops the pod and removes it with every
+    container in it, and so does processes_remove. A stopped pod holds its
+    name and its published port, and podman refuses a pod under a name that
+    is taken, so a pod left behind is a Package that cannot be run again;
+    that is where a pod differs from the single container a Package of one
+    unit stops into.
 
     Boot restore reads the pod: one the runtime no longer has is unregistered
     the way a missing container is, one whose units are all running is read

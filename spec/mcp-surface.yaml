@@ -586,7 +586,10 @@ families:
           Process's face and the one the health probe and the route belong to,
           each unit carries its own image, environment, command, mounts,
           secrets and limits under the Process's ceiling, and the Process is
-          running when every unit is, see PLAN.md section 5.6. A Package of one
+          running when every unit is, see PLAN.md section 5.6. proc_stop of
+          such a Process stops the pod and removes it with every container in
+          it, because podman refuses a pod under a name that is taken and a
+          pod left behind is a Package that cannot be run again. A Package of one
           unit runs as the bare container it always has. Before the
           container starts the Process is registered with kitbashd, which
           mints its Telemetry token; the container receives
