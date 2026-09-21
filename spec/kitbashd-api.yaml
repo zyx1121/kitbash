@@ -244,7 +244,7 @@ api:
   processes_register:
     method: POST
     path: /kitbash/v1/processes
-    request: { id: "UUIDv7", package: "/home/loki/echo", name: "echo", container: "kitbash-echo-echo", digest: "sha256:...", expose: "mcp|http|none", endpoint: "http://127.0.0.1:40275 when expose is http", hostname: "status.example.org when the unit declares one", subscriptions: ["telemetry"], runner: "/org/pve-runner when a run kit owns this Process", health: { http: "/healthz", interval: "30s" }, mounts: [{ source: "/home/loki/notes", target: "/files/notes", mode: "ro|rw" }], secrets: ["ANTHROPIC_API_KEY"], schedule: { cron: "0 8 * * *", env: { TZ: "UTC" }, command: ["node", "tick.js"], memory: "512Mi", cpu: "1" } }
+    request: { id: "UUIDv7", package: "/home/loki/echo", name: "echo", container: "kitbash-echo-echo", digest: "sha256:...", expose: "mcp|http|none", endpoint: "http://127.0.0.1:40275 when expose is http", hostname: "status.example.org when the unit declares one", subscriptions: ["telemetry"], runner: "/org/pve-runner when a run kit owns this Process", health: { http: "/healthz", interval: "30s" }, mounts: [{ source: "/home/loki/notes", target: "/files/notes", mode: "ro|rw" }], secrets: ["ANTHROPIC_API_KEY"], schedule: { cron: "0 8 * * *", env: { TZ: "UTC" }, command: ["node", "tick.js"], memory: "512Mi", cpu: "1" }, pod: "kitbash-board-board, for a Package of more than one unit", units: [{ name: "web", container: "kitbash-board-board-web", digest: "sha256:...", face: true, mounts: [], secrets: [], memory: "256Mi", cpu: "0.5" }] }
     response: { id: "UUIDv7", token: "opaque, at least 32 bytes of entropy, returned once", fanoutSecret: "opaque, 32 bytes, returned once; the bearer the fan out presents to this Process", host: "echo.loki.kitbash.example, the name the proxy serves this Process under, absent on a host with no domain", nextRun: "2026-09-20T08:00:00Z, when kitbashd runs a registered job next, absent for a Process that stays up" }
     authorization: >
       The caller is the member the Process belongs to; kitbashd records the
@@ -325,13 +325,20 @@ api:
       default", labels: { "kitbash.commit": "..." }, env: { LOG_LEVEL: debug },
       command: ["node", "server.js"], restart: "always|on-failure|no", cpu:
       "1", memory: "512Mi", pidsLimit:
-      512, publish: [{ hostPort: 40275, containerPort: 8080 }] }. The unit's
+      512, publish: [{ hostPort: 40275, containerPort: 8080 }], units: [{ name:
+      "web", labels: {}, env: {}, restart: "always", cpu: "1", memory: "256Mi",
+      command: [] }] }. The unit's
       own environment only: kitbashd writes its own seven variables itself, so
       no token and no secret is ever in a request body. The command is the
       unit's own too, the words podman is given after the image, and it is
       empty for a unit that runs the command of its image. The mounts are not in
       the request: they are the registration's, and the request would be a
-      second place they could be claimed from.
+      second place they could be claimed from. For a Process of more than one
+      unit the fields outside units are the face's, and units carries one
+      command line per unit the registration names: a start that names a unit
+      the registration does not, or leaves one of them out, is 400 bad request
+      and nothing is created. The published port is the pod's, because the pod
+      holds the network namespace every unit is in, see pods.
     response: { id: "UUIDv7", container: "kitbash-echo-echo", containerId: "the id the runtime gave it" }
     authorization: >
       The owner of the registration and nobody else, admins included: this runs
@@ -422,6 +429,7 @@ api:
       limits: { memory, cpu, pids, ceiling },
       health: { http, interval, last, healthy },
       schedule: { cron }, nextRun, lastRun: { startedAt, exitCode, durationMs },
+      pod, units: [{ name, state }],
       subscriptions, registeredAt, problem, problemFix } ] }. The caller's
       registered Processes, every key present even when its value is empty,
       and no token anywhere. An admin sees every member's.
@@ -858,6 +866,42 @@ restore:
     created under it. A row with limits and no flag was written by a release
     that always did both, so it counts as placed; a row with neither is a
     registration from before either existed, and is the one restore heals.
+  pods: >
+    A Package of more than one container unit runs as one podman pod, see
+    PLAN.md section 5.6. It is one Process: one registration, one token, one
+    address, one row. The registration carries pod, the name of the pod, and
+    units, one entry per unit with the container it is held under, the image it
+    runs, whether it is the Process's face and the mounts, secrets and limits
+    that are that unit's. The row's own container, digest, expose and endpoint
+    are the face unit's, so every reader that knew one container per Process
+    reads the one that answers. Exactly one unit is the face; two or none is
+    400 bad request. A Package of one unit registers neither field and runs as
+    the bare container it always has, which is what keeps the boot restore of
+    every Process registered by an earlier release untouched.
+
+    The pod owns what a container in it may not: the published port of the face
+    unit, the network namespace and the cgroup, which is the Process's ceiling
+    as it is for one unit and is written as the sum of what the units asked
+    for. podman refuses --publish, --network and --hostname on a container
+    created with --pod, verified against podman 5.7.0. Each unit carries its
+    own limits under the ceiling, its own environment, command, mounts and
+    secrets, and KITBASH_UNIT with the name of the unit it is.
+
+    The four step start of PLAN.md section 2.3 runs per unit inside the pod:
+    create with the pod named, init, read the mounts in that container's own
+    namespace, start. Every unit is created and verified before any of them is
+    started, and the face is started last. A failure at any point removes the
+    pod and every container in it, so a Process is all of its units or none of
+    them on this host. processes_stop stops the pod and processes_remove
+    removes it with every container in it.
+
+    Boot restore reads the pod: one the runtime no longer has is unregistered
+    the way a missing container is, one whose units are all running is read
+    where it stands, and anything else is made again whole, pod and every
+    container, through the same four steps. A pod that has lost one of its
+    containers is reported failed naming that unit, because the environment and
+    the command of that unit were the container's and nothing else on the host
+    remembers them.
   mounts: >
     A unit declares at most four mounts, each one a source folder of Files, a
     target inside the container and a mode of ro or rw, see

@@ -47,6 +47,11 @@ const (
 	EnvUser              = "KITBASH_USER"
 	EnvMCPEndpoint       = "KITBASH_MCP_ENDPOINT"
 	EnvFanoutSecret      = "KITBASH_FANOUT_SECRET"
+	// EnvUnit names the unit one container of a pod runs, given only to a
+	// Process that runs as several. A Process of one unit is the Package
+	// itself and its container is given exactly what it was given before pods
+	// existed, see PLAN.md section 5.6.
+	EnvUnit = "KITBASH_UNIT"
 )
 
 // ownedEnv is every variable kitbashd speaks for. A manifest that names one is
@@ -60,6 +65,7 @@ var ownedEnv = []string{
 	EnvUser,
 	EnvMCPEndpoint,
 	EnvFanoutSecret,
+	EnvUnit,
 }
 
 // DefaultProcessEndpoint is the address a rootless container reaches the
@@ -129,6 +135,11 @@ type startRequest struct {
 	// that lands on podman's command line by design, because that is where
 	// the arguments after an image go; nothing of the environment ever does.
 	Command []string `json:"command,omitempty"`
+	// Units is the command line of each unit of a Process that runs as a pod,
+	// one per unit the registration names. A Process of one unit sends none
+	// and is started by the fields above alone, exactly as it was before pods
+	// existed, see pods.go.
+	Units []startUnit `json:"units,omitempty"`
 }
 
 // portMapping is one published port. A host port of zero leaves the choice to
@@ -250,6 +261,19 @@ func (s *Server) startProcess(w http.ResponseWriter, r *http.Request, p store.Pr
 	var req startRequest
 	if prob := decodeBody(w, r, &req); prob != nil {
 		writeProblem(w, prob)
+		return
+	}
+	// A Package of more than one unit runs as one pod. Everything below is
+	// the single unit path and is untouched by it: the pod start makes the
+	// same four steps per unit, see pods.go.
+	if p.Composition.Declared() {
+		s.startPod(w, r, p, m, req)
+		return
+	}
+	if len(req.Units) > 0 {
+		writeProblem(w, problem.BadRequest(r.URL.Path,
+			"this Process is registered as one container and the start carries units",
+			"Register the Process with the units it runs, then start it."))
 		return
 	}
 	opts, prob := runOptions(r.URL.Path, p, req)
@@ -382,6 +406,18 @@ func (s *Server) startProcess(w http.ResponseWriter, r *http.Request, p store.Pr
 // same seconds proc_stop publishes. The registration is not touched: the
 // session unregisters, which is what revokes the token.
 func (s *Server) stopProcess(w http.ResponseWriter, r *http.Request, p store.Process, m sysusers.Member) {
+	// A Process of several units is one pod, so it is stopped as one: every
+	// container in it is given the same grace, and none of them is left
+	// running beside a face that is down, see PLAN.md section 5.6.
+	if p.Composition.Declared() {
+		if err := s.runner.StopPod(r.Context(), m, p.Composition.Pod, StopTimeout); err != nil && !isNoPod(err) {
+			writeProblem(w, s.runProblem(r, err, p, podman.RunOptions{}))
+			return
+		}
+		s.trackRoute(r.Context(), m, p)
+		writeJSON(w, r.URL.Path, startResponse{ID: p.ID, Container: p.Container})
+		return
+	}
 	if err := s.runner.Stop(r.Context(), m, p.Container, StopTimeout); err != nil {
 		writeProblem(w, s.runProblem(r, err, p, podman.RunOptions{}))
 		return
@@ -396,7 +432,15 @@ func (s *Server) stopProcess(w http.ResponseWriter, r *http.Request, p store.Pro
 // removeProcess removes the container of one Process as its owner, which is
 // what a run that replaces a Process does to the one it takes the place of.
 func (s *Server) removeProcess(w http.ResponseWriter, r *http.Request, p store.Process, m sysusers.Member) {
-	if err := s.runner.RemoveContainer(r.Context(), m, p.Container, true); err != nil {
+	// The pod and every container in it, for a Process that runs as one: a
+	// pod left behind is a name the next run of this Process cannot take and
+	// a published port nothing answers on.
+	if p.Composition.Declared() {
+		if err := s.runner.RemovePod(r.Context(), m, p.Composition.Pod, true); err != nil && !isNoPod(err) {
+			writeProblem(w, s.runProblem(r, err, p, podman.RunOptions{}))
+			return
+		}
+	} else if err := s.runner.RemoveContainer(r.Context(), m, p.Container, true); err != nil {
 		writeProblem(w, s.runProblem(r, err, p, podman.RunOptions{}))
 		return
 	}
@@ -755,6 +799,15 @@ func (s *Server) mintToken(ctx context.Context, p store.Process) (string, error)
 // returned.
 func (s *Server) writeEnvFile(p store.Process, m sysusers.Member, env map[string]string, token string,
 	held map[string]string) (string, error) {
+	return s.writeUnitEnvFile(p, m, "", env, token, held)
+}
+
+// writeUnitEnvFile is writeEnvFile for one unit of a pod. The file is named by
+// the Process id and the unit, so the units of one Process do not race on one
+// file the way two starts of one Process would. An empty unit is the Process
+// of one unit, whose file is named by the id alone, exactly as before.
+func (s *Server) writeUnitEnvFile(p store.Process, m sysusers.Member, unit string, env map[string]string,
+	token string, held map[string]string) (string, error) {
 	dir := s.envDir
 	if err := os.MkdirAll(dir, envDirMode); err != nil {
 		return "", fmt.Errorf("daemon: the environment directory %s: %w", dir, err)
@@ -764,13 +817,19 @@ func (s *Server) writeEnvFile(p store.Process, m sysusers.Member, env map[string
 	if err := os.Chmod(dir, envDirMode); err != nil {
 		return "", fmt.Errorf("daemon: the environment directory %s: %w", dir, err)
 	}
-	path := filepath.Join(dir, p.ID)
+	name := p.ID
+	if unit != "" {
+		// A Process id is a UUID and carries no dot, so this names one unit of
+		// one Process and can be nothing else's file.
+		name = p.ID + "." + unit
+	}
+	path := filepath.Join(dir, name)
 	// Whatever a previous run left is removed rather than truncated: the file
 	// is opened exclusively so nothing on the host can have prepared it.
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return "", fmt.Errorf("daemon: the environment file %s: %w", path, err)
 	}
-	body, _ := podman.EnvFileBody(s.environment(p, env, token, held))
+	body, _ := podman.EnvFileBody(s.unitEnvironment(p, unit, env, token, held))
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, envFileMode)
 	if err != nil {
 		return "", fmt.Errorf("daemon: the environment file %s: %w", path, err)
@@ -798,6 +857,16 @@ func (s *Server) writeEnvFile(p store.Process, m sysusers.Member, env map[string
 // order here is what makes that true of a registration written before the rule
 // existed as well.
 func (s *Server) environment(p store.Process, env map[string]string, token string,
+	held map[string]string) map[string]string {
+	return s.unitEnvironment(p, "", env, token, held)
+}
+
+// unitEnvironment is environment with the unit's name added, for a Process
+// that runs as a pod. KITBASH_UNIT is what tells one container of a Process
+// from another, which is what a record it exports carries and what kitbashd
+// holds it to, see PLAN.md section 2.4. A Process of one unit is given none:
+// there is one container and the Process names it.
+func (s *Server) unitEnvironment(p store.Process, unit string, env map[string]string, token string,
 	held map[string]string) map[string]string {
 	merged := make(map[string]string, len(env)+len(held)+len(ownedEnv))
 	for k, v := range env {
@@ -828,6 +897,9 @@ func (s *Server) environment(p store.Process, env map[string]string, token strin
 	merged[EnvMCPEndpoint] = strings.TrimSuffix(s.processEndpoint(), "/") + MCPPath
 	if p.FanoutSecret != "" {
 		merged[EnvFanoutSecret] = p.FanoutSecret
+	}
+	if unit != "" {
+		merged[EnvUnit] = unit
 	}
 	return merged
 }

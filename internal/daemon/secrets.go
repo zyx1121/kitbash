@@ -160,11 +160,18 @@ func (s *Server) removeSecret(w http.ResponseWriter, r *http.Request, caller Cal
 // the call that fixes it. Nothing is created before this runs, so a Process
 // whose credential is missing is refused rather than started without it.
 func (s *Server) resolveSecrets(instance string, p store.Process) (map[string]string, *problem.Problem) {
-	if len(p.Secrets) == 0 {
+	return s.resolveSecretNames(instance, p.Owner, p.Secrets)
+}
+
+// resolveSecretNames is resolveSecrets for a list the caller holds, which is
+// what one unit of a pod has: the names are per unit, and the registration
+// carries one list for each, see PLAN.md section 5.6.
+func (s *Server) resolveSecretNames(instance, owner string, names []string) (map[string]string, *problem.Problem) {
+	if len(names) == 0 {
 		return nil, nil
 	}
-	resolved := make(map[string]string, len(p.Secrets))
-	for _, name := range p.Secrets {
+	resolved := make(map[string]string, len(names))
+	for _, name := range names {
 		// A name the registration should never have carried is refused here
 		// rather than opened: this is what builds a path, so it is the one
 		// that must not be talked into somebody else's.
@@ -173,13 +180,13 @@ func (s *Server) resolveSecrets(instance string, p store.Process) (map[string]st
 				fmt.Sprintf("%q is not a secret name this Process may declare", name),
 				"Declare deploy.units[0].secrets as environment variable names, none of them a KITBASH_ name.")
 		}
-		value, held, err := s.secrets.Get(p.Owner, name)
+		value, held, err := s.secrets.Get(owner, name)
 		if err != nil {
 			return nil, problem.Internal(instance, err.Error(), "")
 		}
 		if !held {
 			return nil, problem.NotFoundFix(instance,
-				fmt.Sprintf("this Process declares the secret %s and %s has not set it", name, p.Owner),
+				fmt.Sprintf("this Process declares the secret %s and %s has not set it", name, owner),
 				fmt.Sprintf("Call secrets_set %s, then run the Package again.", name))
 		}
 		resolved[name] = value

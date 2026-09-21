@@ -67,10 +67,19 @@ const (
 // Internal marks a record as the cause of an internal problem, which only an
 // admin reads: it carries host paths and third party output, and a member is
 // given the problem's instance to quote instead, see PLAN.md section 2.4.
+// Unit is the unit of a Process one record is about, for a Package that runs
+// as a pod. kitbashd stamps it on the records it writes about a unit itself,
+// and a producer that sends one keeps it only when it names a unit of that
+// Process, see PLAN.md sections 2.4 and 5.6. A record about a Process of one
+// unit carries none. Its column is kitbash_unit, because the metrics table
+// already has a unit, which is the unit of measure of a data point; for the
+// same reason a Metric's own Unit is the measure and this one is reached
+// through the embedded Attributes.
 type Attributes struct {
 	User     string         `json:"user,omitempty"`
 	Package  string         `json:"package,omitempty"`
 	Process  string         `json:"process,omitempty"`
+	Unit     string         `json:"unit,omitempty"`
 	Path     string         `json:"path,omitempty"`
 	Tool     string         `json:"tool,omitempty"`
 	Eval     *bool          `json:"eval,omitempty"`
@@ -105,6 +114,9 @@ type Log struct {
 
 // Metric is one record of the metrics signal: a single data point, already
 // flattened. No producer emits metrics before M4, see PLAN.md section 5.5.
+//
+// Unit here is the unit of measure and shadows the kitbash attribute of the
+// same name: the kitbash unit of a metric is Attributes.Unit, written out.
 type Metric struct {
 	TimeNS int64
 	Name   string
@@ -137,6 +149,7 @@ type Filter struct {
 	User     string
 	Package  string
 	Process  string
+	Unit     string
 	Path     string
 	Tool     string
 	Eval     *bool
@@ -275,6 +288,7 @@ CREATE TABLE IF NOT EXISTS spans (
   user           TEXT    NOT NULL DEFAULT '',
   package        TEXT    NOT NULL DEFAULT '',
   process        TEXT    NOT NULL DEFAULT '',
+  kitbash_unit   TEXT    NOT NULL DEFAULT '',
   path           TEXT    NOT NULL DEFAULT '',
   tool           TEXT    NOT NULL DEFAULT '',
   eval           INTEGER,
@@ -294,6 +308,7 @@ CREATE TABLE IF NOT EXISTS logs (
   user      TEXT    NOT NULL DEFAULT '',
   package   TEXT    NOT NULL DEFAULT '',
   process   TEXT    NOT NULL DEFAULT '',
+  kitbash_unit TEXT NOT NULL DEFAULT '',
   path      TEXT    NOT NULL DEFAULT '',
   tool      TEXT    NOT NULL DEFAULT '',
   eval      INTEGER,
@@ -312,6 +327,7 @@ CREATE TABLE IF NOT EXISTS metrics (
   user    TEXT    NOT NULL DEFAULT '',
   package TEXT    NOT NULL DEFAULT '',
   process TEXT    NOT NULL DEFAULT '',
+  kitbash_unit TEXT NOT NULL DEFAULT '',
   path    TEXT    NOT NULL DEFAULT '',
   tool    TEXT    NOT NULL DEFAULT '',
   eval    INTEGER,
@@ -387,6 +403,7 @@ CREATE INDEX IF NOT EXISTS spans_package  ON spans(package, start_ns);
 CREATE INDEX IF NOT EXISTS spans_producer ON spans(producer, start_ns);
 CREATE INDEX IF NOT EXISTS spans_caller   ON spans(caller, start_ns);
 CREATE INDEX IF NOT EXISTS spans_internal ON spans(internal, start_ns);
+CREATE INDEX IF NOT EXISTS spans_unit     ON spans(kitbash_unit, start_ns);
 
 CREATE INDEX IF NOT EXISTS logs_time     ON logs(time_ns);
 CREATE INDEX IF NOT EXISTS logs_user     ON logs(user, time_ns);
@@ -394,6 +411,7 @@ CREATE INDEX IF NOT EXISTS logs_package  ON logs(package, time_ns);
 CREATE INDEX IF NOT EXISTS logs_producer ON logs(producer, time_ns);
 CREATE INDEX IF NOT EXISTS logs_caller   ON logs(caller, time_ns);
 CREATE INDEX IF NOT EXISTS logs_internal ON logs(internal, time_ns);
+CREATE INDEX IF NOT EXISTS logs_unit     ON logs(kitbash_unit, time_ns);
 
 CREATE INDEX IF NOT EXISTS metrics_time     ON metrics(time_ns);
 CREATE INDEX IF NOT EXISTS metrics_user     ON metrics(user, time_ns);
@@ -401,6 +419,7 @@ CREATE INDEX IF NOT EXISTS metrics_package  ON metrics(package, time_ns);
 CREATE INDEX IF NOT EXISTS metrics_producer ON metrics(producer, time_ns);
 CREATE INDEX IF NOT EXISTS metrics_caller   ON metrics(caller, time_ns);
 CREATE INDEX IF NOT EXISTS metrics_internal ON metrics(internal, time_ns);
+CREATE INDEX IF NOT EXISTS metrics_unit     ON metrics(kitbash_unit, time_ns);
 
 CREATE INDEX IF NOT EXISTS processes_owner ON processes(owner);
 CREATE UNIQUE INDEX IF NOT EXISTS processes_token ON processes(token_hash);
@@ -431,8 +450,8 @@ func (s *Store) Insert(ctx context.Context, e Export) error {
 	if len(e.Spans) > 0 {
 		stmt, err := tx.PrepareContext(ctx, `INSERT INTO spans
 			(trace_id, span_id, parent_span_id, name, start_ns, end_ns, status, status_message,
-			 user, package, process, path, tool, eval, producer, caller, internal, other)
-			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+			 user, package, process, kitbash_unit, path, tool, eval, producer, caller, internal, other)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 		if err != nil {
 			return fmt.Errorf("store: prepare spans: %w", err)
 		}
@@ -444,7 +463,7 @@ func (s *Store) Insert(ctx context.Context, e Export) error {
 			}
 			if _, err := stmt.ExecContext(ctx, sp.TraceID, sp.SpanID, sp.ParentSpanID, sp.Name,
 				sp.StartNS, sp.EndNS, status(sp.Status), sp.StatusMessage,
-				sp.User, sp.Package, sp.Process, sp.Path, sp.Tool, boolArg(sp.Eval), sp.Producer, sp.Caller,
+				sp.User, sp.Package, sp.Process, sp.Unit, sp.Path, sp.Tool, boolArg(sp.Eval), sp.Producer, sp.Caller,
 				boolArg(sp.Internal), other); err != nil {
 				return fmt.Errorf("store: insert span: %w", err)
 			}
@@ -452,9 +471,9 @@ func (s *Store) Insert(ctx context.Context, e Export) error {
 	}
 	if len(e.Logs) > 0 {
 		stmt, err := tx.PrepareContext(ctx, `INSERT INTO logs
-			(time_ns, severity, body, trace_id, span_id, user, package, process, path, tool, eval, producer, caller,
-			 internal, other)
-			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+			(time_ns, severity, body, trace_id, span_id, user, package, process, kitbash_unit, path, tool,
+			 eval, producer, caller, internal, other)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 		if err != nil {
 			return fmt.Errorf("store: prepare logs: %w", err)
 		}
@@ -465,7 +484,7 @@ func (s *Store) Insert(ctx context.Context, e Export) error {
 				return err
 			}
 			if _, err := stmt.ExecContext(ctx, l.TimeNS, l.Severity, l.Body, l.TraceID, l.SpanID,
-				l.User, l.Package, l.Process, l.Path, l.Tool, boolArg(l.Eval), l.Producer, l.Caller,
+				l.User, l.Package, l.Process, l.Unit, l.Path, l.Tool, boolArg(l.Eval), l.Producer, l.Caller,
 				boolArg(l.Internal), other); err != nil {
 				return fmt.Errorf("store: insert log: %w", err)
 			}
@@ -473,8 +492,9 @@ func (s *Store) Insert(ctx context.Context, e Export) error {
 	}
 	if len(e.Metrics) > 0 {
 		stmt, err := tx.PrepareContext(ctx, `INSERT INTO metrics
-			(time_ns, name, value, unit, user, package, process, path, tool, eval, producer, caller, internal, other)
-			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+			(time_ns, name, value, unit, user, package, process, kitbash_unit, path, tool, eval, producer,
+			 caller, internal, other)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 		if err != nil {
 			return fmt.Errorf("store: prepare metrics: %w", err)
 		}
@@ -492,7 +512,7 @@ func (s *Store) Insert(ctx context.Context, e Export) error {
 				return err
 			}
 			if _, err := stmt.ExecContext(ctx, m.TimeNS, m.Name, m.Value, m.Unit,
-				m.User, m.Package, m.Process, m.Path, m.Tool, boolArg(m.Eval), m.Producer, m.Caller,
+				m.User, m.Package, m.Process, m.Attributes.Unit, m.Path, m.Tool, boolArg(m.Eval), m.Producer, m.Caller,
 				boolArg(m.Internal), other); err != nil {
 				return fmt.Errorf("store: insert metric: %w", err)
 			}
@@ -531,9 +551,9 @@ func (s *Store) Query(ctx context.Context, signal string, f Filter) (Page, error
 	}
 
 	columns := map[string]string{
-		"spans":   "trace_id, span_id, parent_span_id, name, start_ns, end_ns, status, status_message, user, package, process, path, tool, eval, producer, caller, internal, other",
-		"logs":    "time_ns, severity, body, trace_id, span_id, user, package, process, path, tool, eval, producer, caller, internal, other",
-		"metrics": "time_ns, name, value, unit, user, package, process, path, tool, eval, producer, caller, internal, other",
+		"spans":   "trace_id, span_id, parent_span_id, name, start_ns, end_ns, status, status_message, user, package, process, kitbash_unit, path, tool, eval, producer, caller, internal, other",
+		"logs":    "time_ns, severity, body, trace_id, span_id, user, package, process, kitbash_unit, path, tool, eval, producer, caller, internal, other",
+		"metrics": "time_ns, name, value, unit, user, package, process, kitbash_unit, path, tool, eval, producer, caller, internal, other",
 	}[table]
 
 	where, args := conditions(timeColumn, f)
@@ -560,7 +580,7 @@ func (s *Store) Query(ctx context.Context, signal string, f Filter) (Page, error
 			var eval, internal sql.NullBool
 			var other string
 			if err := rows.Scan(&sp.TraceID, &sp.SpanID, &sp.ParentSpanID, &sp.Name, &sp.StartNS, &sp.EndNS,
-				&sp.Status, &sp.StatusMessage, &sp.User, &sp.Package, &sp.Process, &sp.Path, &sp.Tool,
+				&sp.Status, &sp.StatusMessage, &sp.User, &sp.Package, &sp.Process, &sp.Unit, &sp.Path, &sp.Tool,
 				&eval, &sp.Producer, &sp.Caller, &internal, &other); err != nil {
 				return page, fmt.Errorf("store: scan span: %w", err)
 			}
@@ -575,7 +595,7 @@ func (s *Store) Query(ctx context.Context, signal string, f Filter) (Page, error
 			var eval, internal sql.NullBool
 			var other string
 			if err := rows.Scan(&l.TimeNS, &l.Severity, &l.Body, &l.TraceID, &l.SpanID,
-				&l.User, &l.Package, &l.Process, &l.Path, &l.Tool, &eval, &l.Producer, &l.Caller,
+				&l.User, &l.Package, &l.Process, &l.Unit, &l.Path, &l.Tool, &eval, &l.Producer, &l.Caller,
 				&internal, &other); err != nil {
 				return page, fmt.Errorf("store: scan log: %w", err)
 			}
@@ -590,7 +610,7 @@ func (s *Store) Query(ctx context.Context, signal string, f Filter) (Page, error
 			var eval, internal sql.NullBool
 			var other string
 			if err := rows.Scan(&m.TimeNS, &m.Name, &m.Value, &m.Unit,
-				&m.User, &m.Package, &m.Process, &m.Path, &m.Tool, &eval, &m.Producer, &m.Caller,
+				&m.User, &m.Package, &m.Process, &m.Attributes.Unit, &m.Path, &m.Tool, &eval, &m.Producer, &m.Caller,
 				&internal, &other); err != nil {
 				return page, fmt.Errorf("store: scan metric: %w", err)
 			}
@@ -631,6 +651,9 @@ func conditions(timeColumn string, f Filter) (string, []any) {
 	}
 	if f.Process != "" {
 		add("process = ?", f.Process)
+	}
+	if f.Unit != "" {
+		add("kitbash_unit = ?", f.Unit)
 	}
 	if f.Tool != "" {
 		add("tool = ?", f.Tool)

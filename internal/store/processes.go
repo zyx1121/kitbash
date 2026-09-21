@@ -139,6 +139,17 @@ type Process struct {
 	// its owner. A registration written before schedules existed carries
 	// none, which is a Process nothing starts on time.
 	Schedule Schedule `json:"schedule,omitempty"`
+	// Composition is the pod this Process runs as, for a Package that
+	// declares more than one unit. A Package that declares one runs as the
+	// bare container Container names and carries none of this, so nothing
+	// about a single unit Process changed when pods arrived, see PLAN.md
+	// section 5.6. A registration written before pods existed carries none
+	// and is read as the single unit Process it is.
+	//
+	// The fields above describe the face: Container, Digest, Expose,
+	// Endpoint, Mounts and Secrets are the exposed unit's, so every reader
+	// that knew one container per Process still reads the one that answers.
+	Composition Composition `json:"composition,omitempty"`
 	// FanoutSecret is the bearer kitbashd puts on every fan out request to
 	// this Process. It is minted with the token at registration and handed to
 	// the container once. The tag keeps it out of processes_list, which is the
@@ -146,6 +157,89 @@ type Process struct {
 	// secret any more than it carries a token. A registration written before
 	// the fan out was authenticated carries none.
 	FanoutSecret string `json:"-"`
+}
+
+// Composition is one Process that runs as a pod: the pod the units share and
+// the units themselves, in the order the manifest declared them. It is the
+// whole of what a start and a boot restore need beyond the row's own fields.
+//
+// Declared is what every reader branches on, and it is two units or more by
+// construction: a Package with one unit runs as a bare container and is never
+// written here, so a reader that sees a composition sees a pod.
+type Composition struct {
+	Pod   string `json:"pod"`
+	Units []Unit `json:"units"`
+}
+
+// Unit is one container of a pod as the registration records it: the name the
+// manifest gave it, the container the runtime holds it under, the image it
+// runs, whether it is the Process's face, and the three things kitbashd
+// resolves or enforces per unit.
+//
+// What the unit runs and the environment it runs with are not here, for the
+// reason a single unit Process does not carry them either: a start sends them
+// and a restore reads them back off the container the runtime still has, see
+// internal/daemon/restore.go.
+type Unit struct {
+	Name      string `json:"name"`
+	Container string `json:"container"`
+	Digest    string `json:"digest"`
+	// Face is the one unit that declares expose mcp or http, which is the
+	// unit the Process's endpoint, health probe and route belong to. Exactly
+	// one unit of a Package carries it, see PLAN.md section 5.6.
+	Face bool `json:"face,omitempty"`
+	// Mounts are the folders of Files this unit sees, as kitbashd resolved
+	// them at registration. They are per unit the way they are per Process,
+	// and the registration is authoritative for these as it is for the rest.
+	Mounts []mounts.Resolved `json:"mounts,omitempty"`
+	// Secrets are the names this unit is given the owner's values under.
+	// Names only, ever, the same rule the Process's own list follows.
+	Secrets []string `json:"secrets,omitempty"`
+	// Limits is what this unit may spend, under the Process's ceiling. The
+	// pod is the ceiling and the units are placed below it, so two units of
+	// one Process cannot together spend more than the Process was given.
+	Limits Limits `json:"limits,omitempty"`
+}
+
+// Declared reports whether this registration is a pod at all. A Process of one
+// unit is not, which is what keeps every path that knew one container per
+// Process the path a single unit Package still takes.
+func (c Composition) Declared() bool { return c.Pod != "" && len(c.Units) > 1 }
+
+// Face is the unit that is the Process's face, and false for a composition
+// that declares none, which is a row nothing this release wrote.
+func (c Composition) Face() (Unit, bool) {
+	for _, u := range c.Units {
+		if u.Face {
+			return u, true
+		}
+	}
+	return Unit{}, false
+}
+
+// Names is the unit names of this Process, which is what a Telemetry record
+// carrying kitbash.unit is held to: a name that is not one of these is a
+// producer naming a unit of somebody else's Process, see PLAN.md section 2.4.
+func (c Composition) Names() []string {
+	names := make([]string, 0, len(c.Units))
+	for _, u := range c.Units {
+		names = append(names, u.Name)
+	}
+	return names
+}
+
+// JSON renders the composition for the column. A Process that is not a pod is
+// an empty string rather than an object of nulls, so a legacy row and a single
+// unit Process read back the same.
+func (c Composition) JSON() string {
+	if !c.Declared() {
+		return ""
+	}
+	body, err := json.Marshal(c)
+	if err != nil {
+		return ""
+	}
+	return string(body)
 }
 
 // Health is the probe of one Process: the path its Package's manifest declared
@@ -410,13 +504,17 @@ func (s *Store) RegisterProcess(ctx context.Context, p Process, tokenHash string
 	// does: after a reboot nothing else remembers that this Process is a job,
 	// and the ticker is built from these rows.
 	scheduled := p.Schedule.JSON()
+	// The units travel with it for the same reason again: a pod and every
+	// container in it are made again at the next boot, and this row is the
+	// only thing that says which units the Process has, see PLAN.md 5.6.
+	composed := p.Composition.JSON()
 	// The fan out secret is replaced with the token, because the two are minted
 	// together: a container holding the old token holds the old secret.
 	if _, err := tx.ExecContext(ctx, `INSERT INTO processes
 		(id, owner, admin, package, name, container, digest, expose, endpoint, hostname,
-		 subscriptions, runner, permits, limits, health, mounts, secrets, schedule, token_hash, fanout_secret,
-		 registered_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		 subscriptions, runner, permits, limits, health, mounts, secrets, schedule, units, token_hash,
+		 fanout_secret, registered_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 			owner = excluded.owner, admin = excluded.admin, package = excluded.package,
 			name = excluded.name, container = excluded.container, digest = excluded.digest,
@@ -426,12 +524,12 @@ func (s *Store) RegisterProcess(ctx context.Context, p Process, tokenHash string
 			permits = excluded.permits,
 			limits = excluded.limits, health = excluded.health,
 			mounts = excluded.mounts, secrets = excluded.secrets,
-			schedule = excluded.schedule,
+			schedule = excluded.schedule, units = excluded.units,
 			token_hash = excluded.token_hash,
 			fanout_secret = excluded.fanout_secret, registered_at = excluded.registered_at`,
 		p.ID, p.Owner, p.Admin, p.Package, p.Name, p.Container, p.Digest, p.Expose, p.Endpoint, p.Hostname,
 		string(subscriptions), p.Runner, string(permits), limits, health, mounted, named, scheduled,
-		tokenHash, p.FanoutSecret,
+		composed, tokenHash, p.FanoutSecret,
 		p.RegisteredAt.UnixNano()); err != nil {
 		return fmt.Errorf("store: register the Process %s: %w", p.ID, err)
 	}
@@ -611,7 +709,7 @@ func (s *Store) Processes(ctx context.Context, owner string) ([]Process, error) 
 // processColumns is the one select every read of this table shares.
 const processColumns = `SELECT id, owner, admin, package, name, container, digest,
 	expose, endpoint, hostname, subscriptions, runner, permits, limits, health, mounts, secrets, schedule,
-	fanout_secret, registered_at`
+	units, fanout_secret, registered_at`
 
 // scanner is what both a single row and a row of a result set satisfy.
 type scanner interface {
@@ -620,11 +718,11 @@ type scanner interface {
 
 func scanProcess(row scanner) (Process, error) {
 	var p Process
-	var subscriptions, permits, limits, health, mounted, named, scheduled string
+	var subscriptions, permits, limits, health, mounted, named, scheduled, composed string
 	var registered int64
 	if err := row.Scan(&p.ID, &p.Owner, &p.Admin, &p.Package, &p.Name, &p.Container, &p.Digest,
 		&p.Expose, &p.Endpoint, &p.Hostname, &subscriptions, &p.Runner, &permits, &limits, &health, &mounted,
-		&named, &scheduled, &p.FanoutSecret,
+		&named, &scheduled, &composed, &p.FanoutSecret,
 		&registered); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Process{}, err
@@ -663,6 +761,14 @@ func scanProcess(row scanner) (Process, error) {
 	}
 	if scheduled != "" {
 		p.Schedule = readSchedule(p.ID, scheduled)
+	}
+	// An empty column is a Process of one unit, which is every registration
+	// written before pods existed and every Package that declares one unit
+	// today. It is read as what it is rather than as a pod of one.
+	if composed != "" {
+		if err := json.Unmarshal([]byte(composed), &p.Composition); err != nil {
+			return Process{}, fmt.Errorf("store: read the units of %s: %w", p.ID, err)
+		}
 	}
 	if permits != "" {
 		block, err := manifest.ParsePermits([]byte(permits))
@@ -737,6 +843,14 @@ func migrate(db *sql.DB) error {
 		if err := addColumn(db, table, "internal", "INTEGER"); err != nil {
 			return err
 		}
+		// kitbash.unit arrives with M12: the unit of a Process that runs as a
+		// pod. Every record written before it carries none, which is what a
+		// record about a Process of one unit carries today. The column is
+		// kitbash_unit because the metrics table already has a unit, which is
+		// the unit of measure of a data point.
+		if err := addTextColumn(db, table, "kitbash_unit"); err != nil {
+			return err
+		}
 	}
 	// The container name and the image digest arrive with M5, the fan out
 	// secret with the authenticated fan out. A registration written before any
@@ -773,9 +887,13 @@ func migrate(db *sql.DB) error {
 	// declared and what its ticks start the container with. A registration
 	// written before it carries none, which is a Process that stays up and
 	// that nothing starts on time, the way every Process was.
+	// The units arrive with M12: the pod a Package of more than one unit runs
+	// as, and every container in it. A registration written before them
+	// carries none, which is the single unit Process it was, the way every
+	// Process was.
 	for _, column := range []string{
 		"container", "digest", "fanout_secret", "permits", "limits", "runner", "health", "mounts", "secrets",
-		"hostname", "schedule",
+		"hostname", "schedule", "units",
 	} {
 		if err := addTextColumn(db, "processes", column); err != nil {
 			return err

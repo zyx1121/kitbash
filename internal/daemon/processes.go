@@ -112,6 +112,26 @@ type processRequest struct {
 	// no container here; kitbashd registers the job and its ticker runs it,
 	// see schedule.go.
 	Schedule *scheduleRequest `json:"schedule,omitempty"`
+	// Pod and Units are what a Package of more than one unit registers: the
+	// pod its units share and one entry per unit. A Package of one unit sends
+	// neither and is registered as the container it always was, see PLAN.md
+	// section 5.6. The fields above are the face unit's.
+	Pod   string        `json:"pod,omitempty"`
+	Units []unitRequest `json:"units,omitempty"`
+}
+
+// unitRequest is one unit of a pod as a registration carries it. What the unit
+// runs and the environment it runs with are in the start request beside it,
+// the same split a Process of one unit makes between the two calls.
+type unitRequest struct {
+	Name      string            `json:"name"`
+	Container string            `json:"container"`
+	Digest    string            `json:"digest"`
+	Face      bool              `json:"face,omitempty"`
+	Mounts    []mounts.Declared `json:"mounts,omitempty"`
+	Secrets   []string          `json:"secrets,omitempty"`
+	Memory    string            `json:"memory,omitempty"`
+	CPU       string            `json:"cpu,omitempty"`
 }
 
 // scheduleRequest is the job one registration declares. The environment and
@@ -185,6 +205,12 @@ type listedProcess struct {
 	// and no last run, see schedule.go.
 	NextRun string     `json:"nextRun,omitempty"`
 	LastRun *listedRun `json:"lastRun,omitempty"`
+	// Pod is the pod a Process of several units runs as and Units what each
+	// of them is doing, read off the runtime rather than stored: the runtime
+	// holds the state of a Process and there is no second record, see PLAN.md
+	// section 2.3. Both are absent for a Process of one unit.
+	Pod   string      `json:"pod,omitempty"`
+	Units []unitState `json:"units,omitempty"`
 }
 
 // listedRun is one finished run as processes_list answers it.
@@ -255,6 +281,13 @@ func (s *Server) registerProcess(w http.ResponseWriter, r *http.Request, caller 
 		writeProblem(w, prob)
 		return
 	}
+	// And the mounts of every unit of a pod, for the same reason and by the
+	// same check. A Package of one unit answers the empty composition here.
+	composed, prob := s.composition(r.Context(), r.URL.Path, caller.User, req)
+	if prob != nil {
+		writeProblem(w, prob)
+		return
+	}
 
 	p := store.Process{
 		ID:            req.ID,
@@ -274,6 +307,7 @@ func (s *Server) registerProcess(w http.ResponseWriter, r *http.Request, caller 
 		Mounts:        resolved,
 		Secrets:       req.Secrets,
 		Schedule:      declaredSchedule(req.Schedule),
+		Composition:   composed,
 		FanoutSecret:  secret,
 		RegisteredAt:  s.now().UTC(),
 	}
@@ -446,6 +480,16 @@ func (s *Server) listProcesses(w http.ResponseWriter, r *http.Request, caller Ca
 		if prob := s.processProblem(p.ID); prob.Detail != "" {
 			entry.Problem = prob.Detail
 			entry.Fix = prob.Fix
+		}
+		// What each unit of a pod is doing. It is one runtime call per unit
+		// and only for a Process that has them, so a host of single unit
+		// Processes answers this listing with exactly the calls it did
+		// before pods existed.
+		if p.Composition.Declared() {
+			entry.Pod = p.Composition.Pod
+			if m, found, err := s.users.Lookup(r.Context(), p.Owner); err == nil && found {
+				entry.Units = s.podStates(r.Context(), m, p)
+			}
 		}
 		listed = append(listed, entry)
 	}
@@ -626,6 +670,19 @@ func validateProcess(instance string, req processRequest) *problem.Problem {
 	}
 	if prob := validateSchedule(instance, req); prob != nil {
 		return prob
+	}
+	// The units of a pod are held to the same shapes the Process's own fields
+	// are, plus the two rules a pod adds: two units or more, and exactly one
+	// of them the face, see pods.go.
+	if prob := validateUnits(instance, req); prob != nil {
+		return prob
+	}
+	for _, unit := range req.Units {
+		if len(unit.Mounts) > mounts.Max {
+			return problem.BadRequest(instance,
+				fmt.Sprintf("a unit may mount at most %d folders, not %d", mounts.Max, len(unit.Mounts)),
+				fmt.Sprintf("Declare at most %d entries in the unit's mounts.", mounts.Max))
+		}
 	}
 	// The count is held here rather than in the resolution, so a registration
 	// declaring a hundred mounts is one refusal and not a hundred opens.

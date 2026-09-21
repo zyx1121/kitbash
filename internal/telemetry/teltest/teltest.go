@@ -8,6 +8,7 @@
 package teltest
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -128,6 +129,32 @@ type Registration struct {
 	// LastRun is the run the daemon saw this job finish most recently. A
 	// client sends none; a test seeds it to stand in for a tick that ran.
 	LastRun *LastRun `json:"lastRun,omitempty"`
+	// Pod and Units are what a Package of more than one unit registers: the
+	// pod its units share and one entry per unit. A Package of one unit sends
+	// neither, see PLAN.md section 5.6. UnitStates is what the daemon answers
+	// each unit is doing, which this fake fills in from the runtime it
+	// mirrors into.
+	Pod        string      `json:"pod,omitempty"`
+	Units      []RegUnit   `json:"units,omitempty"`
+	UnitStates []UnitState `json:"-"`
+}
+
+// RegUnit is one unit of a pod as a registration carries it.
+type RegUnit struct {
+	Name      string           `json:"name"`
+	Container string           `json:"container"`
+	Digest    string           `json:"digest"`
+	Face      bool             `json:"face,omitempty"`
+	Mounts    []manifest.Mount `json:"mounts,omitempty"`
+	Secrets   []string         `json:"secrets,omitempty"`
+	Memory    string           `json:"memory,omitempty"`
+	CPU       string           `json:"cpu,omitempty"`
+}
+
+// UnitState is one unit of a pod as processes_list answers it.
+type UnitState struct {
+	Name  string `json:"name"`
+	State string `json:"state"`
 }
 
 // Schedule is one job on the wire: the cron expression, and what a tick starts
@@ -700,13 +727,48 @@ func (d *Daemon) listProcesses(w http.ResponseWriter, r *http.Request) {
 		write(w, override)
 		return
 	}
-	list := make([]Registration, 0, len(d.order))
+	list := make([]any, 0, len(d.order))
 	for _, id := range d.order {
-		list = append(list, d.registrations[id])
+		reg := d.registrations[id]
+		if reg.Pod == "" {
+			list = append(list, reg)
+			continue
+		}
+		// A pod answers what each of its units is doing under the same key a
+		// registration sends the units under, which is what the daemon does:
+		// the shape going in is the declaration and the shape coming back is
+		// the state, see internal/daemon/processes.go.
+		listed := struct {
+			Registration
+			Units []UnitState `json:"units"`
+		}{Registration: reg, Units: d.unitStates(reg)}
+		listed.Registration.Units = nil
+		list = append(list, listed)
 	}
 	d.mu.Unlock()
 	answer, _ := json.Marshal(map[string]any{"processes": list})
 	write(w, Response{Status: http.StatusOK, ContentType: "application/json", Body: string(answer)})
+}
+
+// unitStates is what each unit of one pod is doing, read off the runtime this
+// fake mirrors into, or the states a test seeded. The caller holds the lock.
+func (d *Daemon) unitStates(reg Registration) []UnitState {
+	if len(reg.UnitStates) > 0 {
+		return reg.UnitStates
+	}
+	states := make([]UnitState, 0, len(reg.Units))
+	for _, unit := range reg.Units {
+		state := ""
+		if d.runtime != nil {
+			if found, err := d.runtime.Containers(context.Background(),
+				podman.Filter{podman.LabelUnit: unit.Name, podman.LabelID: reg.ID}, true); err == nil &&
+				len(found) > 0 {
+				state = found[0].State
+			}
+		}
+		states = append(states, UnitState{Name: unit.Name, State: state})
+	}
+	return states
 }
 
 // unregister answers processes_unregister: 204 for a Process it knew, 404 for

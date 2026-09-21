@@ -69,10 +69,17 @@ func (s *Server) resolveMounts(ctx context.Context, instance, owner string, decl
 // this is the same question asked again rather than a second interpretation of
 // the manifest: what it catches is a folder that has changed since.
 func (s *Server) revalidateMounts(instance string, p store.Process, m sysusers.Member) ([]mounts.Resolved, *problem.Problem) {
-	if len(p.Mounts) == 0 {
+	return s.revalidateResolved(instance, p.Mounts, m)
+}
+
+// revalidateResolved is revalidateMounts for a list the caller holds, which is
+// what one unit of a pod has: the mounts are per unit, and the registration
+// carries one list for each, see PLAN.md section 5.6.
+func (s *Server) revalidateResolved(instance string, held []mounts.Resolved, m sysusers.Member) ([]mounts.Resolved, *problem.Problem) {
+	if len(held) == 0 {
 		return nil, nil
 	}
-	return s.mountChecker(m).Resolve(instance, mounts.Redeclare(p.Mounts))
+	return s.mountChecker(m).Resolve(instance, mounts.Redeclare(held))
 }
 
 // DefaultProcRoot is this host's process table, which is how kitbashd reads
@@ -126,14 +133,15 @@ const mountSwapFix = "Check the folder deploy.units[0].mounts names: it was repl
 // source that stopped existing between the create and the init leaves behind.
 // It is refused with everything else: there is no namespace to read, so there
 // is nothing this can say about it.
-func (s *Server) verifyMounts(ctx context.Context, instance string, p store.Process, m sysusers.Member, expected []mounts.Resolved) *problem.Problem {
+func (s *Server) verifyMounts(ctx context.Context, instance string, p store.Process, m sysusers.Member,
+	container string, expected []mounts.Resolved) *problem.Problem {
 	if len(expected) == 0 {
 		return nil
 	}
-	config, err := s.runner.ContainerConfig(ctx, m, p.Container)
+	config, err := s.runner.ContainerConfig(ctx, m, container)
 	if err != nil {
 		return problem.Internal(instance,
-			fmt.Sprintf("reading back what %s was prepared with: %v", p.Container, err), "")
+			fmt.Sprintf("reading back what %s was prepared with: %v", container, err), "")
 	}
 	return s.verifyConfig(instance, p, config, expected)
 }
@@ -207,6 +215,27 @@ func (s *Server) tearDownAfterSwap(ctx context.Context, p store.Process, m sysus
 	}
 }
 
+// prepareAndVerifyIn is prepareAndVerify for one named container and without
+// the teardown: it prepares the container, reads its mounts in its own
+// namespace, and answers the refusal. The caller decides what to take apart,
+// which for a unit of a pod is the whole pod and not the one container, see
+// pods.go.
+func (s *Server) prepareAndVerifyIn(ctx context.Context, instance string, p store.Process, m sysusers.Member,
+	container, leaf string, expected []mounts.Resolved) *problem.Problem {
+	if err := s.runner.InitContainer(ctx, m, container, leaf); err != nil {
+		if len(expected) == 0 {
+			return problem.Internal(instance,
+				fmt.Sprintf("the container runtime could not prepare %s: %v", container, err), "")
+		}
+		// A source that stopped existing between the create and here is what
+		// this failure usually is, and it is the same refusal: the container
+		// has run nothing and it does not get to.
+		logger.Printf("processes: %s of %s: %s: preparing %s: %v", p.ID, p.Owner, MountSwapped, container, err)
+		return problem.NotPermitted(instance, MountSwapped, mountSwapFix)
+	}
+	return s.verifyMounts(ctx, instance, p, m, container, expected)
+}
+
 // prepareAndVerify is the whole of what a start does between making a container
 // and running it: the runtime prepares it, which is where the bind mounts are
 // made, kitbashd reads them in the container's own namespace, and only a
@@ -218,19 +247,7 @@ func (s *Server) tearDownAfterSwap(ctx context.Context, p store.Process, m sysus
 // here anyway.
 func (s *Server) prepareAndVerify(ctx context.Context, instance string, p store.Process, m sysusers.Member,
 	leaf string, expected []mounts.Resolved) *problem.Problem {
-	if err := s.runner.InitContainer(ctx, m, p.Container, leaf); err != nil {
-		if len(expected) == 0 {
-			return problem.Internal(instance,
-				fmt.Sprintf("the container runtime could not prepare %s: %v", p.Container, err), "")
-		}
-		// A source that stopped existing between the create and here is what
-		// this failure usually is, and it is the same refusal: the container
-		// has run nothing and it does not get to.
-		logger.Printf("processes: %s of %s: %s: preparing %s: %v", p.ID, p.Owner, MountSwapped, p.Container, err)
-		s.tearDownAfterSwap(ctx, p, m)
-		return problem.NotPermitted(instance, MountSwapped, mountSwapFix)
-	}
-	if prob := s.verifyMounts(ctx, instance, p, m, expected); prob != nil {
+	if prob := s.prepareAndVerifyIn(ctx, instance, p, m, p.Container, leaf, expected); prob != nil {
 		s.tearDownAfterSwap(ctx, p, m)
 		return prob
 	}

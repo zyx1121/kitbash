@@ -111,6 +111,90 @@ func (p *Podman) CreateContainer(ctx context.Context, m Member, opts podman.RunO
 	return strings.TrimSpace(out), nil
 }
 
+// CreatePod makes the pod one Process of several units runs as, inside the
+// member's cgroup leaf, and answers the runtime id it printed. Nothing of the
+// Package runs in it: podman starts an infra container that holds the
+// namespaces and runs nothing else, and every unit joins it as a container of
+// its own, see PLAN.md section 5.6.
+//
+// There is no image to check first, the way CreateContainer checks the unit's:
+// the infra image is podman's own and a member who does not have it gets it
+// from the runtime's own store.
+func (p *Podman) CreatePod(ctx context.Context, m Member, opts podman.PodOptions, cgroup string) (string, error) {
+	if err := ensureRuntimeDir(p.runUser(), m); err != nil {
+		return "", err
+	}
+	out, err := p.runFor(ctx, m, cgroup, RunTimeout, podman.PodCreateArgs(opts)...)
+	if err != nil {
+		if exitCode(err, usageExit) {
+			return "", fmt.Errorf("%w: %v", ErrUsage, err)
+		}
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
+// StopPod stops every container of one pod as the member, on the same grace
+// and the same budget one container's stop gets.
+func (p *Podman) StopPod(ctx context.Context, m Member, pod string, timeout int) error {
+	if err := ensureRuntimeDir(p.runUser(), m); err != nil {
+		return err
+	}
+	if err := p.podExists(ctx, m, pod); err != nil {
+		return err
+	}
+	_, err := p.runFor(ctx, m, "", StopBudget, "pod", "stop", "--time", strconv.Itoa(timeout), pod)
+	return err
+}
+
+// RemovePod removes one pod and every container in it as the member. It is
+// what a start that failed on one unit calls, so a Process is either the whole
+// pod or nothing on this host.
+func (p *Podman) RemovePod(ctx context.Context, m Member, pod string, force bool) error {
+	if err := ensureRuntimeDir(p.runUser(), m); err != nil {
+		return err
+	}
+	if err := p.podExists(ctx, m, pod); err != nil {
+		return err
+	}
+	args := []string{"pod", "rm"}
+	if force {
+		args = append(args, "--force")
+	}
+	// A forced removal stops every container first, on the same grace a stop
+	// gets, so it gets the same budget.
+	_, err := p.runFor(ctx, m, "", StopBudget, append(args, pod)...)
+	return err
+}
+
+// PodState is what the runtime calls one pod, lowercased. A pod the member's
+// runtime does not have is ErrNoPod.
+func (p *Podman) PodState(ctx context.Context, m Member, pod string) (string, error) {
+	if err := ensureRuntimeDir(p.runUser(), m); err != nil {
+		return "", err
+	}
+	if err := p.podExists(ctx, m, pod); err != nil {
+		return "", err
+	}
+	out, err := p.run(ctx, m, "pod", "inspect", "--format", "{{.State}}", pod)
+	if err != nil {
+		return "", err
+	}
+	return strings.ToLower(strings.TrimSpace(out)), nil
+}
+
+// podExists answers ErrNoPod for a pod this member's runtime does not have,
+// the way exists answers ErrNoContainer.
+func (p *Podman) podExists(ctx context.Context, m Member, pod string) error {
+	if _, err := p.run(ctx, m, "pod", "exists", pod); err != nil {
+		if exitCode(err, 1) {
+			return fmt.Errorf("%w: %s", ErrNoPod, pod)
+		}
+		return err
+	}
+	return nil
+}
+
 // InitContainer prepares a created container without running it: the runtime makes its
 // rootfs and every bind mount it was created with and leaves its init process
 // created, so the container has a pid and a mount namespace and the image's
@@ -239,8 +323,16 @@ type ContainerConfig struct {
 	// image when the unit declared none. A container that has to be made
 	// again is made with it, so a heal does not drop what the unit declared.
 	Command []string
-	// Publish is what the container publishes on the host.
+	// Publish is what the container publishes on the host. For a container
+	// of a pod it is what the pod publishes: podman leaves a pod member's own
+	// PortBindings empty and reports the pod's mapping under the container's
+	// NetworkSettings, so this is read from both and the answer is the same
+	// question either way, which is the port this Process answers on, see
+	// PLAN.md section 5.6.
 	Publish []podman.PortMapping
+	// Pod is the runtime id of the pod this container belongs to, empty for
+	// the bare container a single unit Package runs as.
+	Pod string
 	// State is what the runtime calls this container: running, initialized,
 	// created, exited and the rest, see internal/podman. A pid alone does not
 	// say whether a container is running, because a container podman init
@@ -289,6 +381,7 @@ type containerInspect struct {
 		Cmd    []string          `json:"Cmd"`
 		Labels map[string]string `json:"Labels"`
 	} `json:"Config"`
+	Pod        string `json:"Pod"`
 	HostConfig struct {
 		CgroupParent  string `json:"CgroupParent"`
 		RestartPolicy struct {
@@ -298,6 +391,15 @@ type containerInspect struct {
 			HostPort string `json:"HostPort"`
 		} `json:"PortBindings"`
 	} `json:"HostConfig"`
+	// NetworkSettings is where a container of a pod carries the pod's
+	// published ports. Its own HostConfig.PortBindings is empty there,
+	// because the mapping belongs to the infra container that holds the
+	// network namespace. Verified against podman 5.7.0.
+	NetworkSettings struct {
+		Ports map[string][]struct {
+			HostPort string `json:"HostPort"`
+		} `json:"Ports"`
+	} `json:"NetworkSettings"`
 	// Mounts is the structured form podman reports a bind mount in.
 	// HostConfig.Binds carries the same mounts as one string each, options and
 	// all, which would have to be parsed back apart; this one is already the
@@ -327,6 +429,7 @@ func containerConfig(out string) (ContainerConfig, error) {
 		Labels:       first.Config.Labels,
 		Restart:      first.HostConfig.RestartPolicy.Name,
 		Command:      first.Config.Cmd,
+		Pod:          first.Pod,
 	}
 	if config.Labels == nil {
 		config.Labels = map[string]string{}
@@ -338,27 +441,41 @@ func containerConfig(out string) (ContainerConfig, error) {
 		}
 		config.Env[key] = value
 	}
-	for spec, bindings := range first.HostConfig.PortBindings {
-		// The key is <port>/<protocol> and kitbash publishes tcp only, so the
-		// protocol is dropped rather than carried into a mapping that has no
-		// field for it.
-		number, _, _ := strings.Cut(spec, "/")
-		containerPort, err := strconv.Atoi(number)
-		if err != nil || containerPort < 1 || containerPort > 65535 {
-			continue
-		}
-		for _, binding := range bindings {
-			hostPort, err := strconv.Atoi(binding.HostPort)
-			if err != nil || hostPort < 0 || hostPort > 65535 {
+	// The container's own bindings first, then the pod's. A container of a
+	// pod has none of its own and takes the pod's; a bare container has its
+	// own and the second map is empty, so nothing is read twice.
+	published := map[podman.PortMapping]bool{}
+	for _, bindings := range []map[string][]struct {
+		HostPort string `json:"HostPort"`
+	}{first.HostConfig.PortBindings, first.NetworkSettings.Ports} {
+		for spec, list := range bindings {
+			// The key is <port>/<protocol> and kitbash publishes tcp only, so
+			// the protocol is dropped rather than carried into a mapping that
+			// has no field for it.
+			number, _, _ := strings.Cut(spec, "/")
+			containerPort, err := strconv.Atoi(number)
+			if err != nil || containerPort < 1 || containerPort > 65535 {
 				continue
 			}
-			config.Publish = append(config.Publish, podman.PortMapping{
-				HostPort: hostPort, ContainerPort: containerPort,
-			})
+			for _, binding := range list {
+				hostPort, err := strconv.Atoi(binding.HostPort)
+				if err != nil || hostPort < 0 || hostPort > 65535 {
+					continue
+				}
+				mapping := podman.PortMapping{HostPort: hostPort, ContainerPort: containerPort}
+				if published[mapping] {
+					continue
+				}
+				published[mapping] = true
+				config.Publish = append(config.Publish, mapping)
+			}
 		}
 	}
 	sort.Slice(config.Publish, func(i, j int) bool {
-		return config.Publish[i].ContainerPort < config.Publish[j].ContainerPort
+		if config.Publish[i].ContainerPort != config.Publish[j].ContainerPort {
+			return config.Publish[i].ContainerPort < config.Publish[j].ContainerPort
+		}
+		return config.Publish[i].HostPort < config.Publish[j].HostPort
 	})
 	for _, mount := range first.Mounts {
 		// Only bind mounts are Files. A volume or a tmpfs is the runtime's own
@@ -810,9 +927,35 @@ func (p *Podman) RemoveAll(ctx context.Context, m Member) error {
 		}
 	}
 	if len(names) == 0 {
+		return p.removeAllPods(ctx, m)
+	}
+	if _, err := p.run(ctx, m, append([]string{"rm", "--force"}, names...)...); err != nil {
+		return err
+	}
+	// And the pods their Processes ran as. A pod whose containers are gone is
+	// still a pod, holding a name and a published port, so removing the
+	// containers alone would leave the account's Processes half on the host,
+	// see PLAN.md section 5.6.
+	return p.removeAllPods(ctx, m)
+}
+
+// removeAllPods force removes every kitbash pod of one member.
+func (p *Podman) removeAllPods(ctx context.Context, m Member) error {
+	out, err := p.run(ctx, m, "pod", "ps", "--filter", "label="+podman.LabelUser+"="+m.Name,
+		"--format", "{{.Name}}")
+	if err != nil {
+		return err
+	}
+	var pods []string
+	for _, line := range strings.Split(out, "\n") {
+		if name := strings.TrimSpace(line); name != "" {
+			pods = append(pods, name)
+		}
+	}
+	if len(pods) == 0 {
 		return nil
 	}
-	_, err = p.run(ctx, m, append([]string{"rm", "--force"}, names...)...)
+	_, err = p.run(ctx, m, append([]string{"pod", "rm", "--force"}, pods...)...)
 	return err
 }
 

@@ -76,9 +76,12 @@ func RegisterProcesses(s *mcp.Server, processes *proc.Service, b *bridge.Bridge)
 			"kitbash.user, kitbash.package, kitbash.name and kitbash.digest. With expose: mcp the manifest's " +
 			"tools join the caller's surface. A Process is identified by its Package path, so a name held " +
 			"by a Process of another Package is a conflict, and so is a tool name another running Process " +
-			"already answers. A Package of one container unit is what this runner runs: a Package that " +
-			"declares more than one is invalid-manifest saying composition of several units is not " +
-			"supported yet. Before the container starts the " +
+			"already answers. A Package of more than one container unit runs as one podman pod named " +
+			"kitbash-<package>-<name>, each unit a container kitbash-<package>-<name>-<unit>: the units " +
+			"share the pod's network namespace and reach each other on localhost, the pod publishes the " +
+			"port of the unit that declares expose mcp or http, each unit carries its own image, " +
+			"environment, command, mounts, secrets and limits, and the Process is running when every unit " +
+			"is. Before the container starts the " +
 			"Process is registered with kitbashd, which mints its Telemetry token; the container receives " +
 			"KITBASH_TELEMETRY_ENDPOINT, KITBASH_TELEMETRY_TOKEN, KITBASH_PROCESS, KITBASH_PACKAGE and " +
 			"KITBASH_USER. A Process whose manifest declares subscriptions: [telemetry] with expose: http " +

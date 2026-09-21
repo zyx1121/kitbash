@@ -17,6 +17,7 @@ const (
 	AttrUser     = "kitbash.user"
 	AttrPackage  = "kitbash.package"
 	AttrProcess  = "kitbash.process"
+	AttrUnit     = "kitbash.unit"
 	AttrPath     = "kitbash.path"
 	AttrTool     = "kitbash.tool"
 	AttrEval     = "kitbash.eval"
@@ -59,6 +60,7 @@ func attributes(resource map[string]any, record []*commonpb.KeyValue) store.Attr
 		AttrUser:     &attrs.User,
 		AttrPackage:  &attrs.Package,
 		AttrProcess:  &attrs.Process,
+		AttrUnit:     &attrs.Unit,
 		AttrPath:     &attrs.Path,
 		AttrTool:     &attrs.Tool,
 		AttrProducer: &attrs.Producer,

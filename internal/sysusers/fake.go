@@ -2,6 +2,7 @@ package sysusers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -54,7 +55,13 @@ type Fake struct {
 	StopGate           chan struct{}
 	RemoveContainerErr error
 	RemoveAllErr       error
-	CopyErr            error
+	// CreatePodErr, StopPodErr and RemovePodErr make the pod calls fail on
+	// demand, which is how a test stages a start that fails on the pod rather
+	// than on one of its units.
+	CreatePodErr error
+	StopPodErr   error
+	RemovePodErr error
+	CopyErr      error
 	// ImageInfoErr makes reading an image fail for a reason that is not a
 	// missing image, which is the host's failure and not the caller's.
 	ImageInfoErr error
@@ -134,6 +141,11 @@ type Fake struct {
 	RemovedContainers []StopCall
 	RemovedFor        []string
 	Copied            []CopyCall
+	// Pods, StoppedPods and RemovedPods are the pod calls, which is what a
+	// Process of more than one unit is made and taken apart by.
+	Pods        []PodCall
+	StoppedPods []StopCall
+	RemovedPods []StopCall
 
 	// stopping counts the Stop calls waiting on StopGate, which is what tells
 	// a test that a caller has reached the containers.
@@ -144,6 +156,10 @@ type Fake struct {
 	// made are the containers this fake created itself, which is what tells a
 	// container the heal made from the one it replaced, see Start.
 	made map[string]bool
+	// pods are the pods this fake holds, by name. A container created with
+	// Pod set belongs to one of them, and removing the pod removes every
+	// container that named it.
+	pods map[string]podman.PodOptions
 	// images is the image store of the fake host, one per member: which
 	// digests they hold, how big each one is and what its labels say it is a
 	// build of. A copy reads one member's and writes the other's, the way a
@@ -175,6 +191,17 @@ type StartCall struct {
 	UID       int
 	Container string
 	Cgroup    string
+}
+
+// PodCall is one recorded pod create, the same shape a container run is
+// recorded in: the options and the command line the runtime would have been
+// given, built by the same function the real runner uses.
+type PodCall struct {
+	Member  string
+	UID     int
+	Options podman.PodOptions
+	Args    []string
+	Cgroup  string
 }
 
 // RunCall is one recorded container run. Args is the command line the runtime
@@ -498,11 +525,26 @@ func (f *Fake) CreateContainer(_ context.Context, m Member, opts podman.RunOptio
 		Restart:      opts.Restart,
 		Publish:      opts.Publish,
 		Mounts:       opts.Mounts,
+		Pod:          opts.Pod,
+	}
+	// A container of a pod publishes what the pod publishes, which is what
+	// podman reports on it and what the real runner reads back, see
+	// internal/sysusers/runner.go.
+	if opts.Pod != "" {
+		f.Configs[opts.Name] = withPodPorts(f.Configs[opts.Name], f.pods[opts.Pod])
 	}
 	if f.RunID != "" {
 		return f.RunID, nil
 	}
 	return "container-" + opts.Name, nil
+}
+
+// withPodPorts is one container of a pod with the pod's published ports on it,
+// which is where podman reports them for a container that shares a network
+// namespace.
+func withPodPorts(config ContainerConfig, pod podman.PodOptions) ContainerConfig {
+	config.Publish = append([]podman.PortMapping(nil), pod.Publish...)
+	return config
 }
 
 // InitContainer gives a created container the pid and the mount namespace the real
@@ -776,6 +818,131 @@ func (f *Fake) RemoveContainer(_ context.Context, m Member, container string, fo
 	delete(f.Configs, container)
 	delete(f.Running, container)
 	return nil
+}
+
+// CreatePod records one pod create and makes the pod exist on this fake host.
+// A pod exists as a name and a set of containers: a container created with
+// Pod set is remembered as one of its units, and removing the pod removes
+// every one of them, the way podman pod rm does.
+func (f *Fake) CreatePod(_ context.Context, m Member, opts podman.PodOptions, cgroup string) (string, error) {
+	call := PodCall{
+		Member:  m.Name,
+		UID:     m.UID,
+		Options: opts,
+		Args:    podman.PodCreateArgs(opts),
+		Cgroup:  cgroup,
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.CreatePodErr != nil {
+		return "", f.CreatePodErr
+	}
+	f.Pods = append(f.Pods, call)
+	if f.pods == nil {
+		f.pods = map[string]podman.PodOptions{}
+	}
+	f.pods[opts.Name] = opts
+	return "pod-" + opts.Name, nil
+}
+
+// StopPod records one pod stop and stops every container in it.
+func (f *Fake) StopPod(ctx context.Context, m Member, pod string, timeout int) error {
+	f.mu.Lock()
+	if _, held := f.pods[pod]; !held || f.Missing[pod] {
+		f.mu.Unlock()
+		return fmt.Errorf("%w: %s", ErrNoPod, pod)
+	}
+	if f.StopPodErr != nil {
+		err := f.StopPodErr
+		f.mu.Unlock()
+		return err
+	}
+	f.StoppedPods = append(f.StoppedPods, StopCall{Member: m.Name, Container: pod, Timeout: timeout})
+	units := f.unitsOf(pod)
+	f.mu.Unlock()
+	for _, container := range units {
+		if err := f.Stop(ctx, m, container, timeout); err != nil && !errors.Is(err, ErrNoContainer) {
+			return err
+		}
+	}
+	return nil
+}
+
+// RemovePod records one pod removal and removes every container in it, the way
+// podman pod rm --force does.
+func (f *Fake) RemovePod(_ context.Context, m Member, pod string, force bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, held := f.pods[pod]; !held || f.Missing[pod] {
+		return fmt.Errorf("%w: %s", ErrNoPod, pod)
+	}
+	if f.RemovePodErr != nil {
+		return f.RemovePodErr
+	}
+	f.RemovedPods = append(f.RemovedPods, StopCall{Member: m.Name, Container: pod, Force: force})
+	for _, container := range f.unitsOf(pod) {
+		f.RemovedContainers = append(f.RemovedContainers, StopCall{
+			Member: m.Name, Container: container, Force: force,
+		})
+		delete(f.Configs, container)
+		delete(f.Running, container)
+		delete(f.made, container)
+	}
+	delete(f.pods, pod)
+	return nil
+}
+
+// PodState answers what this fake calls one pod: running when every container
+// in it is, exited otherwise, and ErrNoPod for one it does not have.
+func (f *Fake) PodState(_ context.Context, _ Member, pod string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, held := f.pods[pod]; !held || f.Missing[pod] {
+		return "", fmt.Errorf("%w: %s", ErrNoPod, pod)
+	}
+	units := f.unitsOf(pod)
+	for _, container := range units {
+		if f.Configs[container].State != podman.StateRunning {
+			return podman.StateExited, nil
+		}
+	}
+	if len(units) == 0 {
+		return podman.StateCreated, nil
+	}
+	return podman.StateRunning, nil
+}
+
+// unitsOf is the containers of one pod, by the name each was created under.
+// The caller holds the lock.
+func (f *Fake) unitsOf(pod string) []string {
+	var units []string
+	for name, config := range f.Configs {
+		if config.Pod == pod {
+			units = append(units, name)
+		}
+	}
+	sort.Strings(units)
+	return units
+}
+
+// PodCalls is every recorded pod create.
+func (f *Fake) PodCalls() []PodCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]PodCall(nil), f.Pods...)
+}
+
+// PodStops and PodRemovals are every recorded pod stop and pod removal.
+func (f *Fake) PodStops() []StopCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]StopCall(nil), f.StoppedPods...)
+}
+
+func (f *Fake) PodRemovals() []StopCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]StopCall(nil), f.RemovedPods...)
 }
 
 // Publish stages a container that publishes these host ports, which is what a
