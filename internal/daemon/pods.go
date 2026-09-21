@@ -144,14 +144,17 @@ func (s *Server) startPod(w http.ResponseWriter, r *http.Request, p store.Proces
 			writeProblem(w, problem.Internal(instance, err.Error(), ""))
 			return
 		}
-		// The file is gone before this answers, the same rule a single unit
-		// start follows: the container keeps the environment podman read out
-		// of it and no file holding a live token outlives the call.
-		defer s.removeEnvFile(p.ID, envFile)
 		unit.opts.EnvFile = envFile
-		if _, err := s.runner.CreateContainer(r.Context(), m, unit.opts, leaf); err != nil {
+		_, createErr := s.runner.CreateContainer(r.Context(), m, unit.opts, leaf)
+		// The file is gone as soon as the container has been made with it. It
+		// is not deferred to the end of the start: a pod writes one file per
+		// unit, and deferring would leave the first unit's file, holding this
+		// Process's live Telemetry token, on the host for as long as the rest
+		// of the pod takes to come up.
+		s.removeEnvFile(p.ID, envFile)
+		if createErr != nil {
 			s.tearDownPod(r.Context(), p, m)
-			writeProblem(w, s.runProblem(r, err, p, unit.opts))
+			writeProblem(w, s.runProblem(r, createErr, p, unit.opts))
 			return
 		}
 		if prob := s.prepareAndVerifyIn(r.Context(), instance, p, m,

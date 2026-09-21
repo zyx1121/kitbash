@@ -326,9 +326,10 @@ type ContainerConfig struct {
 	// Publish is what the container publishes on the host. For a container
 	// of a pod it is what the pod publishes: podman leaves a pod member's own
 	// PortBindings empty and reports the pod's mapping under the container's
-	// NetworkSettings, so this is read from both and the answer is the same
-	// question either way, which is the port this Process answers on, see
-	// PLAN.md section 5.6.
+	// NetworkSettings instead. Both are read and the pair is deduplicated,
+	// because a bare container that publishes a port has the same mapping
+	// under both. The answer is the same question either way, which is the
+	// port this Process answers on, see PLAN.md section 5.6.
 	Publish []podman.PortMapping
 	// Pod is the runtime id of the pod this container belongs to, empty for
 	// the bare container a single unit Package runs as.
@@ -441,9 +442,11 @@ func containerConfig(out string) (ContainerConfig, error) {
 		}
 		config.Env[key] = value
 	}
-	// The container's own bindings first, then the pod's. A container of a
-	// pod has none of its own and takes the pod's; a bare container has its
-	// own and the second map is empty, so nothing is read twice.
+	// The container's own bindings first, then what its network namespace
+	// reports. A container of a pod has no bindings of its own and the
+	// mapping is only under NetworkSettings; a bare container that publishes
+	// a port has it under both, which is why the pair is deduplicated rather
+	// than appended twice. Verified against podman 5.7.0.
 	published := map[podman.PortMapping]bool{}
 	for _, bindings := range []map[string][]struct {
 		HostPort string `json:"HostPort"`

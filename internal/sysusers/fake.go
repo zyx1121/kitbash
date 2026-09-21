@@ -65,6 +65,12 @@ type Fake struct {
 	// ImageInfoErr makes reading an image fail for a reason that is not a
 	// missing image, which is the host's failure and not the caller's.
 	ImageInfoErr error
+	// OnCreate is called at the top of CreateContainer, before anything is
+	// recorded, which is the one moment a test can look at the host as the
+	// caller left it: the environment file of this container exists and the
+	// files of whatever was made before it should not, see StopGate for the
+	// same idea in the other direction.
+	OnCreate func(opts podman.RunOptions)
 	// ConfigErr makes reading one container's configuration fail, which is a
 	// host whose runtime answers nothing about a container it has.
 	ConfigErr error
@@ -476,6 +482,12 @@ func (f *Fake) Start(_ context.Context, m Member, container, cgroup string) erro
 // runtime does too. An image named in Missing is ErrNoImage: the fake has no
 // image store, so the one thing a caller stages is an image that is not there.
 func (f *Fake) CreateContainer(_ context.Context, m Member, opts podman.RunOptions, cgroup string) (string, error) {
+	f.mu.Lock()
+	hook := f.OnCreate
+	f.mu.Unlock()
+	if hook != nil {
+		hook(opts)
+	}
 	call := RunCall{
 		Member:  m.Name,
 		UID:     m.UID,

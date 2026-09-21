@@ -77,6 +77,11 @@ type probe struct {
 	endpoint string
 	path     string
 	interval time.Duration
+	// unit is the name of the unit this probe requests, for a Process that
+	// runs as a pod: the face, which is the only unit that publishes a port
+	// and therefore the only one there is anything to probe. It is empty for
+	// a Process of one unit, which is the Package itself, see PLAN.md 5.6.
+	unit string
 
 	// next is when this Process is due and running whether a request for it
 	// is in flight. A probe that outlives its interval is waited for rather
@@ -188,6 +193,7 @@ func (pr *prober) track(p store.Process, now time.Time) {
 		current.endpoint = p.Endpoint
 		current.path = p.Health.HTTP
 		current.interval = pr.every(p.Health.Interval)
+		current.unit = probedUnit(p)
 		pr.mu.Unlock()
 		return
 	}
@@ -201,10 +207,26 @@ func (pr *prober) track(p store.Process, now time.Time) {
 		endpoint: p.Endpoint,
 		path:     p.Health.HTTP,
 		interval: pr.every(p.Health.Interval),
+		unit:     probedUnit(p),
 		next:     now,
 	}
 	pr.mu.Unlock()
 	pr.wake()
+}
+
+// probedUnit is the unit a probe of one Process is about: the face of a pod,
+// and nothing at all for a Process of one unit. The probe is the one record
+// kitbashd writes about a single unit of a composed Process, so it is the one
+// that carries kitbash.unit, see PLAN.md section 2.4.
+func probedUnit(p store.Process) string {
+	if !p.Composition.Declared() {
+		return ""
+	}
+	face, found := p.Composition.Face()
+	if !found {
+		return ""
+	}
+	return face.Name
 }
 
 // untrack stops probing one Process, which is what unregistering it does. A
@@ -575,6 +597,11 @@ func (s *Server) request(ctx context.Context, target probe) (bool, string) {
 // user is the member who owns the Process, because a probe is about their
 // Process; the producer is kitbashd, because a probe is not something the
 // Process said about itself.
+//
+// And the unit, for a Process that runs as a pod: a probe requests the face,
+// which is the only unit that publishes a port, so the reading is about that
+// unit and not about the Process as a whole. A Process of one unit carries
+// none, the same as every record of one, see PLAN.md section 5.6.
 func (s *Server) recordHealth(ctx context.Context, target probe, healthy bool, status string, at time.Time) {
 	value := float64(unhealthyValue)
 	if healthy {
@@ -588,6 +615,7 @@ func (s *Server) recordHealth(ctx context.Context, target probe, healthy bool, s
 			User:     target.owner,
 			Package:  target.pkg,
 			Process:  target.id,
+			Unit:     target.unit,
 			Path:     target.path,
 			Producer: InternalProducer,
 			Other:    map[string]any{AttrHealthStatus: status},

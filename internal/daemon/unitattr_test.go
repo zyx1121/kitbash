@@ -89,3 +89,50 @@ func TestASingleUnitProcessCarriesNoUnitOnItsRecords(t *testing.T) {
 		t.Errorf("the record carries the unit %q, want none", spans[0].Unit)
 	}
 }
+
+// The health probe is the one record kitbashd writes about a single unit of a
+// composed Process: it requests the face, which is the only unit that
+// publishes a port, so the reading is that unit's and the record says so, see
+// PLAN.md section 2.4.
+func TestTheProbeOfAPodCarriesTheFaceUnit(t *testing.T) {
+	h, fake := serveProbing(t)
+	stub := newProbeStub(t, http.StatusOK)
+
+	req := probeRegistration(stub.server.URL, "/healthz", "")
+	req.Container = "kitbash-board-board-web"
+	req.Pod = "kitbash-board-board"
+	req.Units = []unitRequest{
+		{Name: "web", Container: "kitbash-board-board-web", Digest: req.Digest, Face: true},
+		{Name: "cache", Container: "kitbash-board-board-cache", Digest: cacheDigest},
+	}
+	port, ok := endpointPort(stub.server.URL)
+	if !ok {
+		t.Fatalf("the endpoint %q names no port", stub.server.URL)
+	}
+	fake.Publish(req.Container, port)
+	if _, res, body := h.register(req); res.StatusCode != http.StatusOK {
+		t.Fatalf("register = %d %s, want 200", res.StatusCode, body)
+	}
+
+	record := h.waitForHealth("the health record of a pod")
+	if record.Attributes.Unit != "web" {
+		t.Errorf("the probe records the unit %q, want the face unit web", record.Attributes.Unit)
+	}
+	if record.Attributes.Process != req.ID {
+		t.Errorf("the probe records the Process %q, want %q", record.Attributes.Process, req.ID)
+	}
+}
+
+// A Process of one unit is the Package itself, so its probe names no unit: a
+// record that carried one would be about a container the surface has no name
+// for.
+func TestTheProbeOfASingleUnitProcessCarriesNoUnit(t *testing.T) {
+	h, fake := serveProbing(t)
+	stub := newProbeStub(t, http.StatusOK)
+	h.registerProbed(fake, stub.server.URL, "/healthz", "")
+
+	record := h.waitForHealth("the health record of a Process of one unit")
+	if record.Attributes.Unit != "" {
+		t.Errorf("the probe records the unit %q, want none", record.Attributes.Unit)
+	}
+}

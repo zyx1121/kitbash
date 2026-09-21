@@ -2,8 +2,11 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -420,5 +423,78 @@ func TestEachUnitCarriesItsOwnImageAndExposure(t *testing.T) {
 		if run.Options.Labels[podman.LabelPod] != "kitbash-board-board" {
 			t.Errorf("%s carries no pod label", run.Options.Name)
 		}
+	}
+}
+
+// The manifest schema bounds deploy.units at the same number the daemon does.
+// Two bounds that can drift are one bound that does not hold: a manifest the
+// schema accepts and the registration refuses is a Package a member can write
+// and cannot run.
+func TestTheSchemaBoundsTheUnitsAtTheSameNumber(t *testing.T) {
+	var schema struct {
+		Properties struct {
+			Deploy struct {
+				Properties struct {
+					Units struct {
+						MinItems int `json:"minItems"`
+						MaxItems int `json:"maxItems"`
+					} `json:"units"`
+				} `json:"properties"`
+			} `json:"deploy"`
+		} `json:"properties"`
+	}
+	body, err := os.ReadFile(filepath.Join("..", "..", "spec", "manifest.schema.json"))
+	if err != nil {
+		t.Fatalf("reading the manifest schema: %v", err)
+	}
+	if err := json.Unmarshal(body, &schema); err != nil {
+		t.Fatalf("decoding the manifest schema: %v", err)
+	}
+	units := schema.Properties.Deploy.Properties.Units
+	if units.MaxItems != MaxUnits {
+		t.Errorf("spec/manifest.schema.json bounds deploy.units at %d and this daemon at %d",
+			units.MaxItems, MaxUnits)
+	}
+	if units.MinItems != 1 {
+		t.Errorf("spec/manifest.schema.json requires %d units, want at least one", units.MinItems)
+	}
+}
+
+// The environment file of one unit holds this Process's live Telemetry token,
+// and it is removed as soon as the container has been made with it rather than
+// at the end of the start: a pod writes one file per unit, so a removal
+// deferred to the end would leave the first unit's token on the host for as
+// long as the rest of the pod takes to come up.
+func TestAUnitsEnvironmentFileIsGoneBeforeTheNextUnitIsMade(t *testing.T) {
+	h, fake := supervised(t)
+	id := h.supervisePod(h.user)
+	var held []int
+	fake.OnCreate = func(opts podman.RunOptions) {
+		entries, err := os.ReadDir(filepath.Dir(opts.EnvFile))
+		if err != nil {
+			t.Errorf("reading the environment directory: %v", err)
+			return
+		}
+		held = append(held, len(entries))
+	}
+
+	if res, body := h.start(id, podStart()); res.StatusCode != http.StatusOK {
+		t.Fatalf("start = %d %s, want 200", res.StatusCode, body)
+	}
+	if len(held) != 2 {
+		t.Fatalf("%d containers were made, want one per unit", len(held))
+	}
+	for i, n := range held {
+		if n != 1 {
+			t.Errorf("the host held %d environment files when unit %d was made, want only its own", n, i)
+		}
+	}
+	// And nothing is left when the start answers.
+	entries, err := os.ReadDir(h.server.envDir)
+	if err != nil {
+		t.Fatalf("reading the environment directory: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("%d environment files were left behind by a start that finished", len(entries))
 	}
 }
