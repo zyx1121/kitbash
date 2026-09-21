@@ -194,7 +194,9 @@ func stopThePair(t *testing.T, s *state) {
 	}
 
 	pod := "kitbash-" + pairName + "-" + pairName
-	pods, err := runAs(t, adminName(), "podman", "pod", "ps", "--all", "--format", "{{.Name}}")
+	// podman pod ps lists every pod and takes no --all: a pod that is stopped
+	// is still a pod, which is the thing this asks about.
+	pods, err := runAs(t, adminName(), "podman", "pod", "ps", "--format", "{{.Name}}")
 	if err != nil {
 		t.Fatalf("podman pod ps: %v\n%s", err, pods)
 	}
