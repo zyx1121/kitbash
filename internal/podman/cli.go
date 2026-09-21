@@ -389,7 +389,12 @@ func containerArgs(verb string, opts RunOptions, inline []string) []string {
 		}
 		args = append(args, "--publish", "127.0.0.1:"+host+":"+strconv.Itoa(port.ContainerPort))
 	}
-	return append(args, opts.Image)
+	args = append(args, opts.Image)
+	// The command the unit declared goes after the image, which is where
+	// podman reads the words that replace the image's own command. A unit
+	// that declared none adds nothing, so the image decides, see PLAN.md
+	// section 2.5.
+	return append(args, opts.Command...)
 }
 
 // MountSpec is one bind mount as podman spells it on a --mount flag.

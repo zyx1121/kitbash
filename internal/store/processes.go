@@ -191,10 +191,11 @@ func (h Health) JSON() string {
 // are the registration's own, and every run resolves each of them to the
 // owner's current value, the same as any start.
 type Schedule struct {
-	Cron   string            `json:"cron"`
-	Env    map[string]string `json:"env,omitempty"`
-	Memory string            `json:"memory,omitempty"`
-	CPU    string            `json:"cpu,omitempty"`
+	Cron    string            `json:"cron"`
+	Env     map[string]string `json:"env,omitempty"`
+	Command []string          `json:"command,omitempty"`
+	Memory  string            `json:"memory,omitempty"`
+	CPU     string            `json:"cpu,omitempty"`
 }
 
 // Declared reports whether this registration is a job at all.

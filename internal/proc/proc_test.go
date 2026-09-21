@@ -30,7 +30,7 @@ deploy:
     - type: container
       build: .
       expose: mcp
-      env: { LOG_LEVEL: debug }
+      environment: { LOG_LEVEL: debug }
       limits: { cpu: "1", memory: "512Mi" }
       restart: never
 `

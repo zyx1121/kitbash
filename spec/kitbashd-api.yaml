@@ -244,7 +244,7 @@ api:
   processes_register:
     method: POST
     path: /kitbash/v1/processes
-    request: { id: "UUIDv7", package: "/home/loki/echo", name: "echo", container: "kitbash-echo-echo", digest: "sha256:...", expose: "mcp|http|none", endpoint: "http://127.0.0.1:40275 when expose is http", hostname: "status.example.org when the unit declares one", subscriptions: ["telemetry"], runner: "/org/pve-runner when a run kit owns this Process", health: { http: "/healthz", interval: "30s" }, mounts: [{ source: "/home/loki/notes", target: "/files/notes", mode: "ro|rw" }], secrets: ["ANTHROPIC_API_KEY"], schedule: { cron: "0 8 * * *", env: { TZ: "UTC" }, memory: "512Mi", cpu: "1" } }
+    request: { id: "UUIDv7", package: "/home/loki/echo", name: "echo", container: "kitbash-echo-echo", digest: "sha256:...", expose: "mcp|http|none", endpoint: "http://127.0.0.1:40275 when expose is http", hostname: "status.example.org when the unit declares one", subscriptions: ["telemetry"], runner: "/org/pve-runner when a run kit owns this Process", health: { http: "/healthz", interval: "30s" }, mounts: [{ source: "/home/loki/notes", target: "/files/notes", mode: "ro|rw" }], secrets: ["ANTHROPIC_API_KEY"], schedule: { cron: "0 8 * * *", env: { TZ: "UTC" }, command: ["node", "tick.js"], memory: "512Mi", cpu: "1" } }
     response: { id: "UUIDv7", token: "opaque, at least 32 bytes of entropy, returned once", fanoutSecret: "opaque, 32 bytes, returned once; the bearer the fan out presents to this Process", host: "echo.loki.kitbash.example, the name the proxy serves this Process under, absent on a host with no domain", nextRun: "2026-09-20T08:00:00Z, when kitbashd runs a registered job next, absent for a Process that stays up" }
     authorization: >
       The caller is the member the Process belongs to; kitbashd records the
@@ -323,10 +323,13 @@ api:
       { container: "kitbash-echo-echo, optional and checked against the
       registration", image: "sha256:..., optional, the registration's digest by
       default", labels: { "kitbash.commit": "..." }, env: { LOG_LEVEL: debug },
-      restart: "always|on-failure|no", cpu: "1", memory: "512Mi", pidsLimit:
+      command: ["node", "server.js"], restart: "always|on-failure|no", cpu:
+      "1", memory: "512Mi", pidsLimit:
       512, publish: [{ hostPort: 40275, containerPort: 8080 }] }. The unit's
       own environment only: kitbashd writes its own seven variables itself, so
-      no token and no secret is ever in a request body. The mounts are not in
+      no token and no secret is ever in a request body. The command is the
+      unit's own too, the words podman is given after the image, and it is
+      empty for a unit that runs the command of its image. The mounts are not in
       the request: they are the registration's, and the request would be a
       second place they could be claimed from.
     response: { id: "UUIDv7", container: "kitbash-echo-echo", containerId: "the id the runtime gave it" }

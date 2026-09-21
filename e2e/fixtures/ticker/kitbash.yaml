@@ -15,4 +15,4 @@ deploy:
       # Every minute, read in UTC, so the job the end to end host registers
       # runs inside the wait that step gives it.
       schedule: "* * * * *"
-      env: { TICKER_NOTE: "the end to end job" }
+      environment: { TICKER_NOTE: "the end to end job" }

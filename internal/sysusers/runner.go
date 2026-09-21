@@ -234,6 +234,11 @@ type ContainerConfig struct {
 	Labels map[string]string
 	// Restart is the restart policy, empty when the container has none.
 	Restart string
+	// Command is what the container was created to run, as the runtime
+	// reports it: the words of the unit's own command, or the command of the
+	// image when the unit declared none. A container that has to be made
+	// again is made with it, so a heal does not drop what the unit declared.
+	Command []string
 	// Publish is what the container publishes on the host.
 	Publish []podman.PortMapping
 	// State is what the runtime calls this container: running, initialized,
@@ -281,6 +286,7 @@ type containerInspect struct {
 	} `json:"State"`
 	Config struct {
 		Env    []string          `json:"Env"`
+		Cmd    []string          `json:"Cmd"`
 		Labels map[string]string `json:"Labels"`
 	} `json:"Config"`
 	HostConfig struct {
@@ -320,6 +326,7 @@ func containerConfig(out string) (ContainerConfig, error) {
 		Env:          map[string]string{},
 		Labels:       first.Config.Labels,
 		Restart:      first.HostConfig.RestartPolicy.Name,
+		Command:      first.Config.Cmd,
 	}
 	if config.Labels == nil {
 		config.Labels = map[string]string{}

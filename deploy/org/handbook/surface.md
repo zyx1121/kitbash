@@ -123,9 +123,9 @@ their own set and reads nobody else's.
 
 A value is one line: at most 8192 bytes, no NUL and no line break, because the
 environment file a Process is given is line based. A name matches
-`^[A-Z][A-Z0-9_]{0,63}$`, may not be one the unit's `env` also sets and may not
-be a `KITBASH_` name, which kitbashd speaks for; a manifest that does either is
-`invalid-manifest`. A declared name the owner has not set is `not-found` at
+`^[A-Z][A-Z0-9_]{0,63}$`, may not be one the unit's `environment` also sets
+and may not be a `KITBASH_` name, which kitbashd speaks for; a manifest that
+does either is `invalid-manifest`. A declared name the owner has not set is `not-found` at
 `proc_run`, naming the secret.
 
 ## Paths

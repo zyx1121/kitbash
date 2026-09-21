@@ -9,7 +9,7 @@ deploy:
       expose: http
       port: 8080
       restart: never
-      env:
+      environment:
         CACHE_HOST: {dep_host}
       health: { http: /healthz, interval: 30s }
       limits: { cpu: "1", memory: "256Mi" }

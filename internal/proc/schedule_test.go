@@ -21,7 +21,7 @@ deploy:
       build: .
       expose: none
       schedule: "0 8 * * *"
-      env: { CITY: taipei }
+      environment: { CITY: taipei }
       limits: { cpu: "1", memory: "512Mi" }
 `
 

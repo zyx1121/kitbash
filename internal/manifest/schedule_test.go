@@ -31,10 +31,14 @@ func TestUnitCarriesTheDeclaredSchedule(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	unit, ok := m.Unit()
-	if !ok {
+	units, err := m.Units()
+	if err != nil {
+		t.Fatalf("Units: %v", err)
+	}
+	if len(units) == 0 {
 		t.Fatal("the manifest has no unit")
 	}
+	unit := units[0]
 	if unit.Schedule != "0 8 * * *" {
 		t.Errorf("the unit declares schedule %q, want %q", unit.Schedule, "0 8 * * *")
 	}
@@ -57,7 +61,7 @@ deploy:
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	if unit, _ := plain.Unit(); unit.Scheduled() {
+	if plainUnits, _ := plain.Units(); plainUnits[0].Scheduled() {
 		t.Error("a unit with no schedule reads as a job")
 	}
 }
