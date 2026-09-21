@@ -97,19 +97,19 @@ var secretName = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,63}$`)
 func ValidSecretName(name string) bool { return secretName.MatchString(name) }
 
 // checkSecrets is the part of the secrets rule no JSON Schema can express: a
-// name the unit's own env also sets, and a name kitbashd speaks for. The shape
-// of a name, the count and the duplicates are in spec/manifest.schema.json,
-// which has already run when this does.
+// name the unit's own environment also sets, and a name kitbashd speaks for.
+// The shape of a name, the count and the duplicates are in
+// spec/manifest.schema.json, which has already run when this does.
 //
 // A collision is refused rather than resolved because either resolution is a
 // surprise: dropping the secret starts a Process without the credential it
-// declared, and dropping the env entry drops a line of the manifest that is
-// written in front of the member. Both names are theirs to change.
+// declared, and dropping the environment entry drops a line of the manifest
+// that is written in front of the member. Both names are theirs to change.
 func checkSecrets(raw map[string]any) []string {
 	var messages []string
 	for i, unit := range units(raw) {
 		env := map[string]bool{}
-		if declared, ok := unit["env"].(map[string]any); ok {
+		if declared, ok := unit["environment"].(map[string]any); ok {
 			for key := range declared {
 				env[key] = true
 			}
@@ -130,7 +130,7 @@ func checkSecrets(raw map[string]any) []string {
 			}
 			if env[name] {
 				messages = append(messages, fmt.Sprintf(
-					"%s: %s is also set by deploy.units[%d].env, so the unit declares it twice", where, name, i))
+					"%s: %s is also set by deploy.units[%d].environment, so the unit declares it twice", where, name, i))
 			}
 		}
 	}
@@ -174,8 +174,9 @@ type Mount struct {
 	Mode   string `json:"mode,omitempty"`
 }
 
-// Unit is one entry of deploy.units, read as a container unit. Version 1 runs
-// the first unit of a Package.
+// Unit is one entry of deploy.units, read as a container unit. A Package may
+// declare several; version 1 runs one of them, see Units and PLAN.md
+// section 5.6.
 //
 // Builder and Runner name the Package folder of a kit that builds or runs this
 // unit in place of the built in path, see PLAN.md section 3. They sit beside
@@ -185,9 +186,14 @@ type Mount struct {
 // manifest written before this existed.
 //
 // Raw is the unit as the manifest wrote it, which is what a run kit is handed:
-// the kit decides what image, expose, port, env, health, limits and restart
+// the kit decides what image, expose, port, environment, health, limits and restart
 // mean where it runs a Process, and kitbash does not translate them for it.
 type Unit struct {
+	// Name is what this unit is called inside its Package, required once a
+	// Package declares more than one and unique among them, empty for the
+	// single unit of a Package that is one container. What names that one is
+	// the Package, which is how every manifest written before this read.
+	Name    string
 	Type    string
 	Build   string
 	Image   string
@@ -206,19 +212,23 @@ type Unit struct {
 	// subscriptions, which checkSchedule is what refuses, see PLAN.md
 	// section 2.3 and cron.go.
 	Schedule string
-	Env      map[string]string
-	Health   map[string]any
-	Limits   Limits
-	Restart  string
+	// Command is what the container runs in place of the CMD of its image,
+	// as compose spells it: a list of arguments, not a shell line. A unit
+	// that declares none runs the image's own command.
+	Command     []string
+	Environment map[string]string
+	Health      map[string]any
+	Limits      Limits
+	Restart     string
 	// Mounts are the folders of Files this unit asks to see, at most four,
 	// see PLAN.md section 2.3. They are read as the manifest wrote them:
 	// kitbashd resolves them as root and is the one that decides.
 	Mounts []Mount
 	// Secrets are the environment variable names this unit needs and does not
-	// get from the image, from Env or from kitbashd, at most MaxSecrets of
-	// them. Only the names are here and only the names ever travel: the
-	// values live with kitbashd, and a start resolves each name to the
-	// owner's current value, see PLAN.md section 2.3.
+	// get from the image, from Environment or from kitbashd, at most
+	// MaxSecrets of them. Only the names are here and only the names ever
+	// travel: the values live with kitbashd, and a start resolves each name
+	// to the owner's current value, see PLAN.md section 2.3.
 	Secrets []string
 	Raw     map[string]any
 }
@@ -335,21 +345,41 @@ func (m *Manifest) HasKit(hook string) bool {
 	return false
 }
 
-// Unit returns deploy.units[0], the unit version 1 builds and runs.
-func (m *Manifest) Unit() (Unit, bool) {
-	deploy, ok := m.Raw["deploy"].(map[string]any)
-	if !ok {
-		return Unit{}, false
+// Units returns every unit of deploy.units, in the order the manifest wrote
+// them, with the rules no JSON Schema can express read again: a name every
+// unit of a Package with several carries, unique among them, and the one unit
+// that is the Process's face. A folder that is not a Package answers no units
+// and no error, which is a folder nothing runs rather than a manifest that is
+// wrong.
+//
+// It reads every unit rather than the first because a Package is what its
+// manifest says and not what version 1 ran, see PLAN.md section 5.6. What runs
+// them is still one unit until the runner runs a pod: internal/proc refuses a
+// Package with more than one, naming the reason.
+//
+// The rules are checked here as well as in Parse so a Manifest a caller built
+// by hand is held to them too, and so the message a caller shows comes from
+// the package that owns the rule.
+func (m *Manifest) Units() ([]Unit, error) {
+	raw := units(m.Raw)
+	if len(raw) == 0 {
+		return nil, nil
 	}
-	units, ok := deploy["units"].([]any)
-	if !ok || len(units) == 0 {
-		return Unit{}, false
+	if messages := checkUnits(m.Raw); len(messages) > 0 {
+		return nil, &ErrInvalid{Messages: messages}
 	}
-	raw, ok := units[0].(map[string]any)
-	if !ok {
-		return Unit{}, false
+	list := make([]Unit, 0, len(raw))
+	for _, entry := range raw {
+		list = append(list, readUnit(entry))
 	}
+	return list, nil
+}
+
+// readUnit is one entry of deploy.units as the typed unit the core reads. The
+// document is kept in Raw beside it, which is what a run kit is handed.
+func readUnit(raw map[string]any) Unit {
 	unit := Unit{Expose: ExposeNone, Restart: RestartAlways, Raw: raw}
+	unit.Name, _ = raw["name"].(string)
 	unit.Type, _ = raw["type"].(string)
 	unit.Build, _ = raw["build"].(string)
 	unit.Image, _ = raw["image"].(string)
@@ -364,11 +394,18 @@ func (m *Manifest) Unit() (Unit, bool) {
 	unit.Port = intOf(raw["port"])
 	unit.Hostname, _ = raw["hostname"].(string)
 	unit.Schedule, _ = raw["schedule"].(string)
-	if env, ok := raw["env"].(map[string]any); ok {
-		unit.Env = map[string]string{}
-		for k, v := range env {
+	if command, ok := raw["command"].([]any); ok {
+		for _, entry := range command {
+			if word, ok := entry.(string); ok {
+				unit.Command = append(unit.Command, word)
+			}
+		}
+	}
+	if environment, ok := raw["environment"].(map[string]any); ok {
+		unit.Environment = map[string]string{}
+		for k, v := range environment {
 			if s, ok := v.(string); ok {
-				unit.Env[k] = s
+				unit.Environment[k] = s
 			}
 		}
 	}
@@ -397,7 +434,7 @@ func (m *Manifest) Unit() (Unit, bool) {
 		unit.Limits.CPU, _ = limits["cpu"].(string)
 		unit.Limits.Memory, _ = limits["memory"].(string)
 	}
-	return unit, true
+	return unit
 }
 
 // intOf reads a JSON number, which the validator hands back as a json.Number.

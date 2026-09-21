@@ -120,10 +120,11 @@ type processRequest struct {
 // the daemon at all, see PLAN.md section 2.3. No value of a secret is in it,
 // the same as every other body here.
 type scheduleRequest struct {
-	Cron   string            `json:"cron"`
-	Env    map[string]string `json:"env,omitempty"`
-	Memory string            `json:"memory,omitempty"`
-	CPU    string            `json:"cpu,omitempty"`
+	Cron    string            `json:"cron"`
+	Env     map[string]string `json:"env,omitempty"`
+	Command []string          `json:"command,omitempty"`
+	Memory  string            `json:"memory,omitempty"`
+	CPU     string            `json:"cpu,omitempty"`
 }
 
 // healthRequest is the probe a registration declares, which is the part of
@@ -388,7 +389,7 @@ func declaredSchedule(req *scheduleRequest) store.Schedule {
 	if req == nil {
 		return store.Schedule{}
 	}
-	held := store.Schedule{Cron: req.Cron, Env: req.Env, Memory: req.Memory, CPU: req.CPU}
+	held := store.Schedule{Cron: req.Cron, Env: req.Env, Command: req.Command, Memory: req.Memory, CPU: req.CPU}
 	// The expression is stored as this daemon read it, fields separated by one
 	// space, rather than as the member spaced them: what kitbashd holds is
 	// what it will run, and a listing that echoed the manifest's own spacing
@@ -755,6 +756,9 @@ func validateSchedule(instance string, req processRequest) *problem.Problem {
 			fmt.Sprintf("Remove deploy.units[0].schedule from this Package, or have %s start what it runs on time.", req.Runner))
 	}
 	if prob := checkEnv(instance, req.Schedule.Env); prob != nil {
+		return prob
+	}
+	if prob := checkCommand(instance, req.Schedule.Command); prob != nil {
 		return prob
 	}
 	if req.Schedule.Memory != "" && !podman.ValidMemory(podman.MemoryLimit(req.Schedule.Memory)) {

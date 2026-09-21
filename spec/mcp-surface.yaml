@@ -578,7 +578,10 @@ families:
           its container name: a name already held by a Process of another
           Package is a conflict, and so is a tool name another running Process
           already answers, which leaves the Process running with its tools off
-          the surface. Version 1 runs the first container unit. Before the
+          the surface. A Package of one container unit is what this runner
+          runs: a Package that declares more than one is invalid-manifest
+          saying composition of several units is not supported yet, until the
+          runner runs a Package as one pod, see PLAN.md section 5.6. Before the
           container starts the Process is registered with kitbashd, which
           mints its Telemetry token; the container receives
           KITBASH_TELEMETRY_ENDPOINT, KITBASH_TELEMETRY_TOKEN, KITBASH_PROCESS,

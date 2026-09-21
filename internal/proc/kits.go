@@ -87,8 +87,9 @@ func (s *Service) runWithKit(ctx context.Context, span *telemetry.Span, m *manif
 		return nil, prob
 	}
 	// The unit travels to the kit as the manifest wrote it: what image,
-	// expose, port, env, health, limits and restart mean is the kit's to
-	// decide where it runs a Process, and kitbash translates none of it.
+	// expose, port, environment, health, limits and restart mean is the
+	// kit's to decide where it runs a Process, and kitbash translates none
+	// of it.
 	args := map[string]any{
 		"package": folder,
 		"digest":  digest,

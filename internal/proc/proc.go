@@ -311,10 +311,24 @@ func (s *Service) run(ctx context.Context, span *telemetry.Span, path, digest, n
 		return nil, problem.InvalidManifest(folder, fmt.Sprintf(
 			"the Package name %q is a built in tool family, so its tools would collide with the surface", m.Name))
 	}
-	unit, ok := m.Unit()
-	if !ok || unit.Type != manifest.UnitContainer {
+	units, err := m.Units()
+	if err != nil {
+		return nil, problem.InvalidManifest(folder, err.Error())
+	}
+	// Reading every unit is what the manifest layer does; running every unit
+	// is the runner's, and the runner runs one container and not a pod. A
+	// Package that declares more than one is refused here rather than run
+	// half, so a member is told which part of M12 has landed, see PLAN.md
+	// section 5.6.
+	if len(units) > 1 {
+		return nil, problem.InvalidManifestFix(folder,
+			"composition of several units is not supported yet",
+			"Declare one unit in deploy.units, or wait for the release that runs a Package as a pod.")
+	}
+	if len(units) == 0 || units[0].Type != manifest.UnitContainer {
 		return nil, problem.InvalidManifest(folder, "version 1 runs the first container unit of a Package")
 	}
+	unit := units[0]
 	// A unit that names a runner is the kit's to start. Dispatch is routing
 	// and not a third built in: the built in rootless podman runner below is
 	// still what runs every Package that names none, see PLAN.md section 3.
@@ -346,7 +360,8 @@ func (s *Service) run(ctx context.Context, span *telemetry.Span, path, digest, n
 		Name:        container,
 		Image:       image.ID,
 		Labels:      s.labels(folder, name, image.ID, unit.Expose),
-		Env:         unit.Env,
+		Env:         unit.Environment,
+		Command:     unit.Command,
 		Restart:     restartPolicy(unit.Restart),
 		CPUs:        unit.Limits.CPU,
 		Memory:      podman.MemoryLimit(unit.Limits.Memory),
@@ -743,8 +758,8 @@ func (s *Service) Reconcile(ctx context.Context, running []Process) (registered,
 			// already, so it keeps what its manifest declares it may call and
 			// the health path it declares.
 			reg.Permits = m.Permits()
-			if unit, ok := m.Unit(); ok {
-				reg.Health = s.health(p.Package, unit)
+			if units, err := m.Units(); err == nil && len(units) > 0 {
+				reg.Health = s.health(p.Package, units[0])
 			}
 		}
 		if _, _, prob := s.registry.RegisterProcess(ctx, reg); prob != nil {
@@ -799,6 +814,7 @@ func startOptions(opts podman.RunOptions) telemetry.StartOptions {
 		Restart:   opts.Restart,
 		CPU:       opts.CPUs,
 		Memory:    opts.Memory,
+		Command:   opts.Command,
 	}
 	for _, port := range opts.Publish {
 		out.Publish = append(out.Publish, telemetry.PortMapping{

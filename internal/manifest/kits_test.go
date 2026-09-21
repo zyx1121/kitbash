@@ -22,10 +22,14 @@ deploy:
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	unit, ok := m.Unit()
-	if !ok {
+	units, err := m.Units()
+	if err != nil {
+		t.Fatalf("Units: %v", err)
+	}
+	if len(units) == 0 {
 		t.Fatal("the manifest carries no unit")
 	}
+	unit := units[0]
 	if unit.Builder != "/org/nix-build" {
 		t.Errorf("the builder is %q, want the Package folder the manifest names", unit.Builder)
 	}
@@ -51,10 +55,14 @@ deploy:
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	unit, ok := m.Unit()
-	if !ok {
+	units, err := m.Units()
+	if err != nil {
+		t.Fatalf("Units: %v", err)
+	}
+	if len(units) == 0 {
 		t.Fatal("the manifest carries no unit")
 	}
+	unit := units[0]
 	if unit.Builder != "" || unit.Runner != "" {
 		t.Errorf("the unit names the builder %q and the runner %q, want neither: this is every manifest written before the fields existed",
 			unit.Builder, unit.Runner)

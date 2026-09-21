@@ -133,10 +133,11 @@ type Registration struct {
 // Schedule is one job on the wire: the cron expression, and what a tick starts
 // the container with.
 type Schedule struct {
-	Cron   string            `json:"cron"`
-	Env    map[string]string `json:"env,omitempty"`
-	Memory string            `json:"memory,omitempty"`
-	CPU    string            `json:"cpu,omitempty"`
+	Cron    string            `json:"cron"`
+	Env     map[string]string `json:"env,omitempty"`
+	Command []string          `json:"command,omitempty"`
+	Memory  string            `json:"memory,omitempty"`
+	CPU     string            `json:"cpu,omitempty"`
 }
 
 // LastRun is one finished run as processes_list answers it.

@@ -147,6 +147,10 @@ type RunOptions struct {
 	// through and removes nothing; one that leaves it empty gets a file
 	// written and removed around the call.
 	EnvFile string
+	// Command is what the container runs in place of the command of its
+	// image, as the unit declared it. podman reads it as the words after the
+	// image, so an empty one leaves the image's own command in place.
+	Command []string
 }
 
 // Runner is the container runtime kitbash drives. The CLI implementation talks

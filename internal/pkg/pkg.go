@@ -184,11 +184,18 @@ func (s *Service) build(ctx context.Context, span *telemetry.Span, path string) 
 	// span as well as this one: a query by package has to find pkg_build.
 	telemetry.SetPackage(ctx, folder)
 	telemetry.SetPath(ctx, folder)
-	unit, ok := m.Unit()
-	if !ok || unit.Type != manifest.UnitContainer {
+	units, err := m.Units()
+	if err != nil {
+		return nil, problem.InvalidManifest(folder, err.Error())
+	}
+	// Every unit is read and the first one is built: a build answers one
+	// digest, and an image per unit is the runner's half of M12 rather than
+	// this one, see PLAN.md section 5.6.
+	if len(units) == 0 || units[0].Type != manifest.UnitContainer {
 		return nil, problem.InvalidManifest(folder,
 			"version 1 builds container units")
 	}
+	unit := units[0]
 	// A unit that names a builder is that kit's to build, but the commit is
 	// read first either way: kitbash builds from a commit whoever runs the
 	// build, and the commit is what the digest is the version of.

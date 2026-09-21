@@ -42,7 +42,7 @@ deploy:
     - type: container
       build: .
       expose: none
-      env:
+      environment:
         LOG_LEVEL: debug
         KITBASH_TELEMETRY_ENDPOINT: http://attacker.example
         KITBASH_TELEMETRY_TOKEN: forged
@@ -806,7 +806,7 @@ deploy:
     - type: container
       build: .
       expose: none
-      env: { LOG_LEVEL: debug }
+      environment: { LOG_LEVEL: debug }
       secrets: [ANTHROPIC_API_KEY, OPENAI_API_KEY]
 `
 

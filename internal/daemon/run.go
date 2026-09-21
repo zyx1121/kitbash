@@ -97,6 +97,8 @@ const (
 	MaxLabels       = 32
 	MaxLabelBytes   = 512
 	MaxPublishPorts = 8
+	MaxCommandWords = 64
+	MaxCommandBytes = 4096
 )
 
 // envKey is the shape of an environment variable name. It reaches a file
@@ -122,6 +124,11 @@ type startRequest struct {
 	Memory    string            `json:"memory,omitempty"`
 	PidsLimit int               `json:"pidsLimit,omitempty"`
 	Publish   []portMapping     `json:"publish,omitempty"`
+	// Command is what the container runs in place of the command of its
+	// image, as the unit declared it. It is the one field of a start request
+	// that lands on podman's command line by design, because that is where
+	// the arguments after an image go; nothing of the environment ever does.
+	Command []string `json:"command,omitempty"`
 }
 
 // portMapping is one published port. A host port of zero leaves the choice to
@@ -617,7 +624,36 @@ func runOptions(instance string, p store.Process, req startRequest) (podman.RunO
 	if prob := checkEnv(instance, req.Env); prob != nil {
 		return podman.RunOptions{}, prob
 	}
+	if prob := checkCommand(instance, req.Command); prob != nil {
+		return podman.RunOptions{}, prob
+	}
+	opts.Command = req.Command
 	return opts, nil
+}
+
+// checkCommand holds the command a unit declared to a shape that can be
+// written after an image on a command line. It is bounded for the reason the
+// environment is: a request body is not a place to build an arbitrarily long
+// argument list out of.
+func checkCommand(instance string, command []string) *problem.Problem {
+	if len(command) > MaxCommandWords {
+		return problem.BadRequest(instance,
+			fmt.Sprintf("a unit may declare at most %d words of command, not %d", MaxCommandWords, len(command)),
+			"Put a long command in the image, and name it in deploy.units[].command in a few words.")
+	}
+	for _, word := range command {
+		if word == "" {
+			return problem.BadRequest(instance,
+				"a word of the command is empty, which is an argument the container cannot be given",
+				"Write every word of deploy.units[].command.")
+		}
+		if len(word) > MaxCommandBytes {
+			return problem.BadRequest(instance,
+				fmt.Sprintf("a word of the command is longer than the %d bytes this API carries", MaxCommandBytes),
+				"Give the Process a file to read instead of a long argument.")
+		}
+	}
+	return nil
 }
 
 // labelsOf is the whole Process record as it goes onto the container. The
@@ -666,7 +702,7 @@ func checkEnv(instance string, env map[string]string) *problem.Problem {
 	if len(env) > MaxEnvEntries {
 		return problem.BadRequest(instance,
 			fmt.Sprintf("a unit may declare at most %d environment variables", MaxEnvEntries),
-			"Declare fewer variables in deploy.units[0].env.")
+			"Declare fewer variables in deploy.units[0].environment.")
 	}
 	for k, v := range env {
 		if len(k) > MaxEnvKeyBytes || !envKey.MatchString(k) {

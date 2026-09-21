@@ -30,10 +30,14 @@ func TestUnitCarriesTheDeclaredSecretNames(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	unit, ok := m.Unit()
-	if !ok {
+	units, err := m.Units()
+	if err != nil {
+		t.Fatalf("Units: %v", err)
+	}
+	if len(units) == 0 {
 		t.Fatal("the manifest has no unit")
 	}
+	unit := units[0]
 	if len(unit.Secrets) != 2 || unit.Secrets[0] != "ANTHROPIC_API_KEY" || unit.Secrets[1] != "OPENAI_API_KEY" {
 		t.Errorf("the unit declares %v, want the two names in manifest order", unit.Secrets)
 	}
@@ -57,7 +61,7 @@ func TestSecretsRefusals(t *testing.T) {
 		"more than sixteen names":      "      secrets: [" + names(17) + "]\n",
 		"a name kitbashd speaks for":   "      secrets: [KITBASH_TELEMETRY_TOKEN]\n",
 		"any other KITBASH_ name":      "      secrets: [KITBASH_ANYTHING]\n",
-		"a name env also sets": "      env: { ANTHROPIC_API_KEY: \"in the manifest\" }\n" +
+		"a name environment also sets": "      environment: { ANTHROPIC_API_KEY: \"in the manifest\" }\n" +
 			"      secrets: [ANTHROPIC_API_KEY]\n",
 	}
 	for name, block := range cases {

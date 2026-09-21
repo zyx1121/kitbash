@@ -13,6 +13,6 @@ deploy:
       build: .
       expose: http
       port: 8080
-      env:
+      environment:
         # Milliseconds. A surface span slower than this is judged slow.
         KITBASH_EVAL_THRESHOLD_MS: "1000"

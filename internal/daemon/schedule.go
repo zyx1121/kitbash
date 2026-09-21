@@ -752,6 +752,9 @@ func scheduleOptions(instance string, p store.Process) (podman.RunOptions, *prob
 		opts.Memory = podman.MemoryLimit(p.Schedule.Memory)
 	}
 	opts.CPUs = p.Schedule.CPU
+	// The command the unit declared travels with the registration, because a
+	// tick has no session behind it to send one, see declaredSchedule.
+	opts.Command = p.Schedule.Command
 	labels, prob := labelsOf(instance, p, nil)
 	if prob != nil {
 		return podman.RunOptions{}, prob

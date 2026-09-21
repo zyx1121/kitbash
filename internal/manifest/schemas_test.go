@@ -198,10 +198,14 @@ deploy:
 			if err != nil {
 				t.Fatalf("parsing the manifest: %v", err)
 			}
-			unit, ok := m.Unit()
-			if !ok {
+			units, err := m.Units()
+			if err != nil {
+				t.Fatalf("Units: %v", err)
+			}
+			if len(units) == 0 {
 				t.Fatal("the manifest carries a deploy block but no unit was read")
 			}
+			unit := units[0]
 			path, interval := unit.HealthProbe()
 			if path != tc.path || interval != tc.interval {
 				t.Errorf("HealthProbe() = %q, %q, want %q, %q", path, interval, tc.path, tc.interval)
@@ -221,16 +225,20 @@ deploy:
     - type: container
       build: src
       port: 8080
-      env: { LOG_LEVEL: debug }
+      environment: { LOG_LEVEL: debug }
       limits: { cpu: "1", memory: "512Mi" }
 `))
 	if err != nil {
 		t.Fatalf("parsing the manifest: %v", err)
 	}
-	unit, ok := m.Unit()
-	if !ok {
+	units, err := m.Units()
+	if err != nil {
+		t.Fatalf("Units: %v", err)
+	}
+	if len(units) == 0 {
 		t.Fatal("the manifest carries a deploy block but no unit was read")
 	}
+	unit := units[0]
 	if unit.Expose != manifest.ExposeNone {
 		t.Errorf("expose defaults to %q, want none", unit.Expose)
 	}
@@ -243,8 +251,8 @@ deploy:
 	if unit.Build != "src" {
 		t.Errorf("build is %q, want src", unit.Build)
 	}
-	if unit.Env["LOG_LEVEL"] != "debug" {
-		t.Errorf("env is %v, want LOG_LEVEL debug", unit.Env)
+	if unit.Environment["LOG_LEVEL"] != "debug" {
+		t.Errorf("environment is %v, want LOG_LEVEL debug", unit.Environment)
 	}
 	if unit.Limits.CPU != "1" || unit.Limits.Memory != "512Mi" {
 		t.Errorf("limits are %+v, want cpu 1 and memory 512Mi", unit.Limits)

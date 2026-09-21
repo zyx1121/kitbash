@@ -163,10 +163,11 @@ type Health struct {
 // processes_list answers the cron alone, which is what a member reads; the
 // rest is what kitbashd needs and already holds.
 type Schedule struct {
-	Cron   string            `json:"cron"`
-	Env    map[string]string `json:"env,omitempty"`
-	Memory string            `json:"memory,omitempty"`
-	CPU    string            `json:"cpu,omitempty"`
+	Cron    string            `json:"cron"`
+	Env     map[string]string `json:"env,omitempty"`
+	Command []string          `json:"command,omitempty"`
+	Memory  string            `json:"memory,omitempty"`
+	CPU     string            `json:"cpu,omitempty"`
 }
 
 // LastRun is the run one job finished most recently: when kitbashd started the

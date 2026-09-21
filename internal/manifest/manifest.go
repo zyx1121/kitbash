@@ -126,6 +126,12 @@ func Parse(data []byte) (*Manifest, error) {
 	if messages := checkSchedule(raw); len(messages) > 0 {
 		return nil, &ErrInvalid{Messages: messages}
 	}
+	// And the rules the units are held to together, which is the only kind of
+	// rule a schema cannot see: what each unit is called among the others, and
+	// which one of them is the face of the Process, see checkUnits.
+	if messages := checkUnits(raw); len(messages) > 0 {
+		return nil, &ErrInvalid{Messages: messages}
+	}
 	m := &Manifest{Raw: raw}
 	m.Name, _ = raw["name"].(string)
 	m.Description, _ = raw["description"].(string)

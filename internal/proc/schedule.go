@@ -56,10 +56,11 @@ func (s *Service) runJob(ctx context.Context, m *manifest.Manifest, folder strin
 		}
 	}
 	declared := &telemetry.Schedule{
-		Cron:   unit.Schedule,
-		Env:    ownEnv(unit.Env),
-		Memory: unit.Limits.Memory,
-		CPU:    unit.Limits.CPU,
+		Cron:    unit.Schedule,
+		Env:     ownEnv(unit.Environment),
+		Command: unit.Command,
+		Memory:  unit.Limits.Memory,
+		CPU:     unit.Limits.CPU,
 	}
 	known := s.registered(ctx)
 	existing, isJob := s.heldJob(known, folder, name)
@@ -150,6 +151,14 @@ func sameSchedule(held, declared *telemetry.Schedule) bool {
 	}
 	for key, value := range declared.Env {
 		if held.Env[key] != value {
+			return false
+		}
+	}
+	if len(held.Command) != len(declared.Command) {
+		return false
+	}
+	for i, word := range declared.Command {
+		if held.Command[i] != word {
 			return false
 		}
 	}
