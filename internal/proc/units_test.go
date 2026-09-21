@@ -359,3 +359,55 @@ func TestLogsOfAUnitOfASingleUnitProcessIsNotFound(t *testing.T) {
 		t.Errorf("proc_logs answered %v, want the container's output", out.Lines)
 	}
 }
+
+// podman keeps one infra container per pod, which holds the namespaces and the
+// published port and runs nothing of the Package, and it copies the pod's own
+// labels onto it: it answers the same kitbash.id as every unit and names no
+// unit of its own. Nothing of the Process is it, so no listing counts it and
+// proc_logs never reads it, which the end to end job is what found.
+func TestTheInfraContainerOfAPodIsNotAUnit(t *testing.T) {
+	f := newFixture(t)
+	folder := f.pack(t, "board", twoUnitManifest)
+	f.buildUnit(folder, "board", "web")
+	f.buildUnit(folder, "board", "cache")
+	process, prob := f.processes.Run(context.Background(), folder, "", "")
+	if prob != nil {
+		t.Fatalf("Run: %s", prob.Detail)
+	}
+	pod := "kitbash-board-board"
+	f.runner.AddContainer(podman.Container{
+		ID:    "infra",
+		Name:  pod + "-infra",
+		State: podman.StateRunning,
+		Labels: map[string]string{
+			podman.LabelID:      process.ID,
+			podman.LabelUser:    "tester",
+			podman.LabelPackage: folder,
+			podman.LabelName:    "board",
+			podman.LabelExpose:  "http",
+			podman.LabelPod:     pod,
+		},
+	})
+	f.runner.LogLines[pod+"-web"] = []string{"the face said this"}
+	f.runner.LogLines[pod+"-infra"] = []string{"the infra container said this"}
+
+	out, prob := f.processes.Logs(context.Background(), process.ID, "", 10)
+	if prob != nil {
+		t.Fatalf("Logs: %s", prob.Detail)
+	}
+	if len(out.Lines) != 1 || out.Lines[0] != "the face said this" {
+		t.Errorf("proc_logs answered %v, want the face unit's output", out.Lines)
+	}
+
+	list, prob := f.processes.List(context.Background())
+	if prob != nil {
+		t.Fatalf("List: %s", prob.Detail)
+	}
+	if len(list.Processes) != 1 {
+		t.Fatalf("proc_list answers %d Processes, want one line for one pod: %+v", len(list.Processes), list.Processes)
+	}
+	if len(list.Processes[0].Units) != 2 {
+		t.Errorf("the line carries %d units, want the two the manifest declares: %+v",
+			len(list.Processes[0].Units), list.Processes[0].Units)
+	}
+}

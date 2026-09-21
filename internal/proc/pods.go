@@ -447,6 +447,15 @@ func unitContainer(id string, containers []podman.Container, unit string) (*podm
 		fmt.Sprintf("Name one of its units: %s.", strings.Join(names, ", ")))
 }
 
+// infra reports whether one container is the infra container podman makes for
+// a pod: it holds the namespaces and the published port and runs nothing of
+// the Package. podman gives it the pod's own labels, so it carries the
+// Process's id and the pod's name and is the one container of a pod that
+// names no unit. It is not a unit and belongs in no listing of them.
+func infra(container podman.Container) bool {
+	return container.Labels[podman.LabelPod] != "" && container.Labels[podman.LabelUnit] == ""
+}
+
 // isFace reports whether one container of a pod is the unit that declares the
 // Process's face, which is the one whose exposure is mcp or http.
 func isFace(container podman.Container) bool {

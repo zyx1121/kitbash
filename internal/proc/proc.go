@@ -1280,10 +1280,23 @@ func (s *Service) unitsOf(ctx context.Context, id string) ([]podman.Container, *
 
 // containers reads the container list, mapping a runtime failure onto the
 // surface. The runtime's own output goes to the server log only.
+//
+// The infra container of a pod is dropped here, once, so nothing above this
+// has to know the runtime keeps one: podman copies a pod's labels onto it, so
+// it answers the same kitbash.id filter every unit of that Process does, and a
+// caller reading the first container of a Process would read the one that runs
+// nothing, see PLAN.md section 5.6.
 func (s *Service) containers(ctx context.Context, filter podman.Filter, all bool) ([]podman.Container, *problem.Problem) {
 	containers, err := s.runner.Containers(ctx, filter, all)
 	if err != nil {
 		return nil, problem.Internal("proc", err.Error(), "")
 	}
-	return containers, nil
+	out := make([]podman.Container, 0, len(containers))
+	for _, container := range containers {
+		if infra(container) {
+			continue
+		}
+		out = append(out, container)
+	}
+	return out, nil
 }
