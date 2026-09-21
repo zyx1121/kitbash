@@ -423,7 +423,7 @@ func TestStartMapsAUsageFailureOntoTheUnit(t *testing.T) {
 	if prob.Slug() != problem.SlugBadRequest {
 		t.Errorf("problem is %s, want bad-request", prob.Slug())
 	}
-	if !strings.Contains(prob.Fix, "deploy.units[0]") {
+	if !strings.Contains(prob.Fix, "deploy.units[]") {
 		t.Errorf("fix is %q, want it to name the unit options", prob.Fix)
 	}
 	if strings.Contains(prob.Detail, "podman") {

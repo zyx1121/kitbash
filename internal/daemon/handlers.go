@@ -165,6 +165,7 @@ type queryRequest struct {
 	User     string `json:"user,omitempty"`
 	Package  string `json:"package,omitempty"`
 	Process  string `json:"process,omitempty"`
+	Unit     string `json:"unit,omitempty"`
 	Path     string `json:"path,omitempty"`
 	Tool     string `json:"tool,omitempty"`
 	Eval     *bool  `json:"eval,omitempty"`
@@ -220,6 +221,7 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request) {
 		User:     req.User,
 		Package:  req.Package,
 		Process:  req.Process,
+		Unit:     req.Unit,
 		Path:     req.Path,
 		Tool:     req.Tool,
 		Eval:     req.Eval,

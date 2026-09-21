@@ -185,7 +185,7 @@ $package_tools:
         package: { type: string, description: "Absolute path of the Package folder" }
         digest: { type: string, description: "OCI image id to run" }
         name: { type: string, description: "Process name, the manifest's name by default" }
-        unit: { type: object, description: "deploy.units[0] as the manifest wrote it" }
+        unit: { type: object, description: "The container unit as the manifest wrote it. A Package a run kit starts declares one unit: a Package of several units runs as one pod on this host and may name no runner" }
     output:
       type: object
       required: [id, state]
@@ -463,8 +463,10 @@ families:
           that runs and fails is bad-request carrying that same tail, because
           the build context is the caller's to fix; a runtime that will not run
           at all is internal. An uncommitted change under the path is conflict:
-          kitbash builds from a commit. Version 1 supports one container unit
-          per Package. A unit with build is built from its context; a unit
+          kitbash builds from a commit. Every container unit of the Package is
+          built, each image labelled with the unit it is, and the digest this
+          answers with is the face unit's, which is the one digest the surface
+          has. A unit with build is built from its context; a unit
           with image is pulled by digest and relabelled through a one line
           Containerfile so the result carries the same labels and its own
           image ID.
@@ -549,13 +551,42 @@ families:
           The manifest is answered as it is written, so a unit's hostname, the
           secrets it declares and its permits block are all read here: what a
           Package asks for is part of reading it.
+
+          units is that same manifest read for the question a reader asks
+          first, which is what this Package is made of: one entry per declared
+          unit, in the order the manifest wrote them, each with its name, the
+          build context or the pinned image it runs, expose on the one unit
+          that declares the Process's face, and the digest of the last build of
+          that unit this host holds. A Package of one unit answers one entry,
+          named after the Package when the unit omits a name, because a single
+          unit is the Package itself. The digest of a unit of a composed
+          Package is the newest image this host holds that is labelled for that
+          unit, and it is absent for a unit nobody has built here: a build
+          record is one digest per commit per Package and names no unit, so an
+          /org Package another member built carries none until this member
+          builds or runs it. The one unit of a Package that declares one
+          carries the latest build this same answer lists, which may be one
+          another member recorded, see PLAN.md section 5.6.
         input: { type: object, additionalProperties: false, required: [path], properties: { path: { type: string } } }
         output:
           type: object
-          required: [path, manifest, builds]
+          required: [path, manifest, builds, units]
           properties:
             path: { type: string }
             manifest: { type: object }
+            units:
+              type: array
+              description: >
+                The units this Package declares, in the order the manifest wrote them.
+              items:
+                type: object
+                required: [name]
+                properties:
+                  name: { type: string, description: "The unit's name, or the Package's for the single unit of a Package that omits one" }
+                  expose: { type: string, enum: [mcp, http], description: "On the one unit that declares the Process's face, absent on every other" }
+                  build: { type: string, description: "The build context inside the Package this unit is built from" }
+                  image: { type: string, description: "The image pinned by digest this unit runs, for a unit that is not built here" }
+                  digest: { type: string, description: "The image of the last build of this unit this host knows of. Absent for a unit nothing has built here" }
             builds:
               type: array
               items: { type: object, required: [digest, commit, builtAt], properties: { digest: { type: string }, commit: { type: string }, builtAt: { type: string, format: date-time }, builder: { type: string, description: "The member who built it, for a Package under /org" } } }
@@ -616,7 +647,7 @@ families:
           with is registered with its runner and reported with it, and
           kitbashd supervises none of it.
 
-          A unit with expose: none may declare deploy.units[0].schedule, five
+          A unit with expose: none may declare deploy.units[].schedule, five
           cron fields, minute hour day-of-month month day-of-week, read in
           UTC. proc_run then registers a job: it resolves the digest, builds
           nothing further, starts no container, and answers state scheduled
@@ -644,7 +675,7 @@ families:
           Processes, beyond which registering one is conflict, the same answer
           the 64 Process limit gives.
 
-          A unit whose deploy.units[0].mounts declares folders of Files gets
+          A unit whose deploy.units[].mounts declares folders of Files gets
           them as bind mounts, at most four, each one nosuid, nodev, noexec
           and non recursive. A source is a folder under the caller's own home
           or a top level folder of /org, and it has to be visible by the rule
@@ -676,7 +707,7 @@ families:
           A unit with expose: http is served by kitbashd's reverse proxy when
           the host has a domain, KITBASH_DOMAIN at install: the Process is
           reached at https://<name>.<member>.<domain>, or at the
-          deploy.units[0].hostname the unit declared, and that address is the
+          deploy.units[].hostname the unit declared, and that address is the
           url this returns. The member's label is the attribution: whose work
           a service is, is visible in its address. A host with no domain
           routes nothing and answers no url, and the Process keeps its
@@ -797,7 +828,15 @@ families:
           carries schedule, nextRun and, once it has run under the daemon that
           is answering, lastRun with the exit code and how long it took; the
           runs before that are kitbash.schedule records, which is where a
-          job's history is.
+          job's history is. A Process whose Package declares more than one unit
+          carries units, one entry per unit with the state the runtime reports
+          for it: the Process is running when every unit is, and when it is not
+          this is what says which one is down, which is what asking about that
+          Package is for. A line carries none, the way it carries no mounts and
+          no health. A pod is still one Process and one line either way, so
+          nothing here counts units: the listing has one entry per Process
+          however many containers it runs, and units is what one of them is
+          made of, see PLAN.md 5.6. A Process of one unit carries none.
         input:
           type: object
           additionalProperties: false
@@ -868,7 +907,7 @@ families:
                     type: object
                     description: >
                       The most recent health probe kitbashd ran, for a Process kitbashd runs
-                      itself whose manifest declares deploy.units[0].health.http. Absent until
+                      itself whose manifest declares deploy.units[].health.http. Absent until
                       it has been probed once.
                     required: [healthy]
                     properties:
@@ -895,7 +934,22 @@ families:
           scheduled Process it is the last run: the container of a run is kept until the next tick replaces
           it, and a job whose first tick has not come has no output, which is
           not-found saying so.
-        input: { type: object, additionalProperties: false, required: [id], properties: { id: { type: string }, lines: { type: integer, minimum: 1, default: 200, maximum: 5000 } } }
+
+          A Process that runs as a pod is read one unit at a time. unit names
+          which one, and without it the face is read: the unit that declares
+          expose is what the Process answers for, so the default is the output
+          a member asking about the Process means. A name that is not a unit of
+          that Process is not-found naming the units it has, and a unit named
+          on a Package of one unit is not-found too, because that unit is the
+          Package itself and is read without naming it, see PLAN.md 5.6.
+        input:
+          type: object
+          additionalProperties: false
+          required: [id]
+          properties:
+            id: { type: string }
+            unit: { type: string, description: "Which unit of a Process that runs as a pod to read. Defaults to the unit that declares expose, which is the Process's face" }
+            lines: { type: integer, minimum: 1, default: 200, maximum: 5000 }
         output: { type: object, required: [id, lines], properties: { id: { type: string }, lines: { type: array, items: { type: string } } } }
         errors: [not-found, not-permitted, internal]
 
@@ -926,6 +980,13 @@ families:
           kitbash.schedule.reason on a skipped tick, running or busy, and
           kitbash.schedule.error on a lost one, no-container, timeout or
           runtime.
+
+          unit filters by kitbash.unit, the unit of a Process that runs as a
+          pod one record is about. kitbashd stamps it on the records it writes
+          about one unit, which is the health probe of the face, and a producer
+          that claims it keeps it only when it names a unit of its own Process.
+          A Process of one unit carries none, so a query by unit returns
+          nothing of it, see PLAN.md 5.6.
         input:
           type: object
           additionalProperties: false
@@ -935,6 +996,7 @@ families:
             user: { type: string, description: "Linux user name; admins only when it is not the caller" }
             package: { type: string, description: "Package path, as kitbash.package" }
             process: { type: string, description: "Process id, as kitbash.process" }
+            unit: { type: string, description: "Unit of a Process that runs as a pod, as kitbash.unit; a Process of one unit carries none" }
             path: { type: string, description: "Files path, as kitbash.path; prefix match" }
             tool: { type: string, description: "Surface tool name, as kitbash.tool" }
             eval: { type: boolean, description: "Only evaluation results written back by kits" }

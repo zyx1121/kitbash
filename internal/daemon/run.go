@@ -255,7 +255,7 @@ func (s *Server) startProcess(w http.ResponseWriter, r *http.Request, p store.Pr
 	if p.Schedule.Declared() {
 		writeProblem(w, problem.NotPermitted(r.URL.Path,
 			fmt.Sprintf("the Process %s is a job, and kitbashd starts a job at its schedule", p.ID),
-			"Wait for the next tick, or remove deploy.units[0].schedule from this Package and run it again."))
+			"Wait for the next tick, or remove deploy.units[].schedule from this Package and run it again."))
 		return
 	}
 	var req startRequest
@@ -589,7 +589,7 @@ func (s *Server) runProblem(r *http.Request, err error, p store.Process, opts po
 		// part of it that a caller chose comes from the unit.
 		return problem.BadRequest(r.URL.Path,
 			"the container runtime refused the options of this unit",
-			"Check deploy.units[0]: its limits, restart policy, ports and environment are what this command line is made of.")
+			"Check deploy.units[]: its limits, restart policy, ports and environment are what this command line is made of.")
 	default:
 		return problem.Internal(r.URL.Path,
 			fmt.Sprintf("the container runtime could not run %s", p.Container), "")
@@ -758,7 +758,7 @@ func checkEnv(instance string, env map[string]string) *problem.Problem {
 	if len(env) > MaxEnvEntries {
 		return problem.BadRequest(instance,
 			fmt.Sprintf("a unit may declare at most %d environment variables", MaxEnvEntries),
-			"Declare fewer variables in deploy.units[0].environment.")
+			"Declare fewer variables in deploy.units[].environment.")
 	}
 	for k, v := range env {
 		if len(k) > MaxEnvKeyBytes || !envKey.MatchString(k) {

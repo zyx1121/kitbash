@@ -105,7 +105,7 @@ type Registration struct {
 	Digest    string `json:"digest,omitempty"`
 	Expose    string `json:"expose"`
 	Endpoint  string `json:"endpoint,omitempty"`
-	// Hostname is the name deploy.units[0].hostname declared, sent only when
+	// Hostname is the name deploy.units[].hostname declared, sent only when
 	// the unit declares one. Without it kitbashd serves the Process under the
 	// name it derives from the Process name, the owner and the host's domain;
 	// with it the daemon serves that name instead, and refuses the

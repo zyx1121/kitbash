@@ -395,7 +395,7 @@ api:
     errors: >
       [bad-request, not-permitted, not-visible, invalid-path, not-found,
       internal]. A unit the runtime
-      will not parse (exit 125) is bad-request naming deploy.units[0]; an image
+      will not parse (exit 125) is bad-request naming deploy.units[]; an image
       the member does not have is not-found naming pkg_build; an id nobody
       registered is not-found; a mount that no longer checks out is whatever
       the mount rules below make of it.
@@ -1039,7 +1039,7 @@ restore:
 
 scheduled_processes:
   description: >
-    A Process whose unit declares deploy.units[0].schedule is a job: kitbashd
+    A Process whose unit declares deploy.units[].schedule is a job: kitbashd
     holds the cron expression, computes the next tick in UTC, and at each tick
     starts the container as the owner through the same four steps a start
     takes, create, init, verify, start, with the same environment file,
@@ -1114,7 +1114,7 @@ scheduled_processes:
 
 health_probes:
   description: >
-    A Process whose Package declares deploy.units[0].health.http, is exposed as
+    A Process whose Package declares deploy.units[].health.http, is exposed as
     http or mcp, and publishes an endpoint is probed by kitbashd: GET
     <endpoint><health.http> every health.interval, with a 5 s timeout, from one
     goroutine that starts after restore and follows the registrations as they

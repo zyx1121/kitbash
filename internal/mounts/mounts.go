@@ -165,7 +165,7 @@ func (c *Checker) Resolve(instance string, declared []Declared) ([]Resolved, *pr
 	if len(declared) > Max {
 		return nil, problem.BadRequest(instance,
 			fmt.Sprintf("this unit declares %d mounts and a Process may have at most %d", len(declared), Max),
-			fmt.Sprintf("Declare at most %d entries in deploy.units[0].mounts.", Max))
+			fmt.Sprintf("Declare at most %d entries in deploy.units[].mounts.", Max))
 	}
 	out := make([]Resolved, 0, len(declared))
 	for _, d := range declared {

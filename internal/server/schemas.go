@@ -244,7 +244,7 @@ const processDef = `{
     },
     "health": {
       "type": "object",
-      "description": "The most recent health probe kitbashd ran, for a Process kitbashd runs itself whose manifest declares deploy.units[0].health.http. Absent until it has been probed once.",
+      "description": "The most recent health probe kitbashd ran, for a Process kitbashd runs itself whose manifest declares deploy.units[].health.http. Absent until it has been probed once.",
       "required": ["healthy"],
       "properties": {
         "last": { "type": "string", "format": "date-time" },
@@ -330,10 +330,25 @@ var (
 
 	pkgInspectOutputSchema = json.RawMessage(`{
   "type": "object",
-  "required": ["path", "manifest", "builds"],
+  "required": ["path", "manifest", "builds", "units"],
   "properties": {
     "path": { "type": "string" },
     "manifest": { "type": "object" },
+    "units": {
+      "type": "array",
+      "description": "The units this Package declares, in the order the manifest wrote them.",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string", "description": "The unit's name, or the Package's for the single unit of a Package that omits one" },
+          "expose": { "type": "string", "enum": ["mcp", "http"], "description": "On the one unit that declares the Process's face, absent on every other" },
+          "build": { "type": "string", "description": "The build context inside the Package this unit is built from" },
+          "image": { "type": "string", "description": "The image pinned by digest this unit runs, for a unit that is not built here" },
+          "digest": { "type": "string", "description": "The image of the last build of this unit this host knows of. Absent for a unit nothing has built here" }
+        }
+      }
+    },
     "builds": { "type": "array", "items": ` + buildEntryDef + ` }
   }
 }`)
@@ -444,6 +459,7 @@ var (
   "required": ["id"],
   "properties": {
     "id": { "type": "string" },
+    "unit": { "type": "string", "description": "Which unit of a Process that runs as a pod to read. Defaults to the unit that declares expose, which is the Process's face" },
     "lines": { "type": "integer", "minimum": 1, "default": 200, "maximum": 5000 }
   }
 }`)
@@ -534,6 +550,7 @@ var (
     "user": { "type": "string", "description": "Linux user name; admins only when it is not the caller" },
     "package": { "type": "string", "description": "Package path, as kitbash.package" },
     "process": { "type": "string", "description": "Process id, as kitbash.process" },
+    "unit": { "type": "string", "description": "Unit of a Process that runs as a pod, as kitbash.unit; a Process of one unit carries none" },
     "path": { "type": "string", "description": "Files path, as kitbash.path; prefix match" },
     "tool": { "type": "string", "description": "Surface tool name, as kitbash.tool" },
     "eval": { "type": "boolean", "description": "Only evaluation results written back by kits" },

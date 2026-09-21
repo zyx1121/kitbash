@@ -263,7 +263,7 @@ func TestRunFailureIsWhatKitbashdAnswered(t *testing.T) {
 			name: "the unit options are wrong",
 			answer: teltest.Problem(http.StatusBadRequest, problem.SlugBadRequest, "Bad request",
 				"the container runtime refused the options of this unit",
-				"Check deploy.units[0]: its limits, restart policy, ports and environment are what this command line is made of."),
+				"Check deploy.units[]: its limits, restart policy, ports and environment are what this command line is made of."),
 			slug: problem.SlugBadRequest,
 		},
 		{
@@ -637,7 +637,7 @@ func TestMissingIDPointsAtProcList(t *testing.T) {
 					return prob
 				},
 				"proc_logs": func() *problem.Problem {
-					_, prob := f.processes.Logs(ctx, tc.id, 0)
+					_, prob := f.processes.Logs(ctx, tc.id, "", 0)
 					return prob
 				},
 			} {
@@ -670,7 +670,7 @@ func TestLogsCapTheLineCount(t *testing.T) {
 	}
 	f.runner.LogLines[process.Container] = []string{"first", "second", "third"}
 
-	out, prob := f.processes.Logs(ctx, process.ID, 2)
+	out, prob := f.processes.Logs(ctx, process.ID, "", 2)
 	if prob != nil {
 		t.Fatalf("Logs: %s", prob.Detail)
 	}

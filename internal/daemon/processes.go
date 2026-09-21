@@ -84,7 +84,7 @@ type processRequest struct {
 	Digest    string `json:"digest,omitempty"`
 	Expose    string `json:"expose"`
 	Endpoint  string `json:"endpoint,omitempty"`
-	// Hostname is the one name deploy.units[0].hostname declared, which
+	// Hostname is the one name deploy.units[].hostname declared, which
 	// kitbashd serves this Process under in place of the name it derives. A
 	// name another Process on this host already holds is a conflict, see
 	// proxy.go.
@@ -148,7 +148,7 @@ type scheduleRequest struct {
 }
 
 // healthRequest is the probe a registration declares, which is the part of
-// deploy.units[0].health kitbashd implements: the path it requests and how
+// deploy.units[].health kitbashd implements: the path it requests and how
 // often. A registration that carries no block declares no probe, which is
 // every registration written before probing existed and every Package that
 // asks for none.
@@ -689,7 +689,7 @@ func validateProcess(instance string, req processRequest) *problem.Problem {
 	if len(req.Mounts) > mounts.Max {
 		return problem.BadRequest(instance,
 			fmt.Sprintf("a Process may mount at most %d folders, not %d", mounts.Max, len(req.Mounts)),
-			fmt.Sprintf("Declare at most %d entries in deploy.units[0].mounts.", mounts.Max))
+			fmt.Sprintf("Declare at most %d entries in deploy.units[].mounts.", mounts.Max))
 	}
 	// The declared secret names are held to their shape here, so a
 	// registration kitbashd could never resolve is refused rather than stored
@@ -719,7 +719,7 @@ func validateProcess(instance string, req processRequest) *problem.Problem {
 func validateSecrets(instance string, names []string) *problem.Problem {
 	refuse := func(detail string) *problem.Problem {
 		return problem.BadRequest(instance, detail,
-			fmt.Sprintf("Declare at most %d names in deploy.units[0].secrets, each matching ^[A-Z][A-Z0-9_]{0,63}$ and none of them a %s name.",
+			fmt.Sprintf("Declare at most %d names in deploy.units[].secrets, each matching ^[A-Z][A-Z0-9_]{0,63}$ and none of them a %s name.",
 				manifest.MaxSecrets, manifest.OwnedEnvPrefix))
 	}
 	if len(names) > manifest.MaxSecrets {
@@ -760,18 +760,18 @@ func validateHostname(instance string, req processRequest) *problem.Problem {
 	if !manifest.ValidHostname(req.Hostname) {
 		return problem.BadRequest(instance,
 			fmt.Sprintf("%q is not a host name kitbashd serves", req.Hostname),
-			fmt.Sprintf("Declare deploy.units[0].hostname as a lower case DNS name of at least two labels and at most %d bytes, such as app.example.org.", manifest.MaxHostname))
+			fmt.Sprintf("Declare deploy.units[].hostname as a lower case DNS name of at least two labels and at most %d bytes, such as app.example.org.", manifest.MaxHostname))
 	}
 	if req.Expose != ExposeHTTP {
 		return problem.BadRequest(instance,
 			fmt.Sprintf("this unit declares the host name %s and is exposed as %s, so there is nothing at that name to reach",
 				req.Hostname, req.Expose),
-			"Declare deploy.units[0].expose: http beside the hostname, or remove the hostname.")
+			"Declare deploy.units[].expose: http beside the hostname, or remove the hostname.")
 	}
 	if req.Runner != "" {
 		return problem.NotPermitted(instance,
 			"a Process a run kit owns is not served by kitbashd, so it has no host name here",
-			fmt.Sprintf("Remove deploy.units[0].hostname from this Package, or have %s publish the Process it runs.", req.Runner))
+			fmt.Sprintf("Remove deploy.units[].hostname from this Package, or have %s publish the Process it runs.", req.Runner))
 	}
 	return nil
 }
@@ -810,7 +810,7 @@ func validateSchedule(instance string, req processRequest) *problem.Problem {
 	if req.Runner != "" {
 		return problem.NotPermitted(instance,
 			"a Process a run kit owns is not started by kitbashd, so it has no schedule here",
-			fmt.Sprintf("Remove deploy.units[0].schedule from this Package, or have %s start what it runs on time.", req.Runner))
+			fmt.Sprintf("Remove deploy.units[].schedule from this Package, or have %s start what it runs on time.", req.Runner))
 	}
 	if prob := checkEnv(instance, req.Schedule.Env); prob != nil {
 		return prob

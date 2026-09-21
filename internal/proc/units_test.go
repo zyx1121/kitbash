@@ -2,6 +2,7 @@ package proc_test
 
 import (
 	"context"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -268,11 +269,145 @@ func TestLogsOfAPodReadTheFace(t *testing.T) {
 	f.runner.LogLines["kitbash-board-board-web"] = []string{"the face said this"}
 	f.runner.LogLines["kitbash-board-board-cache"] = []string{"the sidecar said this"}
 
-	out, prob := f.processes.Logs(context.Background(), process.ID, 10)
+	out, prob := f.processes.Logs(context.Background(), process.ID, "", 10)
 	if prob != nil {
 		t.Fatalf("Logs: %s", prob.Detail)
 	}
 	if len(out.Lines) != 1 || out.Lines[0] != "the face said this" {
 		t.Errorf("proc_logs answered %v, want the face unit's output", out.Lines)
+	}
+}
+
+// proc_logs of a named unit reads that unit's container, which is the whole of
+// what #163 adds: a member reading a pod does not have to know the name the
+// runtime gave each container.
+func TestLogsOfAPodReadTheUnitThatWasNamed(t *testing.T) {
+	f := newFixture(t)
+	folder := f.pack(t, "board", twoUnitManifest)
+	f.buildUnit(folder, "board", "web")
+	f.buildUnit(folder, "board", "cache")
+	process, prob := f.processes.Run(context.Background(), folder, "", "")
+	if prob != nil {
+		t.Fatalf("Run: %s", prob.Detail)
+	}
+	f.runner.LogLines["kitbash-board-board-web"] = []string{"the face said this"}
+	f.runner.LogLines["kitbash-board-board-cache"] = []string{"the sidecar said this"}
+
+	for unit, want := range map[string]string{"web": "the face said this", "cache": "the sidecar said this"} {
+		out, prob := f.processes.Logs(context.Background(), process.ID, unit, 10)
+		if prob != nil {
+			t.Fatalf("Logs of %s: %s", unit, prob.Detail)
+		}
+		if len(out.Lines) != 1 || out.Lines[0] != want {
+			t.Errorf("proc_logs of the unit %s answered %v, want %q", unit, out.Lines, want)
+		}
+	}
+}
+
+// A unit this Process does not have is not-found naming the ones it does, so
+// the next call is the right one rather than a second guess.
+func TestLogsOfAUnitThisProcessDoesNotHaveIsNotFound(t *testing.T) {
+	f := newFixture(t)
+	folder := f.pack(t, "board", twoUnitManifest)
+	f.buildUnit(folder, "board", "web")
+	f.buildUnit(folder, "board", "cache")
+	process, prob := f.processes.Run(context.Background(), folder, "", "")
+	if prob != nil {
+		t.Fatalf("Run: %s", prob.Detail)
+	}
+
+	_, prob = f.processes.Logs(context.Background(), process.ID, "redis", 10)
+	if prob == nil {
+		t.Fatal("proc_logs read a unit this Process does not have")
+	}
+	if prob.Status != http.StatusNotFound {
+		t.Errorf("the problem is %d, want not-found", prob.Status)
+	}
+	for _, unit := range []string{"cache", "web"} {
+		if !strings.Contains(prob.Fix, unit) {
+			t.Errorf("the fix is %q, want it to name the unit %s", prob.Fix, unit)
+		}
+	}
+}
+
+// A Package of one unit has no unit to name: it is the Package itself, and a
+// name given for it is not-found rather than the logs of the only container
+// there is, which would teach a member a name that does not exist.
+func TestLogsOfAUnitOfASingleUnitProcessIsNotFound(t *testing.T) {
+	f := newFixture(t)
+	folder := f.pack(t, "ffmpeg", mcpManifest)
+	f.build(folder, "ffmpeg")
+	process, prob := f.processes.Run(context.Background(), folder, "", "")
+	if prob != nil {
+		t.Fatalf("Run: %s", prob.Detail)
+	}
+	f.runner.LogLines["kitbash-ffmpeg-ffmpeg"] = []string{"the only unit said this"}
+
+	_, prob = f.processes.Logs(context.Background(), process.ID, "ffmpeg", 10)
+	if prob == nil {
+		t.Fatal("proc_logs answered for a unit of a Process that has none")
+	}
+	if prob.Status != http.StatusNotFound {
+		t.Errorf("the problem is %d, want not-found", prob.Status)
+	}
+	// Without a unit the same Process reads as it always has.
+	out, prob := f.processes.Logs(context.Background(), process.ID, "", 10)
+	if prob != nil {
+		t.Fatalf("Logs: %s", prob.Detail)
+	}
+	if len(out.Lines) != 1 || out.Lines[0] != "the only unit said this" {
+		t.Errorf("proc_logs answered %v, want the container's output", out.Lines)
+	}
+}
+
+// podman keeps one infra container per pod, which holds the namespaces and the
+// published port and runs nothing of the Package, and it copies the pod's own
+// labels onto it: it answers the same kitbash.id as every unit and names no
+// unit of its own. Nothing of the Process is it, so no listing counts it and
+// proc_logs never reads it, which the end to end job is what found.
+func TestTheInfraContainerOfAPodIsNotAUnit(t *testing.T) {
+	f := newFixture(t)
+	folder := f.pack(t, "board", twoUnitManifest)
+	f.buildUnit(folder, "board", "web")
+	f.buildUnit(folder, "board", "cache")
+	process, prob := f.processes.Run(context.Background(), folder, "", "")
+	if prob != nil {
+		t.Fatalf("Run: %s", prob.Detail)
+	}
+	pod := "kitbash-board-board"
+	f.runner.AddContainer(podman.Container{
+		ID:    "infra",
+		Name:  pod + "-infra",
+		State: podman.StateRunning,
+		Labels: map[string]string{
+			podman.LabelID:      process.ID,
+			podman.LabelUser:    "tester",
+			podman.LabelPackage: folder,
+			podman.LabelName:    "board",
+			podman.LabelExpose:  "http",
+			podman.LabelPod:     pod,
+		},
+	})
+	f.runner.LogLines[pod+"-web"] = []string{"the face said this"}
+	f.runner.LogLines[pod+"-infra"] = []string{"the infra container said this"}
+
+	out, prob := f.processes.Logs(context.Background(), process.ID, "", 10)
+	if prob != nil {
+		t.Fatalf("Logs: %s", prob.Detail)
+	}
+	if len(out.Lines) != 1 || out.Lines[0] != "the face said this" {
+		t.Errorf("proc_logs answered %v, want the face unit's output", out.Lines)
+	}
+
+	list, prob := f.processes.List(context.Background())
+	if prob != nil {
+		t.Fatalf("List: %s", prob.Detail)
+	}
+	if len(list.Processes) != 1 {
+		t.Fatalf("proc_list answers %d Processes, want one line for one pod: %+v", len(list.Processes), list.Processes)
+	}
+	if len(list.Processes[0].Units) != 2 {
+		t.Errorf("the line carries %d units, want the two the manifest declares: %+v",
+			len(list.Processes[0].Units), list.Processes[0].Units)
 	}
 }

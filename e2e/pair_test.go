@@ -26,6 +26,12 @@ import (
 const (
 	pairName   = "pair"
 	pairBudget = 60 * time.Second
+	// probeBudget is how long the first health record of the face is waited
+	// for, several times the five second interval the fixture declares, and
+	// unitDownBudget how long the runtime is given to report a container that
+	// was stopped by hand.
+	probeBudget    = 45 * time.Second
+	unitDownBudget = 30 * time.Second
 )
 
 // runThePair writes the Package, builds every unit of it and runs the pod.
@@ -210,4 +216,184 @@ func stopThePair(t *testing.T, s *state) {
 	if strings.Contains(containers, pod) {
 		t.Errorf("a container of %s is still on the host after proc_stop:\n%s", pod, containers)
 	}
+}
+
+// readEitherUnit is the surface half of M12, issue #163: proc_logs reads the
+// unit it is asked for, pkg_inspect says which units the Package declares and
+// which of them is the face, and a name that is not a unit is not-found.
+func readEitherUnit(t *testing.T, s *state) {
+	// The sidecar is an upstream redis and the face is the counter, so what
+	// each of them says is nothing like the other.
+	cache := pairLogs(t, s, "cache")
+	if !strings.Contains(strings.ToLower(cache), "redis") {
+		t.Errorf("proc_logs of the cache unit answered:\n%s\nwant the output of redis", truncate(cache))
+	}
+	web := pairLogs(t, s, "web")
+	if !strings.Contains(web, "pair/web listening") {
+		t.Errorf("proc_logs of the web unit answered:\n%s\nwant the counter's own output", truncate(web))
+	}
+	// Without a unit the face is what is read, which is the default a member
+	// asking about the Process means.
+	face := pairLogs(t, s, "")
+	if !strings.Contains(face, "pair/web listening") || strings.Contains(strings.ToLower(face), "redis is starting") {
+		t.Errorf("proc_logs without a unit answered:\n%s\nwant the face unit's output", truncate(face))
+	}
+
+	// A unit this Process does not have is not-found naming the ones it does.
+	res := s.admin.call("proc_logs", map[string]any{"id": s.pairID, "unit": "redis"})
+	problem := res.mustProblem(t, "proc_logs", "not-found")
+	for _, unit := range []string{"web", "cache"} {
+		if !strings.Contains(problem.Fix, unit) {
+			t.Errorf("the fix of an unknown unit is %q, want it to name the unit %s", problem.Fix, unit)
+		}
+	}
+
+	// pkg_inspect answers what the Package is made of, which is what an agent
+	// reads before it asks for a unit by name.
+	var inspected struct {
+		Units []struct {
+			Name   string `json:"name"`
+			Expose string `json:"expose"`
+			Build  string `json:"build"`
+			Image  string `json:"image"`
+			Digest string `json:"digest"`
+		} `json:"units"`
+	}
+	s.admin.ok("pkg_inspect", map[string]any{"path": s.pairPath}, &inspected)
+	if len(inspected.Units) != 2 {
+		t.Fatalf("pkg_inspect answered %d units, want the two the manifest declares: %+v", len(inspected.Units), inspected.Units)
+	}
+	faces := 0
+	for _, unit := range inspected.Units {
+		if unit.Expose != "" {
+			faces++
+			if unit.Name != "web" || unit.Expose != "http" {
+				t.Errorf("the face is %+v, want the web unit exposed over http", unit)
+			}
+		}
+		if unit.Digest == "" {
+			t.Errorf("the unit %s carries no digest after pkg_build built it", unit.Name)
+		}
+	}
+	if faces != 1 {
+		t.Errorf("%d units of the fixture declare a face, want exactly one: %+v", faces, inspected.Units)
+	}
+}
+
+// theProbeCarriesTheUnit reads the other new filter: the health probe requests
+// the face and records the unit it read, so tel_query by unit answers the
+// records of that unit and of nothing else.
+func theProbeCarriesTheUnit(t *testing.T, s *state) {
+	var metrics struct {
+		Records []struct {
+			Name       string `json:"name"`
+			Attributes struct {
+				Process string `json:"process"`
+				Unit    string `json:"unit"`
+			} `json:"attributes"`
+		} `json:"records"`
+	}
+	// The probe runs on the interval the fixture declares, so the first
+	// record may not be written yet when this step begins.
+	deadline := time.Now().Add(probeBudget)
+	for {
+		s.admin.ok("tel_query", map[string]any{
+			"signal":  "metrics",
+			"process": s.pairID,
+			"unit":    "web",
+		}, &metrics)
+		if len(metrics.Records) > 0 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+	if len(metrics.Records) == 0 {
+		t.Fatalf("tel_query by unit answered no record within %s, want the health probe of the face", probeBudget)
+	}
+	health := 0
+	for _, record := range metrics.Records {
+		if record.Attributes.Unit != "web" {
+			t.Errorf("a record of the unit %q came back for a query of web: %+v", record.Attributes.Unit, record)
+		}
+		if record.Name == "kitbash.health" {
+			health++
+		}
+	}
+	if health == 0 {
+		t.Errorf("the %d records of the web unit carry no kitbash.health: %+v", len(metrics.Records), metrics.Records)
+	}
+	t.Logf("tel_query by unit answered %d records of the face, %d of them health probes", len(metrics.Records), health)
+}
+
+// theCacheUnitGoesDown is the acceptance sentence of M12: a member kills one
+// unit's process inside the pod and proc_list says which unit is down, without
+// the Process itself being gone.
+func theCacheUnitGoesDown(t *testing.T, s *state) {
+	pod := "kitbash-" + pairName + "-" + pairName
+	if out, err := runAs(t, adminName(), "podman", "stop", "--time", "5", pod+"-cache"); err != nil {
+		t.Fatalf("stopping the cache unit: %v\n%s", err, out)
+	}
+
+	var listed struct {
+		Processes []struct {
+			ID    string `json:"id"`
+			State string `json:"state"`
+			Units []struct {
+				Name  string `json:"name"`
+				State string `json:"state"`
+			} `json:"units"`
+		} `json:"processes"`
+	}
+	// The runtime holds the state, so the next listing is the answer; the
+	// budget is for the container that is still on its way down.
+	deadline := time.Now().Add(unitDownBudget)
+	var process struct {
+		State string
+		Units map[string]string
+	}
+	for {
+		s.admin.ok("proc_list", map[string]any{"package": s.pairPath}, &listed)
+		process.Units = map[string]string{}
+		process.State = ""
+		for _, p := range listed.Processes {
+			if p.ID != s.pairID {
+				continue
+			}
+			process.State = p.State
+			for _, unit := range p.Units {
+				process.Units[unit.Name] = unit.State
+			}
+		}
+		if process.State != "" && process.State != "running" && process.Units["cache"] != "running" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("proc_list still reports %s with the units %+v after the cache was stopped",
+				process.State, process.Units)
+		}
+		time.Sleep(time.Second)
+	}
+	if len(process.Units) != 2 {
+		t.Fatalf("proc_list answers %d units for the pod, want both: %+v", len(process.Units), process.Units)
+	}
+	if process.Units["web"] != "running" {
+		t.Errorf("the web unit is %q, want it still running while the cache is not", process.Units["web"])
+	}
+	t.Logf("proc_list reports the Process %s with cache %s and web %s",
+		process.State, process.Units["cache"], process.Units["web"])
+}
+
+// pairLogs reads the Process's output, of the unit named or of the face when
+// the name is empty.
+func pairLogs(t *testing.T, s *state, unit string) string {
+	t.Helper()
+	args := map[string]any{"id": s.pairID}
+	if unit != "" {
+		args["unit"] = unit
+	}
+	var out struct {
+		Lines []string `json:"lines"`
+	}
+	s.admin.ok("proc_logs", args, &out)
+	return strings.Join(out.Lines, "\n")
 }

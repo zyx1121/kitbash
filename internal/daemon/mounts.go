@@ -93,7 +93,7 @@ const MountSwapped = "the mount source changed between validation and start"
 
 // mountSwapFix is what the owner of that Process can do about it, which is
 // look at the folder rather than at kitbash.
-const mountSwapFix = "Check the folder deploy.units[0].mounts names: it was replaced while the Process was starting. Run the Package again once it is the folder you meant."
+const mountSwapFix = "Check the folder deploy.units[].mounts names: it was replaced while the Process was starting. Run the Package again once it is the folder you meant."
 
 // verifyMounts holds a prepared container to what was validated, and answers a
 // problem when it does not match. There is no fallback: a container kitbashd
@@ -261,7 +261,7 @@ func (s *Server) prepareAndVerify(ctx context.Context, instance string, p store.
 func mountProblem(prob *problem.Problem) restoreProblem {
 	fix := prob.Fix
 	if fix == "" {
-		fix = "Fix the folder deploy.units[0].mounts names, then run the Package again."
+		fix = "Fix the folder deploy.units[].mounts names, then run the Package again."
 	}
 	return restoreProblem{
 		Detail: "this Process declares a mount that is no longer legal, so kitbashd did not start it: " + prob.Detail,

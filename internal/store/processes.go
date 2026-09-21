@@ -243,7 +243,7 @@ func (c Composition) JSON() string {
 }
 
 // Health is the probe of one Process: the path its Package's manifest declared
-// under deploy.units[0].health.http, how often kitbashd requests it, and what
+// under deploy.units[].health.http, how often kitbashd requests it, and what
 // the most recent request saw.
 //
 // HTTP and Interval are the registration and are stored. Last and Healthy are

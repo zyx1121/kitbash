@@ -24,7 +24,8 @@ func RegisterPackages(s *mcp.Server, packages *pkg.Service) {
 			"kitbash.commit and kitbash.user, which is the whole build record. Only the tail of the build log " +
 			"is returned, its last 20 lines; the full log never leaves the host. A build that runs and " +
 			"fails returns that same tail as a bad-request. kitbash builds from a commit, so an uncommitted change under the path is " +
-			"a conflict. Version 1 supports one container unit per Package. A unit with build is built from " +
+			"a conflict. Every container unit of the Package is built, each image labelled with the unit it " +
+			"is, and the digest this answers with is the face unit's. A unit with build is built from " +
 			"its context; a unit with image is pulled by digest and relabelled through a one line " +
 			"Containerfile so the result carries the same labels and its own image ID. A unit whose builder " +
 			"names a Package is built by that kit instead: the kit has to be running as a Process of the " +
@@ -54,8 +55,11 @@ func RegisterPackages(s *mcp.Server, packages *pkg.Service) {
 	}, packagesHandler(packages))
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name:         "pkg_inspect",
-		Description:  "Manifest, build history and provenance of one Package. Builds are newest first.",
+		Name: "pkg_inspect",
+		Description: "Manifest, build history and provenance of one Package. Builds are newest first. units " +
+			"is what the Package is made of: one entry per declared unit with its name, its build context " +
+			"or pinned image, expose on the one unit that is the Process's face, and the digest of the " +
+			"last build of that unit this host holds.",
 		InputSchema:  pkgInspectInputSchema,
 		OutputSchema: pkgInspectOutputSchema,
 	}, inspectHandler(packages))
@@ -105,7 +109,9 @@ func RegisterProcesses(s *mcp.Server, processes *proc.Service, b *bridge.Bridge)
 			"package, state, exposure, the url of an http Process and, for a job, its schedule and " +
 			"nextRun, which is what naming one to ask about takes and what confirming a registered job " +
 			"takes. A scheduled Process is scheduled between its runs and running during one, and once it " +
-			"has run under this daemon it carries lastRun with the exit code and the duration.",
+			"has run under this daemon it carries lastRun with the exit code and the duration. A Process " +
+			"whose Package declares more than one unit carries units, one entry per unit and its state: " +
+			"the Process is running when every unit is, and when it is not this says which one is down.",
 		InputSchema:  procListInputSchema,
 		OutputSchema: procListOutputSchema,
 	}, processesHandler(processes))
@@ -126,7 +132,10 @@ func RegisterProcesses(s *mcp.Server, processes *proc.Service, b *bridge.Bridge)
 		Description: "Recent stdout and stderr of a Process, one array of lines interleaved the way the " +
 			"runtime wrote them, so a Process that died on stderr is read here. Structured logs are in " +
 			"Telemetry; this is the raw stream. For a scheduled Process it is the last run, which is kept " +
-			"until the next tick replaces it.",
+			"until the next tick replaces it. A Process that runs as a pod is read one unit at a time: " +
+			"unit names which, and without it the unit that declares expose is read, which is the face " +
+			"the Process answers for. A name that is not a unit of that Process is not-found naming the " +
+			"units it has.",
 		InputSchema:  procLogsInputSchema,
 		OutputSchema: procLogsOutputSchema,
 	}, logsHandler(processes))
@@ -142,7 +151,8 @@ func RegisterTelemetry(s *mcp.Server, client *telemetry.Client) {
 			"only their own records: user defaults to the caller and naming another member is not-permitted. " +
 			"An admin may name any member or omit user for the whole machine. since defaults to 24 hours ago, " +
 			"until to now. Metrics are accepted by the store but no producer emits them before M4, so that " +
-			"signal returns an empty page.",
+			"signal returns an empty page. unit filters by the unit of a Process that runs as a pod, which " +
+			"kitbashd stamps on the records it writes about one unit; a Process of one unit carries none.",
 		InputSchema:  telQueryInputSchema,
 		OutputSchema: telQueryOutputSchema,
 	}, queryHandler(client))
@@ -310,8 +320,12 @@ type idInput struct {
 	ID string `json:"id"`
 }
 
+// logsInput is proc_logs: the Process, how many lines, and which unit of a
+// Process that runs as a pod to read. Without a unit the face is read, see
+// PLAN.md section 5.6.
 type logsInput struct {
 	ID    string `json:"id"`
+	Unit  string `json:"unit,omitempty"`
 	Lines int    `json:"lines,omitempty"`
 }
 
@@ -578,7 +592,7 @@ func retentionHandler(client *telemetry.Client) mcp.ToolHandlerFor[retentionInpu
 
 func logsHandler(processes *proc.Service) mcp.ToolHandlerFor[logsInput, any] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, in logsInput) (*mcp.CallToolResult, any, error) {
-		out, prob := processes.Logs(ctx, in.ID, in.Lines)
+		out, prob := processes.Logs(ctx, in.ID, in.Unit, in.Lines)
 		if prob != nil {
 			return errorResult(prob), nil, nil
 		}

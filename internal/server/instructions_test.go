@@ -3,6 +3,7 @@ package server_test
 import (
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
@@ -37,6 +38,9 @@ func TestInitializeCarriesTheInstructions(t *testing.T) {
 		"Folders inside a Package need no manifest of their own.",
 		"Write all files of a Package in one fs_write with files.",
 		"A mount source is any folder a manifest above it describes.",
+		// The sentence that turns the two unit example into a rule, which is
+		// what the M11 rounds got wrong on their own, see PLAN.md 5.6.
+		"Units of one Package reach each other on localhost, and exactly one of them declares expose.",
 	} {
 		if !strings.Contains(res.Instructions, want) {
 			t.Errorf("instructions no longer mention %q", want)
@@ -72,6 +76,11 @@ func TestInstructionsStayWithinTheirBudget(t *testing.T) {
 // the manifest the instructions teach is written into a folder and read back
 // with the real loader, so a schema change that would refuse it fails here
 // rather than in the first Package somebody writes from it.
+//
+// It is read through Units(), which is the loader's own view of a composed
+// Package: two units, exactly one of them the face, one built from the folder
+// and one an upstream image pinned by digest. A text that taught two faces, or
+// none, would be a Package the host answers invalid-manifest for.
 func TestTheExampleManifestLoads(t *testing.T) {
 	dir := t.TempDir()
 	body := exampleFile(t, server.ExampleManifest, manifest.FileName)
@@ -91,14 +100,50 @@ func TestTheExampleManifestLoads(t *testing.T) {
 	if !m.IsPackage() {
 		t.Fatal("the example manifest carries no deploy block, so it is not a Package")
 	}
-	units, ok := m.Raw["deploy"].(map[string]any)["units"].([]any)
-	if !ok || len(units) != 1 {
-		t.Fatalf("the example declares %v, want one unit", m.Raw["deploy"])
+	units, err := m.Units()
+	if err != nil {
+		t.Fatalf("the units of the example do not load:\n%s\n%v", body, err)
 	}
-	unit, _ := units[0].(map[string]any)
-	if unit["build"] != "." || unit["expose"] != "http" {
-		t.Fatalf("the example unit is %+v, want build . and expose http", unit)
+	if len(units) != 2 {
+		t.Fatalf("the example declares %d units, want the two the text teaches: %+v", len(units), units)
 	}
+	faces := 0
+	for _, unit := range units {
+		if unit.Name == "" {
+			t.Errorf("the unit %+v carries no name, which a Package of two units requires", unit)
+		}
+		switch unit.Expose {
+		case manifest.ExposeMCP, manifest.ExposeHTTP:
+			faces++
+			if unit.Build != "." || unit.Port == 0 {
+				t.Errorf("the face is %+v, want build . and the port it listens on", unit)
+			}
+		}
+	}
+	if faces != 1 {
+		t.Fatalf("%d units of the example declare a face, want exactly one: %+v", faces, units)
+	}
+	// The unit behind the face is the other half of what a unit may be: an
+	// upstream image pinned by digest, reached on localhost.
+	sidecar := units[1]
+	if !strings.Contains(sidecar.Image, "@sha256:") || sidecar.Build != "" {
+		t.Errorf("the second unit is %+v, want an image pinned by digest", sidecar)
+	}
+	if !strings.Contains(strings.Join(environmentOf(units[0]), " "), "localhost") {
+		t.Errorf("the face is given %v, want an address on localhost for the unit beside it",
+			environmentOf(units[0]))
+	}
+}
+
+// environmentOf is one unit's environment as a list, so a test can say what
+// the face is told without depending on the order of a map.
+func environmentOf(unit manifest.Unit) []string {
+	out := make([]string, 0, len(unit.Environment))
+	for name, value := range unit.Environment {
+		out = append(out, name+"="+value)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // TestTheExampleContainerfileIsBuildable holds the other half of the example

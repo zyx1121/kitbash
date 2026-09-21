@@ -109,6 +109,11 @@ func TestFsSchemasMatchTheSurfaceSpecification(t *testing.T) {
 		{"fs", "fs_read", "output", string(readMetaSchema)},
 		{"pkg", "pkg_build", "output", string(pkgBuildOutputSchema)},
 		{"pkg", "pkg_list", "output", string(pkgListOutputSchema)},
+		// pkg_inspect answers what a Package is made of as well as what was
+		// built of it, and the units block is read by an agent deciding which
+		// unit to ask proc_logs about, so both sides are diffed.
+		{"pkg", "pkg_inspect", "input", string(pkgInspectInputSchema)},
+		{"pkg", "pkg_inspect", "output", string(pkgInspectOutputSchema)},
 		{"proc", "proc_list", "input", string(procListInputSchema)},
 		{"proc", "proc_list", "output", string(procListOutputSchema)},
 		// proc_run answers the same Process the listing describes, plus what

@@ -102,3 +102,114 @@ func TestBuildOfOneUnitIsUnchangedByPods(t *testing.T) {
 		t.Errorf("the tag is %q, want the one a Package of one unit has always had", build.Tag)
 	}
 }
+
+// pkg_inspect says what a Package is made of: every unit the manifest
+// declares, what each one runs, the image the last build left of it, and the
+// one unit that is the Process's face. It is what an agent reads before it
+// asks proc_logs for a unit by name, see PLAN.md section 5.6.
+func TestInspectListsTheUnitsAndTheirImages(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	folder := f.commit(t, "board",
+		fs.File{Path: "kitbash.yaml", Content: text(twoUnitManifest)},
+		fs.File{Path: "Containerfile", Content: text("FROM alpine\n")})
+	if _, prob := f.packages.Build(ctx, folder); prob != nil {
+		t.Fatalf("Build: %s", prob.Detail)
+	}
+
+	out, prob := f.packages.Inspect(ctx, folder)
+	if prob != nil {
+		t.Fatalf("Inspect: %s", prob.Detail)
+	}
+	if len(out.Units) != 2 {
+		t.Fatalf("Inspect answered %d units, want the two the manifest declares: %+v", len(out.Units), out.Units)
+	}
+	// The order is the manifest's, so a reader sees the Package as it is
+	// written rather than sorted into another shape.
+	if out.Units[0].Name != "web" || out.Units[1].Name != "cache" {
+		t.Errorf("the units are %+v, want web then cache", out.Units)
+	}
+	web, cache := out.Units[0], out.Units[1]
+	if web.Expose != "http" {
+		t.Errorf("the face declares expose %q, want http", web.Expose)
+	}
+	if web.Build != "." || web.Image != "" {
+		t.Errorf("the face is %+v, want the build context it declares", web)
+	}
+	if !strings.HasPrefix(cache.Image, "docker.io/library/redis@sha256:") || cache.Build != "" {
+		t.Errorf("the sidecar is %+v, want the image it is pinned to", cache)
+	}
+	// Exactly one unit is the face. A Package where two declare one, or none
+	// does, is refused before it is ever inspected, and this is what says so
+	// on the answer a reader acts on.
+	faces := 0
+	for _, unit := range out.Units {
+		if unit.Expose != "" {
+			faces++
+		}
+	}
+	if faces != 1 {
+		t.Errorf("%d units carry an exposure, want exactly one face: %+v", faces, out.Units)
+	}
+	// One image per unit, each the one that unit was built to.
+	if web.Digest == "" || cache.Digest == "" {
+		t.Fatalf("the units answer the digests %q and %q, want the image of each", web.Digest, cache.Digest)
+	}
+	if web.Digest == cache.Digest {
+		t.Errorf("both units answer %s, want one image per unit", web.Digest)
+	}
+}
+
+// A Package of one unit answers one entry named after the Package, because a
+// single unit is the Package itself, and its digest is the latest build.
+func TestInspectOfOneUnitNamesThePackage(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	folder := f.commit(t, "ffmpeg",
+		fs.File{Path: "kitbash.yaml", Content: text(containerManifest)},
+		fs.File{Path: "Containerfile", Content: text("FROM alpine\n")})
+	built, prob := f.packages.Build(ctx, folder)
+	if prob != nil {
+		t.Fatalf("Build: %s", prob.Detail)
+	}
+
+	out, prob := f.packages.Inspect(ctx, folder)
+	if prob != nil {
+		t.Fatalf("Inspect: %s", prob.Detail)
+	}
+	if len(out.Units) != 1 {
+		t.Fatalf("Inspect answered %d units, want one: %+v", len(out.Units), out.Units)
+	}
+	unit := out.Units[0]
+	if unit.Name != "ffmpeg" {
+		t.Errorf("the unit is called %q, want the Package's own name", unit.Name)
+	}
+	if unit.Expose != "mcp" {
+		t.Errorf("the unit declares expose %q, want mcp", unit.Expose)
+	}
+	if unit.Digest != built.Digest {
+		t.Errorf("the unit answers %s, want the latest build %s", unit.Digest, built.Digest)
+	}
+}
+
+// A Package nobody has built here is described all the same: what it declares
+// is the manifest's, and only the digest is this host's.
+func TestInspectAnswersUnitsOfAPackageNothingHasBuilt(t *testing.T) {
+	f := newFixture(t)
+	folder := f.commit(t, "board",
+		fs.File{Path: "kitbash.yaml", Content: text(twoUnitManifest)},
+		fs.File{Path: "Containerfile", Content: text("FROM alpine\n")})
+
+	out, prob := f.packages.Inspect(context.Background(), folder)
+	if prob != nil {
+		t.Fatalf("Inspect: %s", prob.Detail)
+	}
+	if len(out.Units) != 2 {
+		t.Fatalf("Inspect answered %d units, want two: %+v", len(out.Units), out.Units)
+	}
+	for _, unit := range out.Units {
+		if unit.Digest != "" {
+			t.Errorf("the unit %s answers the digest %s, want none before anything is built", unit.Name, unit.Digest)
+		}
+	}
+}
