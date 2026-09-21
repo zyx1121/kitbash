@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/zyx1121/kitbash/internal/manifest"
 	"github.com/zyx1121/kitbash/internal/podman"
@@ -410,6 +411,40 @@ func faceContainers(containers []podman.Container) []podman.Container {
 		faces = append(faces, pods[id])
 	}
 	return faces
+}
+
+// unitContainer is the container of one Process a caller asked to read: the
+// unit they named, or the face when they named none. proc_logs is what asks,
+// and the face is its default because that unit is what the Process answers
+// for, see PLAN.md section 5.6.
+//
+// A name that is not a unit of this Process is not-found saying which units it
+// has, so the next call is the right one. A Package of one unit has no unit to
+// name: it is the Package itself, and a name given for it is not-found too.
+func unitContainer(id string, containers []podman.Container, unit string) (*podman.Container, *problem.Problem) {
+	if unit == "" {
+		return &faceContainers(containers)[0], nil
+	}
+	names := make([]string, 0, len(containers))
+	for i := range containers {
+		name := containers[i].Labels[podman.LabelUnit]
+		if name == "" {
+			continue
+		}
+		if name == unit {
+			return &containers[i], nil
+		}
+		names = append(names, name)
+	}
+	if len(names) == 0 {
+		return nil, problem.NotFoundFix(id,
+			fmt.Sprintf("this Process runs one unit, which is the Package itself, so it has none named %q", unit),
+			"Call proc_logs without a unit.")
+	}
+	sort.Strings(names)
+	return nil, problem.NotFoundFix(id,
+		fmt.Sprintf("this Process has no unit named %q", unit),
+		fmt.Sprintf("Name one of its units: %s.", strings.Join(names, ", ")))
 }
 
 // isFace reports whether one container of a pod is the unit that declares the

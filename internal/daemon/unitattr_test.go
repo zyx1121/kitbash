@@ -1,11 +1,13 @@
 package daemon
 
 import (
+	"encoding/json"
 	"net/http"
 	"testing"
 	"time"
 
 	"github.com/zyx1121/kitbash/internal/otlp"
+	"github.com/zyx1121/kitbash/internal/store"
 )
 
 // kitbash.unit is the one attribute a container of a pod adds to what it
@@ -134,5 +136,90 @@ func TestTheProbeOfASingleUnitProcessCarriesNoUnit(t *testing.T) {
 	record := h.waitForHealth("the health record of a Process of one unit")
 	if record.Attributes.Unit != "" {
 		t.Errorf("the probe records the unit %q, want none", record.Attributes.Unit)
+	}
+}
+
+// tel_query takes unit as a filter, which is what makes the attribute worth
+// stamping: "what did the cache do" is one query rather than a page of the
+// Process's records read by hand, see PLAN.md section 5.6.
+//
+// The other half is that a Process of one unit carries none, so a query by
+// unit never answers with its records.
+func TestAQueryByUnitAnswersThatUnitAndNoOther(t *testing.T) {
+	h, fake := serveProbing(t)
+	stub := newProbeStub(t, http.StatusOK)
+
+	// A Process that runs as a pod. Its probe requests the face, so the
+	// records it writes carry the unit web.
+	pod := probeRegistration(stub.server.URL, "/healthz", "")
+	pod.Container = "kitbash-board-board-web"
+	pod.Pod = "kitbash-board-board"
+	pod.Units = []unitRequest{
+		{Name: "web", Container: "kitbash-board-board-web", Digest: pod.Digest, Face: true},
+		{Name: "cache", Container: "kitbash-board-board-cache", Digest: cacheDigest},
+	}
+	port, ok := endpointPort(stub.server.URL)
+	if !ok {
+		t.Fatalf("the endpoint %q names no port", stub.server.URL)
+	}
+	fake.Publish(pod.Container, port)
+	if _, res, body := h.register(pod); res.StatusCode != http.StatusOK {
+		t.Fatalf("register = %d %s, want 200", res.StatusCode, body)
+	}
+
+	// A Process of one unit beside it, probed the same way, whose records
+	// carry no unit at all.
+	alone := h.registerProbed(fake, stub.server.URL, "/healthz", "")
+
+	// Both have to have been probed before the query means anything: a filter
+	// that answers nothing of the second Process because the second Process
+	// has written nothing yet is not the assertion this makes.
+	waitFor(t, "a health record of each Process", func() bool {
+		var composed, single bool
+		for _, record := range h.healthRecords() {
+			switch record.Attributes.Process {
+			case pod.ID:
+				composed = true
+			case alone.ID:
+				single = true
+			}
+		}
+		return composed && single
+	})
+
+	res, body := h.postJSON(http.MethodPost, "/kitbash/v1/query",
+		queryRequest{Signal: store.SignalMetrics, Unit: "web"})
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("query status = %d, body %s", res.StatusCode, body)
+	}
+	var got struct {
+		Records []metricRecord `json:"records"`
+	}
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("body %q: %v", body, err)
+	}
+	if len(got.Records) == 0 {
+		t.Fatal("a query by unit answered nothing, want the probe records of the face")
+	}
+	for _, record := range got.Records {
+		if record.Attributes.Unit != "web" {
+			t.Errorf("a record of the unit %q came back for a query of web: %+v", record.Attributes.Unit, record)
+		}
+		if record.Attributes.Process != pod.ID {
+			t.Errorf("a record of the Process %s came back, want the pod %s", record.Attributes.Process, pod.ID)
+		}
+	}
+
+	// A unit nothing is called answers the empty page rather than everything.
+	res, body = h.postJSON(http.MethodPost, "/kitbash/v1/query",
+		queryRequest{Signal: store.SignalMetrics, Unit: "cache"})
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("query status = %d, body %s", res.StatusCode, body)
+	}
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("body %q: %v", body, err)
+	}
+	if len(got.Records) != 0 {
+		t.Errorf("a query for the unit nothing wrote about answered %d records", len(got.Records))
 	}
 }

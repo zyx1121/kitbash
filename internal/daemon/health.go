@@ -16,7 +16,7 @@ import (
 	"github.com/zyx1121/kitbash/internal/sysusers"
 )
 
-// The health probe of a Process. A Package declares deploy.units[0].health.http
+// The health probe of a Process. A Package declares deploy.units[].health.http
 // and kitbashd requests that path on the Process's endpoint every interval,
 // writing one metric record per probe. It restarts nothing, stops nothing and
 // changes no registration: what a probe produces is Telemetry, and what is done
@@ -268,7 +268,7 @@ func (s *Server) verifyProbe(ctx context.Context, m sysusers.Member, p store.Pro
 		if p.Health.Declared() {
 			return false, problem.NotPermitted(instance,
 				"a Process a run kit owns is not probed by kitbashd",
-				fmt.Sprintf("Remove deploy.units[0].health from this Package, or have %s probe the Process it runs.", p.Runner))
+				fmt.Sprintf("Remove deploy.units[].health from this Package, or have %s probe the Process it runs.", p.Runner))
 		}
 		return false, nil
 	}
@@ -656,5 +656,5 @@ func (s *Server) withReadings(list []store.Process) []store.Process {
 
 // healthFix is what a Package author does about a probe this daemon refuses.
 var healthFix = fmt.Sprintf(
-	"Declare deploy.units[0].health.http as the path to request, such as /healthz, and health.interval as a duration such as 30s; an interval under %s is raised to it.",
+	"Declare deploy.units[].health.http as the path to request, such as /healthz, and health.interval as a duration such as 30s; an interval under %s is raised to it.",
 	MinHealthInterval)

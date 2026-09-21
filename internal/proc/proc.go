@@ -333,7 +333,7 @@ func (s *Service) run(ctx context.Context, span *telemetry.Span, path, digest, n
 		return s.runPod(ctx, span, m, folder, units, digest, name)
 	}
 	if len(units) == 0 || units[0].Type != manifest.UnitContainer {
-		return nil, problem.InvalidManifest(folder, "version 1 runs the first container unit of a Package")
+		return nil, problem.InvalidManifest(folder, "a Package runs container units, and this one declares none")
 	}
 	unit := units[0]
 	// A unit that names a runner is the kit's to start. Dispatch is routing
@@ -386,7 +386,7 @@ func (s *Service) run(ctx context.Context, span *telemetry.Span, path, digest, n
 			// register, so the Process would be exposed in name only.
 			return nil, problem.InvalidManifestFix(folder,
 				"expose: http declares no port, so the Process has no endpoint to be reached on",
-				"Give deploy.units[0] the port the container listens on, or set expose to none.")
+				"Give the unit the port the container listens on, or set expose to none.")
 		}
 		mapping := podman.PortMapping{ContainerPort: unit.Port}
 		if host, err := freePort(); err == nil {
@@ -937,14 +937,18 @@ func freePort() (int, error) {
 }
 
 // Logs answers proc_logs: the raw stdout and stderr of a Process.
-func (s *Service) Logs(ctx context.Context, id string, lines int) (*LogsResult, *problem.Problem) {
+//
+// A Process that runs as a pod is several containers, and unit is which of
+// them to read. Without one the face is read, because that is the unit the
+// Process answers for, see PLAN.md section 5.6.
+func (s *Service) Logs(ctx context.Context, id, unit string, lines int) (*LogsResult, *problem.Problem) {
 	if lines <= 0 {
 		lines = DefaultLogLines
 	}
 	if lines > MaxLogLines {
 		lines = MaxLogLines
 	}
-	container, prob := s.byID(ctx, id)
+	containers, prob := s.unitsOf(ctx, id)
 	if prob != nil {
 		// A job whose first tick has not come has no container and no output,
 		// which is an answer rather than a Process nobody has heard of: the
@@ -953,6 +957,13 @@ func (s *Service) Logs(ctx context.Context, id string, lines int) (*LogsResult, 
 			return nil, problem.NotFoundFix(id, "this Process is scheduled and has not run yet, so it has no output",
 				"Call proc_list to see when kitbashd runs it next, and read the logs after that run.")
 		}
+		return nil, prob
+	}
+	// A unit the caller named is answered for even when the Process is a job
+	// or a Package of one unit: a name that is not a unit of this Process is
+	// not-found saying which units it has, see PLAN.md section 5.6.
+	container, prob := unitContainer(id, containers, unit)
+	if prob != nil {
 		return nil, prob
 	}
 	out, err := s.runner.Logs(ctx, container.Name, lines)
@@ -1233,6 +1244,22 @@ func (s *Service) byName(ctx context.Context, name string) (*podman.Container, *
 
 // byID finds one container by the kitbash.id label, which is the Process id.
 func (s *Service) byID(ctx context.Context, id string) (*podman.Container, *problem.Problem) {
+	containers, prob := s.unitsOf(ctx, id)
+	if prob != nil {
+		return nil, prob
+	}
+	// A Process that runs as a pod has one container per unit under this id,
+	// and the one that answers for it is the face: it is the container
+	// proc_logs reads by default and the one a session execs into, see
+	// PLAN.md section 5.6.
+	return &faceContainers(containers)[0], nil
+}
+
+// unitsOf is every container of one Process: one for a Package of one unit and
+// one per unit for a Package that runs as a pod. A Process nobody has heard of
+// is not-found, which is what the callers that want one container answer with
+// as well.
+func (s *Service) unitsOf(ctx context.Context, id string) ([]podman.Container, *problem.Problem) {
 	if id == "" {
 		return nil, problem.NotFoundFix(id, "no Process id was given",
 			"Call proc_list to see your Processes and their ids.")
@@ -1248,11 +1275,7 @@ func (s *Service) byID(ctx context.Context, id string) (*podman.Container, *prob
 		return nil, problem.NotFoundFix(id, "no Process of yours has this id",
 			"Call proc_list to see your Processes and their ids.")
 	}
-	// A Process that runs as a pod has one container per unit under this id,
-	// and the one that answers for it is the face: it is the container
-	// proc_logs reads by default and the one a session execs into, see
-	// PLAN.md section 5.6.
-	return &faceContainers(containers)[0], nil
+	return containers, nil
 }
 
 // containers reads the container list, mapping a runtime failure onto the

@@ -29,10 +29,10 @@ Packages. A folder with a `deploy` block, built to or imported as an OCI image.
 
 | Tool | What it does |
 |------|-------------|
-| `pkg_build` | Build the Package at a path from its current commit. Returns the digest, the commit and the last 20 lines of the build log |
+| `pkg_build` | Build every container unit of the Package at a path from its current commit. Returns the face unit's digest, the commit and the last 20 lines of the build log |
 | `pkg_import` | Wrap something external as a Package folder through a running import kit. Writes the folder, does not build |
 | `pkg_list` | Visible Packages: path, name and the digest of the latest build |
-| `pkg_inspect` | The manifest and the build history of one Package |
+| `pkg_inspect` | The manifest, the units the Package declares and its build history |
 
 ## proc
 
@@ -43,7 +43,20 @@ Processes. A Package running as a rootless container under the caller.
 | `proc_run` | Start a Process from a digest, or converge an existing one to it. With `expose: mcp` its tools join the surface |
 | `proc_list` | The caller's Processes, running or stopped. With a `package`, that Package's Processes in full; without one, a line each, carrying `url` for an http Process and `schedule` and `nextRun` for a job |
 | `proc_stop` | Stop a Process. It stays known, and its tools leave the surface |
-| `proc_logs` | The recent stdout and stderr of a Process, interleaved as the runtime wrote them |
+| `proc_logs` | The recent stdout and stderr of a Process, interleaved as the runtime wrote them. `unit` reads one unit of a Process that runs as a pod; without it the exposed unit is read |
+
+A Package that declares more than one unit runs as one Process that is one
+podman pod: the units share a network namespace and reach each other on
+`localhost`, each one is its own image, and exactly one declares `expose`,
+which is the Process's face and what the address, the health probe and the
+route belong to. It stays one Process with one registration, one token and one
+line in every listing. `pkg_inspect` shows the units a Package declares and
+which of them is the face, `proc_list` asked about that Package carries
+`units` with the state of each, and the Process is `running` when every unit
+is; when it is not, `units` says which one is down. `proc_logs` takes the
+`unit` to read and defaults to the face, a name that is not a unit of that
+Process is `not-found` naming the ones it has, and `tel_query` takes `unit` as
+a filter. `proc_stop` stops the pod and removes it with every container in it.
 
 A unit with `expose: http` gets an address when the host has a domain:
 `proc_run` answers `url` and `proc_list` shows it, `https://<name>.<member>.<domain>`,
@@ -208,6 +221,7 @@ stamps it from the connection the record arrived on.
 | `user` | What a member did. It defaults to the caller; naming another member is admin only |
 | `package` | How one Package behaves, across every Process of it |
 | `process` | What one running Process did |
+| `unit` | What one unit of a Process that runs as a pod did. A Process of one unit carries none |
 | `path` | What happened to a Files path, matched by prefix |
 | `tool` | Every call of one surface tool |
 | `caller` | What a Process did through `/mcp` on its owner's behalf |

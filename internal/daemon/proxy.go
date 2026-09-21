@@ -1249,7 +1249,7 @@ func (s *Server) hostConflict(ctx context.Context, instance string, p store.Proc
 			}
 			return problem.ConflictFix(instance,
 				fmt.Sprintf("the host name %s is already served by another Process on this host", p.Hostname),
-				"Declare another deploy.units[0].hostname, or stop the Process that holds this one.")
+				"Declare another deploy.units[].hostname, or stop the Process that holds this one.")
 		}
 	}
 	return nil

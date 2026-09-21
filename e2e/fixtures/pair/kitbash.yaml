@@ -16,6 +16,10 @@ deploy:
       port: 8080
       environment: { CACHE_PORT: "6379" }
       limits: { memory: "256Mi" }
+      # The probe is what stamps kitbash.unit on a record of one unit: the
+      # daemon requests this path on the face and writes one kitbash.health
+      # metric carrying the unit it read, which is what tel_query filters by.
+      health: { http: /healthz, interval: 5s }
     # The sidecar. It is an upstream image pinned by digest rather than a build
     # of this Package, which is the other half of what a unit may be.
     - name: cache

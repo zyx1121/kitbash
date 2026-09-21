@@ -83,7 +83,28 @@ type Build struct {
 type InspectResult struct {
 	Path     string         `json:"path"`
 	Manifest map[string]any `json:"manifest"`
+	Units    []InspectUnit  `json:"units"`
 	Builds   []Build        `json:"builds"`
+}
+
+// InspectUnit is one unit a Package declares, as pkg_inspect answers it: what
+// it is called, what it runs and what this host has built of it. The manifest
+// beside it is the whole declaration; this is the part a reader asks first,
+// which is what the Package is made of and which unit is its face, see PLAN.md
+// section 5.6.
+type InspectUnit struct {
+	Name string `json:"name"`
+	// Expose is carried by the one unit that declares the Process's face and
+	// by no other: expose: none is the same as declaring nothing, so a unit
+	// behind the face answers an empty field rather than a word.
+	Expose string `json:"expose,omitempty"`
+	Build  string `json:"build,omitempty"`
+	Image  string `json:"image,omitempty"`
+	// Digest is the newest image this host holds of this unit, which is what
+	// the last build of it left. It is empty for a unit nothing has built
+	// here, because a build record is one digest per commit per Package and
+	// names no unit.
+	Digest string `json:"digest,omitempty"`
 }
 
 // ImportRequest is the input of pkg_import. Author and ApprovedBy are what
@@ -558,7 +579,7 @@ func (s *Service) Inspect(ctx context.Context, path string) (*InspectResult, *pr
 	if err != nil {
 		return nil, problem.Internal(folder, err.Error(), "")
 	}
-	result := &InspectResult{Path: folder, Manifest: m.Raw, Builds: []Build{}}
+	result := &InspectResult{Path: folder, Manifest: m.Raw, Units: []InspectUnit{}, Builds: []Build{}}
 	for _, image := range images {
 		result.Builds = append(result.Builds, Build{
 			Digest:  image.ID,
@@ -571,7 +592,68 @@ func (s *Service) Inspect(ctx context.Context, path string) (*InspectResult, *pr
 		})
 	}
 	s.merge(ctx, folder, result)
+	result.Units = declaredUnits(m, images, result.Builds)
 	return result, nil
+}
+
+// declaredUnits is what the Package is made of, in the order the manifest
+// wrote it: one entry per unit, the face marked by its exposure, and the image
+// this host last built of each.
+//
+// A Package of one unit is named after the Package when its unit is not, and
+// its digest is the latest build this tool already lists, which for an /org
+// Package may be one another member recorded. The units of a composed Package
+// are found by the label pkg_build stamps on each image instead, because a
+// record names no unit and two units of one Package are two images.
+func declaredUnits(m *manifest.Manifest, images []podman.Image, builds []Build) []InspectUnit {
+	declared, err := m.Units()
+	if err != nil {
+		// A manifest the loader refuses is not answered at all: Inspect has
+		// already read it. An empty list here is a Package with no deploy
+		// block, which is a folder rather than a Package.
+		return []InspectUnit{}
+	}
+	out := make([]InspectUnit, 0, len(declared))
+	for _, unit := range declared {
+		entry := InspectUnit{
+			Name:  unit.Name,
+			Build: unit.Build,
+			Image: unit.Image,
+		}
+		if entry.Name == "" {
+			entry.Name = m.Name
+		}
+		switch unit.Expose {
+		case manifest.ExposeMCP, manifest.ExposeHTTP:
+			entry.Expose = unit.Expose
+		}
+		if len(declared) == 1 {
+			if len(builds) > 0 {
+				entry.Digest = builds[0].Digest
+			}
+		} else {
+			entry.Digest = newestImageOf(images, unit.Name)
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+// newestImageOf is the image this host holds for one unit of a composed
+// Package, newest first by the time it was built. An empty answer is a unit
+// nobody has built here.
+func newestImageOf(images []podman.Image, unit string) string {
+	digest := ""
+	var at time.Time
+	for _, image := range images {
+		if image.Labels[podman.LabelUnit] != unit {
+			continue
+		}
+		if digest == "" || image.Created.After(at) {
+			digest, at = image.ID, image.Created
+		}
+	}
+	return digest
 }
 
 // merge folds kitbashd's build records into the local image list, so an agent
@@ -655,11 +737,11 @@ func (s *Service) source(folder string, unit manifest.Unit) (contextDir, contain
 	default:
 		return "", "", nil, problem.InvalidManifestFix(folder,
 			"the container unit has neither a build context nor an image",
-			"Give deploy.units[0] a build context or an image pinned by digest.")
+			"Give deploy.units[] a build context or an image pinned by digest.")
 	}
 }
 
-// buildContext resolves deploy.units[0].build against the Package folder. A
+// buildContext resolves deploy.units[].build against the Package folder. A
 // Package cannot reach outside its own tree at build time, which is rule 4 of
 // PLAN.md section 2.5, and a symlink is a way out of the tree that looks like
 // a way in: safepath applies the lexical rules and names what is wrong,
@@ -680,7 +762,7 @@ func (s *Service) buildContext(folder, build string) (string, *problem.Problem) 
 	if err != nil || !info.IsDir() {
 		return "", problem.NotFoundFix(dir,
 			fmt.Sprintf("the build context %q is not a folder", build),
-			"Point deploy.units[0].build at a folder inside this Package.")
+			"Point deploy.units[].build at a folder inside this Package.")
 	}
 	return dir, nil
 }

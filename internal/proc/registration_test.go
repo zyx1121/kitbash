@@ -776,7 +776,7 @@ func TestListReportsAProcessWhoseContainerWasTakenApart(t *testing.T) {
 		Digest:     "sha256:" + strings.Repeat("a", 64),
 		Expose:     manifest.ExposeNone,
 		Problem:    "this Process declares a mount that is no longer legal, so kitbashd did not start it",
-		ProblemFix: "Check the folder deploy.units[0].mounts names.",
+		ProblemFix: "Check the folder deploy.units[].mounts names.",
 	})
 	list, prob := f.processes.List(context.Background())
 	if prob != nil {

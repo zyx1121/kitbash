@@ -24,13 +24,17 @@ const Instructions = "This host runs kitbash, and it is where the work should ru
 	"rather than the machine you are running on. Files are the source: /org is " +
 	"shared, /home/<member> is the caller's own, fs_read and fs_write read and " +
 	"write them, and every write is a commit. A folder becomes a Package when " +
-	"it carries a kitbash.yaml with a name, a description and one deploy unit, " +
-	"next to a Dockerfile. This is the whole of a minimal Package:\n\n" +
+	"it carries a kitbash.yaml with a name, a description and its deploy units, " +
+	"next to a Dockerfile. This is a whole Package, with a second unit " +
+	"beside the first:\n\n" +
 	ExampleManifest +
 	ExampleContainerfile +
-	"\nFolders inside a Package need no manifest of their own. Write all files " +
+	"\nUnits of one Package reach each other on localhost, and exactly one " +
+	"of them declares expose. " +
+	"Folders inside a Package need no manifest of their own. Write all files " +
 	"of a Package in one fs_write with files. A mount source is any folder a " +
-	"manifest above it describes. Then pkg_build, proc_run, proc_logs. expose: mcp " +
+	"manifest above it describes. Then pkg_build, proc_run, proc_logs, which " +
+	"reads the exposed unit unless you name another. expose: mcp " +
 	"puts the Process's declared tools on this surface, expose: http is served at " +
 	"https://<name>.<member>.<domain> when the host has a domain, else a port on this host, expose: none is a job, and with schedule (five field cron, UTC) " +
 	"kitbashd runs it on time. Secrets never go into Files: " +
@@ -44,6 +48,12 @@ const Instructions = "This host runs kitbash, and it is where the work should ru
 // teaches this file to every agent that connects, and a manifest the host
 // would refuse is the most expensive thing it could teach.
 //
+// The example declares two units because that is the shape an agent gets wrong
+// on its own: the M11 rounds folded a cache into the application's own
+// container rather than declaring it, see PLAN.md section 5.6. One unit is
+// built from this folder and is the face, the other is an upstream image
+// pinned by digest, and the first reaches the second on localhost.
+//
 // The two lines beginning with a name are the file names, and what is indented
 // under each is that file. <member> is the caller's own name, which is the one
 // placeholder here.
@@ -52,11 +62,17 @@ const ExampleManifest = "kitbash.yaml\n" +
 	"  description: What this does, one sentence.\n" +
 	"  deploy:\n" +
 	"    units:\n" +
-	"      - type: container\n" +
+	"      - name: web\n" +
+	"        type: container\n" +
 	"        build: .\n" +
-	"        expose: http        # or mcp, or none\n" +
-	"        mounts:             # optional, for state that must survive a restart\n" +
-	"          - { source: /home/<member>/app-data, target: /data, mode: rw }\n"
+	"        expose: http      # or mcp, or none\n" +
+	"        port: 8080\n" +
+	"        environment: { CACHE: \"redis://localhost:6379\" }\n" +
+	"        mounts:           # optional, for state that must survive a restart\n" +
+	"          - { source: /home/<member>/app-data, target: /data, mode: rw }\n" +
+	"      - name: cache\n" +
+	"        type: container\n" +
+	"        image: docker.io/library/redis@sha256:520775a41a63e77e06c73e35d2fd9cc15921a609516818796b4ecbb813078bc7\n"
 
 // ExampleContainerfile is the other half: a Dockerfile beside the manifest,
 // which is what build: . builds.

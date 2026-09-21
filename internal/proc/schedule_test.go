@@ -274,7 +274,7 @@ func TestLogsOfAJobThatHasNotRunSayItHasNotRun(t *testing.T) {
 		t.Fatalf("Run: %s", prob.Detail)
 	}
 
-	_, prob = f.processes.Logs(ctx, process.ID, 0)
+	_, prob = f.processes.Logs(ctx, process.ID, "", 0)
 	if prob == nil {
 		t.Fatal("the logs of a job that has not run were answered")
 	}

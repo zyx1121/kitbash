@@ -69,12 +69,12 @@ func (s *Server) declaredHostname(instance string, p store.Process) *problem.Pro
 	if p.Subscribes() {
 		return problem.InvalidManifestFix(instance,
 			fmt.Sprintf("this unit declares the host name %s and a subscription, and a subscriber is a receiver for kitbashd and is not published", p.Hostname),
-			"Remove deploy.units[0].hostname, or remove provides.subscriptions from this Package. A subscriber keeps its port for the fan out alone and is served under no name.")
+			"Remove deploy.units[].hostname, or remove provides.subscriptions from this Package. A subscriber keeps its port for the fan out alone and is served under no name.")
 	}
 	if isAddressLiteral(p.Hostname) {
 		return problem.InvalidManifestFix(instance,
 			fmt.Sprintf("%s is an address and not a host name, so nothing resolves it to this host", p.Hostname),
-			"Declare deploy.units[0].hostname as a DNS name whose record points at this host, or remove it and use the name kitbash derives.")
+			"Declare deploy.units[].hostname as a DNS name whose record points at this host, or remove it and use the name kitbash derives.")
 	}
 	if underDomain(p.Hostname, s.proxy.domain) {
 		return problem.InvalidManifestFix(instance,

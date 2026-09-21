@@ -178,7 +178,7 @@ func (s *Server) resolveSecretNames(instance, owner string, names []string) (map
 		if !manifest.ValidSecretName(name) || strings.HasPrefix(name, manifest.OwnedEnvPrefix) {
 			return nil, problem.BadRequest(instance,
 				fmt.Sprintf("%q is not a secret name this Process may declare", name),
-				"Declare deploy.units[0].secrets as environment variable names, none of them a KITBASH_ name.")
+				"Declare deploy.units[].secrets as environment variable names, none of them a KITBASH_ name.")
 		}
 		value, held, err := s.secrets.Get(owner, name)
 		if err != nil {

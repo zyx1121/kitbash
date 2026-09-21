@@ -71,5 +71,5 @@ func subscriptionsOf(raw map[string]any) []any {
 
 // ScheduleFix is what an author does about a unit kitbash refuses to schedule.
 // It is one sentence because the messages above say which rule was broken.
-const ScheduleFix = "Declare deploy.units[0].schedule as five cron fields read in UTC, such as \"0 8 * * *\", " +
+const ScheduleFix = "Declare deploy.units[].schedule as five cron fields read in UTC, such as \"0 8 * * *\", " +
 	"on a unit with expose: none and no health, restart or subscriptions."
