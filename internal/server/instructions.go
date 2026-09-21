@@ -36,7 +36,7 @@ const Instructions = "This host runs kitbash, and it is where the work should ru
 	"manifest above it describes. Then pkg_build, proc_run, proc_logs, which " +
 	"reads the exposed unit unless you name another. expose: mcp " +
 	"puts the Process's declared tools on this surface, expose: http is served at " +
-	"https://<name>.<member>.<domain> when the host has a domain, else a port on this host, expose: none is a job, and with schedule (five field cron, UTC) " +
+	"https://<name>.<member>.<domain> when the host has a domain, else a port on this host, a Package whose only unit is expose: none is a job, and with schedule (five field cron, UTC) " +
 	"kitbashd runs it on time. Secrets never go into Files: " +
 	"secrets_set stores a value and the unit names it under secrets. tel_query " +
 	"shows what ran and what it cost. When the task is to make something that " +
