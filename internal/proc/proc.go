@@ -100,6 +100,11 @@ type Process struct {
 	Schedule string   `json:"schedule,omitempty"`
 	NextRun  string   `json:"nextRun,omitempty"`
 	LastRun  *LastRun `json:"lastRun,omitempty"`
+	// Units are the units of a Package that runs as a pod and what each of
+	// them is doing, absent for a Process of one unit. The Process is running
+	// when every unit is, and when it is not, this is what says which unit is
+	// down, see PLAN.md section 5.6.
+	Units []UnitLine `json:"units,omitempty"`
 
 	// Container is the runtime name the bridge execs into. It is not part of
 	// the tool's output: the surface names a Process by its id.
@@ -107,6 +112,13 @@ type Process struct {
 	// Replaced is the Process this run took the place of, if any, so the
 	// bridge can unpublish its tools. It is not part of the output either.
 	Replaced *Process `json:"-"`
+}
+
+// UnitLine is one unit of a Process that runs as a pod: the name its manifest
+// gave it and the state it is in, in the same five states a Process has.
+type UnitLine struct {
+	Name  string `json:"name"`
+	State string `json:"state"`
 }
 
 // Health is one Process's most recent probe: when kitbashd requested the
@@ -315,15 +327,10 @@ func (s *Service) run(ctx context.Context, span *telemetry.Span, path, digest, n
 	if err != nil {
 		return nil, problem.InvalidManifest(folder, err.Error())
 	}
-	// Reading every unit is what the manifest layer does; running every unit
-	// is the runner's, and the runner runs one container and not a pod. A
-	// Package that declares more than one is refused here rather than run
-	// half, so a member is told which part of M12 has landed, see PLAN.md
-	// section 5.6.
+	// A Package of more than one unit runs as one pod, one Process with one
+	// registration and one address, see PLAN.md section 5.6.
 	if len(units) > 1 {
-		return nil, problem.InvalidManifestFix(folder,
-			"composition of several units is not supported yet",
-			"Declare one unit in deploy.units, or wait for the release that runs a Package as a pod.")
+		return s.runPod(ctx, span, m, folder, units, digest, name)
 	}
 	if len(units) == 0 || units[0].Type != manifest.UnitContainer {
 		return nil, problem.InvalidManifest(folder, "version 1 runs the first container unit of a Package")
@@ -575,9 +582,18 @@ func (s *Service) List(ctx context.Context) (*ListResult, *problem.Problem) {
 		return nil, prob
 	}
 	known := s.registered(ctx)
+	// A pod is one Process and one line, so its containers are grouped: the
+	// face is what the line describes and the units are listed beside it. A
+	// Process of one unit has no unit label and is described exactly as it
+	// was, see pods.go.
+	units := podUnits(containers)
 	result := &ListResult{Processes: []Process{}}
-	for _, container := range containers {
+	for _, container := range faceContainers(containers) {
 		process := s.describe(container, manifest.Unit{})
+		if lines, composed := units[process.ID]; composed {
+			process.Units = lines
+			process.State = worstState(process.State, lines)
+		}
 		if reported, held := known[process.ID]; held {
 			if scheduledEntry(reported) {
 				// A job's container is the run before this one, or the one
@@ -740,6 +756,17 @@ func (s *Service) Reconcile(ctx context.Context, running []Process) (registered,
 		// stale case below.
 		here[p.ID] = true
 		if _, ok := byID[p.ID]; ok {
+			continue
+		}
+		// A Process that runs as a pod is not re-registered from a listing:
+		// the registration of a pod names every unit and the container of
+		// each, and a row written from the face alone would be a Process
+		// kitbashd would then stop and restore as one container. Running the
+		// Package again is what puts it back in the registry, which is what
+		// this says, see PLAN.md section 5.6.
+		if len(p.Units) > 0 {
+			s.logger.Printf("proc: the Process %s at %s runs as a pod and kitbashd holds no registration for it; run the Package again to register it",
+				p.ID, p.Package)
 			continue
 		}
 		reg := telemetry.Registration{
@@ -1221,7 +1248,11 @@ func (s *Service) byID(ctx context.Context, id string) (*podman.Container, *prob
 		return nil, problem.NotFoundFix(id, "no Process of yours has this id",
 			"Call proc_list to see your Processes and their ids.")
 	}
-	return &containers[0], nil
+	// A Process that runs as a pod has one container per unit under this id,
+	// and the one that answers for it is the face: it is the container
+	// proc_logs reads by default and the one a session execs into, see
+	// PLAN.md section 5.6.
+	return &faceContainers(containers)[0], nil
 }
 
 // containers reads the container list, mapping a runtime failure onto the

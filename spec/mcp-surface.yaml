@@ -578,10 +578,19 @@ families:
           its container name: a name already held by a Process of another
           Package is a conflict, and so is a tool name another running Process
           already answers, which leaves the Process running with its tools off
-          the surface. A Package of one container unit is what this runner
-          runs: a Package that declares more than one is invalid-manifest
-          saying composition of several units is not supported yet, until the
-          runner runs a Package as one pod, see PLAN.md section 5.6. Before the
+          the surface. A Package of more than one container unit runs as one
+          podman pod named kitbash-<package>-<name>, each unit a container
+          kitbash-<package>-<name>-<unit>: the units share the pod's network
+          namespace and reach each other on localhost, the pod publishes the
+          port of the unit that declares expose mcp or http, which is the
+          Process's face and the one the health probe and the route belong to,
+          each unit carries its own image, environment, command, mounts,
+          secrets and limits under the Process's ceiling, and the Process is
+          running when every unit is, see PLAN.md section 5.6. proc_stop of
+          such a Process stops the pod and removes it with every container in
+          it, because podman refuses a pod under a name that is taken and a
+          pod left behind is a Package that cannot be run again. A Package of one
+          unit runs as the bare container it always has. Before the
           container starts the Process is registered with kitbashd, which
           mints its Telemetry token; the container receives
           KITBASH_TELEMETRY_ENDPOINT, KITBASH_TELEMETRY_TOKEN, KITBASH_PROCESS,
@@ -723,6 +732,18 @@ families:
             state: { type: string, enum: [starting, running, unhealthy, stopped, failed, scheduled] }
             expose: { type: string, enum: [mcp, http, none] }
             endpoint: { type: string, description: "Internal URL when expose is http" }
+            units:
+              type: array
+              description: >
+                The units of a Package that runs as a pod and what each of them is doing.
+                Absent for a Process of one unit. The Process is running when every unit
+                is, and when it is not, this says which one is down.
+              items:
+                type: object
+                required: [name, state]
+                properties:
+                  name: { type: string }
+                  state: { type: string, enum: [starting, running, unhealthy, stopped, failed, scheduled] }
             schedule: { type: string, description: "The cron expression this Process is a job of, absent for a Process that stays up" }
             nextRun: { type: string, format: date-time, description: "When kitbashd runs this job next, UTC" }
             lastRun:
@@ -815,6 +836,18 @@ families:
                       startedAt: { type: string, format: date-time }
                       exitCode: { type: integer }
                       durationMs: { type: integer }
+                  units:
+                    type: array
+                    description: >
+                      The units of a Package that runs as a pod and what each of them is
+                      doing. Absent for a Process of one unit. The Process is running when
+                      every unit is, and when it is not, this says which one is down.
+                    items:
+                      type: object
+                      required: [name, state]
+                      properties:
+                        name: { type: string }
+                        state: { type: string, enum: [starting, running, unhealthy, stopped, failed, scheduled] }
                   startedAt: { type: string, format: date-time }
                   problem: { type: string, description: "Why this Process is not running, when kitbashd could not bring it back" }
                   fix: { type: string, description: "What the owner can do about it" }

@@ -213,6 +213,18 @@ const processDef = `{
         "durationMs": { "type": "integer" }
       }
     },
+    "units": {
+      "type": "array",
+      "description": "The units of a Package that runs as a pod and what each of them is doing. Absent for a Process of one unit. The Process is running when every unit is, and when it is not, this says which one is down.",
+      "items": {
+        "type": "object",
+        "required": ["name", "state"],
+        "properties": {
+          "name": { "type": "string" },
+          "state": { "type": "string", "enum": ["starting", "running", "unhealthy", "stopped", "failed", "scheduled"] }
+        }
+      }
+    },
     "startedAt": { "type": "string", "format": "date-time" },
     "problem": { "type": "string", "description": "Why this Process is not running, when kitbashd could not bring it back" },
     "fix": { "type": "string", "description": "What the owner can do about it" },
@@ -348,6 +360,18 @@ var (
     "state": { "type": "string", "enum": ["starting", "running", "unhealthy", "stopped", "failed", "scheduled"] },
     "expose": { "type": "string", "enum": ["mcp", "http", "none"] },
     "endpoint": { "type": "string", "description": "Internal URL when expose is http" },
+    "units": {
+      "type": "array",
+      "description": "The units of a Package that runs as a pod and what each of them is doing. Absent for a Process of one unit. The Process is running when every unit is, and when it is not, this says which one is down.",
+      "items": {
+        "type": "object",
+        "required": ["name", "state"],
+        "properties": {
+          "name": { "type": "string" },
+          "state": { "type": "string", "enum": ["starting", "running", "unhealthy", "stopped", "failed", "scheduled"] }
+        }
+      }
+    },
     "schedule": { "type": "string", "description": "The cron expression this Process is a job of, absent for a Process that stays up" },
     "nextRun": { "type": "string", "format": "date-time", "description": "When kitbashd runs this job next, UTC" },
     "lastRun": {

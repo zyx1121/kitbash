@@ -150,6 +150,11 @@ type state struct {
 	// last steps read the tick of, see schedule_test.go.
 	tickerPath string
 	tickerID   string
+	// The composed Package of two units, the Process it runs as and the
+	// address its face answers on, see pair_test.go.
+	pairPath     string
+	pairID       string
+	pairEndpoint string
 }
 
 // probeOutput is what a drafted Package's probe tool reports about its binary,
@@ -201,6 +206,7 @@ func TestSurface(t *testing.T) {
 
 		pkgPath:       filepath.Join("/home", adminName(), packageName),
 		tickerPath:    filepath.Join("/home", adminName(), tickerName),
+		pairPath:      filepath.Join("/home", adminName(), pairName),
 		runnerPath:    filepath.Join("/home", adminName(), runnerName),
 		elsewherePath: filepath.Join("/home", adminName(), elsewhereName),
 		cliPath:       filepath.Join("/home", adminName(), cliName),
@@ -255,6 +261,13 @@ func TestSurface(t *testing.T) {
 		{"the same Package under a member who has not set it is refused", aSecondMemberIsRefused},
 		{"the span of secrets_set carries no value", theSpanCarriesNoValue},
 		{"secrets_remove takes the name away and the next run is refused", theSecretIsRemoved},
+		// Composition, M12: the one Package here of more than one unit. It
+		// runs late because it pulls an image and the steps before it are
+		// what the rest of the surface is proved by, see pair_test.go.
+		{"a Package of two units runs as one pod", runThePair},
+		{"the runtime holds one pod with both units in it", thePodHoldsBothUnits},
+		{"the counter answers at its address and increments", theCounterIncrements},
+		{"proc_stop leaves no pod and no container", stopThePair},
 		{"kitbashd ran the job on time and recorded the tick", theJobRan},
 		{"proc_stop unregisters the schedule", stopTheJob},
 	}

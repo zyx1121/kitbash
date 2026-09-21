@@ -41,6 +41,11 @@ var (
 	// ErrNoContainer reports a container the runtime does not have, which is
 	// what restore unregisters rather than retries.
 	ErrNoContainer = errors.New("sysusers: no such container")
+	// ErrNoPod reports a pod the runtime does not have. A Process of more
+	// than one unit runs as one pod, so this is what restore reads to
+	// unregister it the way a missing container unregisters a single unit
+	// Process, see PLAN.md section 5.6.
+	ErrNoPod = errors.New("sysusers: no such pod")
 	// ErrNoImage reports an image the member's store does not have, which is
 	// a Process whose Package was never built here or whose build is gone.
 	ErrNoImage = errors.New("sysusers: no such image")
@@ -200,6 +205,24 @@ type Runner interface {
 	// runtime does not have is ErrNoContainer. The name says container
 	// because Remove on the System of this package is a member.
 	RemoveContainer(ctx context.Context, m Member, container string, force bool) error
+	// CreatePod makes the pod one Process of several units runs as, and
+	// answers the runtime id it printed. Nothing of the Package runs in it:
+	// the pod holds the network namespace, the published port, the host name
+	// and the cgroup, and every unit is a container created with Pod set,
+	// see PLAN.md section 5.6.
+	CreatePod(ctx context.Context, m Member, opts podman.PodOptions, cgroup string) (string, error)
+	// StopPod stops every container of one pod as the member, giving each of
+	// them timeout seconds to exit on its own. A pod the runtime does not
+	// have is ErrNoPod.
+	StopPod(ctx context.Context, m Member, pod string, timeout int) error
+	// RemovePod removes one pod and every container in it as the member. A
+	// pod the runtime does not have is ErrNoPod. It is what tears a Process
+	// down whole: a start that failed on one unit leaves no half pod behind.
+	RemovePod(ctx context.Context, m Member, pod string, force bool) error
+	// PodState is what the runtime calls one pod, lowercased, and ErrNoPod
+	// for a pod the member does not have. Restore reads it to tell a pod that
+	// is still up from one a reboot left exited.
+	PodState(ctx context.Context, m Member, pod string) (string, error)
 	// RemoveAll force removes every kitbash container of one member. It is
 	// best effort: a runtime that will not answer must not stop an admin from
 	// deleting the account.

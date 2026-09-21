@@ -201,6 +201,20 @@ func (s *Server) restoreOwner(ctx context.Context, owner string, processes []sto
 
 	s.memberCgroup(ctx, m)
 	for _, p := range processes {
+		// A Process of several units is one pod, and it comes back as one:
+		// the pod is made again and every unit in it, through the same four
+		// steps, see pods.go. Nothing below this is on that path.
+		if p.Composition.Declared() {
+			outcome := s.restorePod(ctx, m, p)
+			counts.add(outcome)
+			if outcome == restoredMissing {
+				s.unregisterMissing(ctx, p)
+			}
+			if outcome != restoredFailed && outcome != restoredMissing && !p.Limits.Written() {
+				unplaced++
+			}
+			continue
+		}
 		// A Process whose mount is no longer legal is not started. Its
 		// container was created with that folder bound into it, so starting it
 		// again would mount it again: the check has to happen before podman is
@@ -299,16 +313,7 @@ func (s *Server) restoreOwner(ctx context.Context, owner string, processes []sto
 			counts.Missing++
 			logger.Printf("restore: %s of %s no longer exists, unregistering the Process %s",
 				p.Container, owner, p.ID)
-			if _, err := s.store.DeleteProcess(ctx, p.ID); err != nil {
-				logger.Printf("restore: unregistering %s: %v", p.ID, err)
-			}
-			s.fanout.untrack(p.ID)
-			// There is no Process left to report a problem about.
-			s.clearProcessProblem(p.ID)
-			s.probes.untrack(p.ID)
-			s.proxy.untrack(p.ID)
-			s.jobs.untrack(p.ID)
-			s.endMCPSessions(p.ID)
+			s.unregisterMissing(ctx, p)
 		default:
 			logger.Printf("restore: starting %s of %s: %v", p.Container, owner, err)
 			// A Process registered before kitbashd wrote a ceiling for each of
@@ -567,6 +572,11 @@ const (
 	restoredPlaced = iota
 	restoredRunning
 	restoredFailed
+	// restoredMissing is a Process the runtime no longer has at all, which is
+	// what the pod path answers when the pod is gone: the registration names
+	// nothing and the caller unregisters it, the same as a container that is
+	// gone, see restoreOwner.
+	restoredMissing
 )
 
 // add records one Process of the verified restore path in the counts.
@@ -579,7 +589,26 @@ func (c *RestoreCounts) add(outcome int) {
 		c.Running++
 	case restoredFailed:
 		c.Failed++
+	case restoredMissing:
+		c.Missing++
 	}
+}
+
+// unregisterMissing drops the registration of a Process the runtime no longer
+// has, which revokes its token and takes it off everything that was pointing
+// at it. A registration that names nothing is worse than none: it holds a name
+// on the routing table and a live token for a container that does not exist.
+func (s *Server) unregisterMissing(ctx context.Context, p store.Process) {
+	if _, err := s.store.DeleteProcess(ctx, p.ID); err != nil {
+		logger.Printf("restore: unregistering %s: %v", p.ID, err)
+	}
+	s.fanout.untrack(p.ID)
+	// There is no Process left to report a problem about.
+	s.clearProcessProblem(p.ID)
+	s.probes.untrack(p.ID)
+	s.proxy.untrack(p.ID)
+	s.jobs.untrack(p.ID)
+	s.endMCPSessions(p.ID)
 }
 
 // restoreMounted brings back one Process that declares mounts. It answers

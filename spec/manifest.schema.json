@@ -67,6 +67,8 @@
         "units": {
           "type": "array",
           "minItems": 1,
+          "maxItems": 8,
+          "description": "A Package runs as one Process. More than one unit runs as one pod, at most eight of them: every unit is a container, an environment file and a mount check of one start, see PLAN.md section 5.6.",
           "items": { "$ref": "#/$defs/unit" }
         }
       }

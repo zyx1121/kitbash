@@ -34,6 +34,15 @@ type identity struct {
 	// their subject's identity. Only a Process an admin runs may, see
 	// PLAN.md section 2.4 Evaluation.
 	EvalClaims bool
+	// Units are the names of the units of this Process, for a Package that
+	// runs as a pod, and nil for a Process of one unit. A record that carries
+	// kitbash.unit keeps it only when it names one of these: the attribute is
+	// about which container of this Process wrote the record, and a producer
+	// naming a unit of somebody else's Process, or one of nobody's, would put
+	// a query's answer in its own hands. The attribute is dropped and the
+	// record is kept, the way an unknown caller credential is, see PLAN.md
+	// section 2.4.
+	Units []string
 	// Permits is what this Process may call over /mcp, as its Package's
 	// manifest declared it at registration. It is read only by the MCP
 	// endpoint, which hands it to the session child; a record carries none.
@@ -63,6 +72,11 @@ func (id identity) apply(a *store.Attributes) {
 	// say which Process that names; a value it did not mint, or one whose
 	// session ended, names nothing and is dropped rather than stored.
 	a.Caller = id.caller(a.Caller)
+
+	// kitbash.unit is held to the units of the Process the token names. A
+	// session over the socket names no Process at all, so a unit on one of
+	// its records names nothing and is dropped there too.
+	a.Unit = id.unit(a.Unit)
 
 	// kitbash.internal is not anybody's claim. A record marked as the cause
 	// of an internal problem is answered to admins alone, so a producer that
@@ -96,6 +110,22 @@ func (id identity) apply(a *store.Attributes) {
 		a.Process = id.Process
 	}
 	a.Producer = id.Producer
+}
+
+// unit answers the unit name a record may keep: one the Process the token
+// names actually has, and the empty string for everything else, which is a
+// producer naming a unit of another Process, a unit that was renamed, and
+// every record of a Process of one unit.
+func (id identity) unit(name string) string {
+	if name == "" {
+		return ""
+	}
+	for _, known := range id.Units {
+		if known == name {
+			return name
+		}
+	}
+	return ""
 }
 
 // caller resolves the credential on a record to the Process it names, and
@@ -163,6 +193,7 @@ func (s *Server) tokenIdentity(r *http.Request) (identity, *problem.Problem) {
 		Process:    p.ID,
 		Producer:   p.ID,
 		EvalClaims: p.Admin,
+		Units:      p.Composition.Names(),
 		Permits:    p.Permits,
 	}, nil
 }

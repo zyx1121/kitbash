@@ -39,6 +39,16 @@ const (
 	// exists, so a later session re-registers the Process with the endpoint it
 	// was started on rather than guessing one.
 	LabelEndpoint = "kitbash.endpoint"
+	// LabelUnit is the name of the unit one container of a pod runs, as the
+	// manifest declared it. Only a Package with more than one unit carries it:
+	// a single unit Package is the Process itself and its container is named
+	// and labelled exactly as it was before pods existed, see PLAN.md
+	// section 5.6.
+	LabelUnit = "kitbash.unit"
+	// LabelPod is the pod every unit container of one Process belongs to. It
+	// is on the pod and on each of its containers, so the runtime can be asked
+	// for the parts of one Process in one call.
+	LabelPod = "kitbash.pod"
 )
 
 // Container states the runtime reports, lowercased.
@@ -105,6 +115,22 @@ type PortMapping struct {
 	ContainerPort int
 }
 
+// PodOptions is one pod to create. A Package with more than one unit runs as
+// one pod: the units share its network namespace and reach each other on
+// localhost, and the pod is what owns the published port, the host name and
+// the cgroup the containers are placed under, see PLAN.md section 5.6.
+//
+// There is no image and no environment here. A pod runs the infra container
+// podman supplies, which holds the namespaces and runs nothing of the
+// Package's; every unit is a container of its own, created with Pod set.
+type PodOptions struct {
+	Name         string
+	Labels       map[string]string
+	Publish      []PortMapping
+	Hostname     string
+	CgroupParent string
+}
+
 // Container is one container in the caller's runtime, running or not.
 type Container struct {
 	ID        string
@@ -151,6 +177,15 @@ type RunOptions struct {
 	// image, as the unit declared it. podman reads it as the words after the
 	// image, so an empty one leaves the image's own command in place.
 	Command []string
+	// Pod is the pod this container joins, empty for the bare container a
+	// single unit Package runs as. A container in a pod takes its network
+	// namespace, its published ports and its host name from the pod, and
+	// podman refuses --publish, --network and --hostname on one: verified
+	// against podman 5.7.0, which answers "network cannot be configured when
+	// it is shared with a pod". Its cgroup comes from the pod too, because
+	// pod create defaults to --share-parent, so CgroupParent is left off as
+	// well, see PLAN.md section 5.6.
+	Pod string
 }
 
 // Runner is the container runtime kitbash drives. The CLI implementation talks

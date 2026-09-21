@@ -142,6 +142,39 @@ type Registration struct {
 	// owned files at every start and writes them into the environment file
 	// itself, so no value is in this body, see PLAN.md section 2.3.
 	Secrets []string `json:"secrets,omitempty"`
+	// Pod and Units are what a Package of more than one unit registers: the
+	// pod its units share and one entry per unit. A Package of one unit sends
+	// neither and is the Process it always was, see PLAN.md section 5.6.
+	//
+	// The fields above are the face unit's, so a kitbashd that reads this
+	// registration reads the container that answers where it always did.
+	Pod   string    `json:"pod,omitempty"`
+	Units []RegUnit `json:"units,omitempty"`
+}
+
+// RegUnit is one unit of a pod as the registration carries it: the name the
+// manifest gave it, the container the runtime will hold it under, the image it
+// runs, whether it is the Process's face, and what kitbashd resolves or
+// enforces per unit. What the unit runs and the environment it runs with are
+// in the start request beside it, the same split a Process of one unit makes.
+type RegUnit struct {
+	Name      string            `json:"name"`
+	Container string            `json:"container"`
+	Digest    string            `json:"digest"`
+	Face      bool              `json:"face,omitempty"`
+	Mounts    []mounts.Declared `json:"mounts,omitempty"`
+	Secrets   []string          `json:"secrets,omitempty"`
+	Memory    string            `json:"memory,omitempty"`
+	CPU       string            `json:"cpu,omitempty"`
+}
+
+// UnitState is one unit of a pod as processes_list answers it: its name and
+// what the runtime calls it, in the states the surface publishes. proc_list
+// shows the list and the Process is running when every unit is, see PLAN.md
+// section 5.6.
+type UnitState struct {
+	Name  string `json:"name"`
+	State string `json:"state"`
 }
 
 // Health is one Process's probe as kitbashd carries it: the declaration, and
@@ -262,6 +295,12 @@ type Registered struct {
 	Schedule *Schedule `json:"schedule,omitempty"`
 	NextRun  string    `json:"nextRun,omitempty"`
 	LastRun  *LastRun  `json:"lastRun,omitempty"`
+	// Pod and Units are the pod this Process runs as and what each of its
+	// units is doing, for a Package that declares more than one. A Process of
+	// one unit answers neither, and a daemon of an earlier release answers
+	// neither either.
+	Pod   string      `json:"pod,omitempty"`
+	Units []UnitState `json:"units,omitempty"`
 }
 
 // UnmarshalJSON reads a listed Process, accepting user as a spelling of owner.

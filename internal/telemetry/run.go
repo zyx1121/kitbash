@@ -80,6 +80,26 @@ type StartOptions struct {
 	// command of its image. It is the one thing in this body that lands on
 	// podman's command line, which is where the words after an image go.
 	Command []string `json:"command,omitempty"`
+	// Units is the command line of each unit of a Process that runs as a pod,
+	// by the name the registration gave it. The fields above are the face
+	// unit's, so a Process of one unit sends this empty and is started
+	// exactly as it was before pods existed, see PLAN.md section 5.6.
+	Units []StartUnit `json:"units,omitempty"`
+}
+
+// StartUnit is what one unit of a pod is created with beyond what its
+// registration already says. The container and the image are the
+// registration's, matched by name, so a request cannot start an image the
+// registry does not describe.
+type StartUnit struct {
+	Name      string            `json:"name"`
+	Labels    map[string]string `json:"labels,omitempty"`
+	Env       map[string]string `json:"env,omitempty"`
+	Restart   string            `json:"restart,omitempty"`
+	CPU       string            `json:"cpu,omitempty"`
+	Memory    string            `json:"memory,omitempty"`
+	PidsLimit int               `json:"pidsLimit,omitempty"`
+	Command   []string          `json:"command,omitempty"`
 }
 
 // PortMapping is one published port. A host port of zero leaves the choice to

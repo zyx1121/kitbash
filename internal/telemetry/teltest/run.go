@@ -49,6 +49,21 @@ type StartOptions struct {
 	// Command is what the unit declared its container runs in place of the
 	// command of its image, which podman is given after the image.
 	Command []string `json:"command,omitempty"`
+	// Units is the command line of each unit of a Process that runs as a pod.
+	// A Process of one unit sends none, see PLAN.md section 5.6.
+	Units []StartUnit `json:"units,omitempty"`
+}
+
+// StartUnit is one unit's command line in a start request.
+type StartUnit struct {
+	Name      string            `json:"name"`
+	Labels    map[string]string `json:"labels,omitempty"`
+	Env       map[string]string `json:"env,omitempty"`
+	Restart   string            `json:"restart,omitempty"`
+	CPU       string            `json:"cpu,omitempty"`
+	Memory    string            `json:"memory,omitempty"`
+	PidsLimit int               `json:"pidsLimit,omitempty"`
+	Command   []string          `json:"command,omitempty"`
 }
 
 // PortMapping is one published port of a start request.
@@ -180,6 +195,19 @@ func (d *Daemon) action(w http.ResponseWriter, r *http.Request, name string, opt
 	}
 	container := reg.Container
 	answer := map[string]string{"id": id, "container": container}
+	// A Process of more than one unit is a pod: every unit is its own
+	// container, and the three actions apply to all of them. The fake makes
+	// each of them in the runtime it mirrors into, so a proc test reads a
+	// Process that is several containers the way the runtime would show it.
+	if runtime != nil && reg.Pod != "" {
+		if err := d.podAction(r, name, reg, opts, call.Env, runtime, answer); err != nil {
+			write(w, Problem(http.StatusInternalServerError, "internal", "Internal error", err.Error(), ""))
+			return
+		}
+		encoded, _ := json.Marshal(answer)
+		write(w, Response{Status: http.StatusOK, ContentType: "application/json", Body: string(encoded)})
+		return
+	}
 	if runtime != nil {
 		switch name {
 		case startAction:
@@ -223,6 +251,67 @@ func (d *Daemon) action(w http.ResponseWriter, r *http.Request, name string, opt
 	}
 	encoded, _ := json.Marshal(answer)
 	write(w, Response{Status: http.StatusOK, ContentType: "application/json", Body: string(encoded)})
+}
+
+// podAction is the three actions for a Process that runs as a pod: one
+// container per unit, made with the pod's own published ports on it the way
+// podman reports them, and stopped or removed together.
+func (d *Daemon) podAction(r *http.Request, name string, reg Registration, opts StartOptions,
+	env map[string]string, runtime *podman.Fake, answer map[string]string) error {
+	byName := map[string]StartUnit{}
+	for _, u := range opts.Units {
+		byName[u.Name] = u
+	}
+	for _, unit := range reg.Units {
+		switch name {
+		case startAction:
+			sent := byName[unit.Name]
+			unitEnv := map[string]string{}
+			for k, v := range env {
+				unitEnv[k] = v
+			}
+			for k, v := range sent.Env {
+				unitEnv[k] = v
+			}
+			unitEnv["KITBASH_UNIT"] = unit.Name
+			run := podman.RunOptions{
+				Name:        unit.Container,
+				Image:       unit.Digest,
+				Labels:      sent.Labels,
+				Env:         unitEnv,
+				Restart:     sent.Restart,
+				CPUs:        sent.CPU,
+				Memory:      sent.Memory,
+				Command:     sent.Command,
+				Pod:         reg.Pod,
+				Detach:      true,
+				Interactive: true,
+			}
+			if unit.Face {
+				for _, port := range opts.Publish {
+					run.Publish = append(run.Publish, podman.PortMapping{
+						HostPort: port.HostPort, ContainerPort: port.ContainerPort,
+					})
+				}
+			}
+			runtimeID, err := runtime.Run(r.Context(), run)
+			if err != nil {
+				return err
+			}
+			if unit.Face {
+				answer["containerId"] = runtimeID
+			}
+		case stopAction:
+			if err := runtime.Stop(r.Context(), unit.Container, 10); err != nil {
+				return err
+			}
+		case removeAction:
+			if err := runtime.Remove(r.Context(), unit.Container, true); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // processEnv is the environment the daemon would start this container with:

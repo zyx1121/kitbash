@@ -188,12 +188,18 @@ func (s *Service) build(ctx context.Context, span *telemetry.Span, path string) 
 	if err != nil {
 		return nil, problem.InvalidManifest(folder, err.Error())
 	}
-	// Every unit is read and the first one is built: a build answers one
-	// digest, and an image per unit is the runner's half of M12 rather than
-	// this one, see PLAN.md section 5.6.
 	if len(units) == 0 || units[0].Type != manifest.UnitContainer {
 		return nil, problem.InvalidManifest(folder,
 			"version 1 builds container units")
+	}
+	// Every unit of a Package is built, because every unit of a pod is its
+	// own image: a folder of the Package for a unit with build, and the one
+	// line FROM of a unit that names an image pinned by digest, see source.
+	// The answer carries the face unit's digest, which is the one digest the
+	// surface has: the digests of the other units are read back off the
+	// images, which carry the unit they were built for, see PLAN.md 5.6.
+	if len(units) > 1 {
+		return s.buildUnits(ctx, span, m, folder, units)
 	}
 	unit := units[0]
 	// A unit that names a builder is that kit's to build, but the commit is
@@ -261,6 +267,88 @@ func (s *Service) build(ctx context.Context, span *telemetry.Span, path string) 
 		Commit: head.Sha,
 		Log:    tail(log),
 	}, nil
+}
+
+// buildUnits builds every unit of a Package that declares more than one and
+// answers the face unit's digest, which is the digest the surface publishes.
+// Each image is labelled with the unit it was built for, so proc_run asks the
+// store for the image of one unit rather than for the Package's newest.
+//
+// The build record and the copy between members are the face's alone. A record
+// is one digest per commit per Package, and a composed Package has one digest
+// per unit, so recording each of them would make "the build of this commit"
+// ambiguous for every reader of the builds table. What a member of an /org
+// Package pays for that is building the other units themselves, which is a
+// build and not a wrong answer; per unit records are #163's to add.
+func (s *Service) buildUnits(ctx context.Context, span *telemetry.Span, m *manifest.Manifest, folder string,
+	units []manifest.Unit) (*BuildResult, *problem.Problem) {
+	head, prob := s.head(ctx, folder)
+	if prob != nil {
+		return nil, prob
+	}
+	var result *BuildResult
+	for _, unit := range units {
+		if unit.Type != manifest.UnitContainer {
+			return nil, problem.InvalidManifest(folder, "version 1 builds container units")
+		}
+		if unit.Builder != "" {
+			return nil, problem.InvalidManifestFix(folder,
+				fmt.Sprintf("the unit %s names a build kit, and a Package of several units is built here", unit.Name),
+				"Name a builder on a Package of one unit, or declare one unit for this Package.")
+		}
+		built, prob := s.buildUnit(ctx, span, m, folder, unit, head.Sha)
+		if prob != nil {
+			return nil, prob
+		}
+		if unit.Expose == manifest.ExposeMCP || unit.Expose == manifest.ExposeHTTP {
+			result = built
+		}
+	}
+	if result == nil {
+		return nil, problem.InvalidManifest(folder,
+			"exactly one unit declares expose as mcp or http, which is the face of the Process, and none of these units does")
+	}
+	return result, nil
+}
+
+// buildUnit builds one unit of a composed Package. The image carries the unit
+// it was built for beside the Package and the commit, which is what tells two
+// units of one Package apart in a store that holds both.
+func (s *Service) buildUnit(ctx context.Context, span *telemetry.Span, m *manifest.Manifest, folder string,
+	unit manifest.Unit, commit string) (*BuildResult, *problem.Problem) {
+	contextDir, containerfile, cleanup, prob := s.source(folder, unit)
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if prob != nil {
+		return nil, prob
+	}
+	tag := TagPrefix + m.Name + "-" + unit.Name + ":" + shortSha(commit)
+	labels := map[string]string{
+		podman.LabelPath:   folder,
+		podman.LabelName:   m.Name,
+		podman.LabelCommit: commit,
+		podman.LabelUser:   s.files.User(),
+		podman.LabelUnit:   unit.Name,
+	}
+	digest, log, err := s.runner.Build(ctx, contextDir, containerfile, tag, labels)
+	if err != nil {
+		if errors.Is(err, podman.ErrBuildFailed) {
+			span.Error(buildFailure(log))
+			return nil, problem.BadRequest(folder, buildFailure(log),
+				"Fix the build context and call pkg_build again.")
+		}
+		return nil, problem.Internal(folder, err.Error(),
+			"Ask an administrator to check the container runtime on this host.")
+	}
+	span.Info(tail(log))
+	if unit.Expose == manifest.ExposeMCP || unit.Expose == manifest.ExposeHTTP {
+		span.SetDigest(digest)
+		// The record is the face's, which is the digest this Package is
+		// spoken of by.
+		s.record(ctx, span, folder, commit, digest)
+	}
+	return &BuildResult{Path: folder, Digest: digest, Commit: commit, Log: tail(log)}, nil
 }
 
 // head is the commit a build is made from. kitbash builds from a commit, so a

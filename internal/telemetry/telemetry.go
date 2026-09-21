@@ -65,9 +65,14 @@ const (
 	AttrUser    = "kitbash.user"
 	AttrPackage = "kitbash.package"
 	AttrProcess = "kitbash.process"
-	AttrPath    = "kitbash.path"
-	AttrTool    = "kitbash.tool"
-	AttrEval    = "kitbash.eval"
+	// AttrUnit names the unit of a Process that runs as a pod, for the
+	// records kitbashd writes about one unit. A producer may send it too and
+	// keeps it only when it names a unit of its own Process, see PLAN.md
+	// section 5.6.
+	AttrUnit = "kitbash.unit"
+	AttrPath = "kitbash.path"
+	AttrTool = "kitbash.tool"
+	AttrEval = "kitbash.eval"
 )
 
 // AttrDigest and AttrError are the two attributes the producer adds beyond the

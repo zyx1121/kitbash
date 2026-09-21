@@ -338,12 +338,42 @@ func CreateArgs(opts RunOptions, inline []string) []string {
 	return containerArgs("create", opts, inline)
 }
 
+// PodCreateArgs is the podman pod create command line for one Process that
+// runs as a pod, without the binary. The pod owns what the units may not: the
+// network namespace, the published port of the unit that is the Process's
+// face, the host name and the cgroup the containers are placed under, see
+// PLAN.md section 5.6.
+func PodCreateArgs(opts PodOptions) []string {
+	args := []string{"pod", "create", "--name", opts.Name}
+	for _, k := range sortedKeys(opts.Labels) {
+		args = append(args, "--label", k+"="+opts.Labels[k])
+	}
+	if opts.Hostname != "" {
+		args = append(args, "--hostname", opts.Hostname)
+	}
+	// The cgroup of the pod is the ceiling of the Process, and pod create
+	// defaults to --share-parent, so every container that joins it is placed
+	// under the pod's own cgroup below that ceiling.
+	if opts.CgroupParent != "" {
+		args = append(args, "--cgroup-parent="+opts.CgroupParent)
+	}
+	for _, port := range opts.Publish {
+		args = append(args, "--publish", publishSpec(port))
+	}
+	return args
+}
+
 // containerArgs is the command line both verbs share, which is all of it apart
 // from detaching.
 func containerArgs(verb string, opts RunOptions, inline []string) []string {
 	args := []string{verb, "--name", opts.Name}
 	if opts.Detach && verb == "run" {
 		args = append(args, "--detach")
+	}
+	// A container of a pod says so before anything else it shares with the
+	// pod could be written on this line.
+	if opts.Pod != "" {
+		args = append(args, "--pod", opts.Pod)
 	}
 	if opts.Interactive {
 		args = append(args, "--interactive")
@@ -373,21 +403,19 @@ func containerArgs(verb string, opts RunOptions, inline []string) []string {
 	// subtree, which is where the limits above are enforced. Without a parent
 	// there is nothing to enforce them in, so the flags are still passed and
 	// the runtime records them, see internal/cgroups.
-	if opts.CgroupParent != "" {
+	if opts.CgroupParent != "" && opts.Pod == "" {
 		args = append(args, "--cgroups=enabled", "--cgroup-parent="+opts.CgroupParent)
 	}
 	for _, mount := range opts.Mounts {
 		args = append(args, "--mount", MountSpec(mount))
 	}
-	for _, port := range opts.Publish {
-		// The loopback address only: a Process is reachable from this host,
-		// never from the network, until a reverse proxy fronts it. An empty
-		// host port leaves the choice to the runtime.
-		host := ""
-		if port.HostPort > 0 {
-			host = strconv.Itoa(port.HostPort)
+	// A container of a pod publishes nothing of its own: the pod holds the
+	// network namespace and podman refuses --publish beside --pod. The port
+	// the face unit declared is on the pod, see PodCreateArgs.
+	if opts.Pod == "" {
+		for _, port := range opts.Publish {
+			args = append(args, "--publish", publishSpec(port))
 		}
-		args = append(args, "--publish", "127.0.0.1:"+host+":"+strconv.Itoa(port.ContainerPort))
 	}
 	args = append(args, opts.Image)
 	// The command the unit declared goes after the image, which is where
@@ -395,6 +423,18 @@ func containerArgs(verb string, opts RunOptions, inline []string) []string {
 	// that declared none adds nothing, so the image decides, see PLAN.md
 	// section 2.5.
 	return append(args, opts.Command...)
+}
+
+// publishSpec is one published port as podman spells it on a --publish flag.
+// The loopback address only: a Process is reachable from this host, never from
+// the network, until a reverse proxy fronts it. An empty host port leaves the
+// choice to the runtime.
+func publishSpec(port PortMapping) string {
+	host := ""
+	if port.HostPort > 0 {
+		host = strconv.Itoa(port.HostPort)
+	}
+	return "127.0.0.1:" + host + ":" + strconv.Itoa(port.ContainerPort)
 }
 
 // MountSpec is one bind mount as podman spells it on a --mount flag.
