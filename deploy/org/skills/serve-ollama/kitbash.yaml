@@ -1,0 +1,3 @@
+name: serve-ollama
+description: Serve language models with Ollama behind a bearer token. Use for one person or a small group that wants a model quickly and switches between models often; for many concurrent users prefer serve-vllm, for a GGUF file or an architecture Ollama lacks prefer serve-llamacpp.
+tags: [model, llm, recipe]

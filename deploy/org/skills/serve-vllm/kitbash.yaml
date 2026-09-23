@@ -1,0 +1,3 @@
+name: serve-vllm
+description: Serve one Hugging Face model with vLLM for many concurrent users on an NVIDIA GPU. Needs a GPU host, which kitbash does not have until PLAN.md M13; read this to decide, and on a host without GPUs use serve-ollama or serve-llamacpp instead.
+tags: [model, llm, gpu, recipe]

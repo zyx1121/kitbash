@@ -9,5 +9,6 @@ A top level folder is visible only when it carries a `kitbash.yaml` with a name 
 
 Read [`surface.md`](surface.md) for the tools you can call, the path rules, the error shape and how to query Telemetry.
 Read [`kits.md`](kits.md) before writing a Package: the manifest, the five hooks, what a Process is given, and the build and run loop.
+List `/org/skills` before running a model server, a web application or a database: each folder there is a tested recipe with the Package to write and the traps to avoid.
 
 The logo next to this file is here so image reading can be verified.

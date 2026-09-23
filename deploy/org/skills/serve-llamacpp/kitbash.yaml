@@ -1,0 +1,3 @@
+name: serve-llamacpp
+description: Serve one GGUF model with llama.cpp's llama-server and its own API key. Use for a specific quantized GGUF, an architecture Ollama lacks, or the smallest footprint on CPU; to switch between models prefer serve-ollama, for many users on a GPU serve-vllm.
+tags: [model, llm, gguf, recipe]

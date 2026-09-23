@@ -335,4 +335,12 @@ Worked examples under `/org`. Five declare a kit hook; `workflow` declares none.
 - `observe-count`: the smallest observe kit. It counts the fan out.
 - `evaluate-latency`: observe and evaluate. It judges slow spans.
 - `workflow`: it calls the owner's tools through `KITBASH_MCP_ENDPOINT`, and its
-  `WORKFLOW.md` is what a `prompt` entry is for.
+  `WORKFLOW.md` is what a `prompt` entry is for: a file the agent reads with
+  `fs_read` before calling the tools.
+
+`/org/skills` is seeded too, and it is not a Package. Each folder under it is a
+recipe, a manifest with a name and a description and a `SKILL.md`, for one kind
+of Process: `serve-ollama`, `serve-llamacpp`, `serve-vllm`, `postgres` and
+`web-app`. A recipe you write and verify belongs there as well: write it in your
+home first, run it once, date the result in its `SKILL.md`, and move it to
+`/org/skills` by approval.
