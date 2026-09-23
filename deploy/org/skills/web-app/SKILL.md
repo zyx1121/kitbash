@@ -42,8 +42,9 @@ deploy:
 - Files that must survive a restart go through a `mounts` entry to a folder
   inside the Package, with a `.gitignore` that ignores its contents, as the
   postgres recipe shows; without it the files the Process writes leave the
-  folder with uncommitted changes and `pkg_build` refuses it. Anything written elsewhere in the container is
-  gone once the Process is replaced by a new build.
+  folder with uncommitted changes and `pkg_build` refuses it. Anything written
+  elsewhere in the container is gone once the Process is replaced by a new
+  build.
 
 ## Build
 
