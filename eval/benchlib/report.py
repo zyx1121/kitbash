@@ -143,6 +143,24 @@ def table(summaries, fault=False, recipe=False):
     return "\n".join(lines)
 
 
+def by_class_spend(rows):
+    """What a run cost per class, for the classes this round ran and no other.
+
+    A round of one class, the recipe sentences for instance, would otherwise
+    say the other three cost "an amount this client does not report", which
+    reads as a measurement of runs that never happened.
+    """
+    parts = []
+    for name in CLASSES:
+        ran = [r for r in rows if r["class"] == name]
+        if ran:
+            parts.append("%s it was %s" % (CLASS_TITLES[name].lower(), spend(ran)))
+    if len(parts) < 2:
+        return ""
+    text = ", ".join(parts[:-1]) + " and " + parts[-1]
+    return " " + text[0].upper() + text[1:] + "."
+
+
 def readings(rows, summaries):
     """The three readings of PLAN 4.5, restated with this round's numbers."""
     everything = list(summaries.values())
@@ -170,15 +188,12 @@ def readings(rows, summaries):
             "" if not handed_back else " (%s)" % ", ".join("`%s`" % i for i in sorted(set(handed_back))),
         ),
         "",
-        "**What a sentence costs.** The mean run cost %s and took %s. From nothing it was %s, from a "
-        "repository %s, from a fault %s. M10 measured USD 0.28, 0.18 and 0.39 by hand on the three "
-        "sentences this round keeps."
+        "**What a sentence costs.** The mean run cost %s and took %s.%s M10 measured USD 0.28, 0.18 "
+        "and 0.39 by hand on the three sentences this round keeps."
         % (
             spend(rows),
             "-" if mean([r.get("wall_ms") for r in rows]) is None else "%.0f minutes" % (mean([r.get("wall_ms") for r in rows]) / 60000.0),
-            spend([r for r in rows if r["class"] == "nothing"]),
-            spend([r for r in rows if r["class"] == "repository"]),
-            spend([r for r in rows if r["class"] == "fault"]),
+            by_class_spend(rows),
         )
         + ("" if cost is not None else " This client reports no price, so what a run cost is its own token count."),
         "",

@@ -227,6 +227,9 @@ class RecipeTable(unittest.TestCase):
         self.assertIn("recipes read |", text)
         self.assertIn("`serve-ollama`", text)
         self.assertIn("| none |", text)
+        # A round of one class says nothing about the classes it did not run.
+        self.assertNotIn("from a fault", text.lower())
+        self.assertNotIn("does not report", text)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,8 @@
+2026-09-23T11:20:53+00:00 creating member bench-20260923-1920
+2026-09-23T11:20:53+00:00 round 20260923-claude-0.16.0-skills: 2 sentences, k=1, agent claude, kitbash 0.16.0, member bench-20260923-1920
+2026-09-23T11:20:53+00:00 chat-model-private run 1: Run a small chat model I can call from my laptop, only for me.
+2026-09-23T11:22:48+00:00   passed: chat-model-private in 104s, 16 calls, 12 kitbash calls
+2026-09-23T11:22:48+00:00 guestbook-restart run 1: Make a guestbook that keeps its entries when it restarts.
+2026-09-23T11:26:25+00:00   passed: guestbook-restart in 210s, 32 calls, 19 kitbash calls
+2026-09-23T11:26:25+00:00 report written to /private/tmp/claude-501/-Users-loki/b5ad900a-b320-4966-9578-bbb24e529a70/scratchpad/kitbash-m16/eval/results/20260923-claude-0.16.0-skills/README.md
+2026-09-23T11:26:25+00:00 keeping member bench-20260923-1920 as asked
