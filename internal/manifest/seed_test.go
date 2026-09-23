@@ -44,7 +44,9 @@ func TestSeededNestedManifestsAreVisible(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if d.IsDir() && d.Name() == "node_modules" {
+		// Dependencies and test fixtures may carry manifests that are not
+		// seeded as folders of their own, some of them invalid on purpose.
+		if d.IsDir() && (d.Name() == "node_modules" || d.Name() == "fixtures") {
 			return filepath.SkipDir
 		}
 		if d.IsDir() || d.Name() != FileName {

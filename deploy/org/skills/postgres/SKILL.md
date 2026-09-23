@@ -53,10 +53,13 @@ deploy:
 
 ## Traps
 
-- The `.gitignore` is what keeps the database out of Files. Writes through a
-  mount are not committed, but the member's next `fs_write` commits everything
-  the Process left in the repository. Without the ignore file, the next commit
-  takes the whole database with it.
+- The `.gitignore` is what lets the Package build again. Writes through a
+  mount are not committed and `fs_write` commits only the paths it names, so
+  the database files sit in the working tree as untracked changes, and
+  `pkg_build` refuses a folder with uncommitted changes: `conflict`,
+  "uncommitted changes under ...; kitbash builds from a commit". The ignore
+  file makes git skip `pgdata/`, so the tree stays clean while Postgres
+  writes.
 - `PGDATA` points one level below the mount target. The image initializes an
   empty directory only, and the mount root already holds `.gitignore`.
 - Postgres writes the files as its own user inside the container, which is a
@@ -69,5 +72,6 @@ deploy:
 
 Verified on kitbash 0.15.0, 2026-09-23: a Node counter in the web unit, the
 count kept its value across `proc_stop` and `proc_run`, a later `fs_write`
-committed only the file it named, and `pkg_build` still ran with a populated
-`pgdata`.
+committed only the file it named, `pkg_build` still ran with a populated
+`pgdata`, and with the `.gitignore` moved away the same `pkg_build` was
+`conflict`.
