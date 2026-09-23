@@ -32,3 +32,45 @@ func TestSeededManifestsAreVisible(t *testing.T) {
 		}
 	}
 }
+
+// TestSeededNestedManifestsAreVisible does the same for a manifest below the
+// top level, such as each recipe under /org/skills: it begins a description of
+// its own, and one that fails the schema hides that recipe while its parent
+// stays listed, so nothing else would notice.
+func TestSeededNestedManifestsAreVisible(t *testing.T) {
+	root := filepath.Join("..", "..", "deploy", "org")
+	nested := 0
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		// Dependencies and test fixtures may carry manifests that are not
+		// seeded as folders of their own, some of them invalid on purpose.
+		if d.IsDir() && (d.Name() == "node_modules" || d.Name() == "fixtures") {
+			return filepath.SkipDir
+		}
+		if d.IsDir() || d.Name() != FileName {
+			return nil
+		}
+		dir := filepath.Dir(path)
+		if filepath.Dir(dir) == root {
+			return nil // top level, TestSeededManifestsAreVisible
+		}
+		nested++
+		m, err := Load(dir)
+		if err != nil {
+			t.Errorf("%s: %v", dir, err)
+			return nil
+		}
+		if m.Name == "" || m.Description == "" {
+			t.Errorf("%s: manifest has no name or description", dir)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nested == 0 {
+		t.Fatal("no nested manifests found under deploy/org, want the recipes under skills")
+	}
+}

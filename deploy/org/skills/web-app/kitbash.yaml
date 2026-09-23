@@ -1,0 +1,3 @@
+name: web-app
+description: Run a web application or HTTP API as an http Process at its own https address. Use for any site, API or web service; it covers the details the host instructions leave out, the listen address, health, secrets, state and the build traps.
+tags: [web, http, recipe]

@@ -476,7 +476,10 @@ test("the manifest writer round trips through the reader", () => {
 test("the reader and the validator agree with every manifest in this repository", () => {
   // Both are subsets, so the thing that says they are big enough is that they
   // accept what kitbashd already accepts.
-  const seeded = ["import-cli", "import-mcp", "import-oci", "observe-count", "evaluate-latency", "workflow", "handbook"];
+  const seeded = [
+    "import-cli", "import-mcp", "import-oci", "observe-count", "evaluate-latency", "workflow", "handbook",
+    "skills", "skills/serve-ollama", "skills/serve-llamacpp", "skills/serve-vllm", "skills/postgres", "skills/web-app",
+  ];
   for (const folder of seeded) {
     const document = readYaml(readFileSync(path.join(repo, "deploy", "org", folder, "kitbash.yaml"), "utf8"));
     assert.deepEqual(validate(document, schema), [], `deploy/org/${folder}/kitbash.yaml`);

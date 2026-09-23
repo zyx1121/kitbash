@@ -1,0 +1,3 @@
+name: postgres
+description: Give an application a Postgres database whose data survives a restart, as a second unit of the application's own Package. Use whenever a Package needs SQL storage; a database is never a Process of its own here, because only HTTP and MCP reach a Process from outside its pod.
+tags: [database, sql, recipe]

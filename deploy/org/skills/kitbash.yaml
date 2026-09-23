@@ -1,0 +1,3 @@
+name: skills
+description: Tested recipes for running a particular kind of Process here, a model server, a web application or a database, with the setup, the settings and the traps each one has. List this folder before writing a Package of one of those kinds and read the matching SKILL.md.
+tags: [recipes, reference]
