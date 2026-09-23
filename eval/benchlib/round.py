@@ -133,6 +133,7 @@ class Round:
             pre_ids=pre_ids,
             since=since,
             variables=variables,
+            root_alias=self.root_alias,
         )
 
     # ------------------------------------------------------------- one run

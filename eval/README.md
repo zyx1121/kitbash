@@ -59,7 +59,7 @@ sentence of the round has run; with `--only` or after a failure it stays.
 
 ## The sentences
 
-`sentences.json` holds fifteen, five to a class.
+`sentences.json` holds seventeen: five to each of the first three classes, and two in the fourth.
 
 - **From nothing.** A web application, a scheduled job, a service, a link
   shortener and a notes wiki. The first three are M10's own sentences word for
@@ -81,6 +81,13 @@ sentence of the round has run; with `--only` or after a failure it stays.
   member, waits until the address answers, and only then breaks it. A sentence
   outside this class may name a `setup` too, which is the same deploy without
   the fault: the scheduled job posts onto a board deployed that way.
+- **Answered by a recipe.** The two sentences of PLAN.md 5.7 M16, each one a
+  kind of Process a recipe under `/org/skills` covers: a private chat model,
+  which is only for me when the Process refuses a request without the key, and
+  a guestbook whose entries survive a restart with nothing of the database
+  committed. The same sentences run against a host with `/org/skills` moved
+  away are the comparison, so a round of this class names in its folder
+  whether the recipes were there.
 
 Every sentence carries a `check`, a small function keyed by name in
 `benchlib/checks.py` with its parameters written beside it in the sentence
@@ -94,6 +101,10 @@ file:
 | `proc_running` | `proc_list` says a Process is up |
 | `proc_scheduled` | `proc_list` says a job is registered with a cron expression |
 | `tel_schedule` | a `kitbash.schedule` record exists since the round started |
+| `http_refuses_without_key` | every address this run made answers 401 or 403 to a request with no key, `GET /v1/models` and `POST /v1/chat/completions` by default |
+| `entry_survives_restart` | an entry posted through whichever usual path and shape the application takes is read back, the Process is stopped and started through the member's surface, and the entry is still there |
+| `unit_runs_image` | a unit of a Package this run made runs the image named, pinned by digest or built `FROM` it |
+| `nothing_committed` | no database file, a Postgres data directory or an SQLite file, is tracked in the git repository of a Package this run made, read as root with `git ls-files` |
 | `all_of` | every check in the list, the first failure being the reason |
 
 A sentence may also carry `observe`, a mapping of name to check that is read
@@ -119,6 +130,7 @@ One JSON file per run, `<id>-<n>.json`, in the round folder.
 | `member` | the member the round created |
 | `turns`, `tool_calls` | what the transcript counted |
 | `kitbash_calls`, `kitbash_calls_by_tool` | calls to the kitbash surface, and which tools |
+| `recipes_read` | the files under `/org/skills` the run read with `fs_read`, in order, once each; never part of `passed` |
 | `tool_errors` | tool results that came back an error |
 | `questions_asked` | sentences ending in a question mark in the agent's last answer |
 | `asks_user` | whether that answer hands a decision back, by a question or a phrase |

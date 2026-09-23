@@ -8,11 +8,12 @@ import json
 import os
 import statistics
 
-CLASSES = ["nothing", "repository", "fault"]
+CLASSES = ["nothing", "repository", "fault", "recipe"]
 CLASS_TITLES = {
     "nothing": "From nothing",
     "repository": "From a repository",
     "fault": "From a fault",
+    "recipe": "Answered by a recipe",
 }
 
 
@@ -89,14 +90,19 @@ def summarize(runs):
         "cost_usd": mean([r.get("cost_usd") for r in runs]),
         "wall_ms": mean([r.get("wall_ms") for r in runs]),
         "time_to_mitigate_ms": mean([r.get("time_to_mitigate_ms") for r in runs]),
+        # The recipes any run of this sentence read, by folder name.
+        "recipes_read": sorted({p.split("/")[3] for r in runs for p in r.get("recipes_read") or [] if p.count("/") >= 3}),
     }
 
 
-def table(summaries, fault=False):
+def table(summaries, fault=False, recipe=False):
     head = "| Sentence | pass^k | turns | tool calls | kitbash calls | tool errors | questions | cost USD | wall |"
     rule = "|---|---|---|---|---|---|---|---|---|"
     if fault:
         head = head + " time to mitigate |"
+        rule = rule + "---|"
+    if recipe:
+        head = head + " recipes read |"
         rule = rule + "---|"
     lines = [head, rule]
     for item in summaries:
@@ -114,6 +120,8 @@ def table(summaries, fault=False):
         if fault:
             value = item["time_to_mitigate_ms"]
             cells.append("-" if value is None else "%.1f min" % (value / 60000.0))
+        if recipe:
+            cells.append(", ".join("`%s`" % r for r in item.get("recipes_read") or []) or "none")
         lines.append("| " + " | ".join(cells) + " |")
     totals = [
         "**total**",
@@ -129,6 +137,8 @@ def table(summaries, fault=False):
     if fault:
         value = mean([i["time_to_mitigate_ms"] for i in summaries])
         totals.append("-" if value is None else "%.1f min" % (value / 60000.0))
+    if recipe:
+        totals.append("")
     lines.append("| " + " | ".join(totals) + " |")
     return "\n".join(lines)
 
@@ -213,7 +223,7 @@ def render(folder, state=None):
         if not items:
             continue
         items.sort(key=lambda s: s["id"])
-        lines += ["## %s" % CLASS_TITLES[name], "", table(items, fault=(name == "fault")), ""]
+        lines += ["## %s" % CLASS_TITLES[name], "", table(items, fault=(name == "fault"), recipe=(name == "recipe")), ""]
     total = len(summaries)
     passed = sum(1 for s in summaries.values() if s["pass_k"])
     lines += [

@@ -8,7 +8,7 @@ import unittest
 from support import EVAL
 from benchlib import checks, fixtures
 
-CLASSES = {"nothing", "repository", "fault"}
+CLASSES = {"nothing", "repository", "fault", "recipe"}
 INJECT_KINDS = {"podman", "root", "mcp"}
 
 
@@ -26,13 +26,13 @@ class SentenceFile(unittest.TestCase):
             cls.document = json.load(handle)
         cls.sentences = cls.document["sentences"]
 
-    def test_fifteen_sentences_in_three_classes(self):
-        self.assertEqual(len(self.sentences), 15)
+    def test_seventeen_sentences_in_four_classes(self):
+        self.assertEqual(len(self.sentences), 17)
         counted = {}
         for sentence in self.sentences:
             counted[sentence["class"]] = counted.get(sentence["class"], 0) + 1
         self.assertEqual(set(counted), CLASSES)
-        self.assertEqual(sorted(counted.values()), [5, 5, 5])
+        self.assertEqual(sorted(counted.values()), [2, 5, 5, 5])
 
     def test_ids_are_unique(self):
         ids = [s["id"] for s in self.sentences]
