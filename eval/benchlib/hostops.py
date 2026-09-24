@@ -34,6 +34,12 @@ def as_member(root_alias, member, uid, command, timeout=300):
 MEMBER = re.compile(r"^[a-z][a-z0-9-]*$")
 
 
+# Where the subordinate uids of every member are listed. The idle check reads
+# uids only, so /etc/subgid is not needed: a process's gid does not make it the
+# member's.
+SUBUID = "/etc/subuid"
+
+
 class UnsafePath(Exception):
     """A path the bench would change as root that is not plainly the member's own."""
 
@@ -81,15 +87,19 @@ def idle(member, uid):
     """
     if not MEMBER.match(member or "") or not str(uid).isdigit():
         raise UnsafePath("%r (uid %r) is not a member" % (member, uid))
+    # Every range of the member's, on every line keyed by their name or by
+    # their uid: a member may hold several, and either key is valid.
     return (
-        "set -- $(awk -F: -v m=%s '$1==m {print $2, $3; exit}' /etc/subuid 2>/dev/null); "
-        "lo=${1:-0}; n=${2:-0}; busy=''; "
+        "ranges=$(awk -F: -v m=%s -v u=%s '($1 == m || $1 == u) && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ "
+        "{print $2 \":\" $3}' %s 2>/dev/null); busy=''; "
         "for s in /proc/[0-9]*/status; do "
         "for u in $(awk '/^Uid:/ {print $2, $3; exit}' \"$s\" 2>/dev/null); do "
-        "if [ \"$u\" = %s ] || { [ \"$n\" -gt 0 ] && [ \"$u\" -ge \"$lo\" ] && [ \"$u\" -lt $((lo + n)) ]; }; then "
-        "p=${s%%/status}; busy=\"$busy ${p#/proc/}\"; break; fi; done; done; "
+        "hit=''; [ \"$u\" = %s ] && hit=1; "
+        "for r in $ranges; do lo=${r%%:*}; n=${r#*:}; "
+        "[ \"$u\" -ge \"$lo\" ] && [ \"$u\" -lt $((lo + n)) ] && hit=1; done; "
+        "if [ -n \"$hit\" ]; then p=${s%%/status}; busy=\"$busy ${p#/proc/}\"; break; fi; done; done; "
         "[ -z \"$busy\" ] || { echo \"busy: processes of %s are running:$busy\" >&2; false; }"
-        % (member, uid, member)
+        % (member, uid, shlex.quote(SUBUID), uid, member)
     )
 
 

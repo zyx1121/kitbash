@@ -275,5 +275,46 @@ class Teardown(Host):
         self.assertEqual(self.chattr(), ["-i %s" % self.items()])
 
 
+@unittest.skipUnless(os.path.isdir("/proc/self"), "reads /proc")
+class SubordinateUids(unittest.TestCase):
+    """The test's own uid stands in the member's subordinate range, and the member's uid is unused."""
+
+    def setUp(self):
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder, ignore_errors=True)
+        self.subuid = os.path.join(folder, "subuid")
+        missing = object()
+        original = getattr(hostops, "SUBUID", missing)
+        hostops.SUBUID = self.subuid
+        self.addCleanup(lambda: delattr(hostops, "SUBUID") if original is missing
+                        else setattr(hostops, "SUBUID", original))
+        original_ssh = hostops.ssh
+
+        def ssh(alias, command, timeout=300, check=False):
+            # The file the check reads is the test's, whichever path it names.
+            command = command.replace("/etc/subuid", self.subuid)
+            done = subprocess.run(["sh", "-c", command], capture_output=True, text=True)
+            return done.returncode, done.stdout, done.stderr
+
+        hostops.ssh = ssh
+        self.addCleanup(lambda: setattr(hostops, "ssh", original_ssh))
+
+    def lines(self, *lines):
+        with open(self.subuid, "w") as handle:
+            handle.write("".join(line + "\n" for line in lines))
+
+    def test_a_second_range_of_the_member_counts(self):
+        self.lines("someone:%d:1" % os.getuid(), "%s:100000:65536" % MEMBER, "%s:%d:1" % (MEMBER, os.getuid()))
+        self.assertIn(str(os.getpid()), hostops.busy("root@host", MEMBER, IDLE_UID))
+
+    def test_a_range_keyed_by_the_uid_counts(self):
+        self.lines("%s:100000:65536" % MEMBER, "%d:%d:1" % (IDLE_UID, os.getuid()))
+        self.assertIn(str(os.getpid()), hostops.busy("root@host", MEMBER, IDLE_UID))
+
+    def test_another_members_range_does_not(self):
+        self.lines("%s:100000:65536" % MEMBER, "someone:%d:1" % os.getuid(), "4242425:%d:1" % os.getuid())
+        self.assertEqual(hostops.busy("root@host", MEMBER, IDLE_UID), [])
+
+
 if __name__ == "__main__":
     unittest.main()
