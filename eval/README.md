@@ -43,12 +43,13 @@ What a round does, in order:
    configuration directory, one MCP server and no other, and a tool list.
 4. Verifies each run with the sentence's check, which reads the outcome on the
    host and never the transcript.
-5. Stops the member's Processes, clears the immutable flag the mount fault
-   sets, removes the member with `users_remove`, which takes their Processes,
-   files and secrets with them, and deletes the key. The two steps before the
-   removal are there because of what the first round found: a removal of a
-   member holding seventeen Processes outruns `kitbash-mcp`'s client deadline,
-   and the archive it makes chowns the home, which an immutable file refuses.
+5. Stops the member's Processes, clears the immutable flag on the files the
+   mount fault recorded, once nothing of the member runs, removes the member
+   with `users_remove`, which takes their Processes, files and secrets with
+   them, and deletes the key. The two steps before the removal are there
+   because of what the first round found: a removal of a member holding
+   seventeen Processes outruns `kitbash-mcp`'s client deadline, and the
+   archive it makes chowns the home, which an immutable file refuses.
    A removal that answers an error is believed only after `users_list` is
    asked, because the call can fail once the account is already gone.
 
@@ -80,9 +81,16 @@ sentence of the round has run; with `--only` or after a failure it stays.
   Packages are under `fixtures/`, the round writes, builds and runs them as the
   member, waits until the address answers, and only then breaks it. A fault
   runs as the member wherever it can. The one step that needs root, the
-  immutable flag of the mount fault, runs only on a regular file below the
-  member's home that no link leads to (`hostops.guard`), because an agent of an
-  earlier sentence can put a link where the bench expects its file. A sentence
+  immutable flag of the mount fault, runs only while nothing of the member
+  runs: the round stops every Process of theirs, ends podman's pause process,
+  and the root shell itself checks `/proc` for any process under the member's
+  uid or subordinate uids before it acts, then starts the Processes again. A
+  guard check alone is not enough, because a Process of an earlier sentence
+  can swap a folder for a link between the check and the step. When something
+  still runs, the fault is not injected and the row's `inject_verified` says
+  so. The step is also behind `hostops.guard`: a regular file below the
+  member's home that no link leads to. The file is recorded in `round.json`,
+  and teardown clears the flag on the recorded files only, the same way. A sentence
   outside this class may name a `setup` too, which is the same deploy without
   the fault: the scheduled job posts onto a board deployed that way.
 - **Answered by a recipe.** The two sentences of PLAN.md 5.7 M16, each one a
