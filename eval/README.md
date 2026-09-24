@@ -43,12 +43,13 @@ What a round does, in order:
    configuration directory, one MCP server and no other, and a tool list.
 4. Verifies each run with the sentence's check, which reads the outcome on the
    host and never the transcript.
-5. Stops the member's Processes, clears the immutable flag the mount fault
-   sets, removes the member with `users_remove`, which takes their Processes,
-   files and secrets with them, and deletes the key. The two steps before the
-   removal are there because of what the first round found: a removal of a
-   member holding seventeen Processes outruns `kitbash-mcp`'s client deadline,
-   and the archive it makes chowns the home, which an immutable file refuses.
+5. Stops the member's Processes, clears the immutable flag on the files the
+   mount fault recorded, once nothing of the member runs, removes the member
+   with `users_remove`, which takes their Processes, files and secrets with
+   them, and deletes the key. The two steps before the removal are there
+   because of what the first round found: a removal of a member holding
+   seventeen Processes outruns `kitbash-mcp`'s client deadline, and the
+   archive it makes chowns the home, which an immutable file refuses.
    A removal that answers an error is believed only after `users_list` is
    asked, because the call can fail once the account is already gone.
 
@@ -78,7 +79,18 @@ sentence of the round has run; with `--only` or after a failure it stays.
   ITBench measure. Each is injected by the harness against a Process the round
   deployed itself first, so a fault sentence is self contained: the fixture
   Packages are under `fixtures/`, the round writes, builds and runs them as the
-  member, waits until the address answers, and only then breaks it. A sentence
+  member, waits until the address answers, and only then breaks it. A fault
+  runs as the member wherever it can. The one step that needs root, the
+  immutable flag of the mount fault, runs only while nothing of the member
+  runs: the round stops every Process of theirs, ends podman's pause process,
+  and the root shell itself checks `/proc` for any process under the member's
+  uid or subordinate uids before it acts, then starts the Processes again. A
+  guard check alone is not enough, because a Process of an earlier sentence
+  can swap a folder for a link between the check and the step. When something
+  still runs, the fault is not injected and the row's `inject_verified` says
+  so. The step is also behind `hostops.guard`: a regular file below the
+  member's home that no link leads to. The file is recorded in `round.json`,
+  and teardown clears the flag on the recorded files only, the same way. A sentence
   outside this class may name a `setup` too, which is the same deploy without
   the fault: the scheduled job posts onto a board deployed that way.
 - **Answered by a recipe.** The two sentences of PLAN.md 5.7 M16, each one a
@@ -101,10 +113,12 @@ file:
 | `proc_running` | `proc_list` says a Process is up |
 | `proc_scheduled` | `proc_list` says a job is registered with a cron expression |
 | `tel_schedule` | a `kitbash.schedule` record exists since the round started |
-| `http_refuses_without_key` | every address this run made answers 401 or 403 to a request with no key, `GET /v1/models` and `POST /v1/chat/completions` by default |
+| `http_refuses_without_key` | every address this run made refuses a request with no key on the paths of OpenAI's API, Ollama's and llama-server's (`GET /v1/models`, `POST /v1/chat/completions`, `GET /api/tags`, `POST /api/generate`, `GET /props`): no path may answer 2xx, a path the engine lacks may answer 404, and at least one has to answer 401 or 403. Every path that refused is asked again with a random bearer token and has to refuse it too, so a proxy that takes any key fails. Then one `GET` with the key the run set, as a bearer token, has to answer 2xx, or `POST /v1/chat/completions` when every `GET` answers 404 or 405, so a server that refuses everyone fails; no answer body with the key is kept |
 | `entry_survives_restart` | an entry posted through whichever usual path and shape the application takes is read back, the Process is stopped and started through the member's surface, and the entry is still there |
+| `entry_in_database` | an entry the check writes through the application is found by `pg_dumpall --data-only` inside a container of this run's Processes, run as the member with their podman through `--root` |
 | `unit_runs_image` | a unit of a Package this run made runs the image named, pinned by digest or built `FROM` it |
-| `nothing_committed` | no database file, a Postgres data directory or an SQLite file, is tracked in the git repository of a Package this run made, read as root with `git ls-files` |
+| `nothing_committed` | no database file, a Postgres data directory or an SQLite file, is tracked in the git repository of a Package this run made, and `git status --porcelain` is empty in the Package, the conflict `pkg_build` refuses. git runs as the member through `--root`, never as root, with fsmonitor, hooks and the pager switched off, because the repository's configuration is the agent's; a mounted folder outside the Package is left to `pkg_builds` |
+| `pkg_builds` | `pkg_build` of every Package this run made answers a digest, through the member's surface |
 | `all_of` | every check in the list, the first failure being the reason |
 
 A sentence may also carry `observe`, a mapping of name to check that is read
@@ -112,6 +126,14 @@ after the outcome and decides nothing. It lands on the row as
 `observed: {name: {observed, detail}}`, beside `passed` and never part of it,
 which is how a round reports something a run cannot be failed for, such as the
 weather job having posted to its board within the run.
+
+How `http_refuses_without_key` learns the key: the member's surface never
+answers a secret's value and an admin reads only their own, so the check names
+the secrets and key variables the Package's manifest declares, reads their
+values out of the running containers with `podman inspect` as the member,
+through `--root`, and never writes a value into a row. With no root alias the
+request with the key is recorded as skipped in `key_probe`, and the check
+passes on the refusals alone.
 
 A check on a sentence the member wrote freely looks only at Processes that did
 not exist before the run, so the previous sentence's service cannot pass this
@@ -130,7 +152,7 @@ One JSON file per run, `<id>-<n>.json`, in the round folder.
 | `member` | the member the round created |
 | `turns`, `tool_calls` | what the transcript counted |
 | `kitbash_calls`, `kitbash_calls_by_tool` | calls to the kitbash surface, and which tools |
-| `recipes_read` | the files under `/org/skills` the run read with `fs_read`, in order, once each; never part of `passed` |
+| `recipes_read` | the files under `/org/skills` the run read with an `fs_read` that answered without an error, in order, once each; never part of `passed` |
 | `tool_errors` | tool results that came back an error |
 | `questions_asked` | sentences ending in a question mark in the agent's last answer |
 | `asks_user` | whether that answer hands a decision back, by a question or a phrase |

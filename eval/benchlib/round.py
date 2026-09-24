@@ -18,6 +18,10 @@ POLL_SECONDS = 15
 CHECK_ATTEMPTS = 3
 CHECK_DELAY = 10
 HEALTHY_SECONDS = 300
+# How long a member's processes are given to end after their Processes stop,
+# before a root step on their files is refused.
+IDLE_SECONDS = 60
+IDLE_EVERY = 3
 
 
 class UsageLimit(Exception):
@@ -134,6 +138,7 @@ class Round:
             since=since,
             variables=variables,
             root_alias=self.root_alias,
+            uid=self.state.get("uid"),
         )
 
     # ------------------------------------------------------------- one run
@@ -167,11 +172,16 @@ class Round:
         setup = sentence["setup"]
         member = self.state["member"]
         report = {"package": setup["package"], "fixture": setup["fixture"]}
+        # What a previous run of the mount fault flagged, taken back the way
+        # it was set: with nothing of the member running, behind the guard,
+        # and only the files this bench recorded.
+        flagged = [p for p in self.resolve(setup.get("reset_immutable") or [], variables)
+                   if p in self.state.get("flagged", [])]
+        if flagged:
+            report["reset"] = self.while_idle(lambda: [self.clear_flag(p) for p in flagged])
         with self.session() as session:
             for name, value in (setup.get("secrets") or {}).items():
                 session.call("secrets_set", {"name": name, "value": value})
-            for command in self.resolve(setup.get("reset") or [], variables):
-                hostops.ssh(self.root_alias, command)
             depends = setup.get("depends")
             if depends:
                 self.log("  deploying dependency %s" % depends["package"])
@@ -226,14 +236,25 @@ class Round:
         member = self.state["member"]
         uid = self.state["uid"]
         done = []
-        if kind in ("podman", "root"):
+        if kind == "podman":
             for command in self.resolve(inject.get("commands") or [], variables):
-                if kind == "podman":
-                    code, out, err = hostops.as_member(self.root_alias, member, uid, command)
-                else:
-                    code, out, err = hostops.ssh(self.root_alias, command)
+                code, out, err = hostops.as_member(self.root_alias, member, uid, command)
                 done.append({"command": command, "code": code, "out": (out or "").strip()[:200],
                              "err": (err or "").strip()[:200]})
+        elif kind == "immutable":
+            # There is no kind that runs a sentence's commands as root. A
+            # member's path is the agent's to replace with a link, and a
+            # Process of theirs can swap a folder in the moment between a
+            # check and a step, so the one root step a fault needs runs with
+            # every Process of the member stopped and nothing of theirs
+            # running, behind hostops.guard, and the Processes are started
+            # again after it. When something still runs, the fault is not
+            # injected, and the row says so through inject_verified.
+            path = self.resolve(inject["path"], variables)
+            done.append(self.while_idle(lambda: self.set_flag(path, inject.get("create", "[]"))))
+            if done[-1].get("injected"):
+                spec = {"name": "http_ok", "params": {"process": variables.get("pkg"), "path": "/", "status": 200}}
+                fixtures.wait_healthy(self.context(variables=variables), spec, HEALTHY_SECONDS)
         elif kind == "mcp":
             with self.session() as session:
                 for call in self.resolve(inject.get("calls") or [], variables):
@@ -253,6 +274,79 @@ class Round:
         else:
             raise SystemExit("no inject kind named %s" % kind)
         return done
+
+    # ------------------------------------------------ root on member paths
+
+    def quiesce(self):
+        """Stop every Process of the member and wait until nothing of theirs runs.
+
+        Answers the Processes that were up, so resume can start them again,
+        and the pids still running when the wait ran out, empty when idle. The
+        agent of the previous run has ended by now: run_one injects before it
+        starts the agent, and finish returns once the agent has exited or its
+        process group was killed. The member's session opened here is closed
+        before the wait, so it is not one of the processes counted.
+        """
+        member, uid = self.state["member"], self.state["uid"]
+        with self.session() as session:
+            before = session.call("proc_list", {}).get("processes") or []
+            for process in before:
+                try:
+                    session.call("proc_stop", {"id": process["id"]})
+                except mcp.McpError:
+                    pass
+        hostops.stop_pause(self.root_alias, member, uid)
+        deadline = time.time() + IDLE_SECONDS
+        running = hostops.busy(self.root_alias, member, uid)
+        while running and time.time() < deadline:
+            time.sleep(IDLE_EVERY)
+            running = hostops.busy(self.root_alias, member, uid)
+        return [p for p in before if p.get("state") in ("running", "scheduled")], running
+
+    def resume(self, before):
+        """Start again what quiesce stopped."""
+        if not before:
+            return
+        with self.session() as session:
+            for process in before:
+                try:
+                    fixtures.start(session, process["package"], process["name"], self.log)
+                except mcp.McpError as exc:
+                    self.log("  could not start %s again: %s" % (process.get("name"), exc.detail[:200]))
+
+    def while_idle(self, step):
+        """A root step on a member path, run only while nothing of the member runs."""
+        before, running = self.quiesce()
+        try:
+            if running:
+                self.log("  not touching the member's files as root, their processes run: %s" % " ".join(running))
+                return {"injected": False, "busy": running}
+            return step()
+        finally:
+            self.resume(before)
+
+    def set_flag(self, path, create):
+        """The immutable flag set, and the file recorded, so only it is ever cleared."""
+        member, uid = self.state["member"], self.state["uid"]
+        try:
+            code, out, err = hostops.make_immutable(self.root_alias, member, uid, path, create)
+        except hostops.UnsafePath as exc:
+            code, out, err = 1, "", str(exc)
+        if not code:
+            flagged = self.state.setdefault("flagged", [])
+            if path not in flagged:
+                flagged.append(path)
+            self.save_state()
+        return {"immutable": path, "injected": not code, "code": code, "out": (out or "").strip()[:200],
+                "err": (err or "").strip()[:200]}
+
+    def clear_flag(self, path):
+        member, uid = self.state["member"], self.state["uid"]
+        code, out, err = hostops.clear_immutable(self.root_alias, member, uid, path)
+        if not code and path in self.state.get("flagged", []):
+            self.state["flagged"].remove(path)
+            self.save_state()
+        return {"cleared": path, "code": code, "err": (err or "").strip()[:200]}
 
     def run_one(self, sentence, number, adapter):
         row_path = os.path.join(self.folder, "%s-%d.json" % (sentence["id"], number))
@@ -398,22 +492,25 @@ class Round:
         name = self.state.get("member")
         if not name:
             return
-        # The mount fault makes one file immutable, and users_remove archives
-        # the home by chowning it, which an immutable file refuses. The flag
-        # the bench set is the bench's to clear.
-        hostops.ssh(self.root_alias, "chattr -R -i /home/%s 2>/dev/null; true" % name)
         # A removal of a member holding a round's worth of Processes takes
         # longer than kitbash-mcp's client deadline, and the cancellation stops
         # userdel halfway, so the Processes are stopped over the surface first.
+        # The same stop is what makes clearing the flags safe: the mount fault
+        # makes one file immutable, users_remove archives the home by chowning
+        # it, which an immutable file refuses, and the flag is the bench's to
+        # clear. Only the files the bench recorded are cleared, and only while
+        # nothing of the member runs.
         try:
-            with self.session() as session:
-                for process in session.call("proc_list", {}).get("processes") or []:
-                    try:
-                        session.call("proc_stop", {"id": process["id"]})
-                    except mcp.McpError:
-                        pass
+            _, running = self.quiesce()
         except Exception as exc:
+            running = ["unknown"]
             self.log("could not stop the member's Processes first: %s" % str(exc)[:200])
+        flagged = list(self.state.get("flagged", []))
+        if flagged and running:
+            self.log("not clearing %s as root, the member's processes run: %s" % (", ".join(flagged), " ".join(running)))
+        elif flagged:
+            for path in flagged:
+                self.clear_flag(path)
         self.log("removing member %s, which takes its Processes, files and secrets with it" % name)
         try:
             answer = self.admin_call("users_remove", {"name": name})

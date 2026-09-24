@@ -62,17 +62,22 @@ def _blank_transcript(agent):
     }
 
 
-def _recipe(tool, arguments, seen):
-    """A recipe the run read: an fs_read of a file under /org/skills, in order, once each."""
+def _recipe(tool, arguments):
+    """The recipe an fs_read asks for, a file under /org/skills, or None."""
     if tool != "fs_read":
-        return
+        return None
     if isinstance(arguments, str):
         try:
             arguments = json.loads(arguments)
         except ValueError:
-            return
+            return None
     path = (arguments or {}).get("path") or ""
-    if path.startswith(RECIPES) and path not in seen:
+    return path if path.startswith(RECIPES) else None
+
+
+def _read(path, seen):
+    """A recipe the run read, in order, once each. Only a read that answered counts."""
+    if path and path not in seen:
         seen.append(path)
 
 
@@ -93,6 +98,9 @@ def parse_claude_stream(path):
     transcript = _blank_transcript("claude")
     tools = collections.Counter()
     kitbash = collections.Counter()
+    # A recipe read waits for its result: an fs_read that answered an error,
+    # a path that is not there, is not a recipe the run read.
+    asked = {}
     for message in _lines(path):
         kind = message.get("type")
         if kind == "system" and message.get("subtype") == "init":
@@ -104,11 +112,17 @@ def parse_claude_stream(path):
                     tools[name] += 1
                     if name.startswith(KITBASH_PREFIX):
                         kitbash[name[len(KITBASH_PREFIX):]] += 1
-                        _recipe(name[len(KITBASH_PREFIX):], block.get("input"), transcript["recipes_read"])
+                        recipe = _recipe(name[len(KITBASH_PREFIX):], block.get("input"))
+                        if recipe:
+                            asked[block.get("id")] = recipe
         elif kind == "user":
             for block in (message.get("message") or {}).get("content") or []:
-                if isinstance(block, dict) and block.get("type") == "tool_result" and block.get("is_error"):
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    continue
+                if block.get("is_error"):
                     transcript["tool_errors"] += 1
+                else:
+                    _read(asked.get(block.get("tool_use_id")), transcript["recipes_read"])
         elif kind == "rate_limit_event":
             info = message.get("rate_limit_info") or {}
             if info.get("status") not in (None, "allowed"):
@@ -168,10 +182,13 @@ def parse_codex_stream(path):
                 if item_type == "mcp_tool_call":
                     name = "%s__%s" % (item.get("server"), item.get("tool"))
                     tools[name] += 1
+                    failed = bool(item.get("error") or item.get("status") not in (None, "completed"))
                     if item.get("server") == "kitbash":
                         kitbash[item.get("tool")] += 1
-                        _recipe(item.get("tool"), item.get("arguments"), transcript["recipes_read"])
-                    if item.get("error") or item.get("status") not in (None, "completed"):
+                        result = item.get("result") if isinstance(item.get("result"), dict) else {}
+                        if not (failed or result.get("is_error") or result.get("isError")):
+                            _read(_recipe(item.get("tool"), item.get("arguments")), transcript["recipes_read"])
+                    if failed:
                         transcript["tool_errors"] += 1
                 else:
                     tools[item_type] += 1
