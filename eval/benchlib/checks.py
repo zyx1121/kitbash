@@ -7,6 +7,7 @@ detail a reader can act on.
 
 import json
 import re
+import shlex
 import ssl
 import time
 import urllib.error
@@ -23,9 +24,13 @@ HTTP_TIMEOUT = 20
 class Context:
     """What a check is allowed to know: the member's session and the host."""
 
-    def __init__(self, alias, config, member, domain, pre_ids=None, since=None, variables=None, root_alias=None):
+    def __init__(self, alias, config, member, domain, pre_ids=None, since=None, variables=None, root_alias=None,
+                 uid=None):
         self.alias = alias
         self.root_alias = root_alias
+        # The member's uid, which a command run as the member through the root
+        # alias needs for the runtime directory of their podman.
+        self.uid = uid
         self.config = config
         self.member = member
         self.domain = domain
@@ -33,8 +38,8 @@ class Context:
         self.since = since
         self.variables = dict(variables or {})
 
-    def call(self, tool, arguments=None):
-        return mcp.call_once(self.alias, tool, arguments, config=self.config)
+    def call(self, tool, arguments=None, timeout=120):
+        return mcp.call_once(self.alias, tool, arguments, config=self.config, timeout=timeout)
 
     def processes(self):
         answer = self.call("proc_list", {})
@@ -258,24 +263,147 @@ def _new_with_address(ctx, params):
     return [p for p in _candidates(ctx, dict(params, scope="new")) if p.get("state") != "gone"]
 
 
-DEFAULT_KEYLESS = [
-    {"method": "GET", "path": "/v1/models"},
-    {
-        "method": "POST",
-        "path": "/v1/chat/completions",
-        "body": {"model": "any", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1},
-    },
-]
+# The paths a model server answers on, by engine. An address is probed on all
+# of them, because which engine it runs is the agent's choice: a proxy that
+# guards /v1 in front of Ollama and passes /api through is as open as no proxy.
+ENGINE_PROBES = {
+    "openai": [
+        {"method": "GET", "path": "/v1/models"},
+        {
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "body": {"model": "any", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1},
+        },
+    ],
+    "ollama": [
+        {"method": "GET", "path": "/api/tags"},
+        {"method": "POST", "path": "/api/generate", "body": {"model": "any", "prompt": "hi", "stream": False}},
+    ],
+    "llama-server": [
+        {"method": "GET", "path": "/v1/models"},
+        {"method": "GET", "path": "/props"},
+    ],
+}
+
+
+def _probes(engines):
+    """Every request of the engines named, once each, tagged with the engines it belongs to."""
+    probes = []
+    for engine, specs in engines.items():
+        for spec in specs:
+            same = [p for p in probes if (p["method"], p["path"]) == (spec["method"], spec["path"])]
+            if same:
+                same[0]["engines"].append(engine)
+            else:
+                probes.append(dict(spec, engines=[engine]))
+    return probes
+
+
+DEFAULT_KEYLESS = _probes(ENGINE_PROBES)
+
+# A variable a model server reads its key from when the manifest writes it out
+# rather than naming a secret.
+KEY_VARIABLE = re.compile(r"(^|_)(API_?KEY|KEY|TOKEN)$")
+ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _served(status):
+    return status is not None and 200 <= status < 300
+
+
+def _key_names(manifest):
+    """The names a Package gives its units a key under: every secret, and every variable that reads as a key."""
+    names = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key == "secrets" and isinstance(value, list):
+                    names.extend(str(v) for v in value)
+                elif key == "environment" and isinstance(value, dict):
+                    names.extend(str(k) for k in value if KEY_VARIABLE.search(str(k)))
+                else:
+                    walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk((manifest or {}).get("deploy"))
+    return [n for n in dict.fromkeys(names) if ENV_NAME.match(n)]
+
+
+def _as_member(ctx, command):
+    """A compound command as the member. as_member puts the runtime directory in
+    front of the command, which the shell takes only before a simple command."""
+    return hostops.as_member(ctx.root_alias, ctx.member, ctx.uid, "sh -c %s" % shlex.quote(command))
+
+
+def _container_env(ctx, process, names):
+    """The values these names have in the running containers of one Process, read as the member.
+
+    This is the least the bench can use to learn the key the agent set. The
+    member's surface never answers a secret's value, and the admin reads only
+    their own, so the command goes through the root alias, but it runs as the
+    member, with nothing but the member's own podman, and only the lines of
+    the names asked leave the host. It reads what the Process was given, which
+    is the outcome, rather than what the transcript says the agent sent.
+    """
+    pattern = "|".join(names)
+    command = (
+        "for c in $(podman ps -q --filter label=kitbash.id=%s); do "
+        "podman inspect --format '{{range .Config.Env}}{{println .}}{{end}}' $c; done "
+        "| grep -E '^(%s)=' | sort -u" % (re.sub(r"[^A-Za-z0-9-]", "", process.get("id") or ""), pattern)
+    )
+    code, out, _ = _as_member(ctx, command)
+    values = {}
+    for line in (out or "").splitlines():
+        name, _, value = line.partition("=")
+        if name in names and value:
+            values.setdefault(name, []).append(value)
+    return values
+
+
+def _keys(ctx, processes):
+    """The keys the run set, as (name, value) pairs, or the reason none could be read.
+
+    The value never goes into a result: a row is committed, the key is the
+    member's, and a detail names only the variable it came from.
+    """
+    if not ctx.root_alias or not getattr(ctx, "uid", None):
+        return [], "skipped: this check reads the key as the member through the round's root alias, and has no root alias or uid"
+    keys = []
+    declared = []
+    for process in processes:
+        package = process.get("package")
+        if not package:
+            continue
+        names = _key_names(ctx.call("pkg_inspect", {"path": package}).get("manifest"))
+        declared += names
+        if not names:
+            continue
+        for name, values in _container_env(ctx, process, names).items():
+            keys += [(name, value) for value in values]
+    if keys:
+        return list(dict.fromkeys(keys)), None
+    if not declared:
+        return [], "no unit declares a secret or a key variable, so there is no key to make a request with"
+    return [], "no running container of this run holds %s" % ", ".join(sorted(set(declared)))
 
 
 def http_refuses_without_key(ctx, params):
-    """Every address this run made refuses a request that carries no key.
+    """Every address this run made refuses a request with no key, and answers one with it.
 
     Reaching a model server is not the point; being refused without the key
     is, because an http Process is public and a model server that answers
-    everyone is the trap the recipes exist for. Every new address has to
-    refuse every request, so a second, open Process beside a guarded one
-    fails the run.
+    everyone is the trap the recipes exist for. Each address is asked on the
+    paths of every engine, OpenAI's, Ollama's and llama-server's: a path that
+    answers 2xx without a key fails the run, a path the engine does not have
+    may answer 404, and at least one path has to answer 401 or 403. A second,
+    open Process beside a guarded one fails the run too.
+
+    Refusing is half of "only for me". The other half is that the member's
+    own key gets through, so one request with the key the run set has to
+    answer 2xx, and a server that refuses everyone fails.
     """
     candidates = _new_with_address(ctx, params)
     if not candidates:
@@ -285,15 +413,42 @@ def http_refuses_without_key(ctx, params):
     seen = []
     for process in candidates:
         base = ctx.url_of(process).rstrip("/")
+        answers = []
         for spec in requests:
             status, body = fetch(base + spec["path"], method=spec.get("method", "GET"), body=spec.get("body"))
-            seen.append({"url": base + spec["path"], "method": spec.get("method", "GET"), "status": status,
-                         "body": (body or "")[:120]})
-    open_ones = [s for s in seen if s["status"] not in refused]
-    if open_ones:
-        return {"passed": False, "detail": "%s %s answered %s without a key"
-                % (open_ones[0]["method"], open_ones[0]["url"], open_ones[0]["status"]), "tried": seen}
-    return {"passed": True, "detail": "%d requests without a key, all refused" % len(seen), "seen": seen}
+            answers.append({"url": base + spec["path"], "method": spec.get("method", "GET"), "status": status,
+                            "body": (body or "")[:120]})
+        seen += answers
+        open_ones = [a for a in answers if _served(a["status"])]
+        if open_ones:
+            return {"passed": False, "detail": "%s %s answered %s without a key"
+                    % (open_ones[0]["method"], open_ones[0]["url"], open_ones[0]["status"]), "tried": seen}
+        if not [a for a in answers if a["status"] in refused]:
+            return {"passed": False, "detail": "%s refused no request without a key, it answered %s"
+                    % (base, ", ".join(str(a["status"]) for a in answers)), "tried": seen}
+    keys, why = _keys(ctx, candidates)
+    if why and why.startswith("skipped"):
+        return {"passed": True, "detail": "%d requests without a key, all refused; the request with the key was %s"
+                % (len(seen), why), "seen": seen, "key_probe": why}
+    if not keys:
+        return {"passed": False, "detail": "no request with the key could be made: %s" % why, "tried": seen}
+    with_key = [s for s in requests if s.get("method", "GET") == "GET"] or requests
+    answered = []
+    for process in candidates:
+        base = ctx.url_of(process).rstrip("/")
+        for name, value in keys:
+            for spec in with_key:
+                status, _ = fetch(base + spec["path"], method=spec.get("method", "GET"), body=spec.get("body"),
+                                  headers={"Authorization": "Bearer %s" % value})
+                note = {"url": base + spec["path"], "key": name, "status": status}
+                answered.append(note)
+                if _served(status):
+                    return {"passed": True,
+                            "detail": "%d requests without a key, all refused; %s with %s answered %s"
+                            % (len(seen), note["url"], name, status),
+                            "seen": seen, "key_probe": note}
+    return {"passed": False, "detail": "no request with the key answered 2xx, so the Process refuses everyone",
+            "tried": seen, "with_key": answered}
 
 
 def fetch_form(url, fields):
@@ -334,6 +489,21 @@ def _where_marker(base, marker, paths):
     return None
 
 
+def _post_entry(base, marker):
+    """Write a marker through whichever path and shape the application takes, and find where it reads back."""
+    for path in ENTRY_POSTS:
+        for shape in ("json", "form"):
+            if shape == "json":
+                status, _ = fetch(base + path, method="POST", body=_entry_fields(marker))
+            else:
+                status, _ = fetch_form(base + path, _entry_fields(marker))
+            if status and status < 400:
+                found = _where_marker(base, marker, [path] + ENTRY_READS)
+                if found:
+                    return {"post": path, "shape": shape, "read": found}
+    return None
+
+
 def entry_survives_restart(ctx, params):
     """An entry posted before a stop and a start is still there after them.
 
@@ -349,20 +519,7 @@ def entry_survives_restart(ctx, params):
     for process in candidates:
         base = ctx.url_of(process).rstrip("/")
         marker = "bench-%s" % uuid.uuid4().hex[:12]
-        posted = None
-        for path in ENTRY_POSTS:
-            for shape in ("json", "form"):
-                if shape == "json":
-                    status, _ = fetch(base + path, method="POST", body=_entry_fields(marker))
-                else:
-                    status, _ = fetch_form(base + path, _entry_fields(marker))
-                if status and status < 400:
-                    found = _where_marker(base, marker, [path] + ENTRY_READS)
-                    if found:
-                        posted = {"post": path, "shape": shape, "read": found}
-                        break
-            if posted:
-                break
+        posted = _post_entry(base, marker)
         if not posted:
             tried.append({"url": base, "detail": "no path took an entry that could be read back"})
             continue
@@ -376,6 +533,67 @@ def entry_survives_restart(ctx, params):
                         "seen": dict(posted, url=base, marker=marker)}
             time.sleep(5)
         tried.append(dict(posted, url=base, marker=marker, detail="the entry was gone after the restart"))
+    return {"passed": False, "detail": tried[-1]["detail"] if tried else "nothing tried", "tried": tried}
+
+
+def _dump_count(ctx, process, marker):
+    """How many times a marker is in the data of a Postgres among the containers of one Process.
+
+    Run as the member, with their own podman, in each container of the
+    Process: the one that has pg_dumpall and a server on its socket is the
+    Postgres, and only a count leaves the host. The official image trusts a
+    connection on its own socket, and the password is given in case it does
+    not.
+    """
+    command = (
+        "for c in $(podman ps -q --filter label=kitbash.id=%s); do "
+        "podman exec $c sh -c 'command -v pg_dumpall >/dev/null && "
+        "PGPASSWORD=\"$POSTGRES_PASSWORD\" pg_dumpall --data-only -U \"${POSTGRES_USER:-postgres}\"' 2>/dev/null; "
+        "done | grep -c '%s'" % (re.sub(r"[^A-Za-z0-9-]", "", process.get("id") or ""), re.sub(r"[^a-z0-9-]", "", marker))
+    )
+    _, out, err = _as_member(ctx, command)
+    try:
+        return int((out or "0").strip().splitlines()[-1]), err
+    except (ValueError, IndexError):
+        return 0, err
+
+
+def entry_in_database(ctx, params):
+    """An entry written through the application is in the Postgres of this run.
+
+    A guestbook that keeps its entries in a file survives a restart as well
+    as one that keeps them in Postgres, so surviving is not where they are.
+    The check writes its own marker through the application, then dumps the
+    data of every Postgres among the Processes this run made, inside its own
+    container, and looks for the marker there.
+    """
+    if not ctx.root_alias or not getattr(ctx, "uid", None):
+        return {"passed": False, "detail": "this check reads the database as the member and needs the round's root alias and uid"}
+    candidates = _new_with_address(ctx, params)
+    if not candidates:
+        return {"passed": False, "detail": "no Process with an address was made by this run"}
+    wait = params.get("wait", 30)
+    tried = []
+    for process in candidates:
+        base = ctx.url_of(process).rstrip("/")
+        marker = "bench-%s" % uuid.uuid4().hex[:12]
+        posted = _post_entry(base, marker)
+        if not posted:
+            tried.append({"url": base, "detail": "no path took an entry that could be read back"})
+            continue
+        deadline = time.time() + wait
+        while True:
+            for holder in candidates:
+                count, _ = _dump_count(ctx, holder, marker)
+                if count:
+                    return {"passed": True,
+                            "detail": "an entry written to %s is in the Postgres of %s" % (base, holder.get("name")),
+                            "seen": dict(posted, url=base, marker=marker, database=holder.get("name"))}
+            if time.time() >= deadline:
+                break
+            time.sleep(5)
+        tried.append(dict(posted, url=base, marker=marker,
+                          detail="an entry %s took is in no Postgres of this run" % base))
     return {"passed": False, "detail": tried[-1]["detail"] if tried else "nothing tried", "tried": tried}
 
 
@@ -411,29 +629,82 @@ DATABASE_FILE = re.compile(
 )
 
 
-def nothing_committed(ctx, params):
-    """No database file is tracked in the git repository of a Package this run made.
+def _git(ctx, path, arguments):
+    return hostops.ssh(ctx.root_alias, "git -c safe.directory='*' -C '%s' %s" % (path.replace("'", ""), arguments))
 
-    Read as root with git itself, because tracked is git's word: a file the
-    Process wrote beside the Package is only a failure once a commit holds it.
+
+def _mount_sources(ctx, process):
+    """The host folders a Process of this run has mounted, as proc_list resolved them."""
+    sources = []
+    for detailed in ctx.call("proc_list", {"package": process["package"]}).get("processes") or []:
+        if detailed.get("id") != process.get("id"):
+            continue
+        sources += [m.get("source") for m in detailed.get("mounts") or [] if m.get("source")]
+    return sources
+
+
+def nothing_committed(ctx, params):
+    """No database file is committed, and nothing is left uncommitted, in a Package this run made.
+
+    Read as root with git itself, because tracked is git's word. A file the
+    Process wrote is a failure once a commit holds it, and also while it sits
+    in the Package or a mounted folder untracked and not ignored: that is the
+    uncommitted change pkg_build answers conflict to, so the next build of the
+    Package is refused.
     """
     if not ctx.root_alias:
         return {"passed": False, "detail": "this check needs the round's root alias"}
-    packages = sorted({p["package"] for p in _candidates(ctx, dict(params, scope="new")) if p.get("package")})
+    made = [p for p in _candidates(ctx, dict(params, scope="new")) if p.get("package")]
+    packages = sorted({p["package"] for p in made})
     if not packages:
         return {"passed": False, "detail": "no Package was made by this run"}
     tracked = []
     for package in packages:
-        code, out, err = hostops.ssh(
-            ctx.root_alias, "git -c safe.directory='*' -C '%s' ls-files" % package.replace("'", "")
-        )
+        code, out, err = _git(ctx, package, "ls-files")
         if code:
             return {"passed": False, "detail": "git ls-files in %s failed: %s" % (package, err.strip()[:200])}
         tracked += ["%s/%s" % (package, f) for f in out.splitlines() if DATABASE_FILE.search(f)]
     if tracked:
         return {"passed": False, "detail": "%d database files are committed, first %s" % (len(tracked), tracked[0]),
                 "tracked": tracked[:20]}
-    return {"passed": True, "detail": "no database file is tracked in %s" % ", ".join(packages)}
+    folders = list(packages)
+    for process in made:
+        folders += [s for s in _mount_sources(ctx, process) if s not in folders]
+    dirty = []
+    looked = []
+    for folder in folders:
+        code, out, err = _git(ctx, folder, "status --porcelain -- .")
+        if code:
+            if folder in packages:
+                return {"passed": False, "detail": "git status in %s failed: %s" % (folder, err.strip()[:200])}
+            # A mounted folder outside any repository is no Package's change.
+            continue
+        looked.append(folder)
+        dirty += ["%s: %s" % (folder, line.strip()) for line in out.splitlines() if line.strip()]
+    if dirty:
+        return {"passed": False,
+                "detail": "%d uncommitted paths, which pkg_build refuses, first %s" % (len(dirty), dirty[0]),
+                "uncommitted": dirty[:20]}
+    return {"passed": True, "detail": "no database file is tracked and nothing is uncommitted in %s" % ", ".join(looked)}
+
+
+def pkg_builds(ctx, params):
+    """Every Package this run made still builds, through the member's own pkg_build.
+
+    Asked after the restart, because what the Processes wrote since is what
+    turns a Package into one pkg_build answers conflict to.
+    """
+    packages = sorted({p["package"] for p in _candidates(ctx, dict(params, scope="new")) if p.get("package")})
+    if not packages:
+        return {"passed": False, "detail": "no Package was made by this run"}
+    built = []
+    for package in packages:
+        try:
+            answer = ctx.call("pkg_build", {"path": package}, timeout=params.get("timeout", 900))
+        except mcp.McpError as exc:
+            return {"passed": False, "detail": "pkg_build %s refused: %s" % (package, exc.detail[:200]), "built": built}
+        built.append({"package": package, "digest": answer.get("digest"), "commit": answer.get("commit")})
+    return {"passed": True, "detail": "pkg_build answered a digest for %s" % ", ".join(packages), "built": built}
 
 
 def all_of(ctx, params):
@@ -457,7 +728,9 @@ REGISTRY = {
     "http_refuses_without_key": http_refuses_without_key,
     "entry_survives_restart": entry_survives_restart,
     "unit_runs_image": unit_runs_image,
+    "entry_in_database": entry_in_database,
     "nothing_committed": nothing_committed,
+    "pkg_builds": pkg_builds,
     "all_of": all_of,
 }
 

@@ -188,22 +188,26 @@ def readings(rows, summaries):
             "" if not handed_back else " (%s)" % ", ".join("`%s`" % i for i in sorted(set(handed_back))),
         ),
         "",
-        "**What a sentence costs.** The mean run cost %s and took %s.%s M10 measured USD 0.28, 0.18 "
-        "and 0.39 by hand on the three sentences this round keeps."
+        "**What a sentence costs.** The mean run cost %s and took %s.%s%s"
         % (
             spend(rows),
             "-" if mean([r.get("wall_ms") for r in rows]) is None else "%.0f minutes" % (mean([r.get("wall_ms") for r in rows]) / 60000.0),
             by_class_spend(rows),
+            # M10's three are sentences from nothing, so a round that ran none
+            # of that class keeps none of them.
+            " M10 measured USD 0.28, 0.18 and 0.39 by hand on the three sentences this round keeps." if nothing else "",
         )
         + ("" if cost is not None else " This client reports no price, so what a run cost is its own token count."),
         "",
         "**The number to watch is the kitbash calls per sentence.** It is %s here against M10's 8 to 14, "
-        "with %s tool calls in all and %s of them failing. A fault was mitigated in %s."
+        "with %s tool calls in all and %s of them failing.%s"
         % (
             number(calls, 1),
             number(mean([s["tool_calls"] for s in everything]), 1),
             number(mean([s["tool_errors"] for s in everything]), 1),
-            "no run" if not mitigations else "%.1f minutes on average" % (mean(mitigations) / 60000.0),
+            # Only a round that injected a fault has a time to mitigate to report.
+            "" if not fault else " A fault was mitigated in %s."
+            % ("no run" if not mitigations else "%.1f minutes on average" % (mean(mitigations) / 60000.0)),
         ),
     ]
     return "\n".join(lines)

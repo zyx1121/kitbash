@@ -401,7 +401,7 @@
       "id": "guestbook-restart",
       "class": "recipe",
       "prompt": "Make a guestbook that keeps its entries when it restarts.",
-      "source": "PLAN.md 5.7 M16, verbatim. The postgres recipe answers it: a Postgres unit beside the application, its data mounted and ignored by git.",
+      "source": "PLAN.md 5.7 M16, verbatim. The postgres recipe answers it: a Postgres unit beside the application, the entries in it, its data mounted and ignored by git, so the Package still builds.",
       "check": {
         "name": "all_of",
         "params": {
@@ -419,7 +419,17 @@
               }
             },
             {
+              "name": "entry_in_database",
+              "params": {
+                "wait": 30
+              }
+            },
+            {
               "name": "nothing_committed",
+              "params": {}
+            },
+            {
+              "name": "pkg_builds",
               "params": {}
             }
           ]

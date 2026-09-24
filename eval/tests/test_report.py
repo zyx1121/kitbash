@@ -45,6 +45,16 @@ class Render(unittest.TestCase):
         self.assertIn("2 of 3 sentences passed every run", self.text)
         self.assertIn("`repo-node`", self.text.split("deployment conversation", 1)[1])
 
+    def test_the_readings_of_classes_that_ran_are_kept(self):
+        self.assertIn("M10 measured USD 0.28, 0.18 and 0.39", self.text)
+        self.assertIn("A fault was mitigated in", self.text)
+
+    def test_a_round_without_a_fault_says_nothing_of_mitigation(self):
+        rows = [r for r in self.rows if r["class"] != "fault"]
+        text = report.readings(rows, {i: report.summarize(g) for i, g in report.by_sentence(rows).items()})
+        self.assertNotIn("mitigated", text)
+        self.assertIn("M10 measured", text)
+
     def test_the_member_is_named_and_said_to_be_gone(self):
         self.assertIn("bench-20260919-2300", self.text)
 

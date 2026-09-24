@@ -134,6 +134,7 @@ class Round:
             since=since,
             variables=variables,
             root_alias=self.root_alias,
+            uid=self.state.get("uid"),
         )
 
     # ------------------------------------------------------------- one run

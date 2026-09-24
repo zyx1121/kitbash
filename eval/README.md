@@ -101,10 +101,12 @@ file:
 | `proc_running` | `proc_list` says a Process is up |
 | `proc_scheduled` | `proc_list` says a job is registered with a cron expression |
 | `tel_schedule` | a `kitbash.schedule` record exists since the round started |
-| `http_refuses_without_key` | every address this run made answers 401 or 403 to a request with no key, `GET /v1/models` and `POST /v1/chat/completions` by default |
+| `http_refuses_without_key` | every address this run made refuses a request with no key on the paths of OpenAI's API, Ollama's and llama-server's (`GET /v1/models`, `POST /v1/chat/completions`, `GET /api/tags`, `POST /api/generate`, `GET /props`): no path may answer 2xx, a path the engine lacks may answer 404, and at least one has to answer 401 or 403. Then one `GET` with the key the run set, as a bearer token, has to answer 2xx, so a server that refuses everyone fails |
 | `entry_survives_restart` | an entry posted through whichever usual path and shape the application takes is read back, the Process is stopped and started through the member's surface, and the entry is still there |
+| `entry_in_database` | an entry the check writes through the application is found by `pg_dumpall --data-only` inside a container of this run's Processes, run as the member with their podman through `--root` |
 | `unit_runs_image` | a unit of a Package this run made runs the image named, pinned by digest or built `FROM` it |
-| `nothing_committed` | no database file, a Postgres data directory or an SQLite file, is tracked in the git repository of a Package this run made, read as root with `git ls-files` |
+| `nothing_committed` | no database file, a Postgres data directory or an SQLite file, is tracked in the git repository of a Package this run made, and `git status --porcelain` is empty in the Package and in every mounted folder inside a repository, read as root |
+| `pkg_builds` | `pkg_build` of every Package this run made answers a digest, through the member's surface |
 | `all_of` | every check in the list, the first failure being the reason |
 
 A sentence may also carry `observe`, a mapping of name to check that is read
@@ -112,6 +114,14 @@ after the outcome and decides nothing. It lands on the row as
 `observed: {name: {observed, detail}}`, beside `passed` and never part of it,
 which is how a round reports something a run cannot be failed for, such as the
 weather job having posted to its board within the run.
+
+How `http_refuses_without_key` learns the key: the member's surface never
+answers a secret's value and an admin reads only their own, so the check names
+the secrets and key variables the Package's manifest declares, reads their
+values out of the running containers with `podman inspect` as the member,
+through `--root`, and never writes a value into a row. With no root alias the
+request with the key is recorded as skipped in `key_probe`, and the check
+passes on the refusals alone.
 
 A check on a sentence the member wrote freely looks only at Processes that did
 not exist before the run, so the previous sentence's service cannot pass this
@@ -130,7 +140,7 @@ One JSON file per run, `<id>-<n>.json`, in the round folder.
 | `member` | the member the round created |
 | `turns`, `tool_calls` | what the transcript counted |
 | `kitbash_calls`, `kitbash_calls_by_tool` | calls to the kitbash surface, and which tools |
-| `recipes_read` | the files under `/org/skills` the run read with `fs_read`, in order, once each; never part of `passed` |
+| `recipes_read` | the files under `/org/skills` the run read with an `fs_read` that answered without an error, in order, once each; never part of `passed` |
 | `tool_errors` | tool results that came back an error |
 | `questions_asked` | sentences ending in a question mark in the agent's last answer |
 | `asks_user` | whether that answer hands a decision back, by a question or a phrase |
