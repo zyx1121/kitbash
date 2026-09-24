@@ -10,6 +10,7 @@ import json
 import re
 
 KITBASH_PREFIX = "mcp__kitbash__"
+RECIPES = "/org/skills/"
 
 # What a sentence ending in a question mark is, and what a request for the user
 # looks like when it does not end in one.
@@ -57,7 +58,22 @@ def _blank_transcript(agent):
         "result_text": "",
         "stop_reason": None,
         "rate_limited": False,
+        "recipes_read": [],
     }
+
+
+def _recipe(tool, arguments, seen):
+    """A recipe the run read: an fs_read of a file under /org/skills, in order, once each."""
+    if tool != "fs_read":
+        return
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except ValueError:
+            return
+    path = (arguments or {}).get("path") or ""
+    if path.startswith(RECIPES) and path not in seen:
+        seen.append(path)
 
 
 def _lines(path):
@@ -88,6 +104,7 @@ def parse_claude_stream(path):
                     tools[name] += 1
                     if name.startswith(KITBASH_PREFIX):
                         kitbash[name[len(KITBASH_PREFIX):]] += 1
+                        _recipe(name[len(KITBASH_PREFIX):], block.get("input"), transcript["recipes_read"])
         elif kind == "user":
             for block in (message.get("message") or {}).get("content") or []:
                 if isinstance(block, dict) and block.get("type") == "tool_result" and block.get("is_error"):
@@ -153,6 +170,7 @@ def parse_codex_stream(path):
                     tools[name] += 1
                     if item.get("server") == "kitbash":
                         kitbash[item.get("tool")] += 1
+                        _recipe(item.get("tool"), item.get("arguments"), transcript["recipes_read"])
                     if item.get("error") or item.get("status") not in (None, "completed"):
                         transcript["tool_errors"] += 1
                 else:
@@ -197,6 +215,9 @@ def build_row(sentence, transcript, outcome, meta):
         "tool_calls": transcript.get("tool_calls"),
         "kitbash_calls": sum((transcript.get("kitbash_calls") or {}).values()),
         "kitbash_calls_by_tool": transcript.get("kitbash_calls") or {},
+        # Which recipes under /org/skills the run read. Counted from the
+        # transcript like the calls around it, and never part of passed.
+        "recipes_read": transcript.get("recipes_read") or [],
         "tool_errors": transcript.get("tool_errors"),
         "questions_asked": questions_asked(text),
         "asks_user": asks_user(text),

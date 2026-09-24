@@ -1,0 +1,1 @@
+Make a guestbook that keeps its entries when it restarts.

@@ -1,0 +1,1 @@
+Run a small chat model I can call from my laptop, only for me.

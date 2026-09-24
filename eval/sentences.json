@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "note": "Fifteen sentences in three classes. A sentence is what a member says; a check reads the outcome on the host and never the transcript. JSON rather than YAML because the harness is Python standard library only.",
+  "note": "Seventeen sentences in four classes. A sentence is what a member says; a check reads the outcome on the host and never the transcript. JSON rather than YAML because the harness is Python standard library only.",
   "sentences": [
     {
       "id": "todo-board",
@@ -377,6 +377,50 @@
                 "post_path": "/api/notes",
                 "get_path": "/api/notes"
               }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "chat-model-private",
+      "class": "recipe",
+      "prompt": "Run a small chat model I can call from my laptop, only for me.",
+      "source": "PLAN.md 5.7 M16, verbatim. serve-ollama and serve-llamacpp answer it; an http Process is public, so only for me is the part a model server without a key gets wrong.",
+      "check": {
+        "name": "http_refuses_without_key",
+        "params": {
+          "status": [
+            401,
+            403
+          ]
+        }
+      }
+    },
+    {
+      "id": "guestbook-restart",
+      "class": "recipe",
+      "prompt": "Make a guestbook that keeps its entries when it restarts.",
+      "source": "PLAN.md 5.7 M16, verbatim. The postgres recipe answers it: a Postgres unit beside the application, its data mounted and ignored by git.",
+      "check": {
+        "name": "all_of",
+        "params": {
+          "checks": [
+            {
+              "name": "unit_runs_image",
+              "params": {
+                "contains": "postgres"
+              }
+            },
+            {
+              "name": "entry_survives_restart",
+              "params": {
+                "restart_wait": 240
+              }
+            },
+            {
+              "name": "nothing_committed",
+              "params": {}
             }
           ]
         }

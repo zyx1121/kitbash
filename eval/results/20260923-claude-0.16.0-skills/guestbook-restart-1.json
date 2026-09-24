@@ -1,0 +1,128 @@
+{
+ "agent": "claude",
+ "asks_user": false,
+ "check": {
+  "check": "all_of",
+  "detail": "/home/bench-20260923-1920/guestbook unit db runs docker.io/library/postgres@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24; https://guestbook.bench-20260923-1920.kitbash.zyx.tw kept an entry across proc_stop and proc_run; no database file is tracked in /home/bench-20260923-1920/guestbook",
+  "parts": [
+   {
+    "check": "unit_runs_image",
+    "detail": "/home/bench-20260923-1920/guestbook unit db runs docker.io/library/postgres@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24",
+    "name": "unit_runs_image",
+    "passed": true
+   },
+   {
+    "check": "entry_survives_restart",
+    "detail": "https://guestbook.bench-20260923-1920.kitbash.zyx.tw kept an entry across proc_stop and proc_run",
+    "name": "entry_survives_restart",
+    "passed": true,
+    "seen": {
+     "marker": "bench-7083e04d2396",
+     "post": "/entries",
+     "read": "/",
+     "shape": "form",
+     "url": "https://guestbook.bench-20260923-1920.kitbash.zyx.tw"
+    }
+   },
+   {
+    "check": "nothing_committed",
+    "detail": "no database file is tracked in /home/bench-20260923-1920/guestbook",
+    "name": "nothing_committed",
+    "passed": true
+   }
+  ],
+  "passed": true
+ },
+ "class": "recipe",
+ "cost_usd": 0.5488414,
+ "ended_at": "2026-09-23T11:26:19+00:00",
+ "error": null,
+ "exit_code": 0,
+ "id": "guestbook-restart",
+ "inject_verified": null,
+ "injected_at": null,
+ "kitbash_calls": 19,
+ "kitbash_calls_by_tool": {
+  "fs_list": 2,
+  "fs_read": 2,
+  "fs_write": 1,
+  "pkg_build": 1,
+  "proc_list": 3,
+  "proc_logs": 5,
+  "proc_run": 2,
+  "proc_stop": 1,
+  "secrets_set": 1,
+  "users_me": 1
+ },
+ "kitbash_version": "0.16.0",
+ "member": "bench-20260923-1920",
+ "model": "claude-sonnet-5",
+ "observed": null,
+ "passed": true,
+ "prompt": "Make a guestbook that keeps its entries when it restarts.",
+ "questions_asked": 0,
+ "rate_limited": false,
+ "recipes_read": [
+  "/org/skills/web-app/SKILL.md",
+  "/org/skills/postgres/SKILL.md"
+ ],
+ "result_text": "The entry survived the restart. The guestbook is live and confirmed working.\n\n**Summary:**\n- Built at `/home/bench-20260923-1920/guestbook` \u2014 a Node/Express web app (`web` unit) plus a Postgres database (`db` unit) in the same pod, following the org's `web-app` and `postgres` skill recipes.\n- Entries (name + message) are stored in a Postgres table on a persistent mount (`pgdata/`), not in memory, so `proc_stop`/`proc_run` doesn't lose them.\n- Verified live: submitted a \"Restart Test\" entry via the public URL, stopped and restarted the process, and the entry was still there afterward.\n- Live at `https://guestbook.bench-20260923-1920.kitbash.zyx.tw`.",
+ "run": 1,
+ "setup": null,
+ "started_at": "2026-09-23T11:22:48+00:00",
+ "stop_reason": "success",
+ "time_to_mitigate_ms": null,
+ "timed_out": false,
+ "tool_calls": 32,
+ "tool_errors": 2,
+ "tools": {
+  "Bash": 5,
+  "ToolSearch": 4,
+  "WebFetch": 4,
+  "mcp__kitbash__fs_list": 2,
+  "mcp__kitbash__fs_read": 2,
+  "mcp__kitbash__fs_write": 1,
+  "mcp__kitbash__pkg_build": 1,
+  "mcp__kitbash__proc_list": 3,
+  "mcp__kitbash__proc_logs": 5,
+  "mcp__kitbash__proc_run": 2,
+  "mcp__kitbash__proc_stop": 1,
+  "mcp__kitbash__secrets_set": 1,
+  "mcp__kitbash__users_me": 1
+ },
+ "turns": 33,
+ "usage": {
+  "cache_creation": {
+   "ephemeral_1h_input_tokens": 36844,
+   "ephemeral_5m_input_tokens": 0
+  },
+  "cache_creation_input_tokens": 36844,
+  "cache_read_input_tokens": 1407492,
+  "inference_geo": "not_available",
+  "input_tokens": 58,
+  "iterations": [
+   {
+    "cache_creation": {
+     "ephemeral_1h_input_tokens": 290,
+     "ephemeral_5m_input_tokens": 0
+    },
+    "cache_creation_input_tokens": 290,
+    "cache_read_input_tokens": 57369,
+    "input_tokens": 2,
+    "output_tokens": 261,
+    "type": "message"
+   }
+  ],
+  "output_tokens": 11716,
+  "output_tokens_details": {
+   "thinking_tokens": 5430
+  },
+  "server_tool_use": {
+   "web_fetch_requests": 0,
+   "web_search_requests": 0
+  },
+  "service_tier": "standard",
+  "speed": "standard"
+ },
+ "wall_ms": 209840
+}

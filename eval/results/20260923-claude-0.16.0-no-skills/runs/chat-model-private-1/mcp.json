@@ -1,0 +1,1 @@
+{"mcpServers": {"kitbash": {"command": "ssh", "args": ["-o", "BatchMode=yes", "-F", "/private/tmp/claude-501/-Users-loki/b5ad900a-b320-4966-9578-bbb24e529a70/scratchpad/kitbash-m16/eval/results/20260923-claude-0.16.0-no-skills/ssh_config", "bench-member"]}}}

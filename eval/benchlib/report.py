@@ -8,11 +8,12 @@ import json
 import os
 import statistics
 
-CLASSES = ["nothing", "repository", "fault"]
+CLASSES = ["nothing", "repository", "fault", "recipe"]
 CLASS_TITLES = {
     "nothing": "From nothing",
     "repository": "From a repository",
     "fault": "From a fault",
+    "recipe": "Answered by a recipe",
 }
 
 
@@ -89,14 +90,19 @@ def summarize(runs):
         "cost_usd": mean([r.get("cost_usd") for r in runs]),
         "wall_ms": mean([r.get("wall_ms") for r in runs]),
         "time_to_mitigate_ms": mean([r.get("time_to_mitigate_ms") for r in runs]),
+        # The recipes any run of this sentence read, by folder name.
+        "recipes_read": sorted({p.split("/")[3] for r in runs for p in r.get("recipes_read") or [] if p.count("/") >= 3}),
     }
 
 
-def table(summaries, fault=False):
+def table(summaries, fault=False, recipe=False):
     head = "| Sentence | pass^k | turns | tool calls | kitbash calls | tool errors | questions | cost USD | wall |"
     rule = "|---|---|---|---|---|---|---|---|---|"
     if fault:
         head = head + " time to mitigate |"
+        rule = rule + "---|"
+    if recipe:
+        head = head + " recipes read |"
         rule = rule + "---|"
     lines = [head, rule]
     for item in summaries:
@@ -114,6 +120,8 @@ def table(summaries, fault=False):
         if fault:
             value = item["time_to_mitigate_ms"]
             cells.append("-" if value is None else "%.1f min" % (value / 60000.0))
+        if recipe:
+            cells.append(", ".join("`%s`" % r for r in item.get("recipes_read") or []) or "none")
         lines.append("| " + " | ".join(cells) + " |")
     totals = [
         "**total**",
@@ -129,8 +137,28 @@ def table(summaries, fault=False):
     if fault:
         value = mean([i["time_to_mitigate_ms"] for i in summaries])
         totals.append("-" if value is None else "%.1f min" % (value / 60000.0))
+    if recipe:
+        totals.append("")
     lines.append("| " + " | ".join(totals) + " |")
     return "\n".join(lines)
+
+
+def by_class_spend(rows):
+    """What a run cost per class, for the classes this round ran and no other.
+
+    A round of one class, the recipe sentences for instance, would otherwise
+    say the other three cost "an amount this client does not report", which
+    reads as a measurement of runs that never happened.
+    """
+    parts = []
+    for name in CLASSES:
+        ran = [r for r in rows if r["class"] == name]
+        if ran:
+            parts.append("%s it was %s" % (CLASS_TITLES[name].lower(), spend(ran)))
+    if len(parts) < 2:
+        return ""
+    text = ", ".join(parts[:-1]) + " and " + parts[-1]
+    return " " + text[0].upper() + text[1:] + "."
 
 
 def readings(rows, summaries):
@@ -160,15 +188,12 @@ def readings(rows, summaries):
             "" if not handed_back else " (%s)" % ", ".join("`%s`" % i for i in sorted(set(handed_back))),
         ),
         "",
-        "**What a sentence costs.** The mean run cost %s and took %s. From nothing it was %s, from a "
-        "repository %s, from a fault %s. M10 measured USD 0.28, 0.18 and 0.39 by hand on the three "
-        "sentences this round keeps."
+        "**What a sentence costs.** The mean run cost %s and took %s.%s M10 measured USD 0.28, 0.18 "
+        "and 0.39 by hand on the three sentences this round keeps."
         % (
             spend(rows),
             "-" if mean([r.get("wall_ms") for r in rows]) is None else "%.0f minutes" % (mean([r.get("wall_ms") for r in rows]) / 60000.0),
-            spend([r for r in rows if r["class"] == "nothing"]),
-            spend([r for r in rows if r["class"] == "repository"]),
-            spend([r for r in rows if r["class"] == "fault"]),
+            by_class_spend(rows),
         )
         + ("" if cost is not None else " This client reports no price, so what a run cost is its own token count."),
         "",
@@ -213,7 +238,7 @@ def render(folder, state=None):
         if not items:
             continue
         items.sort(key=lambda s: s["id"])
-        lines += ["## %s" % CLASS_TITLES[name], "", table(items, fault=(name == "fault")), ""]
+        lines += ["## %s" % CLASS_TITLES[name], "", table(items, fault=(name == "fault"), recipe=(name == "recipe")), ""]
     total = len(summaries)
     passed = sum(1 for s in summaries.values() if s["pass_k"])
     lines += [
