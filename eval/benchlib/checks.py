@@ -332,10 +332,10 @@ def _key_names(manifest):
     return [n for n in dict.fromkeys(names) if ENV_NAME.match(n)]
 
 
-def _as_member(ctx, command):
+def _as_member(ctx, command, timeout=300):
     """A compound command as the member. as_member puts the runtime directory in
     front of the command, which the shell takes only before a simple command."""
-    return hostops.as_member(ctx.root_alias, ctx.member, ctx.uid, "sh -c %s" % shlex.quote(command))
+    return hostops.as_member(ctx.root_alias, ctx.member, ctx.uid, "sh -c %s" % shlex.quote(command), timeout=timeout)
 
 
 def _container_env(ctx, process, names):
@@ -429,17 +429,21 @@ def http_refuses_without_key(ctx, params):
         if not [a for a in answers if a["status"] in refused]:
             return {"passed": False, "detail": "%s refused no request without a key, it answered %s"
                     % (base, ", ".join(str(a["status"]) for a in answers)), "tried": seen}
-    # A key nobody set has to be refused where no key was: a proxy that only
-    # asks whether there is a bearer at all lets everyone in.
+    # A key nobody set is sent to every path, not only the ones that refused:
+    # a path that answers 404 without a key and 200 to any bearer is open to
+    # anyone who sends one. A path that refused without a key has to refuse
+    # the wrong key too, and no path may answer it 2xx.
     wrong = []
     bogus = "Bearer bench-%s" % uuid.uuid4().hex
-    for base, spec in guarded:
-        status, _ = fetch(base + spec["path"], method=spec.get("method", "GET"), body=spec.get("body"),
-                          headers={"Authorization": bogus})
-        wrong.append({"url": base + spec["path"], "method": spec.get("method", "GET"), "status": status})
-        if status not in refused:
-            return {"passed": False, "detail": "%s %s answered %s to a key nobody set"
-                    % (wrong[-1]["method"], wrong[-1]["url"], status), "tried": seen, "wrong_key": wrong}
+    for process in candidates:
+        base = ctx.url_of(process).rstrip("/")
+        for spec in requests:
+            status, _ = fetch(base + spec["path"], method=spec.get("method", "GET"), body=spec.get("body"),
+                              headers={"Authorization": bogus})
+            wrong.append({"url": base + spec["path"], "method": spec.get("method", "GET"), "status": status})
+            if _served(status) or ((base, spec) in guarded and status not in refused):
+                return {"passed": False, "detail": "%s %s answered %s to a key nobody set"
+                        % (wrong[-1]["method"], wrong[-1]["url"], status), "tried": seen, "wrong_key": wrong}
     keys, why = _keys(ctx, candidates)
     if why and why.startswith("skipped"):
         return {"passed": True, "detail": "%d requests without a key and %d with a wrong one, all refused; "
@@ -660,9 +664,14 @@ GIT_SAFE = ("GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_OPTIONAL_LOCK
             "-c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.pager=cat -c safe.directory='*'")
 
 
+GIT_TIMEOUT = 60
+
+
 def _git(ctx, path, arguments):
     """git on a folder of the member's, run as the member and never as root."""
-    return _as_member(ctx, "%s -C %s %s" % (GIT_SAFE, shlex.quote(path), arguments))
+    # A filter.process the agent names that never answers would hold git
+    # until the ssh deadline, so the member's git gets a short one of its own.
+    return _as_member(ctx, "%s -C %s %s" % (GIT_SAFE, shlex.quote(path), arguments), timeout=GIT_TIMEOUT)
 
 
 def nothing_committed(ctx, params):

@@ -78,7 +78,11 @@ sentence of the round has run; with `--only` or after a failure it stays.
   ITBench measure. Each is injected by the harness against a Process the round
   deployed itself first, so a fault sentence is self contained: the fixture
   Packages are under `fixtures/`, the round writes, builds and runs them as the
-  member, waits until the address answers, and only then breaks it. A sentence
+  member, waits until the address answers, and only then breaks it. A fault
+  runs as the member wherever it can. The one step that needs root, the
+  immutable flag of the mount fault, runs only on a regular file below the
+  member's home that no link leads to (`hostops.guard`), because an agent of an
+  earlier sentence can put a link where the bench expects its file. A sentence
   outside this class may name a `setup` too, which is the same deploy without
   the fault: the scheduled job posts onto a board deployed that way.
 - **Answered by a recipe.** The two sentences of PLAN.md 5.7 M16, each one a

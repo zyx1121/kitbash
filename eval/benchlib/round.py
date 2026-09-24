@@ -171,8 +171,10 @@ class Round:
         with self.session() as session:
             for name, value in (setup.get("secrets") or {}).items():
                 session.call("secrets_set", {"name": name, "value": value})
-            for command in self.resolve(setup.get("reset") or [], variables):
-                hostops.ssh(self.root_alias, command)
+            # What a previous run of the mount fault left, taken back behind
+            # the same guard the fault is set behind.
+            for path in self.resolve(setup.get("reset_immutable") or [], variables):
+                hostops.clear_immutable(self.root_alias, member, self.state["uid"], path)
             depends = setup.get("depends")
             if depends:
                 self.log("  deploying dependency %s" % depends["package"])
@@ -227,14 +229,22 @@ class Round:
         member = self.state["member"]
         uid = self.state["uid"]
         done = []
-        if kind in ("podman", "root"):
+        if kind == "podman":
             for command in self.resolve(inject.get("commands") or [], variables):
-                if kind == "podman":
-                    code, out, err = hostops.as_member(self.root_alias, member, uid, command)
-                else:
-                    code, out, err = hostops.ssh(self.root_alias, command)
+                code, out, err = hostops.as_member(self.root_alias, member, uid, command)
                 done.append({"command": command, "code": code, "out": (out or "").strip()[:200],
                              "err": (err or "").strip()[:200]})
+        elif kind == "immutable":
+            # There is no kind that runs a sentence's commands as root. A
+            # member's path is the agent's to replace with a link, so the one
+            # root step a fault needs is a helper behind hostops.guard.
+            path = self.resolve(inject["path"], variables)
+            try:
+                code, out, err = hostops.make_immutable(self.root_alias, member, uid, path, inject.get("create", "[]"))
+            except hostops.UnsafePath as exc:
+                code, out, err = 1, "", str(exc)
+            done.append({"immutable": path, "code": code, "out": (out or "").strip()[:200],
+                         "err": (err or "").strip()[:200]})
         elif kind == "mcp":
             with self.session() as session:
                 for call in self.resolve(inject.get("calls") or [], variables):
@@ -402,7 +412,7 @@ class Round:
         # The mount fault makes one file immutable, and users_remove archives
         # the home by chowning it, which an immutable file refuses. The flag
         # the bench set is the bench's to clear.
-        hostops.ssh(self.root_alias, "chattr -R -i /home/%s 2>/dev/null; true" % name)
+        hostops.clear_home_flags(self.root_alias, name)
         # A removal of a member holding a round's worth of Processes takes
         # longer than kitbash-mcp's client deadline, and the cancellation stops
         # userdel halfway, so the Processes are stopped over the surface first.

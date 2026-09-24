@@ -9,7 +9,7 @@ from support import EVAL
 from benchlib import checks, fixtures
 
 CLASSES = {"nothing", "repository", "fault", "recipe"}
-INJECT_KINDS = {"podman", "root", "mcp"}
+INJECT_KINDS = {"podman", "immutable", "mcp"}
 
 
 def check_names(spec):
@@ -55,8 +55,11 @@ class SentenceFile(unittest.TestCase):
             self.assertIn("inject", sentence, sentence["id"])
             self.assertIn(sentence["inject"]["kind"], INJECT_KINDS, sentence["id"])
             self.assertTrue(
-                sentence["inject"].get("commands") or sentence["inject"].get("calls"), sentence["id"]
+                sentence["inject"].get("commands") or sentence["inject"].get("calls")
+                or sentence["inject"].get("path"), sentence["id"]
             )
+            # No sentence hands the round a command to run as root.
+            self.assertNotIn("reset", sentence["setup"], sentence["id"])
             setup = sentence["setup"]
             folder = os.path.join(fixtures.FIXTURE_ROOT, setup["fixture"])
             self.assertTrue(os.path.isdir(folder), folder)

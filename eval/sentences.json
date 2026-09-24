@@ -219,20 +219,15 @@
       "setup": {
         "fixture": "bench-board",
         "package": "bench-board-mount",
-        "reset": [
-          "chattr -i /home/{member}/{pkg}-data/items.json 2>/dev/null || true",
-          "chmod 0644 /home/{member}/{pkg}-data/items.json 2>/dev/null || true"
+        "reset_immutable": [
+          "/home/{member}/{pkg}-data/items.json"
         ]
       },
       "inject": {
-        "kind": "root",
-        "note": "The one file the rw mount holds is made unwritable at the inode, so reads keep working and every write returns 500. Permission bits alone would not do it: a container's root is the member and overrides them. The round clears the flag again before it removes its member, because the archive users_remove makes chowns the home and an immutable file refuses that.",
-        "commands": [
-          "test -f /home/{member}/{pkg}-data/items.json || echo '[]' > /home/{member}/{pkg}-data/items.json",
-          "chown {member}:{member} /home/{member}/{pkg}-data/items.json",
-          "chmod 0444 /home/{member}/{pkg}-data/items.json",
-          "chattr +i /home/{member}/{pkg}-data/items.json"
-        ]
+        "kind": "immutable",
+        "note": "The one file the rw mount holds is made unwritable at the inode, so reads keep working and every write returns 500. Permission bits alone would not do it: a container's root is the member and overrides them. The round clears the flag again before it removes its member, because the archive users_remove makes chowns the home and an immutable file refuses that. The file is created and its mode set as the member; only the flag is set as root, and only on a regular file that no link leads to, see hostops.guard.",
+        "path": "/home/{member}/{pkg}-data/items.json",
+        "create": "[]"
       },
       "check": {
         "name": "http_post_roundtrip",

@@ -5,6 +5,8 @@ sees a Process that stopped answering, which is what a user sees.
 """
 
 import os
+import re
+import shlex
 import subprocess
 
 
@@ -26,6 +28,89 @@ def as_member(root_alias, member, uid, command, timeout=300):
     quoted = command.replace("'", "'\\''")
     wrapped = "su - %s -c 'XDG_RUNTIME_DIR=/run/user/%s %s'" % (member, uid, quoted)
     return ssh(root_alias, wrapped, timeout=timeout)
+
+
+# A member's name as kitbash spells it, which is what a home under /home is.
+MEMBER = re.compile(r"^[a-z][a-z0-9-]*$")
+
+
+class UnsafePath(Exception):
+    """A path the bench would change as root that is not plainly the member's own."""
+
+
+def member_path(member, path):
+    """The path, if it is written plainly below the member's home, or UnsafePath.
+
+    Plainly: absolute, normalized, no dot components, below /home/<member>/.
+    Whether a link on the host makes it resolve anywhere else is what
+    guard() asks there, because only the host can say.
+    """
+    if not MEMBER.match(member or ""):
+        raise UnsafePath("%r is not a member name" % member)
+    home = "/home/%s" % member
+    if not path.startswith(home + "/") or os.path.normpath(path) != path or "/." in path:
+        raise UnsafePath("%s is not written plainly below %s" % (path, home))
+    return path
+
+
+def guard(member, path, kind="-f"):
+    """Shell that succeeds only if the path is a regular file (or with -d a
+    directory), is not a symbolic link, and resolves to itself, so no
+    component of it is a link, below the member's home.
+
+    Every root command on a member's path runs behind this. A member, or a
+    Process of theirs, can put a link where the bench expects a file, and a
+    root command that follows it would change a file of root's choosing.
+    """
+    home = "/home/%s" % member
+    quoted = shlex.quote(path)
+    return ('[ %s %s ] && [ ! -L %s ] && [ "$(readlink -f %s)" = %s ] && case %s in %s|%s/*) true ;; *) false ;; esac'
+            % (kind, quoted, quoted, quoted, quoted, quoted, shlex.quote(home), shlex.quote(home)))
+
+
+def make_immutable(root_alias, member, uid, path, create="[]"):
+    """A file of the member's made unwritable at the inode, the mount fault.
+
+    Everything the member may do is done as the member: creating the file
+    when it is missing, taking it back from a container's user with podman
+    unshare, and the mode. Only the immutable flag needs root. Every step,
+    the member's too, runs behind guard(), so a link planted at the path or
+    at its folder is refused rather than followed. Answers (code, stdout,
+    stderr) of the last step run.
+    """
+    member_path(member, path)
+    quoted = shlex.quote(path)
+    refuse = "{ echo 'refused: %s is not a regular file of %s that no link leads to' >&2; exit 1; }" % (path, member)
+    own = ("if [ ! -e %s ] && [ ! -L %s ]; then %s && printf '%%s\\n' %s > %s; fi; "
+           "%s || %s; podman unshare chown -h 0:0 %s 2>/dev/null; chmod 0444 %s"
+           % (quoted, quoted, guard(member, os.path.dirname(path), "-d"), shlex.quote(create), quoted,
+              guard(member, path), refuse, quoted, quoted))
+    code, out, err = as_member(root_alias, member, uid, "sh -c %s" % shlex.quote(own))
+    if code:
+        return code, out, err
+    return ssh(root_alias, "%s || %s; chattr +i %s" % (guard(member, path), refuse, quoted))
+
+
+def clear_immutable(root_alias, member, uid, path):
+    """The mount fault taken back: the flag cleared as root and the mode as the member, both behind guard()."""
+    member_path(member, path)
+    quoted = shlex.quote(path)
+    code, out, err = ssh(root_alias, "%s && chattr -i %s; true" % (guard(member, path), quoted))
+    as_member(root_alias, member, uid,
+              "sh -c %s" % shlex.quote("%s && chmod 0644 %s; true" % (guard(member, path), quoted)))
+    return code, out, err
+
+
+def clear_home_flags(root_alias, member):
+    """Every immutable flag under a member's home cleared, before users_remove archives it.
+
+    chattr -R does not follow the links it meets below the top, and the top
+    is behind guard(), so the home itself cannot be a link to elsewhere.
+    """
+    if not MEMBER.match(member or ""):
+        raise UnsafePath("%r is not a member name" % member)
+    home = "/home/%s" % member
+    return ssh(root_alias, "%s && chattr -R -i %s 2>/dev/null; true" % (guard(member, home, "-d"), shlex.quote(home)))
 
 
 def kitbash_version(root_alias):

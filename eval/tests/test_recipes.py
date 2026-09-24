@@ -57,8 +57,10 @@ PROXY_MANIFEST = {"pkg_inspect": {"manifest": {"name": "chat", "deploy": {"units
 class ModelServer:
     """An address that answers by path, and by whether the request carries the key."""
 
-    def __init__(self, keyless, with_key=None, key=KEY, any_bearer=False):
+    def __init__(self, keyless, with_key=None, key=KEY, any_bearer=False, bearer=None):
         self.keyless = keyless
+        # What some paths answer to a bearer, whichever it is.
+        self.bearer = bearer or {}
         self.with_key = with_key if with_key is not None else {}
         self.key = key
         # A proxy that asks only whether there is a bearer, whatever it says.
@@ -69,6 +71,8 @@ class ModelServer:
         path = url.split(".example", 1)[1]
         auth = (headers or {}).get("Authorization")
         self.sent.append((method, path, auth))
+        if (auth or "").startswith("Bearer ") and path in self.bearer:
+            return self.bearer[path], "{}"
         if auth == "Bearer %s" % self.key or (self.any_bearer and (auth or "").startswith("Bearer ")):
             return self.with_key.get(path, 200), "{}"
         return self.keyless.get(path, 401), "no key"
@@ -99,7 +103,7 @@ class RefusesWithoutKey(unittest.TestCase):
         self.assertIn(("GET", "/v1/models", "Bearer %s" % KEY), server.sent)
         # Every path that refused no key was asked again with a key nobody set.
         wrong = [(m, p) for m, p, auth in server.sent if auth and auth != "Bearer %s" % KEY]
-        self.assertEqual(len(wrong), 5)
+        self.assertEqual(sorted(wrong), sorted(keyless))
         self.assertEqual(len(result["wrong_key"]), 5)
         # The key is read as the member, from the containers of this Process, by the names declared.
         root, member, uid, command = seen[0]
@@ -146,6 +150,14 @@ class RefusesWithoutKey(unittest.TestCase):
         result, _ = self.use(ModelServer({}, any_bearer=True))
         self.assertFalse(result["passed"])
         self.assertIn("answered 200 to a key nobody set", result["detail"])
+
+    def test_a_path_that_hides_behind_404_and_takes_any_bearer_fails(self):
+        """/v1 is guarded; /api answers 404 without a key and 200 to whatever bearer comes."""
+        server = ModelServer({"/api/tags": 404, "/api/generate": 404},
+                             bearer={"/api/tags": 200, "/api/generate": 200})
+        result, _ = self.use(server)
+        self.assertFalse(result["passed"])
+        self.assertIn("/api/tags answered 200 to a key nobody set", result["detail"])
 
     def test_a_proxy_that_guards_only_the_chat_post_takes_the_key_there(self):
         """Every GET is 404 or 405 with or without a key, so the POST is the request with the key."""
