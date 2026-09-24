@@ -3,6 +3,9 @@
 import json
 import os
 import re
+import shlex
+import shutil
+import subprocess
 import tempfile
 import unittest
 
@@ -54,17 +57,19 @@ PROXY_MANIFEST = {"pkg_inspect": {"manifest": {"name": "chat", "deploy": {"units
 class ModelServer:
     """An address that answers by path, and by whether the request carries the key."""
 
-    def __init__(self, keyless, with_key=None, key=KEY):
+    def __init__(self, keyless, with_key=None, key=KEY, any_bearer=False):
         self.keyless = keyless
         self.with_key = with_key if with_key is not None else {}
         self.key = key
+        # A proxy that asks only whether there is a bearer, whatever it says.
+        self.any_bearer = any_bearer
         self.sent = []
 
     def fetch(self, url, method="GET", body=None, headers=None):
         path = url.split(".example", 1)[1]
         auth = (headers or {}).get("Authorization")
         self.sent.append((method, path, auth))
-        if auth == "Bearer %s" % self.key:
+        if auth == "Bearer %s" % self.key or (self.any_bearer and (auth or "").startswith("Bearer ")):
             return self.with_key.get(path, 200), "{}"
         return self.keyless.get(path, 401), "no key"
 
@@ -92,6 +97,10 @@ class RefusesWithoutKey(unittest.TestCase):
             self.assertIn(probe, keyless)
         self.assertEqual(len(result["seen"]), 5)
         self.assertIn(("GET", "/v1/models", "Bearer %s" % KEY), server.sent)
+        # Every path that refused no key was asked again with a key nobody set.
+        wrong = [(m, p) for m, p, auth in server.sent if auth and auth != "Bearer %s" % KEY]
+        self.assertEqual(len(wrong), 5)
+        self.assertEqual(len(result["wrong_key"]), 5)
         # The key is read as the member, from the containers of this Process, by the names declared.
         root, member, uid, command = seen[0]
         self.assertEqual((root, member, uid), ("root@host", "bench-x", 1001))
@@ -133,6 +142,26 @@ class RefusesWithoutKey(unittest.TestCase):
         self.assertFalse(result["passed"])
         self.assertIn("refuses everyone", result["detail"])
 
+    def test_a_proxy_that_takes_any_bearer_fails(self):
+        result, _ = self.use(ModelServer({}, any_bearer=True))
+        self.assertFalse(result["passed"])
+        self.assertIn("answered 200 to a key nobody set", result["detail"])
+
+    def test_a_proxy_that_guards_only_the_chat_post_takes_the_key_there(self):
+        """Every GET is 404 or 405 with or without a key, so the POST is the request with the key."""
+        missing = {"/v1/models": 404, "/api/tags": 404, "/props": 405, "/api/generate": 404}
+        server = ModelServer(dict(missing), with_key=dict(missing, **{"/v1/chat/completions": 200}))
+        result, _ = self.use(server)
+        self.assertTrue(result["passed"], result)
+        self.assertEqual(result["key_probe"]["method"], "POST")
+        self.assertNotIn("body", result["key_probe"])
+
+    def test_no_post_is_made_with_the_key_when_a_get_answers(self):
+        server = ModelServer({}, with_key={"/v1/models": 401, "/api/tags": 401, "/props": 401})
+        result, _ = self.use(server)
+        self.assertFalse(result["passed"])
+        self.assertNotIn(("POST", "/v1/chat/completions", "Bearer %s" % KEY), server.sent)
+
     def test_a_key_written_as_a_variable_is_used_too(self):
         stub = Stub(MODEL, answers={"pkg_inspect": {"manifest": {"deploy": {"units": [
             {"image": "ghcr.io/ggml-org/llama.cpp", "environment": {"LLAMA_API_KEY": KEY, "LLAMA_ARG_PORT": "8080"}}]}}}})
@@ -153,7 +182,9 @@ class RefusesWithoutKey(unittest.TestCase):
         self.assertTrue(result["passed"], result)
         self.assertIn("skipped", result["key_probe"])
         self.assertEqual(seen, [])
-        self.assertFalse([s for s in server.sent if s[2]])
+        # The wrong key needs no host and is still asked; the real key is not.
+        self.assertFalse([s for s in server.sent if s[2] == "Bearer %s" % KEY])
+        self.assertEqual(len(result["wrong_key"]), 5)
 
     def test_a_second_open_process_beside_a_guarded_one_fails(self):
         both = MODEL + [{"id": "m2", "name": "open", "package": "/home/bench-x/open", "state": "running"}]
@@ -289,22 +320,31 @@ class UnitRunsImage(unittest.TestCase):
         self.assertFalse(checks.unit_runs_image(context, {"contains": "postgres"})["passed"])
 
 
+def inner(command):
+    """The command as the member's shell runs it: _as_member wraps it in sh -c."""
+    words = shlex.split(command)
+    assert words[:2] == ["sh", "-c"], command
+    return words[2]
+
+
 class NothingCommitted(unittest.TestCase):
     def ls_files(self, listing, code=0, status=None):
-        """git as root: ls-files answers the listing, status --porcelain answers by folder."""
+        """git as the member: ls-files answers the listing, status --porcelain answers by folder."""
         seen = []
         status = status or {}
 
-        def ssh(alias, command, timeout=300, check=False):
-            seen.append((alias, command))
+        def as_member(root_alias, member, uid, command, timeout=300):
+            command = inner(command)
+            seen.append((member, uid, command))
             if " ls-files" in command:
                 return code, listing, "fatal: nope" if code else ""
-            folder = command.split("-C '", 1)[1].split("'", 1)[0]
-            answer = status.get(folder, "")
-            if answer is None:
-                return 128, "", "fatal: not a git repository"
-            return 0, answer, ""
+            folder = shlex.split(command.split(" -C ", 1)[1])[0]
+            return 0, status.get(folder, ""), ""
 
+        def ssh(alias, command, timeout=300, check=False):
+            raise AssertionError("git ran as root: %s" % command)
+
+        patch(self, checks.hostops, "as_member", as_member)
         patch(self, checks.hostops, "ssh", ssh)
         return seen
 
@@ -312,9 +352,10 @@ class NothingCommitted(unittest.TestCase):
         seen = self.ls_files("kitbash.yaml\nDockerfile\nserver.js\npgdata/.gitignore\n")
         result = checks.nothing_committed(Stub(MODEL), {})
         self.assertTrue(result["passed"], result)
-        self.assertIn("safe.directory", seen[0][1])
-        self.assertIn("/home/bench-x/chat", seen[0][1])
-        self.assertIn("status --porcelain", seen[1][1])
+        self.assertEqual(seen[0][:2], ("bench-x", 1001))
+        self.assertIn("core.fsmonitor=false", seen[0][2])
+        self.assertIn("/home/bench-x/chat", seen[0][2])
+        self.assertIn("status --porcelain", seen[1][2])
 
     def test_a_committed_data_directory_fails(self):
         self.ls_files("kitbash.yaml\npgdata/pgdata/PG_VERSION\npgdata/pgdata/base/1/112\n")
@@ -334,25 +375,75 @@ class NothingCommitted(unittest.TestCase):
         self.assertIn("pkg_build refuses", result["detail"])
         self.assertEqual(result["uncommitted"], ["/home/bench-x/chat: ?? data/"])
 
-    def test_untracked_files_in_a_mounted_folder_fail(self):
+    def test_a_dirty_mounted_folder_outside_the_package_is_left_to_pkg_builds(self):
         detail = {"processes": [{"id": "m1", "mounts": [
             {"source": "/home/bench-x/chat-data", "target": "/var/lib/postgresql/data", "mode": "rw"}]}]}
-        seen = self.ls_files("kitbash.yaml\n", status={"/home/bench-x/chat-data": "?? PG_VERSION\n?? base/\n"})
-        result = checks.nothing_committed(Stub(MODEL, answers={"proc_list": detail}), {})
-        self.assertFalse(result["passed"])
-        self.assertIn("/home/bench-x/chat-data: ?? PG_VERSION", result["uncommitted"])
-        self.assertTrue(any("-C '/home/bench-x/chat-data' status" in c for _, c in seen))
-
-    def test_a_mounted_folder_outside_any_repository_is_not_a_change(self):
-        detail = {"processes": [{"id": "m1", "mounts": [{"source": "/srv/elsewhere", "target": "/data"}]}]}
-        self.ls_files("kitbash.yaml\n", status={"/srv/elsewhere": None})
+        seen = self.ls_files("kitbash.yaml\n", status={"/home/bench-x/chat-data": "?? PG_VERSION\n"})
         result = checks.nothing_committed(Stub(MODEL, answers={"proc_list": detail}), {})
         self.assertTrue(result["passed"], result)
+        self.assertFalse([c for _, _, c in seen if "chat-data" in c])
 
     def test_without_a_root_alias_it_says_so(self):
         result = checks.nothing_committed(Stub(MODEL, root_alias=None), {})
         self.assertFalse(result["passed"])
         self.assertIn("root alias", result["detail"])
+
+
+@unittest.skipUnless(shutil.which("git"), "needs git")
+class GitIsNotRunAsRoot(unittest.TestCase):
+    """A Package whose .git/config names an fsmonitor: whatever it runs must not run as root.
+
+    Both ways the bench reaches the host run the command here for real, root
+    as ssh to the root alias and the member through as_member, and the script
+    writes down which of the two ran it.
+    """
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+        self.repo = os.path.join(self.home, "guestbook")
+        self.marker = os.path.join(self.home, "ran")
+        os.makedirs(self.repo)
+        git = ["git", "-C", self.repo, "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"]
+        subprocess.run(["git", "init", "-q", self.repo], check=True)
+        with open(os.path.join(self.repo, "kitbash.yaml"), "w") as handle:
+            handle.write("name: guestbook\n")
+        subprocess.run(git + ["add", "."], check=True)
+        subprocess.run(git + ["commit", "-q", "-m", "one"], check=True)
+        script = os.path.join(self.home, "planted.sh")
+        with open(script, "w") as handle:
+            handle.write("#!/bin/sh\necho \"$BENCH_AS\" >> %s\n" % self.marker)
+        os.chmod(script, 0o755)
+        for key, value in (("core.fsmonitor", script), ("core.pager", script), ("diff.external", script)):
+            subprocess.run(["git", "-C", self.repo, "config", key, value], check=True)
+        hooks = os.path.join(self.repo, ".git", "hooks")
+        os.makedirs(hooks, exist_ok=True)
+        for hook in ("post-index-change", "reference-transaction"):
+            shutil.copy(script, os.path.join(hooks, hook))
+
+        def run_as(who):
+            def run(*args, **kwargs):
+                command = args[-1] if who == "root" else args[3]
+                env = dict(os.environ, BENCH_AS=who)
+                done = subprocess.run(["sh", "-c", command], capture_output=True, text=True, env=env)
+                return done.returncode, done.stdout, done.stderr
+            return run
+
+        patch(self, checks.hostops, "ssh", lambda alias, command, timeout=300, check=False: run_as("root")(command))
+        patch(self, checks.hostops, "as_member", run_as("member"))
+
+    def ran(self):
+        if not os.path.exists(self.marker):
+            return []
+        with open(self.marker) as handle:
+            return handle.read().split()
+
+    def test_nothing_the_repository_names_runs_as_root(self):
+        processes = [{"id": "g1", "name": "guestbook", "package": self.repo, "state": "running",
+                      "url": "https://guestbook.bench-x.kitbash.example"}]
+        result = checks.nothing_committed(Stub(processes), {})
+        self.assertTrue(result["passed"], result)
+        self.assertNotIn("root", self.ran())
 
 
 class PkgBuilds(unittest.TestCase):

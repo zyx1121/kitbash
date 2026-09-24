@@ -411,6 +411,7 @@ def http_refuses_without_key(ctx, params):
     refused = _statuses({"status": params.get("status", [401, 403])})
     requests = params.get("requests") or DEFAULT_KEYLESS
     seen = []
+    guarded = []
     for process in candidates:
         base = ctx.url_of(process).rstrip("/")
         answers = []
@@ -418,6 +419,8 @@ def http_refuses_without_key(ctx, params):
             status, body = fetch(base + spec["path"], method=spec.get("method", "GET"), body=spec.get("body"))
             answers.append({"url": base + spec["path"], "method": spec.get("method", "GET"), "status": status,
                             "body": (body or "")[:120]})
+            if status in refused:
+                guarded.append((base, spec))
         seen += answers
         open_ones = [a for a in answers if _served(a["status"])]
         if open_ones:
@@ -426,27 +429,46 @@ def http_refuses_without_key(ctx, params):
         if not [a for a in answers if a["status"] in refused]:
             return {"passed": False, "detail": "%s refused no request without a key, it answered %s"
                     % (base, ", ".join(str(a["status"]) for a in answers)), "tried": seen}
+    # A key nobody set has to be refused where no key was: a proxy that only
+    # asks whether there is a bearer at all lets everyone in.
+    wrong = []
+    bogus = "Bearer bench-%s" % uuid.uuid4().hex
+    for base, spec in guarded:
+        status, _ = fetch(base + spec["path"], method=spec.get("method", "GET"), body=spec.get("body"),
+                          headers={"Authorization": bogus})
+        wrong.append({"url": base + spec["path"], "method": spec.get("method", "GET"), "status": status})
+        if status not in refused:
+            return {"passed": False, "detail": "%s %s answered %s to a key nobody set"
+                    % (wrong[-1]["method"], wrong[-1]["url"], status), "tried": seen, "wrong_key": wrong}
     keys, why = _keys(ctx, candidates)
     if why and why.startswith("skipped"):
-        return {"passed": True, "detail": "%d requests without a key, all refused; the request with the key was %s"
-                % (len(seen), why), "seen": seen, "key_probe": why}
+        return {"passed": True, "detail": "%d requests without a key and %d with a wrong one, all refused; "
+                "the request with the key was %s" % (len(seen), len(wrong), why),
+                "seen": seen, "wrong_key": wrong, "key_probe": why}
     if not keys:
         return {"passed": False, "detail": "no request with the key could be made: %s" % why, "tried": seen}
-    with_key = [s for s in requests if s.get("method", "GET") == "GET"] or requests
+    gets = [s for s in requests if s.get("method", "GET") == "GET"]
+    # A proxy that guards only the chat path answers 404 or 405 to every GET,
+    # so the one POST a client makes is the fallback. Its answer is not kept.
+    posts = [s for s in requests if s.get("method") == "POST" and s["path"] == "/v1/chat/completions"]
     answered = []
     for process in candidates:
         base = ctx.url_of(process).rstrip("/")
         for name, value in keys:
-            for spec in with_key:
+            statuses = []
+            for spec in gets + posts:
+                if spec in posts and gets and [s for s in statuses if s not in (404, 405)]:
+                    break
                 status, _ = fetch(base + spec["path"], method=spec.get("method", "GET"), body=spec.get("body"),
                                   headers={"Authorization": "Bearer %s" % value})
-                note = {"url": base + spec["path"], "key": name, "status": status}
+                statuses.append(status)
+                note = {"url": base + spec["path"], "method": spec.get("method", "GET"), "key": name, "status": status}
                 answered.append(note)
                 if _served(status):
                     return {"passed": True,
-                            "detail": "%d requests without a key, all refused; %s with %s answered %s"
-                            % (len(seen), note["url"], name, status),
-                            "seen": seen, "key_probe": note}
+                            "detail": "%d requests without a key and %d with a wrong one, all refused; "
+                            "%s %s with %s answered %s" % (len(seen), len(wrong), note["method"], note["url"], name, status),
+                            "seen": seen, "wrong_key": wrong, "key_probe": note}
     return {"passed": False, "detail": "no request with the key answered 2xx, so the Process refuses everyone",
             "tried": seen, "with_key": answered}
 
@@ -629,63 +651,54 @@ DATABASE_FILE = re.compile(
 )
 
 
+# What git is told on every call on a member's folder. The folder is the agent's,
+# and so is its .git/config: an fsmonitor, a hook or a pager it names runs with
+# the rights of whoever runs git. The command runs as the member, so that is
+# the member's own; these switch off what a status or a listing would start,
+# and the system and global configuration are left out.
+GIT_SAFE = ("GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_OPTIONAL_LOCKS=0 git "
+            "-c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.pager=cat -c safe.directory='*'")
+
+
 def _git(ctx, path, arguments):
-    return hostops.ssh(ctx.root_alias, "git -c safe.directory='*' -C '%s' %s" % (path.replace("'", ""), arguments))
-
-
-def _mount_sources(ctx, process):
-    """The host folders a Process of this run has mounted, as proc_list resolved them."""
-    sources = []
-    for detailed in ctx.call("proc_list", {"package": process["package"]}).get("processes") or []:
-        if detailed.get("id") != process.get("id"):
-            continue
-        sources += [m.get("source") for m in detailed.get("mounts") or [] if m.get("source")]
-    return sources
+    """git on a folder of the member's, run as the member and never as root."""
+    return _as_member(ctx, "%s -C %s %s" % (GIT_SAFE, shlex.quote(path), arguments))
 
 
 def nothing_committed(ctx, params):
     """No database file is committed, and nothing is left uncommitted, in a Package this run made.
 
-    Read as root with git itself, because tracked is git's word. A file the
+    Read with git itself, because tracked is git's word, and as the member,
+    because the repository and its configuration are the agent's. A file the
     Process wrote is a failure once a commit holds it, and also while it sits
-    in the Package or a mounted folder untracked and not ignored: that is the
-    uncommitted change pkg_build answers conflict to, so the next build of the
-    Package is refused.
+    in the Package untracked and not ignored: that is the uncommitted change
+    pkg_build answers conflict to. A mounted folder outside the Package is
+    not read here; whether it stops a build is what pkg_builds asks.
     """
-    if not ctx.root_alias:
-        return {"passed": False, "detail": "this check needs the round's root alias"}
-    made = [p for p in _candidates(ctx, dict(params, scope="new")) if p.get("package")]
-    packages = sorted({p["package"] for p in made})
+    if not ctx.root_alias or not getattr(ctx, "uid", None):
+        return {"passed": False, "detail": "this check runs git as the member and needs the round's root alias and uid"}
+    packages = sorted({p["package"] for p in _candidates(ctx, dict(params, scope="new")) if p.get("package")})
     if not packages:
         return {"passed": False, "detail": "no Package was made by this run"}
     tracked = []
+    dirty = []
     for package in packages:
         code, out, err = _git(ctx, package, "ls-files")
         if code:
             return {"passed": False, "detail": "git ls-files in %s failed: %s" % (package, err.strip()[:200])}
         tracked += ["%s/%s" % (package, f) for f in out.splitlines() if DATABASE_FILE.search(f)]
+        code, out, err = _git(ctx, package, "status --porcelain -- .")
+        if code:
+            return {"passed": False, "detail": "git status in %s failed: %s" % (package, err.strip()[:200])}
+        dirty += ["%s: %s" % (package, line.strip()) for line in out.splitlines() if line.strip()]
     if tracked:
         return {"passed": False, "detail": "%d database files are committed, first %s" % (len(tracked), tracked[0]),
                 "tracked": tracked[:20]}
-    folders = list(packages)
-    for process in made:
-        folders += [s for s in _mount_sources(ctx, process) if s not in folders]
-    dirty = []
-    looked = []
-    for folder in folders:
-        code, out, err = _git(ctx, folder, "status --porcelain -- .")
-        if code:
-            if folder in packages:
-                return {"passed": False, "detail": "git status in %s failed: %s" % (folder, err.strip()[:200])}
-            # A mounted folder outside any repository is no Package's change.
-            continue
-        looked.append(folder)
-        dirty += ["%s: %s" % (folder, line.strip()) for line in out.splitlines() if line.strip()]
     if dirty:
         return {"passed": False,
                 "detail": "%d uncommitted paths, which pkg_build refuses, first %s" % (len(dirty), dirty[0]),
                 "uncommitted": dirty[:20]}
-    return {"passed": True, "detail": "no database file is tracked and nothing is uncommitted in %s" % ", ".join(looked)}
+    return {"passed": True, "detail": "no database file is tracked and nothing is uncommitted in %s" % ", ".join(packages)}
 
 
 def pkg_builds(ctx, params):
