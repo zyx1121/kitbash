@@ -132,19 +132,69 @@ func TestPagesCarryTheFrame(t *testing.T) {
 	}
 }
 
-// The landing page at / wears the same frame, names kitbash, and marks no nav
-// entry as current.
+// The landing page at / wears the same frame, says what kitbash is, what it
+// does and how to use it, and says the same in index.md for agents.
 func TestLanding(t *testing.T) {
-	var b strings.Builder
-	if err := landing.Execute(&b, time.Now().Year()); err != nil {
+	root := t.TempDir()
+	if err := writeLanding(root); err != nil {
 		t.Fatal(err)
 	}
-	html := b.String()
-	hasFrame(t, "the landing page", html)
-	if !strings.Contains(html, "<h1>kitbash</h1>") || !strings.Contains(html, "An operating system for AI agents.") {
-		t.Error("the landing page does not say what kitbash is")
+	read := func(name string) string {
+		b, err := os.ReadFile(filepath.Join(root, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
 	}
-	if strings.Contains(html, ` aria-current="page"`) {
+	page, md := read("index.html"), read("index.md")
+	hasFrame(t, "the landing page", page)
+	if strings.Contains(page, ` aria-current="page"`) {
 		t.Error("the landing page marks a nav entry as current")
+	}
+	if !strings.HasPrefix(md, "# kitbash\n\nAn operating system for AI agents.\n") {
+		t.Error("index.md does not open with the title and the tagline")
+	}
+	for _, heading := range []string{"What it is", "What it does", "How to use it"} {
+		if !strings.Contains(page, "<h2>"+heading+"</h2>") || !strings.Contains(md, "## "+heading+"\n") {
+			t.Errorf("the landing page lacks %q in HTML or Markdown", heading)
+		}
+	}
+	for _, object := range []string{"Files", "Packages", "Processes", "Telemetry", "Secrets", "Approvals", "Skills"} {
+		if !strings.Contains(page, "<dt>"+object+"</dt>") || !strings.Contains(md, "- **"+object+"**: ") {
+			t.Errorf("the landing page does not describe %s", object)
+		}
+	}
+	// Placeholders in the commands are escaped, not parsed as tags.
+	if !strings.Contains(page, "<pre><code>claude mcp add kitbash -- ssh alice@&lt;host&gt;</code></pre>") || strings.Contains(page, "<host>") {
+		t.Error("the connect command is not an escaped code block")
+	}
+	if !strings.Contains(md, "   ```sh\n   claude mcp add kitbash -- ssh alice@<host>\n   ```\n") {
+		t.Error("index.md lacks the connect command as a fenced block")
+	}
+	if !strings.Contains(page, `<a href="https://github.com/zyx1121/kitbash#install" target="_blank" rel="noopener noreferrer">README</a>`) {
+		t.Error("the README link does not leave zyx.tw in a new tab with no referrer")
+	}
+	if !strings.Contains(page, `<link rel="alternate" type="text/markdown" href="/index.md">`) {
+		t.Error("the landing page does not point agents at index.md")
+	}
+}
+
+// inline keeps links to zyx.tw in the same tab and sends every other one to a
+// new tab with no referrer, and it escapes everything else.
+func TestInline(t *testing.T) {
+	for in, want := range map[string]string{
+		"[a](https://www.zyx.tw/terms)": `<a href="https://www.zyx.tw/terms">a</a>`,
+		"[a](https://evilzyx.tw/)":      `<a href="https://evilzyx.tw/" target="_blank" rel="noopener noreferrer">a</a>`,
+		"[a](/errors/)":                 `<a href="/errors/">a</a>`,
+		"`<b>` & <i>":                   "<code>&lt;b&gt;</code> &amp; &lt;i&gt;",
+		"`[a](https://x.example/)`":     "<code>[a](https://x.example/)</code>",
+		"[a](javascript:alert(1))":      "[a](javascript:alert(1))",
+		"[a](//evil.example/)":          "[a](//evil.example/)",
+		// Quotes are escaped before the link is built, so a URL cannot leave its attribute.
+		`[x](https://a.example/?q="><s>)`: `<a href="https://a.example/?q=&#34;&gt;&lt;s&gt;" target="_blank" rel="noopener noreferrer">x</a>`,
+	} {
+		if got := string(inline(in)); got != want {
+			t.Errorf("inline(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
