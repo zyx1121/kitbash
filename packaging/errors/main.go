@@ -93,7 +93,8 @@ var frame = template.Must(template.New("frame").Parse(`{{define "head"}}<meta ch
 :root{color-scheme:dark;--background:oklch(0 0 0);--foreground:oklch(0.985 0 0);--muted:oklch(0.269 0 0);--muted-foreground:oklch(0.65 0 0);--border:oklch(1 0 0 / 10%);--ring:oklch(0.556 0 0)}
 *{box-sizing:border-box;margin:0;padding:0}
 html{font-family:Inter,ui-sans-serif,system-ui,sans-serif;font-feature-settings:"liga" 1,"calt" 1,"ss01" 1,"zero" 1;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;scrollbar-gutter:stable}
-body{background:var(--background);color:var(--foreground);font-size:16px;line-height:24px}
+body{background:var(--background);color:var(--foreground);font-size:20px;line-height:28px}
+@media (min-width:640px){body{font-size:16px;line-height:24px}}
 main{margin:0 auto;width:100%;max-width:36rem;padding:120px 20px 100px}
 @media (min-width:1024px){main{max-width:48rem}}
 @media (min-width:1536px){main{max-width:64rem}}
@@ -109,7 +110,7 @@ section .rows{margin-top:20px}
 .steps li::before{content:counter(step);color:var(--muted-foreground);font-variant-numeric:tabular-nums}
 .steps li>*{grid-column:2}
 .steps p{margin-top:0}
-pre{margin-top:12px;padding:12px 16px;border:1px solid var(--border);border-radius:8px;overflow-x:auto;line-height:20px}
+pre{margin-top:12px;padding:12px 16px;border:1px solid var(--border);border-radius:8px;overflow-x:auto;line-height:1.45}
 pre code{background:none;padding:0;border-radius:0;overflow-wrap:normal}
 .rows{margin-top:100px;display:grid;grid-template-columns:7rem 1fr;gap:12px 20px}
 .rows dt,.muted{color:var(--muted-foreground)}
@@ -117,7 +118,7 @@ pre code{background:none;padding:0;border-radius:0;overflow-wrap:normal}
 .list{margin-top:100px;list-style:none;display:flex;flex-direction:column;row-gap:12px}
 .list li{display:grid;grid-template-columns:1fr}
 @media (min-width:640px){.list li{grid-template-columns:13rem 1fr;column-gap:20px}}
-code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:14px;background:var(--muted);padding:1px 4px;border-radius:4px;overflow-wrap:anywhere}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.875em;background:var(--muted);padding:1px 4px;border-radius:4px;overflow-wrap:anywhere}
 a{color:inherit;border-radius:6px}
 a:focus-visible{outline:2px solid color-mix(in oklab,var(--ring) 50%,transparent)}
 main a{text-decoration:underline;text-decoration-color:color-mix(in oklab,var(--muted-foreground) 40%,transparent);text-underline-offset:4px;outline-offset:2px;transition:text-decoration-color 150ms cubic-bezier(0.4,0,0.2,1)}
@@ -217,11 +218,13 @@ var intro = struct {
 		{"What it does", []block{
 			{Rows: [][2]string{
 				{"Files", "Shared ones under `/org`, each member's under `/home/<member>`. Every write is a git commit."},
-				{"Packages", "A folder with a `kitbash.yaml` and a `Dockerfile`, built into an image."},
-				{"Processes", "Packages running as rootless containers. A web one gets its own https address, an MCP one adds its tools to the surface, and a job can run on a schedule."},
+				{"Packages", "A folder whose `kitbash.yaml` has a `deploy` section, built from a `Dockerfile` or pinned to an image."},
+				{"Processes", "Packages running as rootless containers. Web apps get their own address. MCP servers add their tools to the surface. Jobs can run on a schedule."},
 				{"Telemetry", "What ran, who ran it and what it cost, in one place to query."},
+				{"Secrets", "Kept out of Files and handed to the Processes that name them."},
+				{"Approvals", "A member's write to `/org` waits for an admin."},
+				{"Skills", "Recipes in `/org/skills` for serving models, databases and web apps."},
 			}},
-			{P: "Secrets stay out of Files, a member's write to `/org` waits for an admin's approval, and `/org/skills` holds recipes for serving models, databases and web apps."},
 		}},
 		{"How to use it", []block{
 			{Steps: []step{
@@ -240,22 +243,45 @@ var (
 	linkSpan = regexp.MustCompile(`\[([^\]]+)\]\(([^)\s]+)\)`)
 )
 
-// inline escapes text for HTML, then turns `code` into <code> and
-// [text](url) into a link. A link that leaves zyx.tw opens in a new tab with
-// no referrer.
+// inline escapes text for HTML and turns `code` into <code> and, outside
+// code, [text](url) into a link.
 func inline(text string) template.HTML {
-	s := codeSpan.ReplaceAllString(template.HTMLEscapeString(text), "<code>$1</code>")
-	s = linkSpan.ReplaceAllStringFunc(s, func(m string) string {
+	var b strings.Builder
+	for {
+		loc := codeSpan.FindStringSubmatchIndex(text)
+		if loc == nil {
+			b.WriteString(links(template.HTMLEscapeString(text)))
+			return template.HTML(b.String())
+		}
+		b.WriteString(links(template.HTMLEscapeString(text[:loc[0]])))
+		b.WriteString("<code>" + template.HTMLEscapeString(text[loc[2]:loc[3]]) + "</code>")
+		text = text[loc[1]:]
+	}
+}
+
+// links turns [text](url) in escaped text into links, for http and https URLs
+// and paths on this host only; anything else stays text. A link that leaves
+// zyx.tw opens in a new tab with no referrer.
+func links(escaped string) string {
+	return linkSpan.ReplaceAllStringFunc(escaped, func(m string) string {
 		parts := linkSpan.FindStringSubmatch(m)
-		attrs := ""
-		if u, err := url.Parse(html.UnescapeString(parts[2])); err == nil && u.IsAbs() {
+		raw := html.UnescapeString(parts[2])
+		u, err := url.Parse(raw)
+		switch {
+		case err != nil:
+			return m
+		case u.Scheme == "http" || u.Scheme == "https":
+			attrs := ""
 			if host := u.Hostname(); host != "zyx.tw" && !strings.HasSuffix(host, ".zyx.tw") {
 				attrs = ` target="_blank" rel="noopener noreferrer"`
 			}
+			return `<a href="` + parts[2] + `"` + attrs + `>` + parts[1] + `</a>`
+		case u.Scheme == "" && u.Host == "" && strings.HasPrefix(raw, "/") && !strings.HasPrefix(raw, "//") && !strings.HasPrefix(raw, "/\\"):
+			return `<a href="` + parts[2] + `">` + parts[1] + `</a>`
+		default:
+			return m
 		}
-		return `<a href="` + parts[2] + `"` + attrs + `>` + parts[1] + `</a>`
 	})
-	return template.HTML(s)
 }
 
 var landing = template.Must(template.Must(frame.Clone()).New("landing").Funcs(template.FuncMap{"inline": inline}).Parse(`<!doctype html>

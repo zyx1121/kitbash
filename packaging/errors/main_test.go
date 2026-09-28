@@ -159,7 +159,7 @@ func TestLanding(t *testing.T) {
 			t.Errorf("the landing page lacks %q in HTML or Markdown", heading)
 		}
 	}
-	for _, object := range []string{"Files", "Packages", "Processes", "Telemetry"} {
+	for _, object := range []string{"Files", "Packages", "Processes", "Telemetry", "Secrets", "Approvals", "Skills"} {
 		if !strings.Contains(page, "<dt>"+object+"</dt>") || !strings.Contains(md, "- **"+object+"**: ") {
 			t.Errorf("the landing page does not describe %s", object)
 		}
@@ -187,6 +187,9 @@ func TestInline(t *testing.T) {
 		"[a](https://evilzyx.tw/)":      `<a href="https://evilzyx.tw/" target="_blank" rel="noopener noreferrer">a</a>`,
 		"[a](/errors/)":                 `<a href="/errors/">a</a>`,
 		"`<b>` & <i>":                   "<code>&lt;b&gt;</code> &amp; &lt;i&gt;",
+		"`[a](https://x.example/)`":     "<code>[a](https://x.example/)</code>",
+		"[a](javascript:alert(1))":      "[a](javascript:alert(1))",
+		"[a](//evil.example/)":          "[a](//evil.example/)",
 		// Quotes are escaped before the link is built, so a URL cannot leave its attribute.
 		`[x](https://a.example/?q="><s>)`: `<a href="https://a.example/?q=&#34;&gt;&lt;s&gt;" target="_blank" rel="noopener noreferrer">x</a>`,
 	} {
