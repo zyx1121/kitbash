@@ -77,20 +77,22 @@ var entries = []entry{
 		"Call again once; if it repeats, an admin reads the cause with tel_query and the host operator reads /var/log/kitbashd.log."},
 }
 
-// frame is what every page shares, the frame of every zyx.tw site: the zyx
-// mark top left (mirrored on hover, linking to www.zyx.tw), the nav top right,
+// frame is what every page shares, the frame of every zyx.tw site: the zyx mark
+// top left (mirrored on hover, linking to www.zyx.tw), the nav top right,
 // Privacy and Terms bottom left, the copyright bottom right, all 14 px on 20 px
 // lines 20 px in from the corners, over a 64 px fade at each edge. Each corner
 // item carries the tip every zyx.tw site shows (CornerTip in www.zyx.tw's
 // packages/ui), saying what its label leaves out. A tip opens at once on hover
-// and on keyboard focus of a link, toward the page and lined up with the
-// item's outer edge, and stays open while the pointer is on it; the script in
-// "bottom" closes it on Escape or a press and keeps a touch from opening it,
-// as Base UI does. Like www.zyx.tw's, it is visual only. The column,
-// type sizes and dark tokens are www.zyx.tw's too, so a page an agent is sent
-// to reads like the rest of zyx.tw. "top" takes which page this is ("landing",
-// "index" or "page"), "bottom" the year. Links that leave zyx.tw open in a new
-// tab with no referrer, as www.zyx.tw/privacy says.
+// and on keyboard focus of a link, toward the page and lined up with the item's
+// outer edge, and stays open while the pointer is on it (a bridge as wide as
+// the item spans the 4 px gap, beneath the link's own hit area where they
+// overlap, so it never takes a click meant for a link); the script in "bottom"
+// closes it on Escape or a press and keeps a touch from opening it, as Base UI
+// does. Like www.zyx.tw's, it is visual only. The column, type sizes and dark
+// tokens are www.zyx.tw's too, so a page an agent is sent to reads like the
+// rest of zyx.tw. "top" takes which page this is ("landing", "index" or
+// "page"), "bottom" the year. Links that leave zyx.tw open in a new tab with no
+// referrer, as www.zyx.tw/privacy says.
 var frame = template.Must(template.New("frame").Parse(`{{define "head"}}<meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" href="/errors/static/favicon.ico">
@@ -143,15 +145,15 @@ main a:hover{text-decoration-color:var(--foreground)}
 .tl .tipped,.tr .tipped{--tip-from:-8px}.bl .tipped,.br .tipped{--tip-from:8px}
 .tip,.tipped::after{position:absolute;z-index:50;pointer-events:none;background:var(--foreground);opacity:0;visibility:hidden}
 .tip{width:max-content;max-width:320px;padding:6px 12px;border-radius:8px;color:var(--background);font-size:12px;line-height:16px;font-weight:400;font-variant-numeric:normal;transform:scale(.95)}
-.tip::before{content:"";position:absolute;left:0;right:0;height:4px}
+.tipped::before{content:"";position:absolute;left:0;right:0;height:4px;pointer-events:none}
 .tipped::after{content:"";left:calc(50% - 5px);width:10px;height:10px;border-radius:2px;transform:rotate(45deg)}
-.tl .tip,.tr .tip{top:calc(100% + 4px)}.tl .tip::before,.tr .tip::before{bottom:100%}.tl .tipped::after,.tr .tipped::after{top:calc(100% + 1px)}
-.bl .tip,.br .tip{bottom:calc(100% + 4px)}.bl .tip::before,.br .tip::before{top:100%}.bl .tipped::after,.br .tipped::after{bottom:calc(100% + 1px)}
+.tl .tip,.tr .tip{top:calc(100% + 4px)}.tl .tipped::before,.tr .tipped::before{top:100%}.tl .tipped::after,.tr .tipped::after{top:calc(100% + 1px)}
+.bl .tip,.br .tip{bottom:calc(100% + 4px)}.bl .tipped::before,.br .tipped::before{bottom:100%}.bl .tipped::after,.br .tipped::after{bottom:calc(100% + 1px)}
 .tl .tip{left:0;transform-origin:top left}.tr .tip{right:0;transform-origin:top right}.bl .tip{left:0;transform-origin:bottom left}.br .tip{right:0;transform-origin:bottom right}
-@media (hover:hover){.tipped:hover>.tip,.tipped:hover::after{opacity:1;visibility:visible;transition:visibility 0s}.tipped:hover>.tip{transform:none;pointer-events:auto}}
+@media (hover:hover){.tipped:hover>.tip,.tipped:hover::after{opacity:1;visibility:visible;transition:visibility 0s}.tipped:hover>.tip{transform:none;pointer-events:auto}.tipped:hover::before{pointer-events:auto}}
 .tipped:has(>a:focus-visible)>.tip,.tipped:has(>a:focus-visible)::after{opacity:1;visibility:visible;transition:visibility 0s}.tipped:has(>a:focus-visible)>.tip{transform:none}
-.tipped.off>.tip,.tipped.off::after{opacity:0!important;visibility:hidden!important;pointer-events:none!important}
-@media (prefers-reduced-motion:no-preference){.tip,.tipped::after{transition:opacity 150ms ease,transform 150ms ease,visibility 0s linear 150ms}.tipped.off>.tip,.tipped.off::after{transition:opacity 150ms ease,visibility 0s linear 150ms!important}.tipped:hover>.tip,.tipped:has(>a:focus-visible)>.tip{animation:tip-in 150ms ease}.tipped:hover::after,.tipped:has(>a:focus-visible)::after{animation:tip-arrow-in 150ms ease}}
+.tipped.off>.tip,.tipped.off::after{opacity:0!important;visibility:hidden!important;pointer-events:none!important}.tipped.off>.tip{transform:scale(.95)!important}
+@media (prefers-reduced-motion:no-preference){.tip,.tipped::after{transition:opacity 150ms ease,transform 150ms ease,visibility 0s linear 150ms}.tipped.off>.tip,.tipped.off::after{transition:opacity 150ms ease,transform 150ms ease,visibility 0s linear 150ms!important}.tipped:hover>.tip,.tipped:has(>a:focus-visible)>.tip{animation:tip-in 150ms ease}.tipped:hover::after,.tipped:has(>a:focus-visible)::after{animation:tip-arrow-in 150ms ease}}
 @keyframes tip-in{from{opacity:0;transform:translateY(var(--tip-from)) scale(.95)}}
 @keyframes tip-arrow-in{from{opacity:0;transform:translateY(var(--tip-from)) rotate(45deg)}}
 .fade{pointer-events:none;position:fixed;left:0;right:0;z-index:40;height:64px}
