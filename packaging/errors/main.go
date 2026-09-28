@@ -11,10 +11,14 @@ package main
 import (
 	"embed"
 	"fmt"
+	"html"
 	"html/template"
 	"io/fs"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/zyx1121/kitbash/internal/problem"
@@ -86,7 +90,7 @@ var frame = template.Must(template.New("frame").Parse(`{{define "head"}}<meta ch
 <link rel="icon" href="/errors/static/favicon.ico">
 <style>
 @font-face{font-family:Inter;src:url(/errors/static/InterVariable.woff2) format("woff2");font-weight:100 900;font-display:swap}
-:root{color-scheme:dark;--background:oklch(0 0 0);--foreground:oklch(0.985 0 0);--muted:oklch(0.269 0 0);--muted-foreground:oklch(0.65 0 0);--ring:oklch(0.556 0 0)}
+:root{color-scheme:dark;--background:oklch(0 0 0);--foreground:oklch(0.985 0 0);--muted:oklch(0.269 0 0);--muted-foreground:oklch(0.65 0 0);--border:oklch(1 0 0 / 10%);--ring:oklch(0.556 0 0)}
 *{box-sizing:border-box;margin:0;padding:0}
 html{font-family:Inter,ui-sans-serif,system-ui,sans-serif;font-feature-settings:"liga" 1,"calt" 1,"ss01" 1,"zero" 1;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;scrollbar-gutter:stable}
 body{background:var(--background);color:var(--foreground);font-size:16px;line-height:24px}
@@ -95,7 +99,18 @@ main{margin:0 auto;width:100%;max-width:36rem;padding:120px 20px 100px}
 @media (min-width:1536px){main{max-width:64rem}}
 h1{font-size:30px;line-height:36px;font-weight:400;text-wrap:pretty}
 .sub{margin-top:12px;color:var(--muted-foreground)}
-.center{max-width:none;min-height:100dvh;display:grid;place-content:center;padding:80px 20px;text-align:center}
+section{margin-top:60px}
+section:first-of-type{margin-top:100px}
+h2{font-size:24px;line-height:32px;font-weight:400}
+section p{margin-top:12px;text-wrap:pretty}
+section .rows{margin-top:20px}
+.steps{margin-top:20px;list-style:none;counter-reset:step;display:flex;flex-direction:column;row-gap:20px}
+.steps li{counter-increment:step;display:grid;grid-template-columns:28px minmax(0,1fr)}
+.steps li::before{content:counter(step);color:var(--muted-foreground);font-variant-numeric:tabular-nums}
+.steps li>*{grid-column:2}
+.steps p{margin-top:0}
+pre{margin-top:12px;padding:12px 16px;border:1px solid var(--border);border-radius:8px;overflow-x:auto;line-height:20px}
+pre code{background:none;padding:0;border-radius:0;overflow-wrap:normal}
 .rows{margin-top:100px;display:grid;grid-template-columns:7rem 1fr;gap:12px 20px}
 .rows dt,.muted{color:var(--muted-foreground)}
 .note{margin-top:80px}
@@ -173,23 +188,137 @@ var index = template.Must(template.Must(frame.Clone()).New("index").Parse(`<!doc
 </html>
 `))
 
-var landing = template.Must(template.Must(frame.Clone()).New("landing").Parse(`<!doctype html>
+// block is one piece of a landing section: a paragraph, label and text rows,
+// or numbered steps.
+type block struct {
+	P     string
+	Rows  [][2]string
+	Steps []step
+}
+
+type step struct{ Text, Code string }
+
+type section struct {
+	Heading string
+	Blocks  []block
+}
+
+// intro is what the landing page says: in HTML at / and in Markdown at
+// /index.md. Text is plain, with `backticks` for code and [text](url) for
+// links, so the Markdown is the text itself.
+var intro = struct {
+	Title, Tagline string
+	Sections       []section
+}{
+	Title:   "kitbash",
+	Tagline: "An operating system for AI agents.",
+	Sections: []section{
+		{"What it is", []block{{P: "kitbash turns one machine into a shared computer for an organization's agents. Each member gets a Linux user, and their agent connects over SSH to an MCP surface that is the whole system. Nothing is built for a human at a terminal. This host is Loki's; the code is open under the MIT License."}}},
+		{"What it does", []block{
+			{Rows: [][2]string{
+				{"Files", "Shared ones under `/org`, each member's under `/home/<member>`. Every write is a git commit."},
+				{"Packages", "A folder with a `kitbash.yaml` and a `Dockerfile`, built into an image."},
+				{"Processes", "Packages running as rootless containers. A web one gets its own https address, an MCP one adds its tools to the surface, and a job can run on a schedule."},
+				{"Telemetry", "What ran, who ran it and what it cost, in one place to query."},
+			}},
+			{P: "Secrets stay out of Files, a member's write to `/org` waits for an admin's approval, and `/org/skills` holds recipes for serving models, databases and web apps."},
+		}},
+		{"How to use it", []block{
+			{Steps: []step{
+				{"Install it on one Proxmox VE virtual machine running the Alpine cloud image. Download the release's apk and signing key, check them against `SHA256SUMS`, then run this on the host.", "cp *.rsa.pub /etc/apk/keys/\napk add kitbashd-<version>-r0.<arch>.apk\nsh /usr/share/kitbash/install.sh"},
+				{"Create the first admin on the console. That admin adds everyone else with `users_create`.", "kitbash-adduser alice '<ssh public key>' admin"},
+				{"Connect an agent from the member's own machine.", "claude mcp add kitbash -- ssh alice@<host>"},
+				{"Ask the agent for something that runs. It writes the Files, builds the Package, runs the Process and reads the Telemetry.", ""},
+			}},
+			{P: "Every step, with its checks, is in the [README](https://github.com/zyx1121/kitbash#install), and the design is in [PLAN.md](https://github.com/zyx1121/kitbash/blob/main/PLAN.md)."},
+		}},
+	},
+}
+
+var (
+	codeSpan = regexp.MustCompile("`([^`]+)`")
+	linkSpan = regexp.MustCompile(`\[([^\]]+)\]\(([^)\s]+)\)`)
+)
+
+// inline escapes text for HTML, then turns `code` into <code> and
+// [text](url) into a link. A link that leaves zyx.tw opens in a new tab with
+// no referrer.
+func inline(text string) template.HTML {
+	s := codeSpan.ReplaceAllString(template.HTMLEscapeString(text), "<code>$1</code>")
+	s = linkSpan.ReplaceAllStringFunc(s, func(m string) string {
+		parts := linkSpan.FindStringSubmatch(m)
+		attrs := ""
+		if u, err := url.Parse(html.UnescapeString(parts[2])); err == nil && u.IsAbs() {
+			if host := u.Hostname(); host != "zyx.tw" && !strings.HasSuffix(host, ".zyx.tw") {
+				attrs = ` target="_blank" rel="noopener noreferrer"`
+			}
+		}
+		return `<a href="` + parts[2] + `"` + attrs + `>` + parts[1] + `</a>`
+	})
+	return template.HTML(s)
+}
+
+var landing = template.Must(template.Must(frame.Clone()).New("landing").Funcs(template.FuncMap{"inline": inline}).Parse(`<!doctype html>
 <html lang="en">
 <head>
 {{template "head"}}
-<title>kitbash</title>
-<meta name="description" content="An operating system for AI agents.">
+<title>{{.Title}}</title>
+<meta name="description" content="{{.Tagline}}">
+<link rel="alternate" type="text/markdown" href="/index.md">
 </head>
 <body>
 {{template "top" "landing"}}
-<main class="center">
-<h1>kitbash</h1>
-<p class="sub">An operating system for AI agents.</p>
-</main>
-{{template "bottom" .}}
+<main>
+<h1>{{.Title}}</h1>
+<p class="sub">{{inline .Tagline}}</p>
+{{range .Sections}}<section><h2>{{.Heading}}</h2>
+{{- range .Blocks}}
+{{- if .P}}<p>{{inline .P}}</p>
+{{- else if .Rows}}<dl class="rows">{{range .Rows}}<dt>{{index . 0}}</dt><dd>{{inline (index . 1)}}</dd>{{end}}</dl>
+{{- else}}<ol class="steps">{{range .Steps}}<li><p>{{inline .Text}}</p>{{if .Code}}<pre><code>{{.Code}}</code></pre>{{end}}</li>{{end}}</ol>
+{{- end}}
+{{- end}}</section>
+{{end}}</main>
+{{template "bottom" .Year}}
 </body>
 </html>
 `))
+
+// markdown is the landing page for agents, from the same intro.
+func markdown() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "# %s\n\n%s\n", intro.Title, intro.Tagline)
+	for _, s := range intro.Sections {
+		fmt.Fprintf(&b, "\n## %s\n", s.Heading)
+		for _, bl := range s.Blocks {
+			b.WriteString("\n")
+			switch {
+			case bl.P != "":
+				b.WriteString(bl.P + "\n")
+			case len(bl.Rows) > 0:
+				for _, r := range bl.Rows {
+					fmt.Fprintf(&b, "- **%s**: %s\n", r[0], r[1])
+				}
+			default:
+				for i, st := range bl.Steps {
+					if i > 0 {
+						b.WriteString("\n")
+					}
+					fmt.Fprintf(&b, "%d. %s\n", i+1, st.Text)
+					if st.Code != "" {
+						b.WriteString("\n   ```sh\n")
+						for _, line := range strings.Split(st.Code, "\n") {
+							b.WriteString("   " + line + "\n")
+						}
+						b.WriteString("   ```\n")
+					}
+				}
+			}
+		}
+	}
+	b.WriteString("\nPart of [zyx.tw](https://www.zyx.tw): [Privacy](https://www.zyx.tw/privacy), [Terms](https://www.zyx.tw/terms).\n")
+	return b.String()
+}
 
 func main() {
 	if len(os.Args) != 2 {
@@ -201,7 +330,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	if err := write(filepath.Join(os.Args[1], "index.html"), landing, time.Now().Year()); err != nil {
+	if err := writeLanding(os.Args[1]); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
@@ -244,6 +373,19 @@ func render(out string) error {
 		return err
 	}
 	return os.CopyFS(dst, files)
+}
+
+// writeLanding writes the landing page into root: index.html and index.md.
+func writeLanding(root string) error {
+	data := struct {
+		Title, Tagline string
+		Sections       []section
+		Year           int
+	}{intro.Title, intro.Tagline, intro.Sections, time.Now().Year()}
+	if err := write(filepath.Join(root, "index.html"), landing, data); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(root, "index.md"), []byte(markdown()), 0o644)
 }
 
 // write renders t with data into the file at path.
