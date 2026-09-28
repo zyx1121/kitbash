@@ -133,7 +133,8 @@ func TestPagesCarryTheFrame(t *testing.T) {
 }
 
 // The landing page at / wears the same frame, says what kitbash is, what it
-// does and how to use it, and says the same in index.md for agents.
+// does and how to deploy, use and configure it, and says the same in index.md
+// for agents.
 func TestLanding(t *testing.T) {
 	root := t.TempDir()
 	if err := writeLanding(root); err != nil {
@@ -154,7 +155,7 @@ func TestLanding(t *testing.T) {
 	if !strings.HasPrefix(md, "# kitbash\n\nAn operating system for AI agents.\n") {
 		t.Error("index.md does not open with the title and the tagline")
 	}
-	for _, heading := range []string{"What it is", "What it does", "How to use it"} {
+	for _, heading := range []string{"What it is", "What it does", "Deploy", "Use", "Configure"} {
 		if !strings.Contains(page, "<h2>"+heading+"</h2>") || !strings.Contains(md, "## "+heading+"\n") {
 			t.Errorf("the landing page lacks %q in HTML or Markdown", heading)
 		}

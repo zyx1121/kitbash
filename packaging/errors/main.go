@@ -214,7 +214,7 @@ var intro = struct {
 	Title:   "kitbash",
 	Tagline: "An operating system for AI agents.",
 	Sections: []section{
-		{"What it is", []block{{P: "kitbash turns one machine into a shared computer for an organization's agents. Each member gets a Linux user, and their agent connects over SSH to an MCP surface that is the whole system. Nothing is built for a human at a terminal. This host is Loki's; the code is open under the MIT License."}}},
+		{"What it is", []block{{P: "kitbash turns one machine into a shared computer for an organization's agents. Each member gets a Linux user, and their agent connects over SSH to an MCP surface that is the whole system. Nothing is built for a human at a terminal. It is open source under the MIT License."}}},
 		{"What it does", []block{
 			{Rows: [][2]string{
 				{"Files", "Shared ones under `/org`, each member's under `/home/<member>`. Every write is a git commit."},
@@ -226,14 +226,27 @@ var intro = struct {
 				{"Skills", "Recipes in `/org/skills` for serving models, databases and web apps."},
 			}},
 		}},
-		{"How to use it", []block{
+		{"Deploy", []block{
 			{Steps: []step{
-				{"Install it on one Proxmox VE virtual machine running the Alpine cloud image. Download the release's apk and signing key, check them against `SHA256SUMS`, then run this on the host.", "cp *.rsa.pub /etc/apk/keys/\napk add kitbashd-<version>-r0.<arch>.apk\nsh /usr/share/kitbash/install.sh"},
-				{"Create the first admin on the console. That admin adds everyone else with `users_create`.", "kitbash-adduser alice '<ssh public key>' admin"},
+				{"Create one Proxmox VE virtual machine from the Alpine cloud image, with 4 cores, 4 GB of memory and 40 GB of disk. kitbash runs every Process as a rootless container itself, so it needs a virtual machine of its own.", ""},
+				{"Download the release's apk and signing key, check them against `SHA256SUMS`, then install on the host.", "cp *.rsa.pub /etc/apk/keys/\napk add kitbashd-<version>-r0.<arch>.apk\nsh /usr/share/kitbash/install.sh"},
+				{"Create the first admin on the console.", "kitbash-adduser alice '<ssh public key>' admin"},
+			}},
+		}},
+		{"Use", []block{
+			{Steps: []step{
 				{"Connect an agent from the member's own machine.", "claude mcp add kitbash -- ssh alice@<host>"},
+				{"The admin adds everyone else with `users_create`, from their own agent.", ""},
 				{"Ask the agent for something that runs. It writes the Files, builds the Package, runs the Process and reads the Telemetry.", ""},
 			}},
-			{P: "Every step, with its checks, is in the [README](https://github.com/zyx1121/kitbash#install), and the design is in [PLAN.md](https://github.com/zyx1121/kitbash/blob/main/PLAN.md)."},
+		}},
+		{"Configure", []block{
+			{Rows: [][2]string{
+				{"Domain", "`KITBASH_DOMAIN` gives each web Process `https://<name>.<member>.<domain>`, with one wildcard DNS record."},
+				{"TLS", "`KITBASH_TLS=acme`, the default with a domain, gets certificates from Let's Encrypt on ports 80 and 443. `gateway` leaves TLS to a proxy in front."},
+				{"Addresses", "`KITBASH_PUBLIC_ADDRESS` and `KITBASH_GATEWAY_ADDRESS` tell a host behind NAT or a gateway where it is reached from."},
+			}},
+			{P: "Set them when running `install.sh`, or later in `/etc/conf.d/kitbashd` followed by `rc-service kitbashd restart`. The [README](https://github.com/zyx1121/kitbash#install) has every step and setting, and [PLAN.md](https://github.com/zyx1121/kitbash/blob/main/PLAN.md) has the design."},
 		}},
 	},
 }
