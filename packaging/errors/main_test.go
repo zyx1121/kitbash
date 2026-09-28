@@ -67,8 +67,8 @@ func TestRender(t *testing.T) {
 }
 
 // hasFrame checks what every page must carry: the mark linking to www.zyx.tw, the
-// nav, Privacy and Terms, the copyright, each with its tip, and the font and
-// favicon it loads.
+// nav, Privacy and Terms, the copyright, each with its tip and the script that
+// closes the tips, and the font and favicon it loads.
 func hasFrame(t *testing.T, name, html string) {
 	t.Helper()
 	for _, want := range []string{
@@ -84,6 +84,7 @@ func hasFrame(t *testing.T, name, html string) {
 		`<span class="tip" aria-hidden="true">What every zyx.tw site stores and logs</span>`,
 		`<span class="tip" aria-hidden="true">The rules for every zyx.tw site</span>`,
 		`<span class="tip" aria-hidden="true">Loki (詹詠翔)</span>`,
+		`if(e.key==="Escape")`,
 		`src:url(/errors/static/InterVariable.woff2)`,
 		`<link rel="icon" href="/errors/static/favicon.ico">`,
 	} {

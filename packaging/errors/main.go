@@ -82,10 +82,11 @@ var entries = []entry{
 // Privacy and Terms bottom left, the copyright bottom right, all 14 px on 20 px
 // lines 20 px in from the corners, over a 64 px fade at each edge. Each corner
 // item carries the tip every zyx.tw site shows (CornerTip in www.zyx.tw's
-// packages/ui), saying what its label leaves out; in CSS alone it opens at
-// once on hover, never on touch, and on keyboard focus of a link, toward the
-// page and lined up with the item's outer edge, and like www.zyx.tw's it is
-// visual only. The column,
+// packages/ui), saying what its label leaves out. A tip opens at once on hover
+// and on keyboard focus of a link, toward the page and lined up with the
+// item's outer edge, and stays open while the pointer is on it; the script in
+// "bottom" closes it on Escape or a press and keeps a touch from opening it,
+// as Base UI does. Like www.zyx.tw's, it is visual only. The column,
 // type sizes and dark tokens are www.zyx.tw's too, so a page an agent is sent
 // to reads like the rest of zyx.tw. "top" takes which page this is ("landing",
 // "index" or "page"), "bottom" the year. Links that leave zyx.tw open in a new
@@ -141,14 +142,18 @@ main a:hover{text-decoration-color:var(--foreground)}
 .tipped{position:relative;display:flex}
 .tl .tipped,.tr .tipped{--tip-from:-8px}.bl .tipped,.br .tipped{--tip-from:8px}
 .tip,.tipped::after{position:absolute;z-index:50;pointer-events:none;background:var(--foreground);opacity:0;visibility:hidden}
-.tip{width:max-content;max-width:320px;padding:6px 12px;border-radius:8px;color:var(--background);font-size:12px;line-height:16px;font-weight:400;font-variant-numeric:normal;transform:translateY(var(--tip-from)) scale(.95)}
-.tipped::after{content:"";left:calc(50% - 5px);width:10px;height:10px;border-radius:2px;transform:translateY(var(--tip-from)) rotate(45deg)}
-.tl .tip,.tr .tip{top:calc(100% + 4px)}.tl .tipped::after,.tr .tipped::after{top:calc(100% + 1px)}
-.bl .tip,.br .tip{bottom:calc(100% + 4px)}.bl .tipped::after,.br .tipped::after{bottom:calc(100% + 1px)}
+.tip{width:max-content;max-width:320px;padding:6px 12px;border-radius:8px;color:var(--background);font-size:12px;line-height:16px;font-weight:400;font-variant-numeric:normal;transform:scale(.95)}
+.tip::before{content:"";position:absolute;left:0;right:0;height:4px}
+.tipped::after{content:"";left:calc(50% - 5px);width:10px;height:10px;border-radius:2px;transform:rotate(45deg)}
+.tl .tip,.tr .tip{top:calc(100% + 4px)}.tl .tip::before,.tr .tip::before{bottom:100%}.tl .tipped::after,.tr .tipped::after{top:calc(100% + 1px)}
+.bl .tip,.br .tip{bottom:calc(100% + 4px)}.bl .tip::before,.br .tip::before{top:100%}.bl .tipped::after,.br .tipped::after{bottom:calc(100% + 1px)}
 .tl .tip{left:0;transform-origin:top left}.tr .tip{right:0;transform-origin:top right}.bl .tip{left:0;transform-origin:bottom left}.br .tip{right:0;transform-origin:bottom right}
-@media (hover:hover){.tipped:hover>.tip,.tipped:hover::after{opacity:1;visibility:visible;transition-delay:0s}.tipped:hover>.tip{transform:none}.tipped:hover::after{transform:rotate(45deg)}}
-.tipped:has(>a:focus-visible)>.tip,.tipped:has(>a:focus-visible)::after{opacity:1;visibility:visible;transition-delay:0s}.tipped:has(>a:focus-visible)>.tip{transform:none}.tipped:has(>a:focus-visible)::after{transform:rotate(45deg)}
-@media (prefers-reduced-motion:no-preference){.tip,.tipped::after{transition:opacity 150ms ease,transform 150ms ease,visibility 0s linear 150ms}}
+@media (hover:hover){.tipped:hover>.tip,.tipped:hover::after{opacity:1;visibility:visible;transition:visibility 0s}.tipped:hover>.tip{transform:none;pointer-events:auto}}
+.tipped:has(>a:focus-visible)>.tip,.tipped:has(>a:focus-visible)::after{opacity:1;visibility:visible;transition:visibility 0s}.tipped:has(>a:focus-visible)>.tip{transform:none}
+.tipped.off>.tip,.tipped.off::after{opacity:0!important;visibility:hidden!important;pointer-events:none!important}
+@media (prefers-reduced-motion:no-preference){.tip,.tipped::after{transition:opacity 150ms ease,transform 150ms ease,visibility 0s linear 150ms}.tipped.off>.tip,.tipped.off::after{transition:opacity 150ms ease,visibility 0s linear 150ms!important}.tipped:hover>.tip,.tipped:has(>a:focus-visible)>.tip{animation:tip-in 150ms ease}.tipped:hover::after,.tipped:has(>a:focus-visible)::after{animation:tip-arrow-in 150ms ease}}
+@keyframes tip-in{from{opacity:0;transform:translateY(var(--tip-from)) scale(.95)}}
+@keyframes tip-arrow-in{from{opacity:0;transform:translateY(var(--tip-from)) rotate(45deg)}}
 .fade{pointer-events:none;position:fixed;left:0;right:0;z-index:40;height:64px}
 .fade.top{top:0;background:linear-gradient(to bottom,var(--background) 60%,transparent)}
 .fade.bottom{bottom:0;background:linear-gradient(to top,var(--background) 60%,transparent)}
@@ -160,7 +165,8 @@ main a:hover{text-decoration-color:var(--foreground)}
 {{define "bottom"}}<footer><div class="fade bottom"></div>
 <nav class="corner bl" aria-label="Legal"><span class="tipped"><a class="link" href="https://www.zyx.tw/privacy">Privacy</a><span class="tip" aria-hidden="true">What every zyx.tw site stores and logs</span></span><span class="tipped"><a class="link" href="https://www.zyx.tw/terms">Terms</a><span class="tip" aria-hidden="true">The rules for every zyx.tw site</span></span></nav>
 <div class="corner br"><p class="tipped">© {{.}}<span class="tip" aria-hidden="true">Loki (詹詠翔)</span></p></div>
-</footer>{{end}}`))
+</footer>
+<script>for(const t of document.querySelectorAll(".tipped")){t.addEventListener("pointerenter",e=>t.classList.toggle("off",e.pointerType==="touch"));t.addEventListener("pointerdown",()=>t.classList.add("off"));t.addEventListener("focusout",()=>t.classList.remove("off"))}addEventListener("keydown",e=>{if(e.key==="Escape")for(const t of document.querySelectorAll(".tipped:hover,.tipped:focus-within"))t.classList.add("off")})</script>{{end}}`))
 
 var page = template.Must(template.Must(frame.Clone()).New("page").Parse(`<!doctype html>
 <html lang="en">
