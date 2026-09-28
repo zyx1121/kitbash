@@ -17,6 +17,9 @@ check() {
 	[ "$code" = 200 ] || { echo "deploy: $1 answers $code" >&2; exit 1; }
 }
 check https://kitbash.zyx.tw/errors/
+for file in InterVariable.woff2 LICENSE.txt favicon.ico; do
+	check "https://kitbash.zyx.tw/errors/static/$file"
+done
 for slug in $(sed -n 's/^\tSlug[A-Za-z]* *= *"\([a-z0-9-]*\)"/\1/p' internal/problem/problem.go); do
 	# The type URI has no trailing slash; the gateway redirects it, so check both.
 	check "https://kitbash.zyx.tw/errors/$slug"
