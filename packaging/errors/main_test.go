@@ -53,8 +53,11 @@ func TestEveryProblemSlugHasAPage(t *testing.T) {
 
 func TestRender(t *testing.T) {
 	dir := t.TempDir()
-	if err := render(filepath.Join(dir, "errors")); err != nil {
-		t.Fatal(err)
+	// Twice: rendering over an earlier render must work too.
+	for range 2 {
+		if err := render(filepath.Join(dir, "errors")); err != nil {
+			t.Fatal(err)
+		}
 	}
 	for _, e := range entries {
 		if _, err := os.Stat(filepath.Join(dir, "errors", e.Slug, "index.html")); err != nil {

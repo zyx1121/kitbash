@@ -237,7 +237,13 @@ func render(out string) error {
 	if err != nil {
 		return err
 	}
-	return os.CopyFS(filepath.Join(out, "static"), files)
+	// CopyFS never overwrites, so a second render into the same directory
+	// starts static/ afresh.
+	dst := filepath.Join(out, "static")
+	if err := os.RemoveAll(dst); err != nil {
+		return err
+	}
+	return os.CopyFS(dst, files)
 }
 
 // write renders t with data into the file at path.
