@@ -63,10 +63,29 @@ func TestRender(t *testing.T) {
 	}
 }
 
-// The pages carry the zyx.tw frame and the files it loads: the mark linking to
-// www.zyx.tw, Privacy and Terms, the copyright, the Errors nav current only on
-// the index, and the font and favicon beside them. Deleting any of them from
-// the templates or from static/ fails here.
+// hasFrame checks what every page must carry: the mark linking to www.zyx.tw, the
+// nav, Privacy and Terms, the copyright, and the font and favicon it loads.
+func hasFrame(t *testing.T, name, html string) {
+	t.Helper()
+	for _, want := range []string{
+		`<a class="mark" href="https://www.zyx.tw" aria-label="zyx.tw">`,
+		`<a class="link" href="/errors/"`,
+		`href="https://github.com/zyx1121/kitbash" target="_blank" rel="noopener noreferrer">GitHub</a>`,
+		`href="https://www.zyx.tw/privacy">Privacy</a>`,
+		`href="https://www.zyx.tw/terms">Terms</a>`,
+		"© " + strconv.Itoa(time.Now().Year()),
+		`src:url(/errors/static/InterVariable.woff2)`,
+		`<link rel="icon" href="/errors/static/favicon.ico">`,
+	} {
+		if !strings.Contains(html, want) {
+			t.Errorf("%s lacks %s", name, want)
+		}
+	}
+}
+
+// The pages carry the zyx.tw frame and the files it loads, with the Errors nav
+// current only on the index. Deleting any of it from the templates or from
+// static/ fails here.
 func TestPagesCarryTheFrame(t *testing.T) {
 	out := t.TempDir()
 	if err := render(out); err != nil {
@@ -79,24 +98,12 @@ func TestPagesCarryTheFrame(t *testing.T) {
 		}
 		return string(b)
 	}
-	year := strconv.Itoa(time.Now().Year())
-	shared := []string{
-		`<a class="mark" href="https://www.zyx.tw" aria-label="zyx.tw">`,
-		`href="https://www.zyx.tw/privacy">Privacy</a>`,
-		`href="https://www.zyx.tw/terms">Terms</a>`,
-		"© " + year,
-		`src:url(/errors/static/InterVariable.woff2)`,
-		`<link rel="icon" href="/errors/static/favicon.ico">`,
-	}
 	idx := read("index.html")
 	one := read(filepath.Join(problem.SlugNotFound, "index.html"))
-	for _, want := range shared {
-		if !strings.Contains(idx, want) {
-			t.Errorf("index.html lacks %s", want)
-		}
-		if !strings.Contains(one, want) {
-			t.Errorf("%s/index.html lacks %s", problem.SlugNotFound, want)
-		}
+	hasFrame(t, "index.html", idx)
+	hasFrame(t, problem.SlugNotFound+"/index.html", one)
+	if !strings.Contains(one, `href="https://www.rfc-editor.org/rfc/rfc9457" target="_blank" rel="noopener noreferrer"`) {
+		t.Error("the RFC 9457 link leaves zyx.tw without a new tab and no referrer")
 	}
 	if !strings.Contains(idx, `href="/errors/" aria-current="page">Errors</a>`) {
 		t.Error("the index does not mark Errors as the current page")
@@ -119,5 +126,22 @@ func TestPagesCarryTheFrame(t *testing.T) {
 	}
 	if !strings.HasPrefix(read(filepath.Join("static", "InterVariable.woff2")), "wOF2") {
 		t.Error("static/InterVariable.woff2 is not a WOFF2 file")
+	}
+}
+
+// The landing page at / wears the same frame, names kitbash, and marks no nav
+// entry as current.
+func TestLanding(t *testing.T) {
+	var b strings.Builder
+	if err := landing.Execute(&b, time.Now().Year()); err != nil {
+		t.Fatal(err)
+	}
+	html := b.String()
+	hasFrame(t, "the landing page", html)
+	if !strings.Contains(html, "<h1>kitbash</h1>") || !strings.Contains(html, "An operating system for AI agents.") {
+		t.Error("the landing page does not say what kitbash is")
+	}
+	if strings.Contains(html, ` aria-current="page"`) {
+		t.Error("the landing page marks a nav entry as current")
 	}
 }
