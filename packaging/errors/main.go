@@ -244,9 +244,10 @@ var intro = struct {
 			{Rows: [][2]string{
 				{"Domain", "`KITBASH_DOMAIN` gives each web Process `https://<name>.<member>.<domain>`, with one wildcard DNS record."},
 				{"TLS", "`KITBASH_TLS=acme`, the default with a domain, gets certificates from Let's Encrypt on ports 80 and 443. `gateway` leaves TLS to a proxy in front."},
-				{"Addresses", "`KITBASH_PUBLIC_ADDRESS` and `KITBASH_GATEWAY_ADDRESS` tell a host behind NAT or a gateway where it is reached from."},
+				{"Public address", "`KITBASH_PUBLIC_ADDRESS` is the public address of a host behind NAT or a gateway."},
+				{"Gateway", "`KITBASH_GATEWAY_ADDRESS` is the address the gateway forwards from, and the only one allowed on port 80."},
 			}},
-			{P: "Set them when running `install.sh`, or later in `/etc/conf.d/kitbashd` followed by `rc-service kitbashd restart`. The [README](https://github.com/zyx1121/kitbash#install) has every step and setting, and [PLAN.md](https://github.com/zyx1121/kitbash/blob/main/PLAN.md) has the design."},
+			{P: "Set them when running `install.sh`. To change one later, edit `/etc/conf.d/kitbashd` and run `install.sh` again. The [README](https://github.com/zyx1121/kitbash#install) has every step and setting, and [PLAN.md](https://github.com/zyx1121/kitbash/blob/main/PLAN.md) has the design."},
 		}},
 	},
 }
