@@ -83,7 +83,7 @@ func hasFrame(t *testing.T, name, html string) {
 		`<span class="tip" aria-hidden="true">zyx1121/kitbash</span>`,
 		`<span class="tip" aria-hidden="true">What every zyx.tw site stores and logs</span>`,
 		`<span class="tip" aria-hidden="true">The rules for every zyx.tw site</span>`,
-		`<span class="tip" aria-hidden="true">Loki (詹詠翔)</span>`,
+		`<span class="tip" aria-hidden="true">Loki</span>`,
 		`if(e.key==="Escape")`,
 		`src:url(/errors/static/InterVariable.woff2)`,
 		`<link rel="icon" href="/errors/static/favicon.ico">`,

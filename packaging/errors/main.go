@@ -166,7 +166,7 @@ main a:hover{text-decoration-color:var(--foreground)}
 </header>{{end}}
 {{define "bottom"}}<footer><div class="fade bottom"></div>
 <nav class="corner bl" aria-label="Legal"><span class="tipped"><a class="link" href="https://www.zyx.tw/privacy">Privacy</a><span class="tip" aria-hidden="true">What every zyx.tw site stores and logs</span></span><span class="tipped"><a class="link" href="https://www.zyx.tw/terms">Terms</a><span class="tip" aria-hidden="true">The rules for every zyx.tw site</span></span></nav>
-<div class="corner br"><p class="tipped">© {{.}}<span class="tip" aria-hidden="true">Loki (詹詠翔)</span></p></div>
+<div class="corner br"><p class="tipped">© {{.}}<span class="tip" aria-hidden="true">Loki</span></p></div>
 </footer>
 <script>for(const t of document.querySelectorAll(".tipped")){t.addEventListener("pointerenter",e=>t.classList.toggle("off",e.pointerType==="touch"));t.addEventListener("pointerdown",()=>t.classList.add("off"));t.addEventListener("focusout",()=>t.classList.remove("off"))}addEventListener("keydown",e=>{if(e.key==="Escape")for(const t of document.querySelectorAll(".tipped:hover,.tipped:focus-within"))t.classList.add("off")})</script>{{end}}`))
 
