@@ -131,7 +131,6 @@ a:focus-visible{outline:2px solid color-mix(in oklab,var(--ring) 50%,transparent
 main a{text-decoration:underline;text-decoration-color:color-mix(in oklab,var(--muted-foreground) 40%,transparent);text-underline-offset:4px;outline-offset:2px;transition:text-decoration-color 150ms cubic-bezier(0.4,0,0.2,1)}
 main a:hover{text-decoration-color:var(--foreground)}
 .corner{position:fixed;z-index:50;display:flex;align-items:center;gap:16px;font-size:14px;line-height:20px}
-footer .corner{font-size:12px;line-height:16px}
 .tl{top:20px;left:20px}.tr{top:20px;right:20px}.bl{bottom:20px;left:20px;max-width:calc(100% - 7.25rem);flex-wrap:wrap;row-gap:4px}.br{right:20px;bottom:20px}
 .corner a{position:relative;text-decoration:none;outline-offset:4px}
 .link{color:var(--muted-foreground);transition:color 150ms cubic-bezier(0.4,0,0.2,1)}
