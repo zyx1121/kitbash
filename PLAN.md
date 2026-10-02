@@ -469,3 +469,7 @@ Four nouns, all plural, none invented here.
 | node | A kitbash host in a cluster that runs Processes for the control host and holds no Files or members of its own, see 5.6 |
 | volume | A directory kitbashd keeps for a member outside Files and outside the image, declared by a unit, see 5.6 |
 | skill | A folder with a manifest and a `SKILL.md` and no `deploy` block: a tested recipe an agent reads before writing a Package of that kind, see 2.2 |
+
+## Public page languages
+
+The generated landing and error pages default to Traditional Chinese. Equivalent English HTML and Markdown live under `/en/`. The corner switch preserves the page, query and fragment and stores `zyx_locale` for one year across zyx.tw subdomains. Supported explicit `?lang` values override the saved preference. `/en/` also works without JavaScript. Error slugs, RFC 9457 type URIs, commands and protocol fields never change with language. Translations live in `packaging/errors/zh-TW.json`; both variants are published together.
