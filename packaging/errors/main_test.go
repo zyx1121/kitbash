@@ -55,7 +55,7 @@ func TestRender(t *testing.T) {
 	dir := t.TempDir()
 	// Twice: rendering over an earlier render must work too.
 	for range 2 {
-		if err := render(filepath.Join(dir, "errors"), "en"); err != nil {
+		if err := render(filepath.Join(dir, "errors")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -73,7 +73,7 @@ func hasFrame(t *testing.T, name, html string) {
 	t.Helper()
 	for _, want := range []string{
 		`<a class="mark" href="https://www.zyx.tw" aria-label="zyx.tw">`,
-		`<a class="link" href="/en/errors/"`,
+		`<a class="link" href="/errors/"`,
 		`href="https://github.com/zyx1121/kitbash" target="_blank" rel="noopener noreferrer">GitHub</a>`,
 		`href="https://www.zyx.tw/privacy">Privacy</a>`,
 		`href="https://www.zyx.tw/terms">Terms</a>`,
@@ -99,7 +99,7 @@ func hasFrame(t *testing.T, name, html string) {
 // static/ fails here.
 func TestPagesCarryTheFrame(t *testing.T) {
 	out := t.TempDir()
-	if err := render(out, "en"); err != nil {
+	if err := render(out); err != nil {
 		t.Fatal(err)
 	}
 	read := func(rel string) string {
@@ -116,7 +116,7 @@ func TestPagesCarryTheFrame(t *testing.T) {
 	if !strings.Contains(one, `href="https://www.rfc-editor.org/rfc/rfc9457" target="_blank" rel="noopener noreferrer"`) {
 		t.Error("the RFC 9457 link leaves zyx.tw without a new tab and no referrer")
 	}
-	if !strings.Contains(idx, `href="/en/errors/" aria-current="page">Errors</a>`) {
+	if !strings.Contains(idx, `href="/errors/" aria-current="page">Errors</a>`) {
 		t.Error("the index does not mark Errors as the current page")
 	}
 	if strings.Contains(one, ` aria-current="page"`) {
@@ -145,7 +145,7 @@ func TestPagesCarryTheFrame(t *testing.T) {
 // for agents.
 func TestLanding(t *testing.T) {
 	root := t.TempDir()
-	if err := writeLanding(root, "en"); err != nil {
+	if err := writeLanding(root); err != nil {
 		t.Fatal(err)
 	}
 	read := func(name string) string {
@@ -183,7 +183,7 @@ func TestLanding(t *testing.T) {
 	if !strings.Contains(page, `<a href="https://github.com/zyx1121/kitbash#install" target="_blank" rel="noopener noreferrer">README</a>`) {
 		t.Error("the README link does not leave zyx.tw in a new tab with no referrer")
 	}
-	if !strings.Contains(page, `<link rel="alternate" type="text/markdown" href="/en/index.md">`) {
+	if !strings.Contains(page, `<link rel="alternate" type="text/markdown" href="/index.md">`) {
 		t.Error("the landing page does not point agents at index.md")
 	}
 }
@@ -205,47 +205,5 @@ func TestInline(t *testing.T) {
 		if got := string(inline(in)); got != want {
 			t.Errorf("inline(%q) = %q, want %q", in, got, want)
 		}
-	}
-}
-
-func TestTraditionalChineseAndEnglish(t *testing.T) {
-	for _, locale := range []string{"zh-TW", "en"} {
-		t.Run(locale, func(t *testing.T) {
-			root := t.TempDir()
-			if err := render(filepath.Join(root, "errors"), locale); err != nil {
-				t.Fatal(err)
-			}
-			if err := writeLanding(root, locale); err != nil {
-				t.Fatal(err)
-			}
-			page, _ := os.ReadFile(filepath.Join(root, "index.html"))
-			md, _ := os.ReadFile(filepath.Join(root, "index.md"))
-			title := "An operating system for AI agents."
-			if locale == "zh-TW" {
-				title = "為 AI agent 設計的作業系統。"
-			}
-			if !strings.Contains(string(page), `lang="`+locale+`"`) || !strings.Contains(string(page), title) || !strings.Contains(string(md), title) {
-				t.Fatal("HTML, metadata and Markdown disagree on locale")
-			}
-			if !strings.Contains(string(md), "claude mcp add kitbash -- ssh alice@<host>") {
-				t.Fatal("command was translated")
-			}
-			for _, e := range entries {
-				body, err := os.ReadFile(filepath.Join(root, "errors", e.Slug, "index.html"))
-				if err != nil {
-					t.Fatal(err)
-				}
-				if !strings.Contains(string(body), problem.Base+e.Slug) {
-					t.Fatal("protocol type URI changed")
-				}
-				if locale == "zh-TW" {
-					for _, text := range []string{e.Title, e.When, e.Fix} {
-						if translate(locale)(text) == text {
-							t.Errorf("missing Chinese translation: %s", text)
-						}
-					}
-				}
-			}
-		})
 	}
 }
