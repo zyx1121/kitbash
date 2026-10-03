@@ -93,9 +93,8 @@ var entries = []entry{
 // rest of zyx.tw. "top" takes which page this is ("landing", "index" or
 // "page"), "bottom" the year. Links that leave zyx.tw open in a new tab with no
 // referrer, as www.zyx.tw/privacy says.
-var frame = template.Must(template.New("frame").Funcs(localeFuncs("en")).Parse(`{{define "head"}}<meta charset="utf-8">
+var frame = template.Must(template.New("frame").Parse(`{{define "head"}}<meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<script>{{languageScript}}</script>
 <link rel="icon" href="/errors/static/favicon.ico">
 <style>
 @font-face{font-family:Inter;src:url(/errors/static/InterVariable.woff2) format("woff2");font-weight:100 900;font-display:swap}
@@ -162,31 +161,31 @@ main a:hover{text-decoration-color:var(--foreground)}
 </style>{{end}}
 {{define "top"}}<header><div class="fade top"></div>
 <div class="corner tl"><span class="tipped"><a class="mark" href="https://www.zyx.tw" aria-label="zyx.tw"><svg viewBox="0 0 4096 3615" aria-hidden="true" focusable="false"><path d="M2845.95 13.9357C2917.17 -5.94859 2998.62 -8.73553 3072 33.6369C3135.18 70.1192 3172.66 128.948 3193.36 190.107C3213.74 250.29 3220.34 319.143 3218.74 390.501C3215.54 533.321 3178.64 711.473 3116.9 908.909C3087.54 1002.79 3067.38 1067.46 3055.58 1116.28C3043.27 1167.21 3044.77 1183.61 3045.32 1186.44C3049.46 1207.64 3053.85 1217.91 3057.65 1224.5C3061.46 1231.08 3068.16 1240.01 3084.44 1254.2C3086.61 1256.09 3100.05 1265.59 3150.32 1280.4C3198.49 1294.59 3264.57 1309.46 3360.54 1330.97C3562.38 1376.22 3735.1 1433.34 3860.37 1501.97C3922.96 1536.27 3979.27 1576.42 4021.19 1624.15C4063.8 1672.67 4096 1734.54 4096 1807.5C4096 1892.25 4052.87 1961.41 4000.04 2013.15C3947.46 2064.65 3876.66 2107.96 3796.99 2144.95C3637.03 2219.22 3415.77 2279.62 3157.74 2323.89C2979.46 2354.48 2848.13 2377.03 2749.36 2396.67C2649.09 2416.6 2590.56 2432.05 2554.26 2446.64C2495.41 2470.29 2468.77 2482.03 2445.24 2495.62C2421.7 2509.22 2398.22 2526.42 2348.31 2565.57C2317.52 2589.71 2274.88 2632.68 2207.49 2709.56C2141.09 2785.3 2055.9 2887.77 1940.28 3026.89C1772.92 3228.25 1609.99 3389.69 1465.7 3491.1C1393.83 3541.61 1320.93 3581.28 1250.05 3601.07C1178.83 3620.95 1097.38 3623.73 1024 3581.36C960.82 3544.88 923.345 3486.05 902.64 3424.9C882.264 3364.71 875.65 3295.86 877.25 3224.5C880.452 3081.68 917.353 2903.53 979.096 2706.09C1008.45 2612.2 1028.61 2547.53 1040.41 2498.71C1052.72 2447.78 1051.22 2431.39 1050.67 2428.56C1046.53 2407.36 1042.14 2397.08 1038.34 2390.5C1034.54 2383.91 1027.84 2374.98 1011.55 2360.79C1009.38 2358.9 995.931 2349.4 945.669 2334.59C897.5 2320.41 831.421 2305.53 735.449 2284.02C533.619 2238.78 360.909 2181.67 235.64 2113.04C173.051 2078.74 116.735 2038.59 74.8088 1990.85C32.2045 1942.34 0.0020352 1880.47 0 1807.51C0.00115737 1722.76 43.1356 1653.6 95.9632 1601.86C148.539 1550.36 219.335 1507.05 299.007 1470.06C458.965 1395.78 680.22 1335.38 938.257 1291.1C1116.53 1260.51 1247.86 1237.96 1346.63 1218.33C1446.91 1198.39 1505.44 1182.95 1541.74 1168.36C1600.59 1144.7 1627.22 1132.96 1650.76 1119.37C1674.3 1105.78 1697.78 1088.58 1747.68 1049.43C1778.47 1025.28 1821.11 982.314 1888.51 905.431C1954.9 829.699 2040.09 727.225 2155.71 588.109C2323.07 386.75 2486 225.308 2630.29 123.899C2702.17 73.388 2775.07 33.7253 2845.95 13.9357Z"/></svg></a><span class="tip" aria-hidden="true">www.zyx.tw</span></span></div>
-<nav class="corner tr" aria-label="{{t "Main"}}"><span class="tipped"><a class="link" href="{{prefix}}/errors/"{{if eq . "index"}} aria-current="page"{{end}}>{{t "Errors"}}</a><span class="tip" aria-hidden="true">{{t "Every error class and its fix"}}</span></span><span class="tipped"><a class="link" href="https://github.com/zyx1121/kitbash" target="_blank" rel="noopener noreferrer">GitHub</a><span class="tip" aria-hidden="true">zyx1121/kitbash</span></span><a class="link" data-language href="{{if eq (lang) "en"}}/?lang=zh-TW{{else}}/en/?lang=en{{end}}" lang="{{if eq (lang) "en"}}zh-TW{{else}}en{{end}}" aria-label="{{if eq (lang) "en"}}Switch to Traditional Chinese{{else}}切換為英文{{end}}">{{if eq (lang) "en"}}繁中{{else}}EN{{end}}</a></nav>
+<nav class="corner tr" aria-label="Main"><span class="tipped"><a class="link" href="/errors/"{{if eq . "index"}} aria-current="page"{{end}}>Errors</a><span class="tip" aria-hidden="true">Every error class and its fix</span></span><span class="tipped"><a class="link" href="https://github.com/zyx1121/kitbash" target="_blank" rel="noopener noreferrer">GitHub</a><span class="tip" aria-hidden="true">zyx1121/kitbash</span></span></nav>
 </header>{{end}}
 {{define "bottom"}}<footer><div class="fade bottom"></div>
-<nav class="corner bl" aria-label="{{t "Legal"}}"><span class="tipped"><a class="link" href="https://www.zyx.tw/privacy">{{t "Privacy"}}</a><span class="tip" aria-hidden="true">{{t "What every zyx.tw site stores and logs"}}</span></span><span class="tipped"><a class="link" href="https://www.zyx.tw/terms">{{t "Terms"}}</a><span class="tip" aria-hidden="true">{{t "The rules for every zyx.tw site"}}</span></span></nav>
+<nav class="corner bl" aria-label="Legal"><span class="tipped"><a class="link" href="https://www.zyx.tw/privacy">Privacy</a><span class="tip" aria-hidden="true">What every zyx.tw site stores and logs</span></span><span class="tipped"><a class="link" href="https://www.zyx.tw/terms">Terms</a><span class="tip" aria-hidden="true">The rules for every zyx.tw site</span></span></nav>
 <div class="corner br"><p class="tipped">© {{.}}<span class="tip" aria-hidden="true">Loki</span></p></div>
 </footer>
 <script>for(const t of document.querySelectorAll(".tipped")){t.addEventListener("pointerenter",e=>t.classList.toggle("off",e.pointerType==="touch"));t.addEventListener("pointerdown",()=>t.classList.add("off"));t.addEventListener("focusout",()=>t.classList.remove("off"))}addEventListener("keydown",e=>{if(e.key==="Escape")for(const t of document.querySelectorAll(".tipped:hover,.tipped:focus-within"))t.classList.add("off")})</script>{{end}}`))
 
 var page = template.Must(template.Must(frame.Clone()).New("page").Parse(`<!doctype html>
-<html lang="{{lang}}">
+<html lang="en">
 <head>
 {{template "head"}}
-<title>{{t .Title}}: {{t "kitbash error"}} {{.Slug}}</title>
+<title>{{.Title}}: kitbash error {{.Slug}}</title>
 </head>
 <body>
 {{template "top" "page"}}
 <main>
-<h1>{{t .Title}}</h1>
+<h1>{{.Title}}</h1>
 <p class="sub"><code>{{.Type}}</code></p>
 <dl class="rows">
-<dt>{{t "Status"}}</dt><dd>{{t .Status}}</dd>
-<dt>{{t "When"}}</dt><dd>{{t .When}}</dd>
-<dt>{{t "What to do"}}</dt><dd>{{t .Fix}}</dd>
+<dt>Status</dt><dd>{{.Status}}</dd>
+<dt>When</dt><dd>{{.When}}</dd>
+<dt>What to do</dt><dd>{{.Fix}}</dd>
 </dl>
-<p class="note muted">{{rich "Every problem kitbash returns is an <a href=\"https://www.rfc-editor.org/rfc/rfc9457\" target=\"_blank\" rel=\"noopener noreferrer\">RFC 9457</a> object with <code>type</code>, <code>title</code>, <code>status</code>, <code>detail</code>, an optional <code>instance</code> and a <code>fix</code> written for the call that failed. This page explains the class; the <code>detail</code> and <code>fix</code> in the object explain the instance."}}</p>
+<p class="note muted">Every problem kitbash returns is an <a href="https://www.rfc-editor.org/rfc/rfc9457" target="_blank" rel="noopener noreferrer">RFC 9457</a> object with <code>type</code>, <code>title</code>, <code>status</code>, <code>detail</code>, an optional <code>instance</code> and a <code>fix</code> written for the call that failed. This page explains the class; the <code>detail</code> and <code>fix</code> in the object explain the instance.</p>
 </main>
 {{template "bottom" .Year}}
 </body>
@@ -194,18 +193,18 @@ var page = template.Must(template.Must(frame.Clone()).New("page").Parse(`<!docty
 `))
 
 var index = template.Must(template.Must(frame.Clone()).New("index").Parse(`<!doctype html>
-<html lang="{{lang}}">
+<html lang="en">
 <head>
 {{template "head"}}
-<title>{{t "kitbash errors"}}</title>
+<title>kitbash errors</title>
 </head>
 <body>
 {{template "top" "index"}}
 <main>
-<h1>{{t "kitbash errors"}}</h1>
-<p class="sub">{{rich "Every error the kitbash MCP surface returns names one of these classes in its <code>type</code>. The class says what kind of refusal it was; the object's <code>detail</code> and <code>fix</code> say what to do this time."}}</p>
+<h1>kitbash errors</h1>
+<p class="sub">Every error the kitbash MCP surface returns names one of these classes in its <code>type</code>. The class says what kind of refusal it was; the object's <code>detail</code> and <code>fix</code> say what to do this time.</p>
 <ol class="list">
-{{range .Entries}}<li><a href="{{prefix}}/errors/{{.Slug}}/">{{.Slug}}</a><span>{{t .Title}} <span class="muted">{{t .Status}}</span></span></li>
+{{range .Entries}}<li><a href="/errors/{{.Slug}}/">{{.Slug}}</a><span>{{.Title}} <span class="muted">{{.Status}}</span></span></li>
 {{end}}</ol>
 </main>
 {{template "bottom" .Year}}
@@ -323,23 +322,23 @@ func links(escaped string) string {
 }
 
 var landing = template.Must(template.Must(frame.Clone()).New("landing").Funcs(template.FuncMap{"inline": inline}).Parse(`<!doctype html>
-<html lang="{{lang}}">
+<html lang="en">
 <head>
 {{template "head"}}
-<title>{{t .Title}}</title>
-<meta name="description" content="{{t .Tagline}}">
-<link rel="alternate" type="text/markdown" href="{{prefix}}/index.md">
+<title>{{.Title}}</title>
+<meta name="description" content="{{.Tagline}}">
+<link rel="alternate" type="text/markdown" href="/index.md">
 </head>
 <body>
 {{template "top" "landing"}}
 <main>
-<h1>{{t .Title}}</h1>
-<p class="sub">{{inline (t .Tagline)}}</p>
-{{range .Sections}}<section><h2>{{t .Heading}}</h2>
+<h1>{{.Title}}</h1>
+<p class="sub">{{inline .Tagline}}</p>
+{{range .Sections}}<section><h2>{{.Heading}}</h2>
 {{- range .Blocks}}
-{{- if .P}}<p>{{inline (t .P)}}</p>
-{{- else if .Rows}}<dl class="rows">{{range .Rows}}<dt>{{t (index . 0)}}</dt><dd>{{inline (t (index . 1))}}</dd>{{end}}</dl>
-{{- else}}<ol class="steps">{{range .Steps}}<li><p>{{inline (t .Text)}}</p>{{if .Code}}<pre><code>{{.Code}}</code></pre>{{end}}</li>{{end}}</ol>
+{{- if .P}}<p>{{inline .P}}</p>
+{{- else if .Rows}}<dl class="rows">{{range .Rows}}<dt>{{index . 0}}</dt><dd>{{inline (index . 1)}}</dd>{{end}}</dl>
+{{- else}}<ol class="steps">{{range .Steps}}<li><p>{{inline .Text}}</p>{{if .Code}}<pre><code>{{.Code}}</code></pre>{{end}}</li>{{end}}</ol>
 {{- end}}
 {{- end}}</section>
 {{end}}</main>
@@ -349,27 +348,26 @@ var landing = template.Must(template.Must(frame.Clone()).New("landing").Funcs(te
 `))
 
 // markdown is the landing page for agents, from the same intro.
-func markdown(locale string) string {
-	t := translate(locale)
+func markdown() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "# %s\n\n%s\n", intro.Title, t(intro.Tagline))
+	fmt.Fprintf(&b, "# %s\n\n%s\n", intro.Title, intro.Tagline)
 	for _, s := range intro.Sections {
-		fmt.Fprintf(&b, "\n## %s\n", t(s.Heading))
+		fmt.Fprintf(&b, "\n## %s\n", s.Heading)
 		for _, bl := range s.Blocks {
 			b.WriteString("\n")
 			switch {
 			case bl.P != "":
-				b.WriteString(t(bl.P) + "\n")
+				b.WriteString(bl.P + "\n")
 			case len(bl.Rows) > 0:
 				for _, r := range bl.Rows {
-					fmt.Fprintf(&b, "- **%s**: %s\n", t(r[0]), t(r[1]))
+					fmt.Fprintf(&b, "- **%s**: %s\n", r[0], r[1])
 				}
 			default:
 				for i, st := range bl.Steps {
 					if i > 0 {
 						b.WriteString("\n")
 					}
-					fmt.Fprintf(&b, "%d. %s\n", i+1, t(st.Text))
+					fmt.Fprintf(&b, "%d. %s\n", i+1, st.Text)
 					if st.Code != "" {
 						b.WriteString("\n   ```sh\n")
 						for _, line := range strings.Split(st.Code, "\n") {
@@ -381,11 +379,7 @@ func markdown(locale string) string {
 			}
 		}
 	}
-	if locale == "en" {
-		b.WriteString("\nPart of [zyx.tw](https://www.zyx.tw): [Privacy](https://www.zyx.tw/privacy), [Terms](https://www.zyx.tw/terms).\n")
-	} else {
-		b.WriteString("\n[zyx.tw](https://www.zyx.tw) 的一部分：[隱私權](https://www.zyx.tw/privacy)、[條款](https://www.zyx.tw/terms)。\n")
-	}
+	b.WriteString("\nPart of [zyx.tw](https://www.zyx.tw): [Privacy](https://www.zyx.tw/privacy), [Terms](https://www.zyx.tw/terms).\n")
 	return b.String()
 }
 
@@ -394,24 +388,19 @@ func main() {
 		fmt.Fprintln(os.Stderr, "usage: errors <outdir>")
 		os.Exit(2)
 	}
-	for _, locale := range []string{"zh-TW", "en"} {
-		root := os.Args[1]
-		if locale == "en" {
-			root = filepath.Join(root, "en")
-		}
-		if err := render(filepath.Join(root, "errors"), locale); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		if err := writeLanding(root, locale); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
+	out := filepath.Join(os.Args[1], "errors")
+	if err := render(out); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
 	}
-	fmt.Printf("Published Traditional Chinese and English pages in %s\n", os.Args[1])
+	if err := writeLanding(os.Args[1]); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	fmt.Printf("%d pages in %s and the landing page in %s\n", len(entries)+1, out, os.Args[1])
 }
 
-func render(out string, locale string) error {
+func render(out string) error {
 	if err := os.MkdirAll(out, 0o755); err != nil {
 		return err
 	}
@@ -419,7 +408,7 @@ func render(out string, locale string) error {
 	if err := write(filepath.Join(out, "index.html"), index, struct {
 		Entries []entry
 		Year    int
-	}{entries, year}, locale); err != nil {
+	}{entries, year}); err != nil {
 		return err
 	}
 	for _, e := range entries {
@@ -432,7 +421,7 @@ func render(out string, locale string) error {
 			Type string
 			Year int
 		}{e, problem.Base + e.Slug, year}
-		if err := write(filepath.Join(dir, "index.html"), page, data, locale); err != nil {
+		if err := write(filepath.Join(dir, "index.html"), page, data); err != nil {
 			return err
 		}
 	}
@@ -450,21 +439,20 @@ func render(out string, locale string) error {
 }
 
 // writeLanding writes the landing page into root: index.html and index.md.
-func writeLanding(root string, locale string) error {
+func writeLanding(root string) error {
 	data := struct {
 		Title, Tagline string
 		Sections       []section
 		Year           int
 	}{intro.Title, intro.Tagline, intro.Sections, time.Now().Year()}
-	if err := write(filepath.Join(root, "index.html"), landing, data, locale); err != nil {
+	if err := write(filepath.Join(root, "index.html"), landing, data); err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(root, "index.md"), []byte(markdown(locale)), 0o644)
+	return os.WriteFile(filepath.Join(root, "index.md"), []byte(markdown()), 0o644)
 }
 
 // write renders t with data into the file at path.
-func write(path string, t *template.Template, data any, locale string) error {
-	t = template.Must(t.Clone()).Funcs(localeFuncs(locale))
+func write(path string, t *template.Template, data any) error {
 	f, err := os.Create(path)
 	if err != nil {
 		return err

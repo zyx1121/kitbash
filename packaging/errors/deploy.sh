@@ -10,7 +10,7 @@ out=$(mktemp -d)
 trap 'rm -rf "$out"' EXIT
 go run ./packaging/errors "$out"
 # COPYFILE_DISABLE keeps macOS tar from adding ._ files and xattr headers.
-COPYFILE_DISABLE=1 tar -C "$out" --no-xattrs -cf - index.html index.md errors en \
+COPYFILE_DISABLE=1 tar -C "$out" --no-xattrs -cf - index.html index.md errors \
 	| ssh pve 'pct exec 200 -- sh -c "mkdir -p /home/user/gateway/sites/kitbash && rm -rf /home/user/gateway/sites/kitbash/errors && tar -xf - -C /home/user/gateway/sites/kitbash"'
 check() {
 	code=$(curl -s -o /dev/null -w '%{http_code}' -L "$1")
