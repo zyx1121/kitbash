@@ -14,7 +14,7 @@ old=$(sed -n 's/^pkgver=//p' packaging/apk/APKBUILD)
 [ "$new" != "$old" ] || { echo "bump: already $old" >&2; exit 1; }
 [ -z "$(git status --porcelain)" ] || { echo "bump: working tree not clean" >&2; exit 1; }
 sed -i.bak "s/^pkgver=.*/pkgver=$new/; s/^pkgrel=.*/pkgrel=0/" packaging/apk/APKBUILD
-for f in README.md packaging/iso/README.md; do
+for f in README.md README.zh-TW.md README.zh-CN.md docs/install.md packaging/iso/README.md; do
 	[ -f "$f" ] || continue
 	# ([^0-9]|$) rather than \b: BSD sed on macOS has no word boundary.
 	sed -i.bak -E "s/(kitbashd-|kitbash-|v)$old([^0-9]|\$)/\1$new\2/g" "$f"

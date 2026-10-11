@@ -12,7 +12,7 @@ esac
 fail=0
 # Every kitbashd-X.Y.Z, kitbash-X.Y.Z, vX.Y.Z and kitbash-X.Y.Z-x86_64.iso in
 # the operator facing files must be this version.
-for f in README.md packaging/iso/README.md; do
+for f in README.md README.zh-TW.md README.zh-CN.md docs/install.md packaging/iso/README.md; do
 	[ -f "$f" ] || continue
 	bad=$(grep -noE '(kitbashd-|kitbash-|\bv)[0-9]+\.[0-9]+\.[0-9]+' "$f" | grep -v -- "-$ver\$" | grep -v "v$ver\$" || true)
 	if [ -n "$bad" ]; then
